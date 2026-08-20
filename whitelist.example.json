@@ -1,0 +1,37 @@
+{
+  "version": 3,
+  "updated_at": "2026-01-01T00:00:00+00:00",
+  "collections": [
+    {
+      "name": "学习充电",
+      "created_at": "2026-01-01T00:00:00+00:00"
+    }
+  ],
+  "videos": [
+    {
+      "bvid": "BV1xxxxxxxxxx",
+      "cid": 100001,
+      "title": "示例视频一：这是完全虚构的假数据",
+      "cover": "https://example.com/cover1.jpg",
+      "duration": 3600,
+      "up_name": "示例UP主甲",
+      "added_at": "2026-01-01T00:00:00+00:00",
+      "collection": "学习充电",
+      "pages": [
+        { "cid": 100001, "part": "P1 第一集", "duration": 1200 },
+        { "cid": 100002, "part": "P2 第二集", "duration": 1200 },
+        { "cid": 100003, "part": "P3 第三集", "duration": 1200 }
+      ]
+    },
+    {
+      "bvid": "BV1yyyyyyyyyy",
+      "cid": 200001,
+      "title": "示例视频二：单 P 视频，未分类",
+      "cover": "https://example.com/cover2.jpg",
+      "duration": 600,
+      "up_name": "示例UP主乙",
+      "added_at": "2026-01-02T00:00:00+00:00",
+      "collection": ""
+    }
+  ]
+}

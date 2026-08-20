@@ -1,0 +1,34 @@
+# ============================================================
+# bili-whitelist 仓库根 .gitignore
+# 原则：敏感凭证 / 隐私数据 / 构建产物 一律不入库
+# 注意：gitignore 不支持行内注释，注释一律独占一行
+# ============================================================
+
+# ---------- 敏感凭证（绝不提交） ----------
+# GitHub token 配置（示例见 sync_config.example.json）
+sync_config.json
+# B 站登录 cookie（SESSDATA 等）
+cookie.txt
+# Gist 同步备份（含真实白名单数据）
+*.gistbak*
+# 各类密钥文件
+*.key
+
+# ---------- 隐私数据（真实数据不入库，提供示例文件） ----------
+# 真实白名单数据（示例见 whitelist.example.json）
+whitelist.json
+# 探针输出（含明文 URL 等中间产物）
+probe_out*.json
+probe_1080p_out.json
+
+# ---------- Python ----------
+__pycache__/
+*.pyc
+
+# ---------- 临时文件 ----------
+*.bak
+*.tmp
+
+# ---------- 系统杂项 ----------
+Thumbs.db
+Desktop.ini
