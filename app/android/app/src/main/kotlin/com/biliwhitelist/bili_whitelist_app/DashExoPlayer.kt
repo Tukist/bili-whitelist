@@ -9,6 +9,7 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
+import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.HttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
@@ -22,6 +23,10 @@ import io.flutter.view.TextureRegistry
  * 设计保持"哑"：只响应 Dart 侧方法调用，前后台切换等生命周期由 Dart 播放页处理。
  * 防盗链（M0 实测）：流请求必须带 Referer + 浏览器 UA（双必需），流请求不带 cookie；
  * 流 URL 带 deadline/upsig 数分钟过期 → 播放时必须实时取，不可持久化缓存。
+ *
+ * 本地缓存播放：Dart 侧传 `file://`（或本地绝对路径）时走 [DefaultDataSource]
+ * （file scheme → FileDataSource，无需防盗链头），其余逻辑（MergingMediaSource/
+ * 事件/onUrlExpired）不变；本地文件不产生 HttpDataSource 错误，onUrlExpired 不误报。
  */
 private const val TAG = "DashExoPlayer"
 
@@ -31,6 +36,8 @@ class DashExoPlayer(
     userAgent: String,
     private val listener: Listener,
 ) {
+    /** 保留 applicationContext 供本地数据源使用（构造参数只在属性初始化期可用）。 */
+    private val appContext: Context = context
     /** 播放器事件回调（主线程触发），由插件层转成 EventChannel 事件推给 Dart。 */
     interface Listener {
         /** 准备完成：[width]/[height] 为视频像素尺寸，[durationMs] 为总时长（未知时为 0）。 */
@@ -62,11 +69,14 @@ class DashExoPlayer(
             )
         )
 
+    /** 本地文件数据源：`file://` / 本地绝对路径走本地读取，不设置防盗链头。 */
+    private val localDataSourceFactory = DefaultDataSource.Factory(appContext)
+
     /** 当前倍速（Dart 侧每次 setPlaybackSpeed 更新；prepare 兜底用，防止换源后被重置）。 */
     @Volatile
     private var speed: Float = 1f
 
-    private val player: ExoPlayer = ExoPlayer.Builder(context).build().apply {
+    private val player: ExoPlayer = ExoPlayer.Builder(appContext).build().apply {
         setVideoSurface(surface)
         addListener(object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
@@ -102,14 +112,19 @@ class DashExoPlayer(
     /**
      * 组源并播放：video/audio 各建 ProgressiveMediaSource，再 MergingMediaSource 合并。
      * [audioUrl] 传空/Null 时退化为 mp4 单流（老视频降级）。[positionMs] 用于过期续播。
+     *
+     * 本地缓存（[isLocalUri]）走 [localDataSourceFactory]（无防盗链头）；
+     * 网络流走 [dataSourceFactory]（Referer + UA）。
      */
     fun prepare(videoUrl: String, audioUrl: String?, positionMs: Long) {
-        val videoSource = ProgressiveMediaSource.Factory(dataSourceFactory)
+        val videoFactory = if (isLocalUri(videoUrl)) localDataSourceFactory else dataSourceFactory
+        val videoSource = ProgressiveMediaSource.Factory(videoFactory)
             .createMediaSource(MediaItem.fromUri(videoUrl))
         val mediaSource = if (audioUrl.isNullOrEmpty()) {
             videoSource
         } else {
-            val audioSource = ProgressiveMediaSource.Factory(dataSourceFactory)
+            val audioFactory = if (isLocalUri(audioUrl)) localDataSourceFactory else dataSourceFactory
+            val audioSource = ProgressiveMediaSource.Factory(audioFactory)
                 .createMediaSource(MediaItem.fromUri(audioUrl))
             MergingMediaSource(videoSource, audioSource)
         }
@@ -120,6 +135,13 @@ class DashExoPlayer(
         player.play()
         // 兜底：换源（prepare）后按当前倍速重设，防被重置回 1x
         if (speed != 1f) player.setPlaybackSpeed(speed)
+    }
+
+    /** 是否为本地文件地址：`file:` scheme，或不存在 scheme 的绝对路径。 */
+    private fun isLocalUri(url: String?): Boolean {
+        if (url.isNullOrEmpty()) return false
+        if (url.startsWith("file:")) return true
+        return !url.contains("://") && url.startsWith("/")
     }
 
     fun play() = player.play()

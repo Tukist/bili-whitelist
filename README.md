@@ -62,6 +62,7 @@
 - **听视频模式**：纯音频播放（关屏可听）
 - **登录**：WebView 内嵌 B 站官方登录页（短信验证码），登录态自动续期
 - **GitHub token 配置**：App 内填写，安全存储
+- **离线缓存**：播放页一键下载到本地（单集 / 全部集），**断网可播放**已缓存视频（播放优先走本地文件）；缓存管理（查看 / 删除 / 清空 / 总大小），列表页显示「已缓存」标记
 - 版本号显示（列表页底部）
 
 ---
@@ -97,7 +98,7 @@
 | PC 脚本 | Python 3（标准库 + requests，仅 `push` 用到） |
 | 油猴脚本 | Tampermonkey，`GM_xmlhttpRequest` 直连 Gist API |
 | 同步 | GitHub Gist API（`api.github.com`，实时读写） |
-| App | Flutter（Dart）2.1.1+4 |
+| App | Flutter（Dart）2.2.0+5 |
 | App 网络 | dio（全局头 / Cookie 注入） |
 | App 播放 | 原生 Kotlin 插件：AndroidX Media3（ExoPlayer）`MergingMediaSource` 合并 DASH 双流 |
 | App 登录 | webview_flutter（内嵌 B 站官方登录页） |
@@ -180,6 +181,14 @@ B 站部分接口（如 `playurl`）要求 WBI 签名：
 - 公开 Gist 的 raw 链接有 CDN 缓存，刚写入立刻读取可能拿到旧数据
 - 管理操作与刷新**优先走 `api.github.com` 实时 API**（GET/PATCH），绕开 CDN
 
+### 8. 离线缓存（流数据下载 + 本地播放）
+
+- 下载走实时 `playurl` 取流（DASH video+audio 双流，无 DASH 降级 mp4 单流），**仅带 Referer + 浏览器 UA、不带 cookie** 下载（与在线播放同一套防盗链策略）
+- 媒体文件存应用文档目录 `video_cache/`，元数据 `cache_index.json`；下载用 `.part` 半成品 + 成功后 rename，失败自动清理并重试一次
+- **串行下载队列**：同时只允许一个下载、任务间留间隔（B 站对高频请求风控，串行更稳），多 P「全部集」逐集入队顺序下载
+- **播放优先本地**：已缓存的集直接播本地文件（无网络、无流 URL 过期问题），未缓存的走在线取流
+- 缓存管理：单集删除 / 一键清空 / 总大小统计（UI 层确认后删除）；列表页封面角标显示「已缓存」标记（多 P 部分缓存显示 `已缓存 n/m`）
+
 ---
 
 ## 目录结构
@@ -200,6 +209,7 @@ bili-whitelist/
     ├── lib/                   # Dart 源码
     │   ├── main.dart / config.dart
     │   ├── api/               # bilibili_api.dart（WBI+playurl）、github_api.dart（Gist 同步）
+    │   ├── cache/             # download_manager.dart（离线缓存下载管理器，串行队列）
     │   ├── models/            # whitelist_video.dart（v3 数据模型 + 合集管理逻辑）
     │   ├── pages/             # login_page / playlist_page / player_page
     │   ├── player/            # bili_dash_player.dart（DASH 播放控制器）

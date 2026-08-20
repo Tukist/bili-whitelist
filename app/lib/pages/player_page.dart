@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../api/bilibili_api.dart';
+import '../cache/download_manager.dart';
 import '../config.dart';
 import '../models/whitelist_video.dart';
 import '../player/bili_dash_player.dart';
@@ -42,6 +43,9 @@ class PlayerPage extends StatefulWidget {
 
 class _PlayerPageState extends State<PlayerPage> {
   final BiliApi _api = BiliApi();
+
+  /// 离线缓存管理器（下载/已缓存状态/进度；监听两个 notifier 刷新 UI）。
+  final DownloadManager _downloads = DownloadManager.instance;
 
   BiliDashPlayer? _player;
   int? _textureId;
@@ -106,18 +110,27 @@ class _PlayerPageState extends State<PlayerPage> {
   @override
   void initState() {
     super.initState();
+    // 监听缓存状态变化（下载进度/完成/删除），驱动下载按钮与进度刷新
+    _downloads.cached.addListener(_onCacheStateChanged);
+    _downloads.tasks.addListener(_onCacheStateChanged);
     _checkLoginExpiry();
     _init();
   }
 
   @override
   void dispose() {
+    _downloads.cached.removeListener(_onCacheStateChanged);
+    _downloads.tasks.removeListener(_onCacheStateChanged);
     _timer?.cancel();
     _eventSub?.cancel();
     _eventSub = null;
     _player?.dispose();
     _restoreSystemUi();
     super.dispose();
+  }
+
+  void _onCacheStateChanged() {
+    if (mounted) setState(() {});
   }
 
   // -------------------------------------------------------------------------
@@ -134,6 +147,16 @@ class _PlayerPageState extends State<PlayerPage> {
       _completed = false;
     });
     try {
+      // 先加载缓存索引，保证「播放优先本地缓存」判定准确。
+      // 带超时保护：测试环境无 path_provider 原生通道时 send 永不返回，
+      // 不能让它阻塞播放初始化（超时则本次按未缓存走网络取流）。
+      try {
+        await _downloads
+            .init()
+            .timeout(const Duration(milliseconds: 500));
+      } catch (_) {
+        // 索引加载失败/超时：忽略，走网络取流
+      }
       final player = await BiliDashPlayer.create();
       _eventSub = player.events.listen(_onPlayerEvent, onError: (Object _, StackTrace __) {
         // 事件流中断（如播放器已释放）静默忽略，以错误态兜底
@@ -152,9 +175,27 @@ class _PlayerPageState extends State<PlayerPage> {
     }
   }
 
-  /// 取流并开始播放：优先 DASH 双流（video+audio），无 dash 则 fnval=0 降级 mp4 单流。
+  /// 取流并开始播放：**已缓存 → 直接播本地文件**（无网络、无 URL 过期问题）；
+  /// 否则优先 DASH 双流（video+audio），无 dash 则 fnval=0 降级 mp4 单流。
   /// cid 取当前集 `_currentCid`（多 P 切换选集后为 pages[index].cid）。
   Future<void> _loadStreamAndPlay({required int positionMs}) async {
+    final player = _player;
+    if (player == null) return;
+    // 本地缓存优先：命中则不请求网络流
+    final cached =
+        _downloads.getCached(widget.video.bvid, _currentPageIndex);
+    if (cached != null) {
+      debugPrint('[player_page] 本地缓存播放 video=${cached.videoPath} '
+          'audio=${cached.audioPath}');
+      await player.setDataSource(
+        Uri.file(cached.videoPath).toString(),
+        audioUrl: cached.audioPath.isEmpty
+            ? null
+            : Uri.file(cached.audioPath).toString(),
+        positionMs: positionMs,
+      );
+      return;
+    }
     var result = await _api.fetchPlayUrl(
       bvid: widget.video.bvid,
       cid: _currentCid,
@@ -173,8 +214,6 @@ class _PlayerPageState extends State<PlayerPage> {
     if (!result.hasStream) {
       throw StateError('未拿到可播放的流（可能视频不可播放）');
     }
-    final player = _player;
-    if (player == null) return;
     if (result.dashVideoUrls.isNotEmpty) {
       await player.setDataSource(
         result.dashVideoUrls.first,
@@ -477,6 +516,266 @@ class _PlayerPageState extends State<PlayerPage> {
   void _toggleListenMode() {
     debugPrint('[player_page] toggle listenMode -> ${!_listenMode}');
     setState(() => _listenMode = !_listenMode);
+  }
+
+  // -------------------------------------------------------------------------
+  // 离线缓存：下载按钮 / 菜单 / 进度 / 删除
+  // -------------------------------------------------------------------------
+
+  /// 当前集缓存记录（无则 null）。
+  CachedVideo? get _currentCached =>
+      _downloads.getCached(widget.video.bvid, _currentPageIndex);
+
+  /// 当前集下载任务（下载中/排队；无则 null）。
+  DownloadTask? get _currentTask => _downloads.tasks.value[
+      CachedVideo.keyOf(widget.video.bvid, _currentPageIndex)];
+
+  /// 点击下载按钮：未缓存 → 下载菜单；已缓存 → 缓存操作菜单；下载中不响应。
+  void _onDownloadTap() {
+    final task = _currentTask;
+    if (task != null &&
+        (task.status == DownloadStatus.queued ||
+            task.status == DownloadStatus.downloading)) {
+      return; // 下载中/排队：按钮只显示进度，不弹菜单
+    }
+    final cached = _currentCached;
+    final partTitle = _currentPartTitle;
+    showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: const Color(0xFF202023),
+      builder: (sheetCtx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              dense: true,
+              title: Text(cached != null ? '缓存操作' : '离线下载',
+                  style: const TextStyle(color: Colors.white, fontSize: 15)),
+              subtitle: Text(
+                partTitle,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(color: Colors.white54, fontSize: 12),
+              ),
+            ),
+            const Divider(height: 1),
+            if (cached == null) ...[
+              ListTile(
+                leading:
+                    const Icon(Icons.download_outlined, color: Colors.white),
+                title: const Text('下载本集',
+                    style: TextStyle(color: Colors.white, fontSize: 15)),
+                onTap: () {
+                  Navigator.pop(sheetCtx);
+                  _confirmDownloadPage(_currentPageIndex);
+                },
+              ),
+              if (widget.video.isMultiPage)
+                ListTile(
+                  leading: const Icon(Icons.download_done,
+                      color: Colors.white),
+                  title: Text('下载全部集（${widget.video.pageCount} 集）',
+                      style:
+                          const TextStyle(color: Colors.white, fontSize: 15)),
+                  onTap: () {
+                    Navigator.pop(sheetCtx);
+                    _confirmDownloadAll();
+                  },
+                ),
+            ] else ...[
+              ListTile(
+                leading: const Icon(Icons.refresh, color: Colors.white),
+                title: const Text('重新下载',
+                    style: TextStyle(color: Colors.white, fontSize: 15)),
+                onTap: () {
+                  Navigator.pop(sheetCtx);
+                  _confirmDownloadPage(_currentPageIndex);
+                },
+              ),
+              ListTile(
+                leading: Icon(Icons.delete_outline,
+                    color: Theme.of(context).colorScheme.error),
+                title: Text('删除缓存',
+                    style: TextStyle(
+                        color: Theme.of(context).colorScheme.error,
+                        fontSize: 15)),
+                onTap: () {
+                  Navigator.pop(sheetCtx);
+                  _confirmDeleteCache();
+                },
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// 确认下载本集（提示消耗流量）→ 入队。
+  Future<void> _confirmDownloadPage(int pageIndex) async {
+    final pages = _pages;
+    final partTitle = pages != null && pageIndex < pages.length
+        ? pages[pageIndex].part
+        : _currentPartTitle;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        title: const Text('离线下载'),
+        content: Text('将下载《${partTitle.isEmpty ? widget.video.title : partTitle}》'
+            '到本地缓存（约需网络流量），之后可在无网时离线播放。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogCtx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogCtx, true),
+            child: const Text('开始下载'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    _startDownloadPage(pageIndex);
+  }
+
+  /// 确认下载全部 P（提示流量）→ 逐集入队。
+  Future<void> _confirmDownloadAll() async {
+    final n = widget.video.pageCount;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        title: const Text('离线下载'),
+        content: Text('将依次下载全部 $n 集到本地缓存'
+            '（${n > 1 ? '流量较大，' : ''}完成后可在无网时离线播放）。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogCtx, false),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogCtx, true),
+            child: const Text('开始下载'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    _startDownloadAll();
+  }
+
+  /// 启动单集下载（入队后立即返回；完成/失败用 SnackBar 反馈）。
+  void _startDownloadPage(int pageIndex) {
+    final future = _downloads.downloadVideo(widget.video, pageIndex);
+    future.then((_) {
+      final cached =
+          _downloads.getCached(widget.video.bvid, pageIndex);
+      if (mounted) {
+        _showSnack('已缓存：${cached?.partTitle ?? '第 ${pageIndex + 1} 集'}');
+      }
+    }).catchError((Object e) {
+      if (mounted) _showSnack('下载失败：${_shortErr(e)}');
+    });
+  }
+
+  /// 启动全部 P 下载（逐集入队，内部串行执行）。
+  void _startDownloadAll() {
+    _downloads.downloadAllPages(widget.video).then((_) {
+      if (mounted) _showSnack('全部 ${widget.video.pageCount} 集已缓存');
+    }).catchError((Object e) {
+      if (mounted) _showSnack('下载未完成：${_shortErr(e)}');
+    });
+  }
+
+  /// 确认删除当前集缓存。
+  Future<void> _confirmDeleteCache() async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        title: const Text('删除缓存'),
+        content: Text('确定删除《$_currentPartTitle》的本地缓存吗？'
+            '删除后离线将无法播放本集。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogCtx, false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(dialogCtx, true),
+            child: const Text('删除', style: TextStyle(color: Colors.red)),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    await _downloads.deleteCache(widget.video.bvid, _currentPageIndex);
+    if (mounted) _showSnack('已删除缓存');
+  }
+
+  void _showSnack(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  /// 下载错误精简文案（去掉过长的类型/堆栈前缀）。
+  String _shortErr(Object e) {
+    final s = '$e';
+    final idx = s.indexOf('\n');
+    return (idx > 0 ? s.substring(0, idx) : s);
+  }
+
+  /// 底部下载控制按钮：未缓存「下载」/ 下载中进度环+百分比 / 已缓存「已缓存」。
+  Widget _buildDownloadControl() {
+    final task = _currentTask;
+    final downloading = task != null &&
+        (task.status == DownloadStatus.queued ||
+            task.status == DownloadStatus.downloading);
+    final cached = _currentCached;
+    final Widget icon;
+    final String label;
+    final Color color;
+    if (downloading) {
+      icon = SizedBox(
+        width: 18,
+        height: 18,
+        child: CircularProgressIndicator(
+          value: task.progress,
+          strokeWidth: 2,
+          color: Colors.pinkAccent,
+        ),
+      );
+      label = task.progress == null ? '下载中' : '${task.percent}%';
+      color = Colors.pinkAccent;
+    } else if (cached != null) {
+      icon =
+          const Icon(Icons.check_circle_outline, color: Colors.pinkAccent, size: 18);
+      label = '已缓存';
+      color = Colors.pinkAccent;
+    } else {
+      icon = const Icon(Icons.download_outlined, color: Colors.white, size: 18);
+      label = '下载';
+      color = Colors.white;
+    }
+    return InkWell(
+      onTap: downloading ? null : _onDownloadTap,
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          icon,
+          const SizedBox(width: 4),
+          Flexible(
+            child: Text(
+              label,
+              softWrap: false,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(color: color, fontSize: 14),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -920,10 +1219,14 @@ class _PlayerPageState extends State<PlayerPage> {
                             const Icon(Icons.queue_music,
                                 color: Colors.white, size: 18),
                             const SizedBox(width: 4),
-                            Text(
-                              '选集 ${_currentPageIndex + 1}/${widget.video.pageCount}',
-                              style: const TextStyle(
-                                  color: Colors.white, fontSize: 14),
+                            Flexible(
+                              child: Text(
+                                '选集 ${_currentPageIndex + 1}/${widget.video.pageCount}',
+                                softWrap: false,
+                                overflow: TextOverflow.ellipsis,
+                                style: const TextStyle(
+                                    color: Colors.white, fontSize: 14),
+                              ),
                             ),
                           ],
                         ),
@@ -939,10 +1242,14 @@ class _PlayerPageState extends State<PlayerPage> {
                           const Icon(Icons.speed,
                               color: Colors.white, size: 18),
                           const SizedBox(width: 4),
-                          Text(
-                            _fmtSpeed(_speed),
-                            style: const TextStyle(
-                                color: Colors.white, fontSize: 14),
+                          Flexible(
+                            child: Text(
+                              _fmtSpeed(_speed),
+                              softWrap: false,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                  color: Colors.white, fontSize: 14),
+                            ),
                           ),
                         ],
                       ),
@@ -965,19 +1272,25 @@ class _PlayerPageState extends State<PlayerPage> {
                             size: 18,
                           ),
                           const SizedBox(width: 4),
-                          Text(
-                            _listenMode ? '听视频中' : '听视频',
-                            style: TextStyle(
-                              color: _listenMode
-                                  ? Colors.pinkAccent
-                                  : Colors.white,
-                              fontSize: 14,
+                          Flexible(
+                            child: Text(
+                              _listenMode ? '听视频中' : '听视频',
+                              softWrap: false,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                color: _listenMode
+                                    ? Colors.pinkAccent
+                                    : Colors.white,
+                                fontSize: 14,
+                              ),
                             ),
                           ),
                         ],
                       ),
                     ),
                   ),
+                  // 下载按钮：未缓存「下载」/ 下载中进度环+百分比 / 已缓存「已缓存」
+                  Expanded(child: _buildDownloadControl()),
                   // 全屏按钮
                   Expanded(
                     child: IconButton(
