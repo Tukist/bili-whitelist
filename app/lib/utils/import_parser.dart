@@ -105,19 +105,29 @@ Future<String> parseBvid(String input, {Dio? dio}) async {
 ///
 /// - 带浏览器 UA（防反爬），`followRedirects=true` 自动跟随 301/302
 /// - 网络异常 / 请求失败 → 抛 [ImportParseException]「短链解析失败」
+/// - 瞬时网络错误（连接/接收超时、连接失败）自动重试 1 次（间隔 800ms），
+///   降低弱网/抖动环境下的误报「短链解析失败」
 /// - [dio] 可注入（测试用）
 Future<String> resolveShortLink(String shortUrl, {Dio? dio}) async {
   final d = dio ?? _defaultShortLinkDio();
-  try {
-    final resp = await d.get<String>(
-      shortUrl,
-      options: Options(responseType: ResponseType.plain),
-    );
-    // realUri：跟随重定向后的最终真实地址（无重定向时为原始 URL）
-    return resp.realUri.toString();
-  } on DioException {
-    throw const ImportParseException('短链解析失败');
+  for (var attempt = 0; attempt < 2; attempt++) {
+    try {
+      final resp = await d.get<String>(
+        shortUrl,
+        options: Options(responseType: ResponseType.plain),
+      );
+      // realUri：跟随重定向后的最终真实地址（无重定向时为原始 URL）
+      return resp.realUri.toString();
+    } on DioException catch (e) {
+      final transient = e.type == DioExceptionType.connectionTimeout ||
+          e.type == DioExceptionType.sendTimeout ||
+          e.type == DioExceptionType.receiveTimeout ||
+          e.type == DioExceptionType.connectionError;
+      if (!transient) break; // 非瞬时错误（如 4xx 业务码）不重试
+      await Future<void>.delayed(const Duration(milliseconds: 800));
+    }
   }
+  throw const ImportParseException('短链解析失败');
 }
 
 /// 短链解析默认 dio：浏览器 UA + 跟随重定向。

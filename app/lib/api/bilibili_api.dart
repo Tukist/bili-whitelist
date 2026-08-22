@@ -1,4 +1,5 @@
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import '../config.dart';
@@ -59,6 +60,13 @@ class BiliApi {
 
   /// WBI key 会话内缓存（img_key, sub_key）。
   (String, String)? _wbiKeys;
+
+  /// 浏览器指纹 cookie（buvid3/buvid4，spi 接口获取，会话内缓存）。
+  ///
+  /// B 站对「无 buvid 指纹 + 高频匿名请求」的客户端极易触发 v_voucher 风控
+  /// （playurl 返回 code=0 但无任何流）。补上指纹后显著降低触发概率。
+  String? _buvid3;
+  String? _buvid4;
 
   BiliApi({Dio? dio, FlutterSecureStorage? storage})
       : _dio = dio ??
@@ -190,12 +198,40 @@ class BiliApi {
   }
 
   /// 有 SESSDATA 就注入 Cookie 头（无则不加，保持匿名调用）。
+  ///
+  /// Cookie 由「浏览器指纹（buvid3/buvid4）+ 可选 SESSDATA」拼接。
   Future<void> _injectAuth() async {
+    await _ensureBuvid();
+    final parts = <String>[
+      if (_buvid3 != null) 'buvid3=$_buvid3',
+      if (_buvid4 != null) 'buvid4=$_buvid4',
+    ];
     final sessdata = await readSessdata();
     if (sessdata != null && sessdata.isNotEmpty) {
-      _dio.options.headers['Cookie'] = 'SESSDATA=$sessdata';
-    } else {
+      parts.add('SESSDATA=$sessdata');
+    }
+    if (parts.isEmpty) {
       _dio.options.headers.remove('Cookie');
+    } else {
+      _dio.options.headers['Cookie'] = parts.join('; ');
+    }
+  }
+
+  /// 获取浏览器指纹 buvid3/buvid4（spi 接口，匿名可得，会话内缓存）。
+  ///
+  /// 失败静默忽略（不阻塞主流程，只是少了指纹更容易触发 v_voucher 风控）。
+  Future<void> _ensureBuvid() async {
+    if (_buvid3 != null) return;
+    try {
+      final resp =
+          await _dio.get<Map<String, dynamic>>('/x/frontend/finger/spi');
+      final d = resp.data?['data'] as Map<String, dynamic>? ?? {};
+      final b3 = d['b_3'] as String?;
+      final b4 = d['b_4'] as String?;
+      if (b3 != null && b3.isNotEmpty) _buvid3 = b3;
+      if (b4 != null && b4.isNotEmpty) _buvid4 = b4;
+    } catch (_) {
+      // 拿不到指纹就继续（功能可用，风控概率升高）
     }
   }
 
@@ -302,6 +338,7 @@ class BiliApi {
       subKey: subKey,
       withDm: true,
     );
+    debugPrint('[bili_api] fetchPlayUrl bvid=$bvid cid=$cid qn=$qn fnval=$fnval');
     for (var attempt = 0; attempt < 2; attempt++) {
       final resp = await _dio.get<Map<String, dynamic>>(
           '/x/player/wbi/playurl',
@@ -320,6 +357,17 @@ class BiliApi {
         );
       }
       final d = data?['data'] as Map<String, dynamic>? ?? {};
+      // B 站软风控/限流特征：code=0 但 data 只带 v_voucher（或整体为空），
+      // 没有任何 dash/durl 流。不识别的话 App 会误报「视频不可播放」。
+      if (d.containsKey('v_voucher') || d.isEmpty) {
+        debugPrint('[bili_api] fetchPlayUrl 风控空响应 data=$d '
+            '(bvid=$bvid fnval=$fnval)');
+        throw BiliApiException(
+          code: -352,
+          message: '接口被限流，请稍后重试',
+          path: '/x/player/wbi/playurl',
+        );
+      }
       final quality = (d['quality'] as num?)?.toInt() ?? 0;
       // 传统 mp4：durl[0].url
       final durl = d['durl'] as List?;
@@ -342,6 +390,9 @@ class BiliApi {
           if (url != null && url.isNotEmpty) audioUrls.add(url);
         }
       }
+      debugPrint('[bili_api] fetchPlayUrl fnval=$fnval ok: quality=$quality '
+          'dashV=${videoUrls.length} dashA=${audioUrls.length} '
+          'mp4=${mp4Url != null} (bvid=$bvid)');
       return PlayUrlResult(
         quality: quality,
         mp4Url: mp4Url,

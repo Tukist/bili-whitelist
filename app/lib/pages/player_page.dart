@@ -196,6 +196,7 @@ class _PlayerPageState extends State<PlayerPage> {
       );
       return;
     }
+    debugPrint('[player_page] 取流 bvid=${widget.video.bvid} cid=$_currentCid');
     var result = await _api.fetchPlayUrl(
       bvid: widget.video.bvid,
       cid: _currentCid,
@@ -204,6 +205,7 @@ class _PlayerPageState extends State<PlayerPage> {
     );
     // 老视频无 DASH → 重取 fnval=0 拿 durl[0].url（fnval=16 的响应里没有 durl）
     if (result.dashVideoUrls.isEmpty) {
+      debugPrint('[player_page] fnval=16 无 DASH，降级 fnval=0');
       result = await _api.fetchPlayUrl(
         bvid: widget.video.bvid,
         cid: _currentCid,
@@ -243,6 +245,33 @@ class _PlayerPageState extends State<PlayerPage> {
           return;
         } on BiliApiException catch (retryE) {
           if (retryE.code != -412) {
+            _showFatal(retryE);
+            return;
+          }
+        } catch (retryE) {
+          _showFatal(retryE);
+          return;
+        }
+      }
+      _showFatal(e);
+      return;
+    }
+    // -352 接口限流（v_voucher 软风控，playurl 返回 code=0+空流）：
+    // 退避 3s→6s 重试两次（短时限流可自愈），仍失败给出明确提示。
+    // 完全解除需过 B 站验证码，App 内无法自动化，只能靠等待/换网络。
+    if (e is BiliApiException && e.code == -352) {
+      for (final delay in const [
+        Duration(seconds: 3),
+        Duration(seconds: 6),
+      ]) {
+        await Future<void>.delayed(delay);
+        if (!mounted) return;
+        try {
+          await _loadStreamAndPlay(positionMs: 0);
+          if (mounted) setState(() => _buffering = false);
+          return;
+        } on BiliApiException catch (retryE) {
+          if (retryE.code != -352) {
             _showFatal(retryE);
             return;
           }

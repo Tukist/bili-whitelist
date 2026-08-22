@@ -386,6 +386,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
       _showSnack(e.message);
       return;
     }
+    debugPrint('[import] parseBvid -> $bvid');
 
     // 2) 配置门禁：未配置 token/gist_id 时提前引导，避免浪费 B 站接口调用
     if (!await _github.hasConfig()) {
@@ -397,6 +398,8 @@ class _PlaylistPageState extends State<PlaylistPage> {
     final Map<String, dynamic> meta;
     try {
       meta = await BiliApi().fetchVideoMeta(bvid);
+      debugPrint('[import] fetchVideoMeta ok: cid=${meta['cid']} '
+          'title=${meta['title']} pages=${(meta['pages'] as List?)?.length}');
     } on BiliApiException catch (e) {
       _showSnack('获取视频信息失败：${e.message}');
       return;
@@ -425,6 +428,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
         return;
       }
       await ServiceLocator.syncService.saveToCache(next);
+      debugPrint('[import] 已写入 Gist + 本地缓存: $bvid');
       if (mounted) {
         setState(() {
           _data = next;
