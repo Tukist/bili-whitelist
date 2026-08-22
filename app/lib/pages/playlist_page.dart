@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 
@@ -9,6 +10,7 @@ import '../cache/download_manager.dart';
 import '../config.dart';
 import '../models/whitelist_video.dart';
 import '../services/service_locator.dart';
+import '../utils/import_parser.dart';
 import 'login_page.dart';
 import 'player_page.dart';
 
@@ -27,8 +29,10 @@ String fmtDuration(int seconds) {
 ///
 /// - 封面用 `Image.network(..., headers:)` 带防盗链头（Referer + 浏览器 UA）
 /// - 下拉刷新触发重新同步；AppBar 显示缓存数据时间
-/// - **没有任何新增白名单的入口**（添加白名单只由 PC 端油猴脚本维护）；
-///   管理功能仅限：新建/重命名/删除合集、移动视频、删除视频（防沉迷原则不变）
+/// - **新增白名单的入口只有「导入」**（解析 B 站分享链接/文本加入白名单，
+///   与电脑端油猴脚本等价）；管理功能仅限：新建/重命名/删除合集、移动视频、
+///   删除视频（防沉迷原则不变）
+/// - 右上角导入入口：粘贴分享链接/文本（支持 b23.tv 短链和完整链接）
 /// - 右上角管理入口：GitHub token/gist_id 配置 + 新建合集
 /// - 右上角登录入口可进 WebView 登录页（解锁 1080P，M4 起内嵌官方登录页）
 /// - 启动时静默检查登录态：SESSDATA 距过期 < 7 天自动续期；
@@ -180,7 +184,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
 
   // ---------------------------------------------------------------------------
   // 管理写操作：内存副本 → saveToGist 成功 → 写本地缓存 → 刷新 UI；
-  // 失败只提示、不动内存与本地缓存。防沉迷：无任何新增视频入口。
+  // 失败只提示、不动内存与本地缓存。防沉迷：新增视频入口只有「导入」（与电脑端等价）。
   // ---------------------------------------------------------------------------
 
   void _showSnack(String message) {
@@ -362,6 +366,110 @@ class _PlaylistPageState extends State<PlaylistPage> {
     await _saveAndRefresh(next);
   }
 
+  /// 打开导入对话框（解析分享链接 → 加入白名单）。
+  void _openImport() {
+    showDialog<void>(
+      context: context,
+      builder: (_) => _ImportDialog(onImport: _importVideo),
+    );
+  }
+
+  /// 导入视频：解析 BV → 取元数据 → 拉 Gist 合并（按 bvid 查重）→ 写回并刷新。
+  ///
+  /// 错误分类提示：解析失败 / 未配置 / B 站接口 / 网络 / Gist 各类错误。
+  Future<void> _importVideo(String input) async {
+    // 1) 解析出 bvid（短链会发一次重定向请求）
+    final String bvid;
+    try {
+      bvid = await parseBvid(input);
+    } on ImportParseException catch (e) {
+      _showSnack(e.message);
+      return;
+    }
+
+    // 2) 配置门禁：未配置 token/gist_id 时提前引导，避免浪费 B 站接口调用
+    if (!await _github.hasConfig()) {
+      _showSnack('请先到右上角管理入口配置 GitHub token 与 Gist ID');
+      return;
+    }
+
+    // 3) 取视频元数据
+    final Map<String, dynamic> meta;
+    try {
+      meta = await BiliApi().fetchVideoMeta(bvid);
+    } on BiliApiException catch (e) {
+      _showSnack('获取视频信息失败：${e.message}');
+      return;
+    } on DioException {
+      _showSnack('网络请求失败，请检查网络后重试');
+      return;
+    }
+
+    final video = _videoFromMeta(meta, fallbackBvid: bvid);
+    final displayTitle = video.title.isEmpty ? video.bvid : video.title;
+
+    // 4) 拉取当前 Gist → 按 bvid 查重 → 合并 → 写回
+    try {
+      final current = await _github.fetchFromGist();
+      final existing = current?.videos ?? const <WhitelistVideo>[];
+      if (existing.any((v) => v.bvid == video.bvid)) {
+        _showSnack('已在白名单：$displayTitle');
+        return;
+      }
+      final next = (current ?? WhitelistData.empty()).copyWith(
+        videos: [...existing, video],
+      );
+      final ok = await _github.saveToGist(next);
+      if (!ok) {
+        _showSnack('保存到 Gist 失败，请重试');
+        return;
+      }
+      await ServiceLocator.syncService.saveToCache(next);
+      if (mounted) {
+        setState(() {
+          _data = next;
+          _ensureTab();
+        });
+      }
+      final multi = countLinkTokens(input) > 1;
+      _showSnack(
+        '已导入：$displayTitle${multi ? '（检测到多个链接，仅导入第一个）' : ''}',
+      );
+    } on GithubApiException catch (e) {
+      _showSnack('导入失败：${e.message}');
+    } catch (e) {
+      _showSnack('导入失败：$e');
+    }
+  }
+
+  /// 从 B 站 view 接口元数据构造 [WhitelistVideo]（未分类、当前时间 added_at）。
+  WhitelistVideo _videoFromMeta(
+    Map<String, dynamic> meta, {
+    required String fallbackBvid,
+  }) {
+    final owner = meta['owner'] as Map<String, dynamic>? ?? const {};
+    final rawPages = meta['pages'] as List? ?? const [];
+    final pages = rawPages
+        .whereType<Map<String, dynamic>>()
+        .map((p) => PageInfo(
+              cid: (p['cid'] as num?)?.toInt() ?? 0,
+              part: p['part'] as String? ?? '',
+              duration: (p['duration'] as num?)?.toInt() ?? 0,
+            ))
+        .toList();
+    return WhitelistVideo(
+      bvid: meta['bvid'] as String? ?? fallbackBvid,
+      cid: (meta['cid'] as num?)?.toInt() ?? 0,
+      title: meta['title'] as String? ?? '',
+      cover: meta['pic'] as String? ?? '',
+      duration: (meta['duration'] as num?)?.toInt() ?? 0,
+      upName: owner['name'] as String? ?? '',
+      addedAt: DateTime.now().toUtc().toIso8601String(),
+      pages: pages.isEmpty ? null : pages,
+      collection: '',
+    );
+  }
+
   /// 打开管理面板（GitHub 配置 + 新建合集）。
   void _openManage() {
     showModalBottomSheet<void>(
@@ -429,6 +537,11 @@ class _PlaylistPageState extends State<PlaylistPage> {
       appBar: AppBar(
         title: const Text('白名单点播'),
         actions: [
+          IconButton(
+            tooltip: '导入视频',
+            icon: const Icon(Icons.add_link),
+            onPressed: _openImport,
+          ),
           IconButton(
             tooltip: '管理（GitHub 配置 / 合集）',
             icon: const Icon(Icons.settings_outlined),
@@ -522,6 +635,86 @@ class _PlaylistPageState extends State<PlaylistPage> {
   void _openLogin(BuildContext context) {
     Navigator.of(context)
         .push(MaterialPageRoute<void>(builder: (_) => const LoginPage()));
+  }
+}
+
+/// 导入对话框：多行输入框粘贴 B 站分享链接/文本，确认后交回页面执行导入。
+class _ImportDialog extends StatefulWidget {
+  final Future<void> Function(String text) onImport;
+
+  const _ImportDialog({required this.onImport});
+
+  @override
+  State<_ImportDialog> createState() => _ImportDialogState();
+}
+
+class _ImportDialogState extends State<_ImportDialog> {
+  final _ctrl = TextEditingController();
+  bool _submitting = false;
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    final text = _ctrl.text.trim();
+    if (text.isEmpty) return;
+    setState(() => _submitting = true);
+    try {
+      await widget.onImport(text);
+    } finally {
+      if (mounted) Navigator.of(context).pop();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return AlertDialog(
+      title: const Text('导入视频'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          TextField(
+            controller: _ctrl,
+            autofocus: true,
+            minLines: 2,
+            maxLines: 4,
+            enabled: !_submitting,
+            decoration: const InputDecoration(
+              hintText: '粘贴 B 站分享链接/文本，支持 b23.tv 短链和完整链接',
+              border: OutlineInputBorder(),
+              isDense: true,
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            '导入即加入白名单（与电脑端等价）',
+            style: theme.textTheme.bodySmall
+                ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: _submitting ? null : () => Navigator.pop(context),
+          child: const Text('取消'),
+        ),
+        FilledButton(
+          onPressed: _submitting ? null : _submit,
+          child: _submitting
+              ? const SizedBox(
+                  width: 16,
+                  height: 16,
+                  child: CircularProgressIndicator(strokeWidth: 2),
+                )
+              : const Text('导入'),
+        ),
+      ],
+    );
   }
 }
 
@@ -983,7 +1176,7 @@ class _ManageSheetState extends State<_ManageSheet> {
             const SizedBox(height: 4),
             Text(
               '管理功能只允许：新建 / 重命名 / 删除合集，移动 / 删除视频。'
-              '新增白名单仍只在电脑端完成（防沉迷原则）。',
+              '新增白名单走右上角「导入」入口（解析分享链接，与电脑端等价）。',
               style: theme.textTheme.bodySmall
                   ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
             ),
