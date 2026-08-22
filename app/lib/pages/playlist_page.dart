@@ -57,6 +57,10 @@ class _PlaylistPageState extends State<PlaylistPage> {
   bool _syncing = false;
   final GithubApi _github = GithubApi();
 
+  /// 列表滚动控制器：导入成功后滚动到新视频（列表末尾），
+  /// 保证用户立即可见导入结果，不用手动翻到列表底部。
+  final ScrollController _listScroll = ScrollController();
+
   /// 离线缓存管理器（列表页显示已缓存标记；缓存状态变化时刷新）。
   final DownloadManager _downloads = DownloadManager.instance;
 
@@ -84,6 +88,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
   @override
   void dispose() {
     _downloads.cached.removeListener(_onCacheChanged);
+    _listScroll.dispose();
     super.dispose();
   }
 
@@ -432,7 +437,23 @@ class _PlaylistPageState extends State<PlaylistPage> {
       if (mounted) {
         setState(() {
           _data = next;
+          // 导入的视频固定为未分类：若用户当前停留在某个合集 Tab，
+          // 会被 Tab 过滤而看不到新视频（表现为「导入成功但列表不显示」），
+          // 因此导入成功后自动切回「全部」，确保立即可见。
+          if (video.isUncategorized && _selectedTab != kTabAll) {
+            _selectedTab = kTabAll;
+          }
           _ensureTab();
+        });
+        // 列表帧更新后滚动到末尾（新视频追加在列表末尾），
+        // 让用户立刻看到导入结果，无需手动翻页。
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (!mounted || !_listScroll.hasClients) return;
+          _listScroll.animateTo(
+            _listScroll.position.maxScrollExtent,
+            duration: const Duration(milliseconds: 300),
+            curve: Curves.easeOut,
+          );
         });
       }
       final multi = countLinkTokens(input) > 1;
@@ -572,6 +593,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
               onRefresh: _load,
               child: hasData
                   ? ListView.separated(
+                      controller: _listScroll,
                       physics: const AlwaysScrollableScrollPhysics(),
                       itemCount: _videos.length,
                       separatorBuilder: (_, __) =>
