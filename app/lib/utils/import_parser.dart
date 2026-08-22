@@ -29,8 +29,10 @@ final RegExp _bareBvidRe = RegExp(r'BV[0-9A-Za-z]{10}');
 /// 完整链接里的 BV（`bilibili.com/video/BV...`，`www.`/`m.` 是子串自动命中）。
 final RegExp _fullLinkRe = RegExp(r'bilibili\.com/video/(BV[0-9A-Za-z]{10})');
 
-/// b23.tv 短链里的短码（`b23.tv/xxx`，xxx 为字母数字）。
-final RegExp _shortCodeRe = RegExp(r'b23\.tv/[A-Za-z0-9]+');
+/// b23.tv 短链（`https://b23.tv/xxx`，xxx 为字母数字；协议头可选，
+/// 兼容用户只粘贴 `b23.tv/xxx` 的情况）。短链码后若带 `?query`
+/// （手机分享格式），正则只匹配到 `?` 前的短码部分。
+final RegExp _shortCodeRe = RegExp(r'(?:https?://)?b23\.tv/[A-Za-z0-9]+');
 
 /// 从文本中提取第一个裸 BV 号（含完整链接里直接可见的 BV）。
 ///
@@ -49,11 +51,18 @@ String? extractFullLinkBvid(String text) =>
 String? extractBvidFromUrl(String url) =>
     extractFullLinkBvid(url) ?? extractBareBvid(url);
 
-/// 从文本中提取第一个 b23.tv 短链（含 `b23.tv/` 前缀的完整短 URL）。
+/// 从文本中提取第一个 b23.tv 短链，返回**完整可请求的短链 URL**
+/// （自动补 `https://` 协议头）。
 ///
+/// ⚠️ 必须返回带协议头的完整 URL：dio 请求 `b23.tv/xxx`（无协议头）时
+/// `Uri` 解析不到 host，会抛 `No host specified` 导致所有短链解析失败。
 /// 找不到返回 null。
-String? extractShortCode(String text) =>
-    _shortCodeRe.firstMatch(text)?.group(0);
+String? extractShortCode(String text) {
+  final m = _shortCodeRe.firstMatch(text);
+  if (m == null) return null;
+  final raw = m.group(0)!;
+  return raw.startsWith('http') ? raw : 'https://$raw';
+}
 
 /// 统计文本里的「链接」数量（裸 BV 次数 + 短链次数）。
 ///

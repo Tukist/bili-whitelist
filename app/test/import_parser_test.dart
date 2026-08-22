@@ -78,6 +78,29 @@ void main() {
       );
     });
 
+    test('完整链接带分P/分享 query → 裸 BV 命中，不走网络', () async {
+      expect(
+        await parseBvid('https://www.bilibili.com/video/$_bv1'
+            '?p=2&share_source=copy_web&vd_source=abc'),
+        _bv1,
+      );
+    });
+
+    test('extractShortCode 返回带协议头的完整短链', () {
+      // 完整 URL：原样返回
+      expect(extractShortCode('https://b23.tv/spVKBAi'),
+          'https://b23.tv/spVKBAi');
+      // 无协议头：自动补 https://
+      expect(extractShortCode('b23.tv/spVKBAi'), 'https://b23.tv/spVKBAi');
+      // 带 query（手机分享格式）：只取短码部分，query 丢弃
+      expect(
+        extractShortCode('https://b23.tv/spVKBAi'
+            '?share_medium=android&bbid=123&ts=1787426885'),
+        'https://b23.tv/spVKBAi',
+      );
+      expect(extractShortCode('没有短链'), isNull);
+    });
+
     test('夹杂标题文本', () async {
       expect(
         await parseBvid('【测试视频】这个视频很好看 '
@@ -131,8 +154,68 @@ void main() {
         await parseBvid('【标题】 https://b23.tv/spVKBAi', dio: dio),
         _bv1,
       );
-      // 请求确实打到短链
-      expect(adapter.requests.single.uri.toString(), contains('b23.tv/spVKBAi'));
+      // 请求必须打到带协议头的完整短链（无协议头会 No host specified）
+      final uri = adapter.requests.single.uri;
+      expect(uri.toString(), 'https://b23.tv/spVKBAi');
+    });
+
+    test('带 query 的短链（手机分享格式）→ 只取短码部分请求', () async {
+      final adapter = _RedirectAdapter(
+        finalLocation: Uri.parse('https://m.bilibili.com/video/$_bv1?p=1'),
+      );
+      final dio = _dioWith(adapter);
+
+      expect(
+        await parseBvid('https://b23.tv/spVKBAi'
+            '?share_medium=android&share_source=copy_link&bbid=123&ts=1787426885',
+            dio: dio),
+        _bv1,
+      );
+      final uri = adapter.requests.single.uri;
+      expect(uri.toString(), 'https://b23.tv/spVKBAi');
+    });
+
+    test('无协议头短链 b23.tv/xxx → 自动补 https:// 再请求', () async {
+      final adapter = _RedirectAdapter(
+        finalLocation: Uri.parse('https://www.bilibili.com/video/$_bv1/'),
+      );
+      final dio = _dioWith(adapter);
+
+      expect(
+        await parseBvid('b23.tv/spVKBAi', dio: dio),
+        _bv1,
+      );
+      expect(
+        adapter.requests.single.uri.toString(),
+        'https://b23.tv/spVKBAi',
+      );
+    });
+
+    test('重定向最终 URL 是相对路径 /video/BVxx/?... → 提取 BV', () async {
+      // 真实链路：b23.tv 302 → www.bilibili.com/video/BVxx?... → 301 相对路径
+      // /video/BVxx/?...（dio realUri 直接记录相对 Location，无 host）。
+      final adapter = _RedirectAdapter(
+        finalLocation: Uri.parse('/video/$_bv1/?buvid=abc&p=1'),
+      );
+      final dio = _dioWith(adapter);
+
+      expect(
+        await parseBvid('https://b23.tv/spVKBAi', dio: dio),
+        _bv1,
+      );
+    });
+
+    test('移动端重定向 m.bilibili.com/video/BVxx?p=1 → 提取 BV', () async {
+      final adapter = _RedirectAdapter(
+        finalLocation:
+            Uri.parse('https://m.bilibili.com/video/$_bv1?p=1&share_medium=android'),
+      );
+      final dio = _dioWith(adapter);
+
+      expect(
+        await parseBvid('https://b23.tv/spVKBAi', dio: dio),
+        _bv1,
+      );
     });
 
     test('短链重定向到非视频 → 短链解析失败', () async {
@@ -170,6 +253,11 @@ void main() {
     expect(countLinkTokens('$_bv1 $_bv2'), 2);
     expect(countLinkTokens('https://b23.tv/spVKBAi'), 1);
     expect(countLinkTokens('https://b23.tv/spVKBAi $_bv1'), 2);
+    expect(
+      countLinkTokens('https://b23.tv/spVKBAi'
+          '?share_medium=android&bbid=1&ts=2 $_bv1'),
+      2,
+    );
     expect(countLinkTokens('没有链接'), 0);
   });
 }
