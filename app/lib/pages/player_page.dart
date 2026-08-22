@@ -5,6 +5,7 @@ import 'package:flutter/services.dart';
 
 import '../api/bilibili_api.dart';
 import '../cache/download_manager.dart';
+import '../cache/playback_progress.dart';
 import '../config.dart';
 import '../models/whitelist_video.dart';
 import '../player/bili_dash_player.dart';
@@ -107,6 +108,17 @@ class _PlayerPageState extends State<PlayerPage> {
   String? _loginExpiryText;
   Timer? _timer;
 
+  // 播放进度记忆（本地 shared_preferences，按 bvid+pageIndex 分别记忆）
+  PlaybackProgress? _progressStore;
+
+  /// 下一次 onPrepared 时是否恢复记忆进度：
+  /// 首次进入 / 手动切集 / 手动重试后为 true（恢复对应集的进度）；
+  /// URL 过期续播等自动换源不置 true（沿用续播位置，不被记忆覆盖）。
+  bool _pendingRestore = true;
+
+  /// 500ms tick 计数：每 20 次（=10s）定时保存一次进度（防杀进程丢失）。
+  int _tickCount = 0;
+
   @override
   void initState() {
     super.initState();
@@ -121,6 +133,19 @@ class _PlayerPageState extends State<PlayerPage> {
   void dispose() {
     _downloads.cached.removeListener(_onCacheStateChanged);
     _downloads.tasks.removeListener(_onCacheStateChanged);
+    // 退出前保存一次进度（fire-and-forget，防杀进程/直接返回丢失进度）。
+    // 播放器尚未释放，getPosition 可用；看完（_completed）已清记忆，跳过。
+    final store = _progressStore;
+    final player = _player;
+    if (store != null && player != null && !_completed) {
+      player.getPosition().then((pos) {
+        if (pos > 0) {
+          store.saveProgress(widget.video.bvid, _currentPageIndex, pos);
+        }
+      }).catchError((Object _) {
+        // 原生通道异常：忽略，进度最多丢一次
+      });
+    }
     _timer?.cancel();
     _eventSub?.cancel();
     _eventSub = null;
@@ -156,6 +181,15 @@ class _PlayerPageState extends State<PlayerPage> {
             .timeout(const Duration(milliseconds: 500));
       } catch (_) {
         // 索引加载失败/超时：忽略，走网络取流
+      }
+      // 加载播放进度记忆存储（失败/超时则本次会话不记忆，不影响播放）。
+      // 带超时保护：测试环境无 shared_preferences 原生通道时 send 永不返回，
+      // 不能让它阻塞播放初始化（与上方 _downloads.init 同模式）。
+      try {
+        _progressStore = await PlaybackProgress.load()
+            .timeout(const Duration(milliseconds: 500));
+      } catch (_) {
+        _progressStore = null;
       }
       final player = await BiliDashPlayer.create();
       _eventSub = player.events.listen(_onPlayerEvent, onError: (Object _, StackTrace __) {
@@ -355,6 +389,8 @@ class _PlayerPageState extends State<PlayerPage> {
       _durationMs = durationMs;
       if (width > 0 && height > 0) _aspectRatio = width / height;
     });
+    // 首次进入 / 切集后恢复该集记忆进度（不打断自动播放）
+    _maybeRestoreProgress(durationMs);
   }
 
   void _onCompleted() {
@@ -365,6 +401,8 @@ class _PlayerPageState extends State<PlayerPage> {
       _positionMs = _durationMs;
       _completed = true;
     });
+    // 观看完成 → 清除进度记忆（下次从头播）
+    _clearProgress();
   }
 
   void _onNativeError(int code, String message) {
@@ -409,6 +447,8 @@ class _PlayerPageState extends State<PlayerPage> {
     if (player == null || _dragging) return;
     final pos = await player.getPosition();
     if (mounted) setState(() => _positionMs = pos);
+    // 播放中每 20 次 tick（=10s）保存一次进度（防杀进程丢失）
+    if (++_tickCount % 20 == 0) _saveProgress();
   }
 
   Future<void> _togglePlay() async {
@@ -418,6 +458,7 @@ class _PlayerPageState extends State<PlayerPage> {
     if (_playing) {
       await player.pause();
       setState(() => _playing = false);
+      _saveProgress(); // 暂停时保存一次进度
     } else {
       if (_positionMs >= _durationMs && _durationMs > 0) {
         await player.seekTo(0);
@@ -428,6 +469,88 @@ class _PlayerPageState extends State<PlayerPage> {
       }
       await player.play();
       setState(() => _playing = true);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 快退 3 秒
+  // -------------------------------------------------------------------------
+
+  /// 快退 3 秒：当前播放位置 -3000ms（下限 0）。连点连续生效：
+  /// 每次独立 getPosition → seekTo，原生 seek 完成后下一次取到新位置。
+  Future<void> _rewind3s() async {
+    debugPrint('[player_page] 快退 3 秒');
+    final player = _player;
+    if (player == null) return;
+    final pos = await player.getPosition();
+    final target = pos > 3000 ? pos - 3000 : 0;
+    debugPrint('[player_page] seekTo ${target}ms (快退 3 秒，原 ${pos}ms)');
+    await player.seekTo(target);
+    if (mounted) setState(() => _positionMs = target);
+    _saveProgress(); // 快退后保存，防快退丢失
+  }
+
+  // -------------------------------------------------------------------------
+  // 播放进度记忆（保存 / 恢复 / 清除）
+  // -------------------------------------------------------------------------
+
+  /// 保存当前播放位置（跳过未开始/已完成）。
+  Future<void> _saveProgress() async {
+    final store = _progressStore;
+    final player = _player;
+    if (store == null || player == null || _completed) return;
+    final pos = await player.getPosition();
+    if (pos <= 0) return;
+    await store.saveProgress(widget.video.bvid, _currentPageIndex, pos);
+    debugPrint('[player_page] 保存进度 '
+        '${widget.video.bvid}#$_currentPageIndex $pos ms');
+  }
+
+  /// 清除当前集进度记忆（观看完成 / 从头播放时）。
+  Future<void> _clearProgress() async {
+    final store = _progressStore;
+    if (store == null) return;
+    await store.clearProgress(widget.video.bvid, _currentPageIndex);
+    debugPrint('[player_page] 清除进度 '
+        '${widget.video.bvid}#$_currentPageIndex');
+  }
+
+  /// onPrepared 后尝试恢复记忆进度（仅首次进入 / 切集 / 手动重试后）：
+  /// - 无记忆或 <=5s → 从头播，不打扰
+  /// - 距结尾 <3s → 视为已看完，清除记忆后从头播
+  /// - 其余 → seekTo(记忆位置)（不打断自动播放）+ SnackBar「从头播放」action
+  Future<void> _maybeRestoreProgress(int durationMs) async {
+    if (!_pendingRestore) return;
+    _pendingRestore = false;
+    final store = _progressStore;
+    if (store == null) return;
+    final saved = store.getProgress(widget.video.bvid, _currentPageIndex);
+    if (saved == null || saved <= 5000) return;
+    if (durationMs > 0 && saved >= durationMs - 3000) {
+      await _clearProgress();
+      return;
+    }
+    debugPrint('[player_page] 恢复进度 '
+        '${widget.video.bvid}#$_currentPageIndex $saved ms');
+    await _player?.seekTo(saved);
+    if (!mounted) return;
+    _showSnackWithAction(
+      '已从上次 ${_fmtMs(saved)} 继续',
+      actionLabel: '从头播放',
+      onAction: _restartFromBeginning,
+    );
+  }
+
+  /// SnackBar「从头播放」action：seekTo(0) + 清记忆，下次从头播。
+  void _restartFromBeginning() {
+    debugPrint('[player_page] 从头播放');
+    _player?.seekTo(0);
+    _clearProgress();
+    if (mounted) {
+      setState(() {
+        _positionMs = 0;
+        _completed = false;
+      });
     }
   }
 
@@ -748,6 +871,25 @@ class _PlayerPageState extends State<PlayerPage> {
       ..showSnackBar(SnackBar(content: Text(message)));
   }
 
+  /// 带操作按钮的 SnackBar（进度恢复提示的「从头播放」action）。
+  void _showSnackWithAction(
+    String message, {
+    required String actionLabel,
+    required VoidCallback onAction,
+  }) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(
+        content: Text(message),
+        // 悬浮在底部控制行（进度条行 36 + 按钮行 44 = 80px）之上，
+        // 避免「从头播放」action 与全屏按钮区域重叠误触
+        behavior: SnackBarBehavior.floating,
+        margin: const EdgeInsets.only(left: 16, right: 16, bottom: 80),
+        action: SnackBarAction(label: actionLabel, onPressed: onAction),
+      ));
+  }
+
   /// 下载错误精简文案（去掉过长的类型/堆栈前缀）。
   String _shortErr(Object e) {
     final s = '$e';
@@ -820,6 +962,7 @@ class _PlayerPageState extends State<PlayerPage> {
     if (index == _currentPageIndex) return;
     debugPrint('[player_page] switchToPage ${index + 1}/${pages.length} '
         'cid=${pages[index].cid} part=${pages[index].part}');
+    _pendingRestore = true; // 切集后 onPrepared 恢复新集记忆进度
     setState(() {
       _currentPageIndex = index;
       _buffering = true;
@@ -958,6 +1101,7 @@ class _PlayerPageState extends State<PlayerPage> {
     _player = null;
     _textureId = null;
     old?.dispose();
+    _pendingRestore = true; // 手动重试视为重新进入：onPrepared 恢复记忆进度
     _init();
   }
 
@@ -1133,7 +1277,8 @@ class _PlayerPageState extends State<PlayerPage> {
     );
   }
 
-  /// 中心播放/暂停大按钮（播放完成时上方附带提示文案）。
+  /// 中心控制：快退 3 秒（左）+ 播放/暂停大按钮（中）+ 对称占位（右）。
+  /// 固定大小 IconButton，位于点击层之上不会被手势层吞；横竖屏均居中不遮挡。
   Widget _buildCenterControls() {
     return Column(
       mainAxisSize: MainAxisSize.min,
@@ -1144,12 +1289,27 @@ class _PlayerPageState extends State<PlayerPage> {
             child: Text('播放完成',
                 style: TextStyle(color: Colors.white, fontSize: 16)),
           ),
-        IconButton(
-          iconSize: 72,
-          color: Colors.white,
-          icon: Icon(
-              _playing ? Icons.pause_circle_filled : Icons.play_circle_filled),
-          onPressed: _player == null ? null : _togglePlay,
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            // 快退 3 秒：Icons.replay 转圈箭头，tooltip 提示；连点连续生效
+            IconButton(
+              tooltip: '快退 3 秒',
+              iconSize: 40,
+              color: Colors.white,
+              icon: const Icon(Icons.replay),
+              onPressed: _player == null ? null : _rewind3s,
+            ),
+            IconButton(
+              iconSize: 72,
+              color: Colors.white,
+              icon: Icon(
+                  _playing ? Icons.pause_circle_filled : Icons.play_circle_filled),
+              onPressed: _player == null ? null : _togglePlay,
+            ),
+            // 右侧同宽占位，保持播放/暂停按钮视觉居中
+            const SizedBox(width: 48),
+          ],
         ),
       ],
     );
