@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../api/bilibili_api.dart';
+import '../api/translate_api.dart';
 import '../cache/download_manager.dart';
 import '../cache/playback_progress.dart';
 import '../config.dart';
@@ -45,6 +46,9 @@ class PlayerPage extends StatefulWidget {
 
 class _PlayerPageState extends State<PlayerPage> {
   final BiliApi _api = BiliApi();
+
+  /// 翻译服务（副字幕「翻译（中文）」；配置在管理面板）。
+  final TranslateApi _translateApi = TranslateApi();
 
   /// 离线缓存管理器（下载/已缓存状态/进度；监听两个 notifier 刷新 UI）。
   final DownloadManager _downloads = DownloadManager.instance;
@@ -97,6 +101,20 @@ class _PlayerPageState extends State<PlayerPage> {
 
   /// 副字幕轨道（null=无；不能与主字幕同轨）。
   SubtitleTrack? _secondarySubtitleTrack;
+
+  /// 副字幕是否「翻译（中文）」模式：true 时副字幕显示主字幕内容的译文。
+  ///
+  /// 与 [_secondarySubtitleTrack] 互斥（选翻译则轨道置空，反之翻译关闭）。
+  bool _secondaryIsTranslation = false;
+
+  /// 主字幕译文列表（按 cue 顺序索引对应，译文[i] ↔ 第 i 条主字幕 cue）。
+  List<String> _translationTexts = const [];
+
+  /// 翻译状态：加载中（面板显示「翻译中 x/y」）/ 失败文案（null=正常）。
+  bool _translationLoading = false;
+  String? _translationError;
+  int _translationDone = 0;
+  int _translationTotal = 0;
 
   /// 已下载的字幕条目缓存（lan -> cues，页面级）。
   final Map<String, List<SubtitleCue>> _subtitleCues = {};
@@ -206,6 +224,12 @@ class _PlayerPageState extends State<PlayerPage> {
       _subtitleError = null;
       _mainSubtitleTrack = null;
       _secondarySubtitleTrack = null;
+      _secondaryIsTranslation = false;
+      _translationTexts = const [];
+      _translationLoading = false;
+      _translationError = null;
+      _translationDone = 0;
+      _translationTotal = 0;
       _mainSubtitleText = '';
       _secondarySubtitleText = '';
       _subtitleCues.clear();
@@ -495,17 +519,34 @@ class _PlayerPageState extends State<PlayerPage> {
   ///
   /// 性能：仅当主/副文本任一变化才 setState，避免每 tick 重建字幕层；
   /// 播放暂停时 getPosition 停在原地 → 字幕保持显示当前句。
+  ///
+  /// 副字幕三种来源：
+  /// - 普通轨道：命中副轨 cue 的 content
+  /// - 翻译模式：主字幕当前 cue 的 index → 译文[index]（译文与 cue 一一对应）；
+  ///   翻译失败且无译文时显示「翻译失败」（小号，不阻塞播放）
   void _updateSubtitleText(int positionMs) {
     final mainTrack = _mainSubtitleTrack;
-    final secTrack = _secondarySubtitleTrack;
     final mainCues = mainTrack == null ? null : _subtitleCues[mainTrack.lan];
-    final secCues = secTrack == null ? null : _subtitleCues[secTrack.lan];
     final mainText = mainCues == null
         ? ''
         : currentCue(mainCues, positionMs.toDouble())?.content ?? '';
-    final secText = secCues == null
-        ? ''
-        : currentCue(secCues, positionMs.toDouble())?.content ?? '';
+    var secText = '';
+    if (_secondaryIsTranslation) {
+      if (_translationError != null && _translationTexts.isEmpty) {
+        secText = '翻译失败';
+      } else if (_translationTexts.isNotEmpty && mainCues != null) {
+        final idx = currentCueIndex(mainCues, positionMs.toDouble());
+        if (idx != null && idx < _translationTexts.length) {
+          secText = _translationTexts[idx];
+        }
+      }
+    } else {
+      final secTrack = _secondarySubtitleTrack;
+      final secCues = secTrack == null ? null : _subtitleCues[secTrack.lan];
+      secText = secCues == null
+          ? ''
+          : currentCue(secCues, positionMs.toDouble())?.content ?? '';
+    }
     if (mainText != _mainSubtitleText ||
         secText != _secondarySubtitleText) {
       setState(() {
@@ -888,6 +929,39 @@ class _PlayerPageState extends State<PlayerPage> {
           refresh: refresh,
           disabled: t.lan == _mainSubtitleTrack?.lan, // 不能与主字幕同轨
         ),
+      // 翻译（中文）：恒显示；未配置翻译服务时点击提示去配置
+      _buildTranslateTile(refresh),
+      // 翻译进度/失败状态行（面板内可见「翻译中 x/y」）
+      if (_translationLoading)
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 6, 16, 2),
+          child: Row(
+            children: [
+              const SizedBox(
+                width: 12,
+                height: 12,
+                child: CircularProgressIndicator(
+                    strokeWidth: 2, color: Colors.pinkAccent),
+              ),
+              const SizedBox(width: 8),
+              Text('翻译中 $_translationDone/$_translationTotal',
+                  style:
+                      const TextStyle(color: Colors.white54, fontSize: 12)),
+            ],
+          ),
+        )
+      else if (_translationTotal > 0 && _translationError == null)
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 6, 16, 2),
+          child: Text('已翻译 $_translationDone/$_translationTotal 条',
+              style: const TextStyle(color: Colors.white54, fontSize: 12)),
+        ),
+      if (_translationError != null)
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 6, 16, 2),
+          child: Text('翻译失败：$_translationError',
+              style: const TextStyle(color: Colors.redAccent, fontSize: 12)),
+        ),
     ];
   }
 
@@ -943,6 +1017,31 @@ class _PlayerPageState extends State<PlayerPage> {
     );
   }
 
+  /// 副字幕「🔤 翻译（中文）」选项行：选中即把主字幕内容翻译成中文显示。
+  ///
+  /// 恒显示；未配置翻译服务时点击提示去配置（不选中）。
+  Widget _buildTranslateTile(VoidCallback refresh) {
+    final isSelected = _secondaryIsTranslation;
+    return ListTile(
+      dense: true,
+      title: Text(
+        '🔤 翻译（中文）',
+        style: TextStyle(
+          color: isSelected ? Colors.pinkAccent : Colors.white,
+          fontSize: 14,
+          fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+        ),
+      ),
+      trailing: isSelected
+          ? const Icon(Icons.check, color: Colors.pinkAccent, size: 18)
+          : const SizedBox(width: 18),
+      onTap: () {
+        _selectTranslationMode();
+        refresh();
+      },
+    );
+  }
+
   /// 选择主字幕轨道：立即更新选中态 + 异步下载 cues；
   /// 副字幕若与主字幕同轨则自动清空（防止同轨双行）。
   void _selectMainSubtitle(SubtitleTrack? track) {
@@ -953,12 +1052,124 @@ class _PlayerPageState extends State<PlayerPage> {
       setState(() => _secondarySubtitleTrack = null);
     }
     _ensureSubtitleCues(track);
+    // 翻译模式下切换主字幕 → 重新翻译新的主字幕内容
+    if (_secondaryIsTranslation && track != null) {
+      _runTranslation();
+    }
   }
 
-  /// 选择副字幕轨道（面板侧已禁用与主字幕同轨的项）。
+  /// 选择副字幕轨道（面板侧已禁用与主字幕同轨的项）；
+  /// 退出翻译模式（翻译与轨道互斥）。
   void _selectSecondarySubtitle(SubtitleTrack? track) {
-    setState(() => _secondarySubtitleTrack = track);
+    setState(() {
+      _secondarySubtitleTrack = track;
+      _secondaryIsTranslation = false;
+      _translationError = null;
+    });
     _ensureSubtitleCues(track);
+  }
+
+  /// 选中「翻译（中文）」：校验主字幕/翻译配置 → 启动翻译流程。
+  ///
+  /// - 未选主字幕 → 提示先选主字幕（需翻译的原文轨道）
+  /// - 未配置翻译服务 → 提示去管理面板配置（不选中）
+  /// - 已配置 → 副字幕切到翻译模式，_runTranslation 负责缓存/翻译/渲染
+  Future<void> _selectTranslationMode() async {
+    final mainTrack = _mainSubtitleTrack;
+    if (mainTrack == null) {
+      _showSnack('请先选择主字幕轨道（需翻译的原文轨道）');
+      return;
+    }
+    final hasCfg = await _translateApi.hasConfig();
+    if (!mounted) return;
+    if (!hasCfg) {
+      _showSnack('未配置翻译服务，请到管理面板配置');
+      return;
+    }
+    setState(() {
+      _secondarySubtitleTrack = null;
+      _secondaryIsTranslation = true;
+      _translationTexts = const [];
+      _translationError = null;
+    });
+    await _runTranslation();
+  }
+
+  /// 执行翻译流程：加载主字幕 cues → 查本地缓存 → 无缓存则批量翻译（进度回显）。
+  ///
+  /// - 缓存命中（同 bvid_cid_lan 已翻译过）直接显示，不重复翻译
+  /// - 翻译完成写缓存（切集/重进命中即显示）
+  /// - 失败：面板/字幕层提示「翻译失败」+ SnackBar 具体错误（401 配置无效/网络）
+  Future<void> _runTranslation() async {
+    final mainTrack = _mainSubtitleTrack;
+    if (mainTrack == null) return;
+    setState(() {
+      _translationLoading = true;
+      _translationError = null;
+      _translationDone = 0;
+      _translationTotal = 0;
+    });
+    final cues = await _ensureSubtitleCuesFor(mainTrack);
+    if (!mounted) return;
+    if (cues == null || cues.isEmpty) {
+      setState(() {
+        _translationLoading = false;
+        _translationError = '主字幕内容为空，无法翻译';
+      });
+      _showSnack('主字幕内容为空，无法翻译');
+      return;
+    }
+    final bvid = widget.video.bvid;
+    final cid = _currentCid;
+    final lan = mainTrack.lan;
+
+    // 1) 本地缓存命中：直接显示
+    final cached = await _translateApi.getCachedTranslation(bvid, cid, lan);
+    if (!mounted) return;
+    if (cached != null && cached.length == cues.length) {
+      setState(() {
+        _translationTexts = cached;
+        _translationLoading = false;
+        _translationTotal = cues.length;
+        _translationDone = cues.length;
+      });
+      debugPrint('[player_page] 翻译命中缓存 ${bvid}_${cid}_$lan');
+      return;
+    }
+
+    // 2) 无缓存：批量翻译（进度 ValueNotifier 驱动面板「翻译中 x/y」）
+    final texts = [for (final c in cues) c.content];
+    setState(() {
+      _translationTotal = texts.length;
+      _translationDone = 0;
+    });
+    final progress = ValueNotifier<int>(0);
+    progress.addListener(() {
+      if (mounted && _translationLoading) {
+        setState(() => _translationDone = progress.value);
+      }
+    });
+    try {
+      final result =
+          await _translateApi.translateBatch(texts, progress: progress);
+      if (!mounted) return;
+      setState(() {
+        _translationTexts = result;
+        _translationLoading = false;
+        _translationDone = result.length;
+      });
+      await _translateApi.saveTranslation(bvid, cid, lan, result);
+    } catch (e) {
+      if (!mounted) return;
+      final msg = e is TranslateApiException ? e.message : '$e';
+      setState(() {
+        _translationLoading = false;
+        _translationError = msg;
+      });
+      _showSnack('翻译失败：$msg');
+    } finally {
+      progress.dispose();
+    }
   }
 
   /// 下载选中轨道字幕内容（内存缓存去重），完成后刷新字幕层。
@@ -976,6 +1187,25 @@ class _PlayerPageState extends State<PlayerPage> {
       debugPrint('[player_page] 字幕下载失败 ${track.lan}: $e');
       _showSnack('字幕加载失败：${_shortErr(e)}');
     });
+  }
+
+  /// 等待指定轨道字幕下载完成（内存缓存命中直接返回；失败返回 null）。
+  ///
+  /// 与 [_ensureSubtitleCues]（fire-and-forget）不同，翻译流程需要先拿到
+  /// cues 才能决定缓存/翻译，故 await 版并返回结果。
+  Future<List<SubtitleCue>?> _ensureSubtitleCuesFor(SubtitleTrack track) async {
+    final cached = _subtitleCues[track.lan];
+    if (cached != null) return cached;
+    try {
+      final cues = await _api.downloadSubtitle(track,
+          bvid: widget.video.bvid, cid: _currentCid);
+      if (!mounted) return cues;
+      setState(() => _subtitleCues[track.lan] = cues);
+      return cues;
+    } catch (e) {
+      debugPrint('[player_page] 字幕下载失败 ${track.lan}: $e');
+      return null;
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -1285,6 +1515,12 @@ class _PlayerPageState extends State<PlayerPage> {
       _subtitleError = null;
       _mainSubtitleTrack = null;
       _secondarySubtitleTrack = null;
+      _secondaryIsTranslation = false;
+      _translationTexts = const [];
+      _translationLoading = false;
+      _translationError = null;
+      _translationDone = 0;
+      _translationTotal = 0;
       _mainSubtitleText = '';
       _secondarySubtitleText = '';
       _subtitleCues.clear();

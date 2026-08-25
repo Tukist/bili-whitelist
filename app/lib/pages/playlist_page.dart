@@ -6,6 +6,7 @@ import 'package:package_info_plus/package_info_plus.dart';
 
 import '../api/bilibili_api.dart';
 import '../api/github_api.dart';
+import '../api/translate_api.dart';
 import '../cache/download_manager.dart';
 import '../config.dart';
 import '../models/whitelist_video.dart';
@@ -1462,6 +1463,27 @@ class _ManageSheetState extends State<_ManageSheet> {
                 label: const Text('缓存管理'),
               ),
             ),
+            const SizedBox(height: 16),
+            const Divider(height: 1),
+            const SizedBox(height: 16),
+            // ---- 翻译服务配置 ----
+            Text('翻译服务', style: theme.textTheme.titleMedium),
+            const SizedBox(height: 4),
+            Text(
+              'OpenAI 兼容翻译服务，用于字幕副字幕翻译（「翻译（中文）」）；'
+              'key 仅存本机，可留空=不启用翻译。',
+              style: theme.textTheme.bodySmall
+                  ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+            ),
+            const SizedBox(height: 8),
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: () => _showTranslateConfig(context),
+                icon: const Icon(Icons.translate, size: 18),
+                label: const Text('翻译服务配置'),
+              ),
+            ),
           ],
         ),
       ),
@@ -1474,6 +1496,159 @@ class _ManageSheetState extends State<_ManageSheet> {
       isScrollControlled: true,
       useSafeArea: true,
       builder: (_) => const _CacheManageSheet(),
+    );
+  }
+
+  /// 打开翻译服务配置弹窗（base_url / api_key / model）。
+  Future<void> _showTranslateConfig(BuildContext context) async {
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (_) => _TranslateConfigDialog(api: TranslateApi()),
+    );
+    if (saved == true && context.mounted) _showSnack('翻译服务配置已保存（仅存本机）');
+  }
+}
+
+/// 翻译服务配置弹窗：base_url / api_key / model 三个输入框。
+///
+/// - 打开时回填已保存的配置（无配置时给默认 base_url / model）
+/// - key 用密码框（默认隐藏）；保存走 [TranslateApi.saveConfig]
+///   （secure storage，仅存本机；任一项留空 = 不启用翻译）
+/// - 保存成功 pop(true)，管理面板提示「已保存（仅存本机）」
+class _TranslateConfigDialog extends StatefulWidget {
+  final TranslateApi api;
+
+  const _TranslateConfigDialog({required this.api});
+
+  @override
+  State<_TranslateConfigDialog> createState() => _TranslateConfigDialogState();
+}
+
+class _TranslateConfigDialogState extends State<_TranslateConfigDialog> {
+  final _baseUrlCtrl = TextEditingController(text: 'https://api.deepseek.com');
+  final _apiKeyCtrl = TextEditingController();
+  final _modelCtrl = TextEditingController(text: 'deepseek-chat');
+  bool _loading = true;
+  bool _saving = false;
+  bool _obscureKey = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void dispose() {
+    _baseUrlCtrl.dispose();
+    _apiKeyCtrl.dispose();
+    _modelCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _load() async {
+    try {
+      final cfg = await widget.api.loadConfig();
+      if (mounted && cfg != null) {
+        _baseUrlCtrl.text = cfg.baseUrl;
+        _apiKeyCtrl.text = cfg.apiKey;
+        _modelCtrl.text = cfg.model;
+      }
+      if (mounted) setState(() => _loading = false);
+    } catch (_) {
+      // 读取失败（如存储异常）不阻塞配置使用
+      if (mounted) setState(() => _loading = false);
+    }
+  }
+
+  Future<void> _save() async {
+    setState(() => _saving = true);
+    try {
+      await widget.api.saveConfig(
+        baseUrl: _baseUrlCtrl.text,
+        apiKey: _apiKeyCtrl.text,
+        model: _modelCtrl.text,
+      );
+      if (mounted) Navigator.of(context).pop(true);
+    } catch (_) {
+      if (mounted) {
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(const SnackBar(content: Text('翻译配置保存失败，请重试')));
+      }
+    } finally {
+      if (mounted) setState(() => _saving = false);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('翻译服务'),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Text(
+              'OpenAI 兼容翻译服务，用于字幕副字幕翻译；'
+              'key 仅存本机，可留空=不启用翻译。',
+              style: TextStyle(fontSize: 12, color: Colors.black54),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _baseUrlCtrl,
+              enabled: !_loading,
+              decoration: const InputDecoration(
+                labelText: 'Base URL',
+                hintText: 'https://api.deepseek.com',
+                border: OutlineInputBorder(),
+                isDense: true,
+              ),
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _apiKeyCtrl,
+              enabled: !_loading,
+              obscureText: _obscureKey,
+              decoration: InputDecoration(
+                labelText: 'API Key',
+                hintText: 'sk-xxx（留空=不启用翻译）',
+                border: const OutlineInputBorder(),
+                isDense: true,
+                suffixIcon: IconButton(
+                  icon: Icon(_obscureKey
+                      ? Icons.visibility_outlined
+                      : Icons.visibility_off_outlined),
+                  tooltip: _obscureKey ? '显示 Key' : '隐藏 Key',
+                  onPressed: () => setState(() => _obscureKey = !_obscureKey),
+                ),
+              ),
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              controller: _modelCtrl,
+              enabled: !_loading,
+              decoration: const InputDecoration(
+                labelText: 'Model',
+                hintText: 'deepseek-chat',
+                border: OutlineInputBorder(),
+                isDense: true,
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(false),
+          child: const Text('取消'),
+        ),
+        FilledButton(
+          onPressed: _saving ? null : _save,
+          child: Text(_saving ? '保存中…' : '保存'),
+        ),
+      ],
     );
   }
 }

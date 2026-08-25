@@ -104,10 +104,20 @@ List<SubtitleCue> parseSubtitleCues(String jsonText) {
 /// 返回 [positionMs]（毫秒）所在位置命中的字幕条目：
 /// `from <= pos/1000 <= to`；同一时刻多条命中时取**最后一条**；无命中返回 null。
 SubtitleCue? currentCue(List<SubtitleCue> cues, double positionMs) {
+  final idx = currentCueIndex(cues, positionMs);
+  return idx == null ? null : cues[idx];
+}
+
+/// 返回 [positionMs]（毫秒）所在位置命中的字幕条目**下标**：
+/// 命中规则与 [currentCue] 一致（同一时刻多条命中取最后一条）；无命中返回 null。
+///
+/// 供「翻译（中文）」按 cue 顺序索引匹配译文：译文[i] 对应第 i 条 cue。
+int? currentCueIndex(List<SubtitleCue> cues, double positionMs) {
   final pos = positionMs / 1000;
-  SubtitleCue? hit;
-  for (final cue in cues) {
-    if (cue.from <= pos && pos <= cue.to) hit = cue;
+  int? hit;
+  for (var i = 0; i < cues.length; i++) {
+    final cue = cues[i];
+    if (cue.from <= pos && pos <= cue.to) hit = i;
   }
   return hit;
 }
