@@ -3,6 +3,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import '../config.dart';
+import '../models/search_result.dart';
 import '../wbi/wbi_signer.dart';
 
 /// B 站业务接口错误（带业务 code）。
@@ -308,6 +309,63 @@ class BiliApi {
       return info;
     }
     throw StateError('view 接口重试后仍失败（$bvid）');
+  }
+
+  /// 搜索 B 站视频（`x/web-interface/wbi/search/type`，search_type=video）。
+  ///
+  /// 带 WBI 签名 + buvid 指纹 Cookie + 完整浏览器头（复用 [._injectAuth] /
+  /// [._ensureWbiKeys]，登录态存在时也会注入 SESSDATA）。
+  ///
+  /// 返回单页最多 20 条结果。错误处理（UI 据此提示）：
+  /// - code=-412 → 抛 [BiliApiException]「搜索接口被风控拦截，请稍后再搜」
+  /// - code=-352 或其他业务码 → 抛 [BiliApiException]（带接口 message）
+  /// - 网络失败（[DioException]）→ 原样上抛（UI 提示网络失败）
+  /// - code=0 但结果为空 / result 不是 List → 返回空数组（视为无结果）
+  ///
+  /// ⚠️ 搜索接口风控严格：调用方必须控制频率（输入防抖或手动搜索按钮），
+  /// 不要高频连续搜索。
+  Future<List<SearchResult>> searchVideo(String keyword, {int page = 1}) async {
+    await _injectAuth();
+    final (imgKey, subKey) = await _ensureWbiKeys();
+    final params = WbiSigner.encodeWbi(
+      {
+        'search_type': 'video',
+        'keyword': keyword,
+        'page': '$page',
+        'page_size': '20',
+      },
+      imgKey: imgKey,
+      subKey: subKey,
+    );
+    debugPrint('[bili_api] searchVideo keyword=$keyword page=$page');
+    final resp = await _dio.get<Map<String, dynamic>>(
+      '/x/web-interface/wbi/search/type',
+      queryParameters: params,
+    );
+    final data = resp.data;
+    final code = data?['code'] as int?;
+    if (code == -412) {
+      throw const BiliApiException(
+        code: -412,
+        message: '搜索接口被风控拦截，请稍后再搜',
+        path: '/x/web-interface/wbi/search/type',
+      );
+    }
+    if (code != 0) {
+      throw BiliApiException(
+        code: code ?? -1,
+        message: data?['message'] as String? ?? '搜索失败',
+        path: '/x/web-interface/wbi/search/type',
+      );
+    }
+    final d = data?['data'] as Map<String, dynamic>?;
+    final raw = d?['result'];
+    if (raw is! List) return const [];
+    return raw
+        .whereType<Map<String, dynamic>>()
+        .map(SearchResult.fromSearchJson)
+        .where((r) => r.bvid.isNotEmpty)
+        .toList();
   }
 
   /// 播放流（playurl 接口，带 WBI 签名），返回解析后的流地址。
