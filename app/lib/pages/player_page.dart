@@ -7,6 +7,7 @@ import '../api/bilibili_api.dart';
 import '../cache/download_manager.dart';
 import '../cache/playback_progress.dart';
 import '../config.dart';
+import '../models/subtitle.dart';
 import '../models/whitelist_video.dart';
 import '../player/bili_dash_player.dart';
 import 'login_page.dart';
@@ -74,6 +75,35 @@ class _PlayerPageState extends State<PlayerPage> {
 
   // 听视频（纯音频）模式：隐藏画面，音频继续
   bool _listenMode = false;
+
+  // 字幕（M-字幕功能）
+  // ---------------------------------------------------------------------
+  // 面板打开时拉取轨道列表（登录态可能变化，每次进入重新拉）；
+  // 选中轨道时下载对应 cues（按 bvid_cid_lan 内存缓存，见 BiliApi）。
+  // 渲染只在 _tick（每 500ms）刷新，且仅文本变化时 setState。
+
+  /// 字幕总开关（关掉则不渲染任何字幕）。
+  bool _subtitleEnabled = false;
+
+  /// 当前视频可用的字幕轨道列表（面板打开时拉取）。
+  List<SubtitleTrack> _subtitleTracks = const [];
+
+  /// 轨道拉取状态：加载中 / 错误文案（null=正常）。
+  bool _subtitleLoading = false;
+  String? _subtitleError;
+
+  /// 主字幕轨道（null=无，即关闭主字幕）。
+  SubtitleTrack? _mainSubtitleTrack;
+
+  /// 副字幕轨道（null=无；不能与主字幕同轨）。
+  SubtitleTrack? _secondarySubtitleTrack;
+
+  /// 已下载的字幕条目缓存（lan -> cues，页面级）。
+  final Map<String, List<SubtitleCue>> _subtitleCues = {};
+
+  /// 当前渲染的主/副字幕文本（仅文本变化时 setState）。
+  String _mainSubtitleText = '';
+  String _secondarySubtitleText = '';
 
   // 多 P 选集：_currentPageIndex 指向 pages 中的当前集
   // （无 pages 数据 → 单 P，不展示选集 UI）
@@ -170,6 +200,15 @@ class _PlayerPageState extends State<PlayerPage> {
       _buffering = true;
       _loaded = false;
       _completed = false;
+      // 重新初始化（重试/重进）→ 清空字幕状态，等下次面板打开/切集再拉
+      _subtitleTracks = const [];
+      _subtitleLoading = false;
+      _subtitleError = null;
+      _mainSubtitleTrack = null;
+      _secondarySubtitleTrack = null;
+      _mainSubtitleText = '';
+      _secondarySubtitleText = '';
+      _subtitleCues.clear();
     });
     try {
       // 先加载缓存索引，保证「播放优先本地缓存」判定准确。
@@ -447,8 +486,33 @@ class _PlayerPageState extends State<PlayerPage> {
     if (player == null || _dragging) return;
     final pos = await player.getPosition();
     if (mounted) setState(() => _positionMs = pos);
+    if (mounted) _updateSubtitleText(pos);
     // 播放中每 20 次 tick（=10s）保存一次进度（防杀进程丢失）
     if (++_tickCount % 20 == 0) _saveProgress();
+  }
+
+  /// 按当前播放位置刷新主/副字幕文本（复用 _tick 的 500ms 轮询）。
+  ///
+  /// 性能：仅当主/副文本任一变化才 setState，避免每 tick 重建字幕层；
+  /// 播放暂停时 getPosition 停在原地 → 字幕保持显示当前句。
+  void _updateSubtitleText(int positionMs) {
+    final mainTrack = _mainSubtitleTrack;
+    final secTrack = _secondarySubtitleTrack;
+    final mainCues = mainTrack == null ? null : _subtitleCues[mainTrack.lan];
+    final secCues = secTrack == null ? null : _subtitleCues[secTrack.lan];
+    final mainText = mainCues == null
+        ? ''
+        : currentCue(mainCues, positionMs.toDouble())?.content ?? '';
+    final secText = secCues == null
+        ? ''
+        : currentCue(secCues, positionMs.toDouble())?.content ?? '';
+    if (mainText != _mainSubtitleText ||
+        secText != _secondarySubtitleText) {
+      setState(() {
+        _mainSubtitleText = mainText;
+        _secondarySubtitleText = secText;
+      });
+    }
   }
 
   Future<void> _togglePlay() async {
@@ -668,6 +732,250 @@ class _PlayerPageState extends State<PlayerPage> {
   void _toggleListenMode() {
     debugPrint('[player_page] toggle listenMode -> ${!_listenMode}');
     setState(() => _listenMode = !_listenMode);
+  }
+
+  // -------------------------------------------------------------------------
+  // 字幕设置
+  // -------------------------------------------------------------------------
+
+  /// 拉取当前视频字幕轨道列表（进入面板时调用；[onChanged] 用于面板
+  /// 内重试时同步刷新面板 UI，面板未开时传 null）。
+  ///
+  /// 错误分类（面板内展示错误文案 + 重试）：
+  /// - -101 未登录/登录失效 → 提示重新登录（AI 字幕需登录态）
+  /// - -352 限流 / 其他业务码 → 显示接口 message
+  /// - 网络失败 → 显示网络错误
+  Future<void> _loadSubtitleTracks({VoidCallback? onChanged}) async {
+    _subtitleLoading = true;
+    _subtitleError = null;
+    onChanged?.call();
+    try {
+      final tracks =
+          await _api.fetchSubtitles(widget.video.bvid, _currentCid);
+      if (!mounted) return;
+      _subtitleTracks = tracks;
+      _subtitleLoading = false;
+      onChanged?.call();
+      debugPrint('[player_page] 字幕轨道 ${tracks.length} 条'
+          '（${tracks.map((t) => t.lan).join(',')}）');
+    } catch (e) {
+      if (!mounted) return;
+      _subtitleLoading = false;
+      _subtitleError = _errMsg(e);
+      onChanged?.call();
+    }
+  }
+
+  /// 打开字幕设置面板：先拉取轨道列表，再弹 BottomSheet。
+  Future<void> _showSubtitleSheet() async {
+    debugPrint('[player_page] show subtitle sheet');
+    await _loadSubtitleTracks();
+    if (!mounted) return;
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: const Color(0xFF202023),
+      isScrollControlled: true,
+      useSafeArea: true,
+      constraints: BoxConstraints(
+        maxHeight: MediaQuery.sizeOf(context).height * 0.7,
+      ),
+      builder: (sheetContext) => _buildSubtitleSheet(sheetContext),
+    );
+  }
+
+  /// 字幕设置面板内容。
+  ///
+  /// StatefulBuilder 局部刷新：轨道选中/开关变化即时反映在面板上，
+  /// 同时（可选）刷新 PlayerPage（字幕层/底部按钮高亮）。
+  Widget _buildSubtitleSheet(BuildContext sheetContext) {
+    return StatefulBuilder(
+      builder: (sheetContext, sheetSetState) {
+        void refreshBoth() {
+          if (mounted) setState(() {});
+          sheetSetState(() {});
+        }
+
+        return SafeArea(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Padding(
+                padding: EdgeInsets.only(top: 14, bottom: 6),
+                child: Text('字幕设置',
+                    style: TextStyle(color: Colors.white70, fontSize: 13)),
+              ),
+              SwitchListTile(
+                dense: true,
+                title: const Text('显示字幕',
+                    style: TextStyle(color: Colors.white, fontSize: 15)),
+                value: _subtitleEnabled,
+                onChanged: (v) {
+                  _subtitleEnabled = v;
+                  refreshBoth();
+                },
+              ),
+              const Divider(height: 1),
+              Flexible(
+                child: ListView(
+                  shrinkWrap: true,
+                  children: _buildSubtitleSheetBody(refreshBoth),
+                ),
+              ),
+              const SizedBox(height: 8),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  /// 字幕面板主体：加载中 / 错误 / 无字幕提示 / 主副轨道选择。
+  List<Widget> _buildSubtitleSheetBody(VoidCallback refresh) {
+    if (_subtitleLoading) {
+      return const [
+        Padding(
+          padding: EdgeInsets.all(24),
+          child: Center(
+            child: CircularProgressIndicator(color: Colors.pinkAccent),
+          ),
+        ),
+      ];
+    }
+    if (_subtitleError != null) {
+      return [
+        Padding(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(_subtitleError!,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(color: Colors.white70, fontSize: 13)),
+              const SizedBox(height: 12),
+              OutlinedButton(
+                onPressed: () => _loadSubtitleTracks(onChanged: refresh),
+                style:
+                    OutlinedButton.styleFrom(foregroundColor: Colors.white),
+                child: const Text('重试'),
+              ),
+            ],
+          ),
+        ),
+      ];
+    }
+    if (_subtitleTracks.isEmpty) {
+      return const [
+        Padding(
+          padding: EdgeInsets.all(24),
+          child: Center(
+            child: Text('该视频无可用字幕',
+                style: TextStyle(color: Colors.white54, fontSize: 14)),
+          ),
+        ),
+      ];
+    }
+    return [
+      _buildSubtitleTrackHeader('主字幕'),
+      _buildSubtitleTrackTile(null, isMain: true, refresh: refresh),
+      for (final t in _subtitleTracks)
+        _buildSubtitleTrackTile(t, isMain: true, refresh: refresh),
+      _buildSubtitleTrackHeader('副字幕'),
+      _buildSubtitleTrackTile(null, isMain: false, refresh: refresh),
+      for (final t in _subtitleTracks)
+        _buildSubtitleTrackTile(
+          t,
+          isMain: false,
+          refresh: refresh,
+          disabled: t.lan == _mainSubtitleTrack?.lan, // 不能与主字幕同轨
+        ),
+    ];
+  }
+
+  Widget _buildSubtitleTrackHeader(String title) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 10, 16, 2),
+      child: Text(title,
+          style: const TextStyle(color: Colors.white70, fontSize: 12)),
+    );
+  }
+
+  /// 单条轨道选择行：选中打勾高亮；[disabled]（副轨与主轨同语种）置灰不可点。
+  Widget _buildSubtitleTrackTile(
+    SubtitleTrack? track, {
+    required bool isMain,
+    required VoidCallback refresh,
+    bool disabled = false,
+  }) {
+    final isSelected = track == null
+        ? (isMain
+            ? _mainSubtitleTrack == null
+            : _secondarySubtitleTrack == null)
+        : (isMain
+            ? _mainSubtitleTrack?.lan == track.lan
+            : _secondarySubtitleTrack?.lan == track.lan);
+    return ListTile(
+      dense: true,
+      title: Text(
+        track == null ? '无' : (track.lanDoc.isEmpty ? track.lan : track.lanDoc),
+        style: TextStyle(
+          color: disabled
+              ? Colors.white24
+              : isSelected
+                  ? Colors.pinkAccent
+                  : Colors.white,
+          fontSize: 14,
+          fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
+        ),
+      ),
+      trailing: isSelected
+          ? const Icon(Icons.check, color: Colors.pinkAccent, size: 18)
+          : const SizedBox(width: 18),
+      onTap: disabled
+          ? null
+          : () {
+              if (isMain) {
+                _selectMainSubtitle(track);
+              } else {
+                _selectSecondarySubtitle(track);
+              }
+              refresh();
+            },
+    );
+  }
+
+  /// 选择主字幕轨道：立即更新选中态 + 异步下载 cues；
+  /// 副字幕若与主字幕同轨则自动清空（防止同轨双行）。
+  void _selectMainSubtitle(SubtitleTrack? track) {
+    setState(() => _mainSubtitleTrack = track);
+    if (track != null &&
+        _secondarySubtitleTrack != null &&
+        _secondarySubtitleTrack!.lan == track.lan) {
+      setState(() => _secondarySubtitleTrack = null);
+    }
+    _ensureSubtitleCues(track);
+  }
+
+  /// 选择副字幕轨道（面板侧已禁用与主字幕同轨的项）。
+  void _selectSecondarySubtitle(SubtitleTrack? track) {
+    setState(() => _secondarySubtitleTrack = track);
+    _ensureSubtitleCues(track);
+  }
+
+  /// 下载选中轨道字幕内容（内存缓存去重），完成后刷新字幕层。
+  void _ensureSubtitleCues(SubtitleTrack? track) {
+    if (track == null) return;
+    if (_subtitleCues.containsKey(track.lan)) return;
+    _api
+        .downloadSubtitle(track,
+            bvid: widget.video.bvid, cid: _currentCid)
+        .then((cues) {
+      if (!mounted) return;
+      setState(() => _subtitleCues[track.lan] = cues);
+    }).catchError((Object e) {
+      if (!mounted) return;
+      debugPrint('[player_page] 字幕下载失败 ${track.lan}: $e');
+      _showSnack('字幕加载失败：${_shortErr(e)}');
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -971,6 +1279,15 @@ class _PlayerPageState extends State<PlayerPage> {
       _error = null;
       _positionMs = 0;
       _durationMs = 0;
+      // 字幕：切集清空轨道/文本（新集字幕等下次打开面板重新拉取）
+      _subtitleTracks = const [];
+      _subtitleLoading = false;
+      _subtitleError = null;
+      _mainSubtitleTrack = null;
+      _secondarySubtitleTrack = null;
+      _mainSubtitleText = '';
+      _secondarySubtitleText = '';
+      _subtitleCues.clear();
     });
     try {
       await _loadStreamAndPlay(positionMs: 0);
@@ -1167,6 +1484,22 @@ class _PlayerPageState extends State<PlayerPage> {
             ),
           // 2. 听视频占位界面（封面 + 标题 + 提示，点按恢复画面）
           if (_listenMode) _buildListenPlaceholder(),
+          // 2.5 字幕层：Texture 之上、控制层之下（听视频模式隐藏）。
+          // 底部控制行约 80px（进度条行 36 + 按钮行 44），字幕悬浮在其上方。
+          // 主字幕大号在上，副字幕小号在其下（见 _SubtitleOverlay）。
+          if (!_listenMode &&
+              _subtitleEnabled &&
+              (_mainSubtitleText.isNotEmpty ||
+                  _secondarySubtitleText.isNotEmpty))
+            Positioned(
+              left: 24,
+              right: 24,
+              bottom: 100,
+              child: _SubtitleOverlay(
+                mainText: _mainSubtitleText,
+                secondaryText: _secondarySubtitleText,
+              ),
+            ),
           // 3. 登录过期横幅
           if (_loginExpiryText != null)
             Positioned(
@@ -1478,6 +1811,40 @@ class _PlayerPageState extends State<PlayerPage> {
                       ),
                     ),
                   ),
+                  // 字幕按钮：图标 + 状态反馈（开启时高亮），点按弹出字幕设置
+                  Expanded(
+                    child: InkWell(
+                      onTap: _player == null ? null : _showSubtitleSheet,
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(
+                            _subtitleEnabled
+                                ? Icons.subtitles
+                                : Icons.subtitles_off,
+                            color: _subtitleEnabled
+                                ? Colors.pinkAccent
+                                : Colors.white,
+                            size: 18,
+                          ),
+                          const SizedBox(width: 4),
+                          Flexible(
+                            child: Text(
+                              _subtitleEnabled ? '字幕中' : '字幕',
+                              softWrap: false,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                color: _subtitleEnabled
+                                    ? Colors.pinkAccent
+                                    : Colors.white,
+                                fontSize: 14,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
                   // 下载按钮：未缓存「下载」/ 下载中进度环+百分比 / 已缓存「已缓存」
                   Expanded(child: _buildDownloadControl()),
                   // 全屏按钮
@@ -1582,6 +1949,64 @@ class _LoginExpiryBanner extends StatelessWidget {
               ],
             ),
           ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 字幕叠加层：主字幕（大号）在上，副字幕（小号）在其下，居中可换行。
+class _SubtitleOverlay extends StatelessWidget {
+  final String mainText;
+  final String secondaryText;
+
+  const _SubtitleOverlay({required this.mainText, required this.secondaryText});
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        if (mainText.isNotEmpty)
+          _SubtitleLine(text: mainText, fontSize: 19),
+        if (secondaryText.isNotEmpty) ...[
+          const SizedBox(height: 5),
+          _SubtitleLine(text: secondaryText, fontSize: 13),
+        ],
+      ],
+    );
+  }
+}
+
+/// 单行字幕：半透明圆角底 + 白字 + 黑色阴影描边（清晰可读）。
+class _SubtitleLine extends StatelessWidget {
+  final String text;
+  final double fontSize;
+
+  const _SubtitleLine({required this.text, required this.fontSize});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      decoration: BoxDecoration(
+        color: Colors.black45,
+        borderRadius: BorderRadius.circular(6),
+      ),
+      child: Text(
+        text,
+        textAlign: TextAlign.center,
+        style: TextStyle(
+          color: Colors.white,
+          fontSize: fontSize,
+          fontWeight: FontWeight.w600,
+          // 黑色阴影描边：无底时也保证字幕可读
+          shadows: const [
+            Shadow(offset: Offset(0, 1), blurRadius: 2, color: Colors.black),
+            Shadow(offset: Offset(0, -1), blurRadius: 2, color: Colors.black),
+            Shadow(offset: Offset(1, 0), blurRadius: 2, color: Colors.black),
+            Shadow(offset: Offset(-1, 0), blurRadius: 2, color: Colors.black),
+          ],
         ),
       ),
     );

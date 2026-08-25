@@ -60,6 +60,7 @@
 - **DASH 1080P 播放**：video + audio 双流合并播放；流 URL 过期自动续播
 - **倍速九档**：0.5x – 3x，长按 2x 快捷
 - **听视频模式**：纯音频播放（关屏可听）
+- **字幕**：播放页「字幕」入口可选主 / 副字幕轨道，**大号 + 小号双语同步显示**（时间轴同步）；支持 B 站 CC 人工字幕与**登录后的 AI 字幕**（多语言，如英 / 中 / 日）；无字幕视频有提示
 - **登录**：WebView 内嵌 B 站官方登录页（短信验证码），登录态自动续期
 - **GitHub token 配置**：App 内填写，安全存储
 - **离线缓存**：播放页一键下载到本地（单集 / 全部集），**断网可播放**已缓存视频（播放优先走本地文件）；缓存管理（查看 / 删除 / 清空 / 总大小），列表页显示「已缓存」标记
@@ -101,7 +102,7 @@
 | PC 脚本 | Python 3（标准库 + requests，仅 `push` 用到） |
 | 油猴脚本 | Tampermonkey，`GM_xmlhttpRequest` 直连 Gist API |
 | 同步 | GitHub Gist API（`api.github.com`，实时读写） |
-| App | Flutter（Dart）2.3.0+6 |
+| App | Flutter（Dart）2.6.0+11 |
 | App 网络 | dio（全局头 / Cookie 注入） |
 | App 播放 | 原生 Kotlin 插件：AndroidX Media3（ExoPlayer）`MergingMediaSource` 合并 DASH 双流 |
 | App 登录 | webview_flutter（内嵌 B 站官方登录页） |
@@ -203,6 +204,12 @@ B 站部分接口（如 `playurl`）要求 WBI 签名：
 - 复用第 1 节的 WBI 签名：请求搜索接口同样带 `wts` + `w_rid` 签名，外加浏览器 UA / Referer 指纹与限流退避（与播放链路同一套风控应对）
 - 「全部 B 站」Tab 调搜索接口按关键词查（视频标题 / UP 主），结果归一化为本地 `SearchResult` 模型展示；「我的白名单」Tab 直接对本地白名单数据按标题/UP 主做子串过滤，无需网络
 - 一键加入复用第 9 节同一写路径（`WhitelistWriter`：构造 v3 数据 → Gist 实时 API 写回 → 查重合并），与手动导入/电脑端油猴脚本完全一致
+
+### 11. 字幕（x/player/wbi/v2 + AI 字幕需登录态）
+
+- 轨道列表走 `x/player/wbi/v2`（复用 WBI 签名 + buvid 指纹 + 登录态），解析 `data.subtitle.subtitles[]`；**AI 字幕需登录态**（未登录 / 失效返回 -101，提示重新登录）
+- 字幕文件（`subtitle_url`，`//` 开头补 `https:`）下载带 Referer + UA 防盗链头，内容按 `bvid_cid_lan` 内存缓存，同一轨道不重复下载
+- 播放页主 / 副字幕各选一条轨道，按播放进度（500ms 轮询）取当前句，**大号主字幕 + 小号副字幕**同步渲染；字幕 JSON 解析容错（BOM / 非法条目跳过）
 
 ---
 

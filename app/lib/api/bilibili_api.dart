@@ -4,6 +4,7 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import '../config.dart';
 import '../models/search_result.dart';
+import '../models/subtitle.dart';
 import '../wbi/wbi_signer.dart';
 
 /// B 站业务接口错误（带业务 code）。
@@ -68,6 +69,10 @@ class BiliApi {
   /// （playurl 返回 code=0 但无任何流）。补上指纹后显著降低触发概率。
   String? _buvid3;
   String? _buvid4;
+
+  /// 字幕内容内存缓存（key = `bvid_cid_lan`，见 [SubtitleTrack.cacheKey]），
+  /// 避免同一轨道重复下载字幕文件。
+  final Map<String, List<SubtitleCue>> _subtitleCache = {};
 
   BiliApi({Dio? dio, FlutterSecureStorage? storage})
       : _dio = dio ??
@@ -459,5 +464,116 @@ class BiliApi {
       );
     }
     throw StateError('playurl 接口重试后仍失败（$bvid/$cid）');
+  }
+
+  // -------------------------------------------------------------------------
+  // 字幕（M-字幕功能）
+  // -------------------------------------------------------------------------
+
+  /// 视频字幕轨道列表（`x/player/wbi/v2`，带 WBI 签名 + buvid 指纹 +
+  /// 登录态 SESSDATA，复用 [._injectAuth]/[._ensureWbiKeys]）。
+  ///
+  /// 返回 `data.subtitle.subtitles[]` 解析出的轨道列表；
+  /// 视频无字幕轨道（subtitles 缺失/空）→ 空列表。
+  ///
+  /// 错误分类（调用方 UI 据此提示）：
+  /// - code=-101 → [BiliApiException]「未登录/登录失效」（AI 字幕需登录态，
+  ///   重新登录后生效）
+  /// - code=-352 → [BiliApiException]「接口被限流」
+  /// - code=-412 → 刷新 WBI key 重试一次（与 view/playurl 同模式）
+  /// - 其他业务码 → [BiliApiException]（带接口 message）
+  /// - 网络失败（[DioException]）→ 原样上抛
+  Future<List<SubtitleTrack>> fetchSubtitles(String bvid, int cid) async {
+    await _injectAuth();
+    final (imgKey, subKey) = await _ensureWbiKeys();
+    final params = WbiSigner.encodeWbi(
+      {'bvid': bvid, 'cid': '$cid'},
+      imgKey: imgKey,
+      subKey: subKey,
+      withDm: true,
+    );
+    debugPrint('[bili_api] fetchSubtitles bvid=$bvid cid=$cid');
+    for (var attempt = 0; attempt < 2; attempt++) {
+      final resp = await _dio.get<Map<String, dynamic>>(
+        '/x/player/wbi/v2',
+        queryParameters: params,
+      );
+      final data = resp.data;
+      final code = data?['code'] as int?;
+      if (code == -412 && attempt == 0) {
+        await _refreshWbiKeys();
+        continue;
+      }
+      if (code == -101) {
+        throw const BiliApiException(
+          code: -101,
+          message: '未登录或登录已失效，请重新登录后查看字幕',
+          path: '/x/player/wbi/v2',
+        );
+      }
+      if (code == -352) {
+        throw const BiliApiException(
+          code: -352,
+          message: '字幕接口被限流，请稍后重试',
+          path: '/x/player/wbi/v2',
+        );
+      }
+      if (code != 0) {
+        throw BiliApiException(
+          code: code ?? -1,
+          message: data?['message'] as String? ?? '字幕接口错误',
+          path: '/x/player/wbi/v2',
+        );
+      }
+      final d = data?['data'] as Map<String, dynamic>?;
+      final subtitle = d?['subtitle'] as Map<String, dynamic>?;
+      final raw = subtitle?['subtitles'];
+      if (raw is! List) return const [];
+      final tracks = raw
+          .whereType<Map<String, dynamic>>()
+          .map(SubtitleTrack.fromJson)
+          .where((t) => t.lan.isNotEmpty && t.subtitleUrl.isNotEmpty)
+          .toList();
+      debugPrint('[bili_api] fetchSubtitles ok: ${tracks.length} tracks '
+          '${tracks.map((t) => '${t.lan}:${t.lanDoc}').join(', ')} '
+          '(bvid=$bvid)');
+      return tracks;
+    }
+    throw StateError('字幕接口重试后仍失败（$bvid/$cid）');
+  }
+
+  /// 下载并解析一条字幕轨道的内容（带防盗链 Referer + UA）。
+  ///
+  /// [subtitleUrl] 常以 `//` 开头（无协议）→ 补全为 `https:`；
+  /// 字幕文件在 i*.hdslb.com 域名，不走全局 baseUrl，用绝对 URL 请求。
+  /// 内容按 `bvid_cid_lan` 内存缓存，重复调用不重复下载。
+  /// 失败抛异常（网络 [DioException] / 无内容）。
+  Future<List<SubtitleCue>> downloadSubtitle(
+    SubtitleTrack track, {
+    String bvid = '',
+    int cid = 0,
+  }) async {
+    final key = track.cacheKey(bvid, cid);
+    final hit = _subtitleCache[key];
+    if (hit != null) {
+      debugPrint('[bili_api] downloadSubtitle 命中缓存 $key');
+      return hit;
+    }
+    var url = track.subtitleUrl;
+    if (url.startsWith('//')) url = 'https:$url';
+    debugPrint('[bili_api] downloadSubtitle lan=${track.lan} url=$url');
+    final resp = await _dio.get<String>(
+      url,
+      options: Options(
+        // 字幕文件防盗链：必须带 B 站页面的 Referer + 浏览器 UA
+        headers: {'Referer': kBiliReferer, 'User-Agent': kBrowserUA},
+        responseType: ResponseType.plain,
+      ),
+    );
+    final text = resp.data ?? '';
+    final cues = parseSubtitleCues(text);
+    debugPrint('[bili_api] downloadSubtitle lan=${track.lan} cues=${cues.length}');
+    _subtitleCache[key] = cues;
+    return cues;
   }
 }
