@@ -62,6 +62,7 @@
 - **听视频模式**：纯音频播放（关屏可听）
 - **字幕**：播放页「字幕」入口可选主 / 副字幕轨道，**大号 + 小号双语同步显示**（时间轴同步）；支持 B 站 CC 人工字幕与**登录后的 AI 字幕**（多语言，如英 / 中 / 日）；无字幕视频有提示
 - **字幕翻译**：副字幕可选「翻译（中文）」——主字幕内容经 **OpenAI 兼容翻译服务**（可配置 base_url / api_key / model，key 仅存本机）批量翻译成中文显示，带翻译进度提示；**本地缓存**（同一视频同一轨道只翻译一次，切集 / 重进命中缓存直接显示）
+- **本地转写字幕**：无字幕视频也能看字幕——播放页「🎙 转写字幕」用 **whisper（whisper_ggml，本地推理）**识别当前集音频生成带时间轴的字幕，转写结果作为主字幕显示、可继续走翻译；**模型 142MB 首次下载**（hf-mirror 国内镜像，带进度），结果**本地缓存**（同一集只转写一次，切集 / 重进命中即显示）
 - **登录**：WebView 内嵌 B 站官方登录页（短信验证码），登录态自动续期
 - **GitHub token 配置**：App 内填写，安全存储
 - **离线缓存**：播放页一键下载到本地（单集 / 全部集），**断网可播放**已缓存视频（播放优先走本地文件）；缓存管理（查看 / 删除 / 清空 / 总大小），列表页显示「已缓存」标记
@@ -219,6 +220,14 @@ B 站部分接口（如 `playurl`）要求 WBI 签名：
 - **本地缓存**：译文按 `(bvid, cid, 主字幕 lan)` 落应用支持目录 JSON（`subtitle_translation_*.json`），同一视频同一轨道只翻译一次，切集 / 重进命中缓存直接显示
 - 副字幕「翻译（中文）」与普通副字幕轨道**互斥**（选翻译则轨道置空）；未配置服务时点击提示去管理面板配置；401（key 无效）/ 超时 / 断网给出中文错误提示（字幕层「翻译失败」+ SnackBar 具体原因）
 
+### 13. 本地转写字幕（whisper_ggml + 模型下载 + 缓存）
+
+- **入口**：字幕设置面板「🎙 转写字幕」区块（轨道列表 / 翻译下方）——未转写显示按钮与说明（首次需下载模型 142MB）；转写中显示进度（模型下载 % → 转写 %）+ 取消；已转写显示「✅ 已转写」+ 设为主字幕 + 重新转写
+- **转写链路**：`WhisperModelManager`（hf-mirror 下载 ggml-base.bin 142MB，进度 + 失败重试 + 完整性校验）→ `WhisperAudioSource`（离线缓存 audio.m4s 优先，否则临时下载 DASH 音频流）→ `Transcriber`（whisper_ggml 本地推理，内部 FFmpeg 转 16k wav，segments 带 from/to 时间戳）→ `SubtitleCue` 列表
+- **结果即主字幕**：转写完成后主字幕自动设为转写结果（无 B 站轨道选中时仅显示转写字幕）；已转写可在主字幕选择里切「🎙 本地转写」；**可继续走翻译**（副字幕「翻译（中文）」直接翻译转写结果，译文缓存键用 `lan=whisper` 独立命名）
+- **本地缓存**：结果落 `<支持目录>/transcription_cache/transcription_<bvid>_<pageIndex>.json`，同一集只转写一次，切集 / 重进命中缓存直接显示（无需重新转写）；「重新转写」先清缓存再重跑
+- **错误分类**：模型下载失败 / 音频流获取失败 / whisper 引擎失败 / 并发（「正在转写其他视频，请稍后再试」）/ 取消，均给出中文提示（面板红字 + SnackBar）；转写状态随切集 / 重进重置
+
 ---
 
 ## 目录结构
@@ -238,12 +247,12 @@ bili-whitelist/
     ├── pubspec.yaml
     ├── lib/                   # Dart 源码
     │   ├── main.dart / config.dart
-    │   ├── api/               # bilibili_api.dart（WBI+playurl）、github_api.dart（Gist 同步）
+    │   ├── api/               # bilibili_api.dart（WBI+playurl）、github_api.dart（Gist 同步）、translate_api.dart（字幕翻译）、whisper_model.dart（模型下载）/ whisper_audio.dart（转写音频）
     │   ├── cache/             # download_manager.dart（离线缓存下载管理器，串行队列）
     │   ├── models/            # whitelist_video.dart（v3 数据模型 + 合集管理逻辑）
     │   ├── pages/             # login_page / playlist_page / player_page
     │   ├── player/            # bili_dash_player.dart（DASH 播放控制器）
-    │   ├── services/          # service_locator.dart
+    │   ├── services/          # service_locator.dart、transcriber.dart（本地转写）/ transcription_cache.dart（转写缓存）
     │   ├── sync/              # whitelist_source.dart（白名单数据源）
     │   ├── utils/             # import_parser.dart（本地导入解析：完整链接/短链/BV）
     │   └── wbi/               # wbi_signer.dart（WBI 签名器）
