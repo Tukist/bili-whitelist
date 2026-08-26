@@ -5,10 +5,11 @@
 /// 2. 音频：`SherpaAudioPreparer.prepareWav`（m4s → 16kHz mono wav）
 /// 3. 转写：`OnlineRecognizer`（zipformer2 transducer）→ `createStream` →
 ///    按块（1s=16000 samples）喂 `acceptWaveform` → `decode` → `getResult`
-///    实时更新 partialText → `isEndpoint` 检测句尾 → 完成句子（带时间戳）入
+///    实时更新 partialText → `isEndpoint` 检测句尾 → 完整句子先
+///    [splitSentence] 二次分句为短字幕子句（时间戳按字符数比例分配）入
 ///    sentences → `reset` 继续；喂完 `inputFinished` 收尾
-/// 4. 逐句翻译：每个完成句子立即调 [TranslateApi]（复用配置/缓存），翻译失败
-///    不阻塞（translation 留空，后续可补）
+/// 4. 子句批量翻译：一次端点拆出的子句一次 [TranslateApi] 批量请求，结果
+///    按序回填各子句 translation；翻译失败不阻塞（translation 留空，后续可补）
 ///
 /// 关键设计：
 /// - 「实时推进」：转写处理速度决定字幕跟播速度（模拟器慢、真机 1~3s 延迟），
@@ -31,6 +32,7 @@ import '../api/sherpa_audio.dart';
 import '../api/sherpa_model.dart';
 import '../api/translate_api.dart';
 import '../models/whitelist_video.dart';
+import '../utils/sentence_splitter.dart';
 
 /// 实时转写错误（message 可直接展示给用户）。
 class RealtimeException implements Exception {
@@ -50,7 +52,7 @@ class RealtimeSentence {
   final String text;
   final double fromTs; // 秒（已喂音频时间轴）
   final double toTs; // 秒
-  String? translation; // 逐句翻译结果（翻译失败为 null，可后续补）
+  String? translation; // 子句译文（翻译失败为 null，可后续补）
 
   RealtimeSentence({
     required this.text,
@@ -316,10 +318,12 @@ Future<WavSource> openPcm16Wav(
 // 实时转写服务（单例）
 // ---------------------------------------------------------------------------
 
-/// 逐句翻译函数（可注入替身；默认走 [TranslateApi.translateBatch]）。
+/// 子句批量翻译函数（可注入替身；默认走 [TranslateApi.translateBatch]）。
 ///
-/// 返回译文；失败返回 null（不阻塞转写，translation 留空）。
-typedef SentenceTranslator = Future<String?> Function(String text);
+/// 入参为一次端点拆出的全部子句文本，返回与入参**逐条对应**的译文
+/// （元素为 null 表示该条翻译失败）；整个调用失败返回全 null 列表
+/// （不阻塞转写，translation 留空后续可补）。
+typedef SentenceTranslator = Future<List<String?>> Function(List<String> texts);
 
 /// sherpa 流式实时转写服务（单例）。
 ///
@@ -404,7 +408,7 @@ class RealtimeTranscriber {
 
   final List<RealtimeSentence> _sentencesList = [];
 
-  /// 开始某集实时转写（模型 → 音频 → 流式转写 + 逐句翻译）。
+  /// 开始某集实时转写（模型 → 音频 → 流式转写 + 子句批量翻译）。
   ///
   /// [language] 保留参数（8 语模型自动检测语言，暂不强制指定）。
   /// 进行中再次调用抛 [RealtimeException]（拒绝并提示）。
@@ -484,7 +488,7 @@ class RealtimeTranscriber {
     }
   }
 
-  /// 流式主循环：逐块喂 → decode → partialText → endpoint 收句 → 逐句翻译。
+  /// 流式主循环：逐块喂 → decode → partialText → endpoint 收句二次分句 → 批量翻译。
   Future<void> _runStreaming(RtRecognizer recognizer, String wavPath) async {
     final wav = await _wavSource(wavPath, chunkSamples: chunkSamples);
     final stream = recognizer.createStream();
@@ -567,7 +571,11 @@ class RealtimeTranscriber {
     }
   }
 
-  /// 收尾一个完成的句子：加入列表 + reset 流 + 异步逐句翻译。
+  /// 收尾一个完成的句子：先二次分句为短字幕子句 → 全部入列 → 批量翻译。
+  ///
+  /// sherpa 端点不常触发，一句可能覆盖几十秒/多句话，先按标点拆成
+  /// 短子句（时间戳按字符数比例分配），每个子句作为独立 sentence 入列；
+  /// 一次端点的子句一次批量翻译请求，结果按序回填各子句 translation。
   Future<void> _finalizeSentence(
     RtRecognizer recognizer,
     RtStream stream,
@@ -577,25 +585,36 @@ class RealtimeTranscriber {
   ) async {
     if (text.trim().isEmpty) return;
     recognizer.reset(stream);
-    final sentence = RealtimeSentence(
-      text: text.trim(),
-      fromTs: fromSec,
-      toTs: toSec,
-    );
-    _sentencesList.add(sentence);
+    final parts = splitSentence(text, fromSec, toSec);
+    if (parts.isEmpty) return;
+    final sentences = [
+      for (final p in parts)
+        RealtimeSentence(text: p.text, fromTs: p.fromTs, toTs: p.toTs),
+    ];
+    _sentencesList.addAll(sentences);
     _publishSentences();
-    debugPrint('[realtime] 句 [$fromSec~$toSec] $text');
-    // 逐句翻译：异步执行，失败不阻塞转写（translation 留空）
-    unawaited(_translateSentence(sentence));
+    for (final s in sentences) {
+      debugPrint('[realtime] 句 [${s.fromTs}~${s.toTs}] ${s.text}');
+    }
+    // 子句批量翻译：异步执行，失败不阻塞转写（translation 留空后续可补）
+    unawaited(_translateBatch(sentences));
   }
 
-  Future<void> _translateSentence(RealtimeSentence sentence) async {
+  /// 一次端点拆出的子句一次批量翻译，结果按序回填各子句 translation。
+  Future<void> _translateBatch(List<RealtimeSentence> sentences) async {
+    if (sentences.isEmpty) return;
     try {
-      final result = await _translate(sentence.text);
-      if (result != null && result.trim().isNotEmpty) {
-        sentence.translation = result.trim();
-        _publishSentences(); // 更新译文后通知 UI
+      final results = await _translate([for (final s in sentences) s.text]);
+      if (results.length != sentences.length) return; // 数量不符，放弃回填
+      var changed = false;
+      for (var i = 0; i < sentences.length; i++) {
+        final r = results[i];
+        if (r != null && r.trim().isNotEmpty) {
+          sentences[i].translation = r.trim();
+          changed = true;
+        }
       }
+      if (changed) _publishSentences(); // 更新译文后通知 UI
     } catch (e) {
       debugPrint('[realtime] 句子翻译失败，跳过（可后续补）：$e');
     }
@@ -609,15 +628,15 @@ class RealtimeTranscriber {
     if (_stopRequested) throw const RealtimeStopped();
   }
 
-  /// 默认逐句翻译：复用 [TranslateApi]（配置/缓存），单句调 translateBatch。
-  static Future<String?> _defaultTranslate(String text) async {
+  /// 默认批量翻译：复用 [TranslateApi]（配置/缓存），一次端点子句一次请求。
+  static Future<List<String?>> _defaultTranslate(List<String> texts) async {
     try {
-      final list = await TranslateApi().translateBatch([text]);
-      if (list.isEmpty) return null;
-      return list.first;
+      final list = await TranslateApi().translateBatch(texts);
+      // translateBatch 保证逐条对应；个别失败时元素回退原文，仍按序回填
+      return [for (final t in list) t];
     } catch (e) {
       debugPrint('[realtime] 默认翻译失败：$e');
-      return null;
+      return List.filled(texts.length, null);
     }
   }
 }

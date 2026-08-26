@@ -4,8 +4,8 @@
 /// 状态机 / 句子积累 / 翻译调度 / 错误分类 / wav 解析）：
 /// - SherpaModelManager：下载 / 已存在跳过 / 解压 / 完整性判断 / 失败重试
 /// - SherpaAudioPreparer：m4s → wav 转码调用 / 复用 / 失败分类
-/// - RealtimeTranscriber：状态流转 / 块循环 / 句子积累（时间戳）/ 逐句翻译 /
-///   stop / 并发拒绝 / 错误分类
+/// - RealtimeTranscriber：状态流转 / 块循环 / 句子积累（时间戳）/ 二次分句 /
+///   批量翻译 / stop / 并发拒绝 / 错误分类
 /// - openPcm16Wav：真实 wav 字节解析（块分割 / 采样校验）
 library;
 
@@ -21,6 +21,7 @@ import 'package:bili_whitelist_app/api/sherpa_audio.dart';
 import 'package:bili_whitelist_app/api/sherpa_model.dart';
 import 'package:bili_whitelist_app/models/whitelist_video.dart';
 import 'package:bili_whitelist_app/services/realtime_transcriber.dart';
+import 'package:bili_whitelist_app/utils/sentence_splitter.dart';
 
 const _video = WhitelistVideo(
   bvid: 'BV1TEST',
@@ -568,11 +569,12 @@ void main() {
                     Float32List(16000),
                   ],
                 ).open(path),
-        translate: translate ?? (text) async => '译$text',
+        translate: translate ??
+            (texts) async => [for (final t in texts) '译$t'],
       );
     }
 
-    test('状态流转 + 句子积累 + 逐句翻译 + 时间戳', () async {
+    test('状态流转 + 句子积累 + 批量翻译 + 时间戳', () async {
       final recognizer = FakeRtRecognizer(
         samplesPerSentence: 32000, // 2 块一句 → 3 块共 2 句
         presetTexts: const ['你好世界', '第二句话'],
@@ -580,9 +582,9 @@ void main() {
       final translated = <String>[];
       final transcriber = makeTranscriber(
         recognizer: recognizer,
-        translate: (text) async {
-          translated.add(text);
-          return '译$text';
+        translate: (texts) async {
+          translated.addAll(texts);
+          return [for (final t in texts) '译$t'];
         },
       );
 
@@ -627,10 +629,61 @@ void main() {
       expect(transcriber.stage.value, RtStage.done);
     });
 
+    test('长句二次分句：子句独立入列 + 时间戳比例分配 + 批量翻译按序回填', () async {
+      // 62 字符长句（sherpa 端点不常触发，一句覆盖多句的情况）
+      const longText = '今天是个好日子我们一起去公园散步然后回家吃饭，'
+          '顺便买点水果和蔬菜，晚上我们再看一部非常精彩的电影吧，'
+          '明天还要早起上班呢。';
+      final recognizer = FakeRtRecognizer(
+        samplesPerSentence: 32000, // 第 2 块触发 endpoint 收长句 [0,2]
+        presetTexts: const [longText],
+      );
+      final batches = <List<String>>[];
+      final transcriber = makeTranscriber(
+        recognizer: recognizer,
+        translate: (texts) async {
+          batches.add(texts);
+          return [for (final t in texts) '译:$t'];
+        },
+      );
+      await transcriber.start(_video, 0);
+
+      final list = transcriber.sentences.value;
+      // 长句被拆成 2 个子句 + 尾部兜底 1 句（'句子2'）
+      expect(list, hasLength(3));
+      expect(list[0].text,
+          '今天是个好日子我们一起去公园散步然后回家吃饭，顺便买点水果和蔬菜，');
+      expect(list[1].text, '晚上我们再看一部非常精彩的电影吧，明天还要早起上班呢。');
+      expect(list[2].text, '句子2');
+      // 每个子句长度适中（≤45）
+      for (final s in list) {
+        expect(s.text.length, lessThanOrEqualTo(maxPartLength));
+        expect(s.text, isNotEmpty);
+      }
+      // 时间戳：长句 [0,2] 按字符数比例分配（33/60、27/60），单调不重叠
+      expect(list[0].fromTs, 0);
+      expect(list[0].toTs, closeTo(2 * 33 / 60, 1e-9));
+      expect(list[1].fromTs, closeTo(2 * 33 / 60, 1e-9));
+      expect(list[1].toTs, 2);
+      expect(list[2].fromTs, 2);
+      expect(list[2].toTs, 3);
+      for (var i = 1; i < list.length; i++) {
+        expect(list[i].fromTs, greaterThanOrEqualTo(list[i - 1].toTs));
+      }
+      // 翻译批量：一次端点拆出的子句一次请求（第 1 批 = 2 个子句），按序回填
+      expect(batches, hasLength(2));
+      expect(batches[0], [list[0].text, list[1].text]);
+      expect(batches[1], ['句子2']);
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      for (final s in list) {
+        expect(s.translation, '译:${s.text}');
+      }
+    });
+
     test('翻译失败不阻塞转写（translation 留空）', () async {
       final transcriber = makeTranscriber(
         recognizer: FakeRtRecognizer(samplesPerSentence: 32000),
-        translate: (text) async => throw Exception('api down'),
+        translate: (texts) async => throw Exception('api down'),
       );
       await transcriber.start(_video, 0);
       expect(transcriber.stage.value, RtStage.done);
@@ -674,7 +727,7 @@ void main() {
         recognizerFactory: (_) => FakeRtRecognizer(samplesPerSentence: 32000),
         wavSource: (path, {chunkSamples = 16000}) async =>
             FakeWavSource(0, []).open(path),
-        translate: (text) async => null,
+        translate: (texts) async => List.filled(texts.length, null),
       );
       final first = transcriber.start(_video, 0); // 挂起在模型阶段
       await _waitStage(transcriber, RtStage.modelDownload);
@@ -725,7 +778,7 @@ void main() {
         recognizerFactory: (_) => throw StateError('so not found'),
         wavSource: (path, {chunkSamples = 16000}) async =>
             FakeWavSource(0, []).open(path),
-        translate: (text) async => null,
+        translate: (texts) async => List.filled(texts.length, null),
       );
       await expectLater(
         transcriber.start(_video, 0),

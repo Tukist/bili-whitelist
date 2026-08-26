@@ -220,11 +220,12 @@ B 站部分接口（如 `playurl`）要求 WBI 签名：
 - **本地缓存**：译文按 `(bvid, cid, 主字幕 lan)` 落应用支持目录 JSON（`subtitle_translation_*.json`），同一视频同一轨道只翻译一次，切集 / 重进命中缓存直接显示
 - 副字幕「翻译（中文）」与普通副字幕轨道**互斥**（选翻译则轨道置空）；未配置服务时点击提示去管理面板配置；401（key 无效）/ 超时 / 断网给出中文错误提示（字幕层「翻译失败」+ SnackBar 具体原因）
 
-### 13. 实时转写（sherpa-onnx 流式 + 逐句翻译）
+### 13. 实时转写（sherpa-onnx 流式 + 二次分句 + 子句批量翻译）
 
 - **入口**：字幕设置面板「🎙 实时转写（流式）」区块（轨道列表 / 翻译下方）——未开始时显示按钮与说明（首次需下载模型 247MB）；模型下载/音频准备中显示阶段进度；转写中显示「转写中…」+ **实时文本预览（partial）** + 停止；完成后显示「✅ 实时转写完成（N 句）· 已作为字幕」；错误显示红字 + 重试
-- **转写链路**：`SherpaModelManager`（GitHub releases 下载 8 语流式 zipformer tar.bz2 247MB，进度 0~1 + 失败重试 + 完整性校验）→ `SherpaAudioPreparer`（离线缓存音频优先，否则临时下载 DASH 音频流，ffmpeg 转 16kHz 单声道 wav）→ `RealtimeTranscriber`（sherpa_onnx 流式识别：按 1s 块喂 OnlineStream → 增量解码 → 实时更新 partial → 检测句尾收句（带时间戳）→ **逐句异步翻译**）
-- **主字幕 = 原文、副字幕 = 译文**：转写结果作为主字幕数据源（按播放位置取当前句），副字幕显示该句译文（`RealtimeTranscriber.sentences[i].translation`，翻译服务未配置 / 失败则无副字幕）；partial 实时文本仅面板预览
+- **转写链路**：`SherpaModelManager`（GitHub releases 下载 8 语流式 zipformer tar.bz2 247MB，进度 0~1 + 失败重试 + 完整性校验）→ `SherpaAudioPreparer`（离线缓存音频优先，否则临时下载 DASH 音频流，ffmpeg 转 16kHz 单声道 wav）→ `RealtimeTranscriber`（sherpa_onnx 流式识别：按 1s 块喂 OnlineStream → 增量解码 → 实时更新 partial → 检测句尾收句 → **二次分句** + 子句批量翻译）
+- **二次分句**：sherpa 端点检测不常触发，一句可能覆盖几十秒/多句话（字幕"一连好几行"）——`lib/utils/sentence_splitter.dart` 把一次端点的完整句子先按句末标点（`。．.!！?？…；;`）拆，过长的子句（>45 字符）再按逗号 / 顿号 / 空格拆；每子句时间戳按**字符数比例**分配（覆盖原句区间、单调不重叠），作为独立字幕入列
+- **主字幕 = 原文、副字幕 = 译文**：转写结果作为主字幕数据源（按播放位置取当前子句），副字幕显示该子句译文（`RealtimeTranscriber.sentences[i].translation`）；**一次端点拆出的子句一次批量翻译请求**（OpenAI 兼容服务，按序回填各子句），翻译服务未配置 / 失败则无副字幕；partial 实时文本仅面板预览
 - **手动放置模型（下载慢兜底）**：模型解压目录 `<应用支持目录>/sherpa/8lang/<模型名>/`，检测四件套（encoder/decoder/joiner .onnx + tokens.txt，encoder > 10MB）完整即**跳过下载直接使用**——网络下载慢（GitHub 国内仅几 KB/s）时可在 PC 下载 tar.bz2 解压后把模型目录放进该路径；面板在下载阶段提示目录路径
 - **状态管理**：转写状态随切集 / 重进 / 退出播放页重置（dispose 停止）；并发控制（一次一个，进行中再次开始拒绝并提示）
 
