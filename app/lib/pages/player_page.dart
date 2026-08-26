@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../api/bilibili_api.dart';
+import '../api/sherpa_model.dart';
 import '../api/translate_api.dart';
 import '../api/whisper_audio.dart';
 import '../api/whisper_model.dart';
@@ -13,6 +14,7 @@ import '../config.dart';
 import '../models/subtitle.dart';
 import '../models/whitelist_video.dart';
 import '../player/bili_dash_player.dart';
+import '../services/realtime_transcriber.dart';
 import '../services/transcriber.dart';
 import 'login_page.dart';
 
@@ -148,6 +150,22 @@ class _PlayerPageState extends State<PlayerPage> {
   /// 取消后再次开始的旧运行回写新状态。
   int _transcribeRun = 0;
 
+  // 实时转写（sherpa 流式）状态
+  // ---------------------------------------------------------------------
+  // 与上方 whisper「转写字幕」并存：whisper 是「整段识别出带时间轴字幕」，
+  // 这里是「边播边出实时字幕」（主字幕=原文句子、副字幕=逐句译文）。
+  // 状态直接监听全局单例 RealtimeTranscriber 的 ValueNotifier：
+  // 面板（ValueListenableBuilder）与字幕层（stage 监听）各自刷新。
+  final RealtimeTranscriber _realtime = RealtimeTranscriber.instance;
+
+  /// 实时转写结果是否为当前主字幕数据源：
+  /// stage=transcribing/done 时为 true（主字幕=原文、副字幕=译文，按播放位置
+  /// 从 sentences 取当前句）；停止/切集/重进后置 false（字幕回退到轨道/whisper）。
+  bool _realtimeAsSubtitle = false;
+
+  /// 模型目录提示路径（面板「手动放置模型」指引；异步取，取不到显示通用文案）。
+  String _realtimeModelDir = '';
+
   /// 字幕设置面板是否打开（转写完成后先关面板再弹 SnackBar，避免被遮挡）。
   bool _subtitleSheetOpen = false;
 
@@ -205,6 +223,11 @@ class _PlayerPageState extends State<PlayerPage> {
     // 监听缓存状态变化（下载进度/完成/删除），驱动下载按钮与进度刷新
     _downloads.cached.addListener(_onCacheStateChanged);
     _downloads.tasks.addListener(_onCacheStateChanged);
+    // 实时转写（sherpa）：stage 变化决定「是否作为字幕源」，句子/译文更新
+    // 时按播放位置刷新字幕文本；面板用 ValueListenableBuilder 自行刷新。
+    _realtime.stage.addListener(_onRealtimeStageChanged);
+    _realtime.sentences.addListener(_onRealtimeSentencesChanged);
+    _realtimeModelDirHint();
     _checkLoginExpiry();
     _init();
   }
@@ -213,6 +236,10 @@ class _PlayerPageState extends State<PlayerPage> {
   void dispose() {
     _downloads.cached.removeListener(_onCacheStateChanged);
     _downloads.tasks.removeListener(_onCacheStateChanged);
+    _realtime.stage.removeListener(_onRealtimeStageChanged);
+    _realtime.sentences.removeListener(_onRealtimeSentencesChanged);
+    // 退出播放页：停止实时转写（标志位在块边界生效，不打断引擎单步）
+    _realtime.stop();
     // 退出前保存一次进度（fire-and-forget，防杀进程/直接返回丢失进度）。
     // 播放器尚未释放，getPosition 可用；看完（_completed）已清记忆，跳过。
     final store = _progressStore;
@@ -240,12 +267,54 @@ class _PlayerPageState extends State<PlayerPage> {
   }
 
   // -------------------------------------------------------------------------
+  // 实时转写（sherpa）：监听回调 + 辅助
+  // -------------------------------------------------------------------------
+
+  /// stage 变化：transcribing/done → 实时转写作为字幕源（自动开字幕）；
+  /// 其余（idle/error/modelDownload/audioPrep）→ 不占字幕源。
+  void _onRealtimeStageChanged() {
+    if (!mounted) return;
+    setState(() {
+      _realtimeAsSubtitle = _realtime.stage.value == RtStage.transcribing ||
+          _realtime.stage.value == RtStage.done;
+      if (_realtimeAsSubtitle) _subtitleEnabled = true;
+    });
+    // 切换数据源后立即按播放位置刷新一次字幕文本
+    _updateSubtitleText(_positionMs);
+  }
+
+  /// 句子列表/译文更新（新句进列表、译文异步返回）：刷新当前句字幕。
+  void _onRealtimeSentencesChanged() {
+    if (!mounted) return;
+    _updateSubtitleText(_positionMs);
+  }
+
+  /// 异步取模型目录路径（面板「手动放置模型」指引用；取不到回退通用文案）。
+  Future<void> _realtimeModelDirHint() async {
+    try {
+      final dir = await SherpaModelManager.instance.targetModelDir();
+      if (mounted) setState(() => _realtimeModelDir = dir);
+    } catch (_) {
+      // 原生通道异常（测试环境等）：面板回退通用文案
+    }
+  }
+
+  /// 停止 + 清除实时转写状态（切集/重进/重试时调用；句子按集隔离）。
+  void _resetRealtime() {
+    _realtime.stop();
+    _realtime.clear();
+    _realtimeAsSubtitle = false;
+  }
+
+  // -------------------------------------------------------------------------
   // 初始化 / 取流
   // -------------------------------------------------------------------------
 
   Future<void> _init() async {
     // 重进/重试：取消在途转写（转写状态随集/页重置，见 _switchToPage）
     _transcriber.cancel();
+    // 实时转写（sherpa）随页重置：停止 + 清句子/partial/错误
+    _resetRealtime();
     setState(() {
       _error = null;
       _loginPrompt = false;
@@ -576,6 +645,21 @@ class _PlayerPageState extends State<PlayerPage> {
   /// - 翻译模式：主字幕当前 cue 的 index → 译文[index]（译文与 cue 一一对应）；
   ///   翻译失败且无译文时显示「翻译失败」（小号，不阻塞播放）
   void _updateSubtitleText(int positionMs) {
+    // 实时转写（sherpa）：主字幕=当前播放位置命中的原文句子、副字幕=其译文。
+    // 句子时间轴=当前集音频时间轴，与播放位置一一对应（见 RealtimeTranscriber）。
+    if (_realtimeAsSubtitle) {
+      final s = _currentRealtimeSentence(positionMs);
+      final mainText = s?.text ?? '';
+      final secText = s?.translation ?? '';
+      if (mainText != _mainSubtitleText ||
+          secText != _secondarySubtitleText) {
+        setState(() {
+          _mainSubtitleText = mainText;
+          _secondarySubtitleText = secText;
+        });
+      }
+      return;
+    }
     final mainCues = _mainSubtitleCues();
     final mainText = mainCues == null
         ? ''
@@ -604,6 +688,19 @@ class _PlayerPageState extends State<PlayerPage> {
         _secondarySubtitleText = secText;
       });
     }
+  }
+
+  /// 实时转写句子中命中当前播放位置的一句（`fromTs <= pos/1000 <= toTs`，
+  /// 同刻多条取最后一条，规则同 [currentCue]）；无命中返回 null。
+  RealtimeSentence? _currentRealtimeSentence(int positionMs) {
+    final list = _realtime.sentences.value;
+    if (list.isEmpty) return null;
+    final pos = positionMs / 1000;
+    RealtimeSentence? hit;
+    for (final s in list) {
+      if (s.fromTs <= pos && pos <= s.toTs) hit = s;
+    }
+    return hit;
   }
 
   Future<void> _togglePlay() async {
@@ -1026,7 +1123,7 @@ class _PlayerPageState extends State<PlayerPage> {
           ),
       ];
     }
-    return [...body, _buildTranscribeSection(refresh)];
+    return [...body, _buildTranscribeSection(refresh), _buildRealtimeSection(refresh)];
   }
 
   /// 「🎙 转写字幕」区块：轨道列表/翻译下方。状态机：
@@ -1194,6 +1291,245 @@ class _PlayerPageState extends State<PlayerPage> {
       },
     );
   }
+
+  /// 「🎙 实时转写（流式）」区块：与上方 whisper「转写字幕」并存。
+  ///
+  /// 状态机（监听 [RealtimeTranscriber.stage]，ValueListenableBuilder 驱动，
+  /// 面板内任意变化自动刷新，无需手动 refresh）：
+  /// - idle：主按钮「🎙 实时转写」+ 说明（首次需下载模型 247MB）+ 手动放置指引
+  /// - modelDownload：进度条 + 「模型下载 x%」+ 下载慢/手动放置提示
+  /// - audioPrep：进度条 + 「音频准备中」
+  /// - transcribing：「转写中…」+ partial 实时预览（小字）+ 「停止」
+  /// - done：「✅ 实时转写完成（N 句）· 已作为字幕」+ 重新转写
+  /// - error：红字错误 + 「重试」
+  Widget _buildRealtimeSection(VoidCallback refresh) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const Divider(height: 1),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 10, 16, 2),
+          child: Text('🎙 实时转写（流式）',
+              style: const TextStyle(color: Colors.white70, fontSize: 12)),
+        ),
+        ..._buildRealtimeStates(refresh),
+        const SizedBox(height: 8),
+      ],
+    );
+  }
+
+  /// 实时转写区块状态内容：按 stage 分发（[refresh] 仅用于错误「重试」
+  /// 等即时动作，阶段变化由 ValueListenableBuilder 自行驱动）。
+  List<Widget> _buildRealtimeStates(VoidCallback refresh) {
+    return [
+      ValueListenableBuilder<RtStage>(
+        valueListenable: _realtime.stage,
+        builder: (context, stage, _) =>
+            _buildRealtimeStageBody(stage, refresh),
+      ),
+    ];
+  }
+
+  Widget _buildRealtimeStageBody(RtStage stage, VoidCallback refresh) {
+    switch (stage) {
+      case RtStage.modelDownload:
+        return ValueListenableBuilder<double>(
+          valueListenable: _realtime.progress,
+          builder: (context, p, _) => Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              // ensureModel 进度：下载 0~0.9，解压 0.9~1.0 → 显示段 0~100%
+              _buildRealtimeProgressRow('模型下载', (p / 0.9).clamp(0.0, 1.0)),
+              _buildRealtimeModelHint(),
+            ],
+          ),
+        );
+      case RtStage.audioPrep:
+        return ValueListenableBuilder<double>(
+          valueListenable: _realtime.progress,
+          builder: (context, p, _) =>
+              _buildRealtimeProgressRow('音频准备中', p.clamp(0.0, 1.0)),
+        );
+      case RtStage.transcribing:
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 6, 16, 0),
+              child: Row(
+                children: [
+                  const SizedBox(
+                    width: 12,
+                    height: 12,
+                    child: CircularProgressIndicator(
+                        strokeWidth: 2, color: Colors.pinkAccent),
+                  ),
+                  const SizedBox(width: 8),
+                  const Expanded(
+                    child: Text('转写中…',
+                        style:
+                            TextStyle(color: Colors.white54, fontSize: 12)),
+                  ),
+                  TextButton(
+                    onPressed: _stopRealtime,
+                    style: TextButton.styleFrom(
+                        foregroundColor: Colors.white70),
+                    child: const Text('停止'),
+                  ),
+                ],
+              ),
+            ),
+            // partialText 实时预览（小字；仅面板预览，不占字幕层）
+            ValueListenableBuilder<String>(
+              valueListenable: _realtime.partialText,
+              builder: (context, t, _) => Padding(
+                padding: const EdgeInsets.fromLTRB(16, 4, 16, 0),
+                child: Text(
+                  t.trim().isEmpty ? '（识别中…）' : t.trim(),
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: Colors.white38, fontSize: 12),
+                ),
+              ),
+            ),
+          ],
+        );
+      case RtStage.done:
+        return ValueListenableBuilder<List<RealtimeSentence>>(
+          valueListenable: _realtime.sentences,
+          builder: (context, list, _) => Padding(
+            padding: const EdgeInsets.fromLTRB(16, 6, 16, 0),
+            child: Row(
+              children: [
+                const Icon(Icons.check_circle,
+                    color: Colors.greenAccent, size: 16),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    '✅ 实时转写完成（${list.length} 句）· 已作为字幕',
+                    style: const TextStyle(
+                        color: Colors.greenAccent, fontSize: 13),
+                  ),
+                ),
+                TextButton(
+                  onPressed: _startRealtime,
+                  style: TextButton.styleFrom(
+                      foregroundColor: Colors.white70),
+                  child: const Text('重新转写'),
+                ),
+              ],
+            ),
+          ),
+        );
+      case RtStage.error:
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            ValueListenableBuilder<String?>(
+              valueListenable: _realtime.error,
+              builder: (context, err, _) => Padding(
+                padding: const EdgeInsets.fromLTRB(16, 4, 16, 0),
+                child: Text(
+                  err ?? '实时转写失败',
+                  style: const TextStyle(color: Colors.redAccent, fontSize: 12),
+                ),
+              ),
+            ),
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 2, 16, 0),
+              child: OutlinedButton(
+                onPressed: _startRealtime,
+                style:
+                    OutlinedButton.styleFrom(foregroundColor: Colors.white),
+                child: const Text('重试'),
+              ),
+            ),
+          ],
+        );
+      case RtStage.idle:
+        return Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 6, 16, 0),
+              child: FilledButton(
+                onPressed: _startRealtime,
+                style: FilledButton.styleFrom(
+                  backgroundColor: Colors.pinkAccent,
+                  foregroundColor: Colors.black,
+                ),
+                child: const Text('🎙 实时转写'),
+              ),
+            ),
+            const Padding(
+              padding: EdgeInsets.only(top: 6),
+              child: Text('流式识别，边播边出字幕（首次需下载模型 247MB）',
+                  style: TextStyle(color: Colors.white38, fontSize: 12)),
+            ),
+            if (_realtimeModelDir.isNotEmpty)
+              Padding(
+                padding: const EdgeInsets.only(top: 2),
+                child: Text('也可手动放置模型文件到：$_realtimeModelDir',
+                    style: const TextStyle(color: Colors.white24, fontSize: 11)),
+              ),
+          ],
+        );
+    }
+  }
+
+  /// 阶段进度行：文案 + 线性进度条。
+  Widget _buildRealtimeProgressRow(String label, double v) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 6, 16, 0),
+          child: Text('$label ${(v * 100).round()}%',
+              style: const TextStyle(color: Colors.white54, fontSize: 12)),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 4, 16, 0),
+          child: LinearProgressIndicator(
+            value: v,
+            color: Colors.pinkAccent,
+            backgroundColor: Colors.white12,
+            minHeight: 3,
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// 模型下载阶段提示：下载可能较慢 + 手动放置模型指引（目录路径）。
+  Widget _buildRealtimeModelHint() {
+    final dir = _realtimeModelDir;
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(16, 4, 16, 0),
+      child: Text(
+        dir.isEmpty
+            ? '下载可能较慢（GitHub 国内网络），也可手动放置模型文件后重试'
+            : '下载可能较慢（GitHub 国内网络），也可手动放置模型文件到：$dir',
+        style: const TextStyle(color: Colors.white38, fontSize: 12),
+      ),
+    );
+  }
+
+  /// 开始实时转写（sherpa 流式）：模型 → 音频 → 流式转写 + 逐句翻译。
+  /// 阶段/进度/partial/句子由单例 ValueNotifier 驱动面板与字幕层刷新；
+  /// 错误：start 内部已置 stage=error + error 文案（面板红字），这里补 SnackBar。
+  Future<void> _startRealtime() async {
+    if (_realtime.isRunning) return;
+    try {
+      await _realtime.start(widget.video, _currentPageIndex);
+    } catch (e) {
+      if (!mounted) return;
+      _showSnack('实时转写失败：${_realtime.error.value ?? '$e'}');
+    }
+  }
+
+  /// 停止实时转写（标志位，块边界生效；stage 回 idle，句子保留在单例）。
+  void _stopRealtime() => _realtime.stop();
 
   Widget _buildSubtitleTrackHeader(String title) {
     return Padding(
@@ -1862,6 +2198,8 @@ class _PlayerPageState extends State<PlayerPage> {
     _pendingRestore = true; // 切集后 onPrepared 恢复新集记忆进度
     // 切集：取消在途转写（转写状态随集重置，新集缓存由 _loadWhisperCache 恢复）
     _transcriber.cancel();
+    // 实时转写（sherpa）随集重置：停止 + 清句子（句子时间轴是当前集音频）
+    _resetRealtime();
     setState(() {
       _currentPageIndex = index;
       _buffering = true;
