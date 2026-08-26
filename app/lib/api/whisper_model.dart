@@ -72,6 +72,13 @@ class WhisperModelManager {
   static const String modelUrl =
       'https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-base.bin';
 
+  /// 模型完整大小（字节，约 141MB；来自 hf-mirror X-Linked-Size/实际文件长度）。
+  ///
+  /// 部分 CDN 节点/网络下最终响应可能无 Content-Length（chunked 传输），
+  /// 此时 dio 的 onReceiveProgress total=-1，用它兜底计算进度（见
+  /// [_defaultDownloadFile]），避免「模型下载 0%」卡住不更新。
+  static const int kModelBytes = 147951465;
+
   /// 模型最小合理大小（base 约 142MB；小于 100MB 视为下载不完整/损坏）。
   static const int kMinModelBytes = 100 * 1024 * 1024;
 
@@ -151,7 +158,8 @@ class WhisperModelManager {
 
   ModelFileDownloader get _downloadFile => _downloadOverride ?? _defaultDownloadFile;
 
-  /// 默认下载：独立 dio 全量下载，进度按字节比例回调（total 未知时不回调）。
+  /// 默认下载：独立 dio 全量下载，进度按字节比例回调
+  /// （total 未知/chunked 时用 [kModelBytes] 兜底，保证进度仍递增）。
   Future<void> _defaultDownloadFile(
     String url,
     String savePath,
@@ -161,7 +169,10 @@ class WhisperModelManager {
       url,
       savePath,
       onReceiveProgress: (received, total) {
-        if (total > 0) onProgress?.call(received / total);
+        // total 来自响应头 Content-Length；部分节点/网络下缺失（chunked）
+        // 时 dio 传 -1，用已知模型大小兜底，保证进度始终递增。
+        final t = total > 0 ? total : kModelBytes;
+        onProgress?.call((received / t).clamp(0.0, 1.0));
       },
       options: Options(followRedirects: true), // hf-mirror 302 → 真实文件
     );
