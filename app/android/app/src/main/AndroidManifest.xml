@@ -1,8 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <!-- 播放流 / API 请求 / 白名单同步都需要网络（debug/profile 清单自带，主清单必须声明，否则 release 断网） -->
     <uses-permission android:name="android.permission.INTERNET"/>
     <application
-        android:label="bili_whitelist_app"
+        android:label="ビリビリ"
         android:name="${applicationName}"
         android:icon="@mipmap/ic_launcher">
         <!-- API 35 模拟器（gfxstream/swiftshader 软渲染）下 Impeller 的 OpenGLES
