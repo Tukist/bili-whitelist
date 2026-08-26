@@ -62,6 +62,16 @@ android {
             // M3b：优先用 release 签名；key.properties 缺失时回退 debug 签名保证可构建
             val releaseSigning = signingConfigs.findByName("release")
             signingConfig = releaseSigning ?: signingConfigs.getByName("debug")
+
+            // M4b：R8 修复。Flutter 插件对 release 默认启用 minify（R8），会误删
+            // ffmpeg-kit 的 native 方法声明（如 AbiDetect.getNativeCpuAbi），导致
+            // libffmpegkit_abidetect.so 的 JNI RegisterNatives 失败、插件注册中断
+            // （其后的 secure_storage/webview/path_provider 全部未注册 → 真机三故障）。
+            // proguard-rules.pro 保留 native 方法；此处显式声明，避免依赖插件默认行为。
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
         }
     }
 }
