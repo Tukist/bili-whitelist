@@ -5,7 +5,13 @@
     <application
         android:label="ビリビリ"
         android:name="${applicationName}"
-        android:icon="@mipmap/ic_launcher">
+        android:icon="@mipmap/ic_launcher"
+        android:allowBackup="false">
+        <!-- 禁用系统自动备份：flutter_secure_storage 9.x 的 AES 密钥存于 Android
+             Keystore（硬件绑定），备份/恢复到新设备后 Keystore key 失效，解密报
+             InvalidKeyException: Failed to unwrap key → 配置保存失败 / 登录态读不到
+             （见 pub.dev 该包官方文档警告）。本地数据可由 Gist/API 重新同步，
+             完全禁用备份避免 key 失效导致的安全存储不可用。 -->
         <!-- API 35 模拟器（gfxstream/swiftshader 软渲染）下 Impeller 的 OpenGLES
              后端渲染 SurfaceTexture 纹理黑屏（flutter 已知问题，fvp#197 等）。
              禁用 Impeller 回退 Skia 后 Texture 视频画面正常；真机（Vulkan/GPU）
