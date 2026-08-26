@@ -924,6 +924,7 @@ class _PlayerPageState extends State<PlayerPage> {
 
   /// 字幕面板主体：加载中 / 错误 / 无字幕提示 / 主副轨道选择 + 翻译，
   /// 末尾恒挂「🎙 转写字幕」区块（无字幕视频也可本地转写，故不放行提前 return）。
+  /// 「翻译（中文）」恒显示（tracks 为空时也显示——转写结果作主字幕时同样可翻译）。
   List<Widget> _buildSubtitleSheetBody(VoidCallback refresh) {
     final List<Widget> body;
     if (_subtitleLoading) {
@@ -935,54 +936,61 @@ class _PlayerPageState extends State<PlayerPage> {
           ),
         ),
       ];
-    } else if (_subtitleError != null) {
-      body = [
-        Padding(
-          padding: const EdgeInsets.all(20),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Text(_subtitleError!,
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(color: Colors.white70, fontSize: 13)),
-              const SizedBox(height: 12),
-              OutlinedButton(
-                onPressed: () => _loadSubtitleTracks(onChanged: refresh),
-                style:
-                    OutlinedButton.styleFrom(foregroundColor: Colors.white),
-                child: const Text('重试'),
-              ),
-            ],
-          ),
-        ),
-      ];
-    } else if (_subtitleTracks.isEmpty) {
-      body = const [
-        Padding(
-          padding: EdgeInsets.all(24),
-          child: Center(
-            child: Text('该视频无可用字幕（可尝试下方「转写字幕」本地识别）',
-                style: TextStyle(color: Colors.white54, fontSize: 14)),
-          ),
-        ),
-      ];
     } else {
-      body = [
-        _buildSubtitleTrackHeader('主字幕'),
-        _buildSubtitleTrackTile(null, isMain: true, refresh: refresh),
-        // 已转写 → 主字幕选择里多一个「本地转写」选项（不占 B 站轨道项）
-        if (_whisperCues != null) _buildWhisperMainTile(refresh),
-        for (final t in _subtitleTracks)
-          _buildSubtitleTrackTile(t, isMain: true, refresh: refresh),
-        _buildSubtitleTrackHeader('副字幕'),
-        _buildSubtitleTrackTile(null, isMain: false, refresh: refresh),
-        for (final t in _subtitleTracks)
-          _buildSubtitleTrackTile(
-            t,
-            isMain: false,
-            refresh: refresh,
-            disabled: t.lan == _mainSubtitleTrack?.lan, // 不能与主字幕同轨
+      final List<Widget> trackPart;
+      if (_subtitleError != null) {
+        trackPart = [
+          Padding(
+            padding: const EdgeInsets.all(20),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(_subtitleError!,
+                    textAlign: TextAlign.center,
+                    style:
+                        const TextStyle(color: Colors.white70, fontSize: 13)),
+                const SizedBox(height: 12),
+                OutlinedButton(
+                  onPressed: () => _loadSubtitleTracks(onChanged: refresh),
+                  style:
+                      OutlinedButton.styleFrom(foregroundColor: Colors.white),
+                  child: const Text('重试'),
+                ),
+              ],
+            ),
           ),
+        ];
+      } else if (_subtitleTracks.isEmpty) {
+        trackPart = const [
+          Padding(
+            padding: EdgeInsets.all(24),
+            child: Center(
+              child: Text('该视频无可用字幕（可尝试下方「转写字幕」本地识别）',
+                  style: TextStyle(color: Colors.white54, fontSize: 14)),
+            ),
+          ),
+        ];
+      } else {
+        trackPart = [
+          _buildSubtitleTrackHeader('主字幕'),
+          _buildSubtitleTrackTile(null, isMain: true, refresh: refresh),
+          // 已转写 → 主字幕选择里多一个「本地转写」选项（不占 B 站轨道项）
+          if (_whisperCues != null) _buildWhisperMainTile(refresh),
+          for (final t in _subtitleTracks)
+            _buildSubtitleTrackTile(t, isMain: true, refresh: refresh),
+          _buildSubtitleTrackHeader('副字幕'),
+          _buildSubtitleTrackTile(null, isMain: false, refresh: refresh),
+          for (final t in _subtitleTracks)
+            _buildSubtitleTrackTile(
+              t,
+              isMain: false,
+              refresh: refresh,
+              disabled: t.lan == _mainSubtitleTrack?.lan, // 不能与主字幕同轨
+            ),
+        ];
+      }
+      body = [
+        ...trackPart,
         // 翻译（中文）：恒显示；未配置翻译服务时点击提示去配置
         _buildTranslateTile(refresh),
         // 翻译进度/失败状态行（面板内可见「翻译中 x/y」）
