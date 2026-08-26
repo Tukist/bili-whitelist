@@ -1723,6 +1723,11 @@ class _PlayerPageState extends State<PlayerPage> {
           // 2.5 字幕层：Texture 之上、控制层之下（听视频模式隐藏）。
           // 底部控制行约 80px（进度条行 36 + 按钮行 44），字幕悬浮在其上方。
           // 主字幕大号在上，副字幕小号在其下（见 _SubtitleOverlay）。
+          // 字幕相对屏幕底部定位，但固定 bottom 值在全屏横屏下会跑偏：
+          // 竖屏逻辑高 914，bottom:100 使字幕落在 86% 处（控制行上方，正常）；
+          // 全屏横屏逻辑高仅 411，同样 bottom:100 会把字幕顶到画面中部（复现 bounds
+          // [982,736][1690,807]，屏幕高 1080）。故全屏时按控制层显隐取值：
+          // 控制层显示→抬升到控制行上方（110）；控制层隐藏（沉浸观影）→贴画面底部（24）。
           if (!_listenMode &&
               _subtitleEnabled &&
               (_mainSubtitleText.isNotEmpty ||
@@ -1730,7 +1735,7 @@ class _PlayerPageState extends State<PlayerPage> {
             Positioned(
               left: 24,
               right: 24,
-              bottom: 100,
+              bottom: _fullscreen ? (_controlsVisible ? 110.0 : 24.0) : 100.0,
               child: _SubtitleOverlay(
                 mainText: _mainSubtitleText,
                 secondaryText: _secondarySubtitleText,
