@@ -19,7 +19,6 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:bili_whitelist_app/api/sherpa_audio.dart';
 import 'package:bili_whitelist_app/api/sherpa_model.dart';
-import 'package:bili_whitelist_app/api/whisper_audio.dart';
 import 'package:bili_whitelist_app/models/whitelist_video.dart';
 import 'package:bili_whitelist_app/services/realtime_transcriber.dart';
 
@@ -152,8 +151,8 @@ class FakeWavSource {
       ));
 }
 
-/// 假音频源（WhisperAudioSource 子类，override getAudioPath）。
-class FakeAudioSource extends WhisperAudioSource {
+/// 假音频源（SherpaAudioSource 子类，override getAudioPath）。
+class FakeAudioSource extends SherpaAudioSource {
   final String path;
   final Object? error;
 

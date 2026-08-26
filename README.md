@@ -62,7 +62,6 @@
 - **听视频模式**：纯音频播放（关屏可听）
 - **字幕**：播放页「字幕」入口可选主 / 副字幕轨道，**大号 + 小号双语同步显示**（时间轴同步）；支持 B 站 CC 人工字幕与**登录后的 AI 字幕**（多语言，如英 / 中 / 日）；无字幕视频有提示
 - **字幕翻译**：副字幕可选「翻译（中文）」——主字幕内容经 **OpenAI 兼容翻译服务**（可配置 base_url / api_key / model，key 仅存本机）批量翻译成中文显示，带翻译进度提示；**本地缓存**（同一视频同一轨道只翻译一次，切集 / 重进命中缓存直接显示）
-- **本地转写字幕**：无字幕视频也能看字幕——播放页「🎙 转写字幕」用 **whisper（whisper_ggml，本地推理）**识别当前集音频生成带时间轴的字幕，转写结果作为主字幕显示、可继续走翻译；**模型 142MB 首次下载**（hf-mirror 国内镜像，带进度），结果**本地缓存**（同一集只转写一次，切集 / 重进命中即显示）
 - **实时转写（Sherpa 流式）**：播放页「🎙 实时转写（流式）」边播边出字幕——**主字幕 = 实时原文句子、副字幕 = 逐句译文**（OpenAI 兼容翻译服务，未配置则无副字幕），**8 语模型**（中/英/日/俄/泰/越/印尼/阿拉伯）本地推理；**模型 247MB 首次下载**（GitHub releases，国内可能较慢，支持**手动放置模型文件**到指定目录跳过下载），转写中面板实时预览 + 可随时停止，完成即作为字幕显示
 - **登录**：WebView 内嵌 B 站官方登录页（短信验证码），登录态自动续期
 - **GitHub token 配置**：App 内填写，安全存储
@@ -221,17 +220,9 @@ B 站部分接口（如 `playurl`）要求 WBI 签名：
 - **本地缓存**：译文按 `(bvid, cid, 主字幕 lan)` 落应用支持目录 JSON（`subtitle_translation_*.json`），同一视频同一轨道只翻译一次，切集 / 重进命中缓存直接显示
 - 副字幕「翻译（中文）」与普通副字幕轨道**互斥**（选翻译则轨道置空）；未配置服务时点击提示去管理面板配置；401（key 无效）/ 超时 / 断网给出中文错误提示（字幕层「翻译失败」+ SnackBar 具体原因）
 
-### 13. 本地转写字幕（whisper_ggml + 模型下载 + 缓存）
+### 13. 实时转写（sherpa-onnx 流式 + 逐句翻译）
 
-- **入口**：字幕设置面板「🎙 转写字幕」区块（轨道列表 / 翻译下方）——未转写显示按钮与说明（首次需下载模型 142MB）；转写中显示进度（模型下载 % → 转写 %）+ 取消；已转写显示「✅ 已转写」+ 设为主字幕 + 重新转写
-- **转写链路**：`WhisperModelManager`（hf-mirror 下载 ggml-base.bin 142MB，进度 + 失败重试 + 完整性校验）→ `WhisperAudioSource`（离线缓存 audio.m4s 优先，否则临时下载 DASH 音频流）→ `Transcriber`（whisper_ggml 本地推理，内部 FFmpeg 转 16k wav，segments 带 from/to 时间戳）→ `SubtitleCue` 列表
-- **结果即主字幕**：转写完成后主字幕自动设为转写结果（无 B 站轨道选中时仅显示转写字幕）；已转写可在主字幕选择里切「🎙 本地转写」；**可继续走翻译**（副字幕「翻译（中文）」直接翻译转写结果，译文缓存键用 `lan=whisper` 独立命名）
-- **本地缓存**：结果落 `<支持目录>/transcription_cache/transcription_<bvid>_<pageIndex>.json`，同一集只转写一次，切集 / 重进命中缓存直接显示（无需重新转写）；「重新转写」先清缓存再重跑
-- **错误分类**：模型下载失败 / 音频流获取失败 / whisper 引擎失败 / 并发（「正在转写其他视频，请稍后再试」）/ 取消，均给出中文提示（面板红字 + SnackBar）；转写状态随切集 / 重进重置
-
-### 14. 实时转写（sherpa-onnx 流式 + 逐句翻译）
-
-- **入口**：字幕设置面板「🎙 实时转写（流式）」区块（whisper「转写字幕」下方，两个功能并存）——未开始时显示按钮与说明（首次需下载模型 247MB）；模型下载/音频准备中显示阶段进度；转写中显示「转写中…」+ **实时文本预览（partial）** + 停止；完成后显示「✅ 实时转写完成（N 句）· 已作为字幕」；错误显示红字 + 重试
+- **入口**：字幕设置面板「🎙 实时转写（流式）」区块（轨道列表 / 翻译下方）——未开始时显示按钮与说明（首次需下载模型 247MB）；模型下载/音频准备中显示阶段进度；转写中显示「转写中…」+ **实时文本预览（partial）** + 停止；完成后显示「✅ 实时转写完成（N 句）· 已作为字幕」；错误显示红字 + 重试
 - **转写链路**：`SherpaModelManager`（GitHub releases 下载 8 语流式 zipformer tar.bz2 247MB，进度 0~1 + 失败重试 + 完整性校验）→ `SherpaAudioPreparer`（离线缓存音频优先，否则临时下载 DASH 音频流，ffmpeg 转 16kHz 单声道 wav）→ `RealtimeTranscriber`（sherpa_onnx 流式识别：按 1s 块喂 OnlineStream → 增量解码 → 实时更新 partial → 检测句尾收句（带时间戳）→ **逐句异步翻译**）
 - **主字幕 = 原文、副字幕 = 译文**：转写结果作为主字幕数据源（按播放位置取当前句），副字幕显示该句译文（`RealtimeTranscriber.sentences[i].translation`，翻译服务未配置 / 失败则无副字幕）；partial 实时文本仅面板预览
 - **手动放置模型（下载慢兜底）**：模型解压目录 `<应用支持目录>/sherpa/8lang/<模型名>/`，检测四件套（encoder/decoder/joiner .onnx + tokens.txt，encoder > 10MB）完整即**跳过下载直接使用**——网络下载慢（GitHub 国内仅几 KB/s）时可在 PC 下载 tar.bz2 解压后把模型目录放进该路径；面板在下载阶段提示目录路径
@@ -256,12 +247,12 @@ bili-whitelist/
     ├── pubspec.yaml
     ├── lib/                   # Dart 源码
     │   ├── main.dart / config.dart
-    │   ├── api/               # bilibili_api.dart（WBI+playurl）、github_api.dart（Gist 同步）、translate_api.dart（字幕翻译）、whisper_model.dart（模型下载）/ whisper_audio.dart（转写音频）、sherpa_model.dart（8语流式模型下载）/ sherpa_audio.dart（实时转写音频）
+    │   ├── api/               # bilibili_api.dart（WBI+playurl）、github_api.dart（Gist 同步）、translate_api.dart（字幕翻译）、sherpa_model.dart（8语流式模型下载）/ sherpa_audio.dart（实时转写音频）
     │   ├── cache/             # download_manager.dart（离线缓存下载管理器，串行队列）
     │   ├── models/            # whitelist_video.dart（v3 数据模型 + 合集管理逻辑）
     │   ├── pages/             # login_page / playlist_page / player_page
     │   ├── player/            # bili_dash_player.dart（DASH 播放控制器）
-    │   ├── services/          # service_locator.dart、transcriber.dart（本地转写）/ transcription_cache.dart（转写缓存）、realtime_transcriber.dart（实时转写：sherpa 流式状态机 + 逐句翻译）
+    │   ├── services/          # service_locator.dart、realtime_transcriber.dart（实时转写：sherpa 流式状态机 + 逐句翻译）
     │   ├── sync/              # whitelist_source.dart（白名单数据源）
     │   ├── utils/             # import_parser.dart（本地导入解析：完整链接/短链/BV）
     │   └── wbi/               # wbi_signer.dart（WBI 签名器）

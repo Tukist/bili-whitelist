@@ -6,8 +6,6 @@ import 'package:flutter/services.dart';
 import '../api/bilibili_api.dart';
 import '../api/sherpa_model.dart';
 import '../api/translate_api.dart';
-import '../api/whisper_audio.dart';
-import '../api/whisper_model.dart';
 import '../cache/download_manager.dart';
 import '../cache/playback_progress.dart';
 import '../config.dart';
@@ -15,7 +13,6 @@ import '../models/subtitle.dart';
 import '../models/whitelist_video.dart';
 import '../player/bili_dash_player.dart';
 import '../services/realtime_transcriber.dart';
-import '../services/transcriber.dart';
 import 'login_page.dart';
 
 /// 可选的播放倍速档位（默认 1.0，均落在原生支持区间 0.25~4.0 内）。
@@ -124,50 +121,20 @@ class _PlayerPageState extends State<PlayerPage> {
   /// 已下载的字幕条目缓存（lan -> cues，页面级）。
   final Map<String, List<SubtitleCue>> _subtitleCues = {};
 
-  // 本地转写（whisper）状态
-  // ---------------------------------------------------------------------
-  // 「🎙 转写字幕」：本地识别当前集音频生成字幕（缓存命中直接显示）。
-  // _whisperCues 为当前集转写结果（缓存或新转写）；_mainIsWhisper 表示
-  // 主字幕数据源=转写结果（此时渲染/翻译不再看 _mainSubtitleTrack）。
-  final Transcriber _transcriber = Transcriber.instance;
-
-  /// 当前集转写结果（null=未转写；缓存命中 / 转写完成后非空）。
-  List<SubtitleCue>? _whisperCues;
-
-  /// 主字幕数据源是否为「本地转写」（true 时走 _whisperCues）。
-  bool _mainIsWhisper = false;
-
-  /// 转写是否进行中（面板显示进度 + 取消按钮）。
-  bool _whisperTranscribing = false;
-
-  /// 整体转写进度 0~1（0~0.1 模型下载，0.1~1.0 转写推理）。
-  final ValueNotifier<double> _whisperProgress = ValueNotifier(0);
-
-  /// 最近一次转写错误文案（null=正常；面板红字提示，分类见各异常 message）。
-  String? _whisperError;
-
-  /// 转写运行令牌：每次 _startTranscribe 自增；完成/失败回调校验，防止
-  /// 取消后再次开始的旧运行回写新状态。
-  int _transcribeRun = 0;
-
   // 实时转写（sherpa 流式）状态
   // ---------------------------------------------------------------------
-  // 与上方 whisper「转写字幕」并存：whisper 是「整段识别出带时间轴字幕」，
-  // 这里是「边播边出实时字幕」（主字幕=原文句子、副字幕=逐句译文）。
+  // 「边播边出实时字幕」：主字幕=原文句子、副字幕=逐句译文。
   // 状态直接监听全局单例 RealtimeTranscriber 的 ValueNotifier：
   // 面板（ValueListenableBuilder）与字幕层（stage 监听）各自刷新。
   final RealtimeTranscriber _realtime = RealtimeTranscriber.instance;
 
   /// 实时转写结果是否为当前主字幕数据源：
   /// stage=transcribing/done 时为 true（主字幕=原文、副字幕=译文，按播放位置
-  /// 从 sentences 取当前句）；停止/切集/重进后置 false（字幕回退到轨道/whisper）。
+  /// 从 sentences 取当前句）；停止/切集/重进后置 false（字幕回退到轨道）。
   bool _realtimeAsSubtitle = false;
 
   /// 模型目录提示路径（面板「手动放置模型」指引；异步取，取不到显示通用文案）。
   String _realtimeModelDir = '';
-
-  /// 字幕设置面板是否打开（转写完成后先关面板再弹 SnackBar，避免被遮挡）。
-  bool _subtitleSheetOpen = false;
 
   /// 当前渲染的主/副字幕文本（仅文本变化时 setState）。
   String _mainSubtitleText = '';
@@ -257,7 +224,6 @@ class _PlayerPageState extends State<PlayerPage> {
     _eventSub?.cancel();
     _eventSub = null;
     _player?.dispose();
-    _whisperProgress.dispose();
     _restoreSystemUi();
     super.dispose();
   }
@@ -311,8 +277,6 @@ class _PlayerPageState extends State<PlayerPage> {
   // -------------------------------------------------------------------------
 
   Future<void> _init() async {
-    // 重进/重试：取消在途转写（转写状态随集/页重置，见 _switchToPage）
-    _transcriber.cancel();
     // 实时转写（sherpa）随页重置：停止 + 清句子/partial/错误
     _resetRealtime();
     setState(() {
@@ -337,15 +301,7 @@ class _PlayerPageState extends State<PlayerPage> {
       _mainSubtitleText = '';
       _secondarySubtitleText = '';
       _subtitleCues.clear();
-      // 转写状态：随页重置（缓存命中由 _loadWhisperCache 异步恢复）
-      _whisperCues = null;
-      _mainIsWhisper = false;
-      _whisperTranscribing = false;
-      _whisperError = null;
-      _whisperProgress.value = 0;
-      _transcribeRun++; // 作废旧转写的完成/失败回调
     });
-    _loadWhisperCache();
     try {
       // 先加载缓存索引，保证「播放优先本地缓存」判定准确。
       // 带超时保护：测试环境无 path_provider 原生通道时 send 永不返回，
@@ -627,9 +583,8 @@ class _PlayerPageState extends State<PlayerPage> {
     if (++_tickCount % 20 == 0) _saveProgress();
   }
 
-  /// 当前主字幕数据源 cues：本地转写优先；否则 B 站主轨道下载结果。
+  /// 当前主字幕数据源 cues：B 站主轨道下载结果。
   List<SubtitleCue>? _mainSubtitleCues() {
-    if (_mainIsWhisper) return _whisperCues;
     final track = _mainSubtitleTrack;
     if (track == null) return null;
     return _subtitleCues[track.lan];
@@ -725,7 +680,7 @@ class _PlayerPageState extends State<PlayerPage> {
   }
 
   // -------------------------------------------------------------------------
-  // 快退 3 秒
+  // 快退 / 快进 3 秒（对称）
   // -------------------------------------------------------------------------
 
   /// 快退 3 秒：当前播放位置 -3000ms（下限 0）。连点连续生效：
@@ -740,6 +695,22 @@ class _PlayerPageState extends State<PlayerPage> {
     await player.seekTo(target);
     if (mounted) setState(() => _positionMs = target);
     _saveProgress(); // 快退后保存，防快退丢失
+  }
+
+  /// 快进 3 秒：当前播放位置 +3000ms（上限视频时长 _durationMs）。
+  /// 连点连续生效：每次独立 getPosition → seekTo，原生 seek 完成后下一次
+  /// 取到新位置；到结尾不越界（clamp 到时长）。
+  Future<void> _forward3s() async {
+    debugPrint('[player_page] 快进 3 秒');
+    final player = _player;
+    if (player == null) return;
+    final pos = await player.getPosition();
+    final max = _durationMs > 0 ? _durationMs : pos + 3000;
+    final target = pos + 3000 < max ? pos + 3000 : max;
+    debugPrint('[player_page] seekTo ${target}ms (快进 3 秒，原 ${pos}ms)');
+    await player.seekTo(target);
+    if (mounted) setState(() => _positionMs = target);
+    _saveProgress(); // 快进后保存，防快进丢失
   }
 
   // -------------------------------------------------------------------------
@@ -957,7 +928,6 @@ class _PlayerPageState extends State<PlayerPage> {
   /// 打开字幕设置面板：先拉取轨道列表，再弹 BottomSheet。
   Future<void> _showSubtitleSheet() async {
     debugPrint('[player_page] show subtitle sheet');
-    _subtitleSheetOpen = true;
     await _loadSubtitleTracks();
     if (!mounted) return;
     await showModalBottomSheet<void>(
@@ -970,7 +940,6 @@ class _PlayerPageState extends State<PlayerPage> {
       ),
       builder: (sheetContext) => _buildSubtitleSheet(sheetContext),
     );
-    _subtitleSheetOpen = false;
   }
 
   /// 字幕设置面板内容。
@@ -1020,8 +989,8 @@ class _PlayerPageState extends State<PlayerPage> {
   }
 
   /// 字幕面板主体：加载中 / 错误 / 无字幕提示 / 主副轨道选择 + 翻译，
-  /// 末尾恒挂「🎙 转写字幕」区块（无字幕视频也可本地转写，故不放行提前 return）。
-  /// 「翻译（中文）」恒显示（tracks 为空时也显示——转写结果作主字幕时同样可翻译）。
+  /// 末尾恒挂「🎙 实时转写（流式）」区块（无字幕视频也可实时转写，故不放行提前 return）。
+  /// 「翻译（中文）」恒显示（tracks 为空时也显示——实时转写结果作主字幕时同样可翻译）。
   List<Widget> _buildSubtitleSheetBody(VoidCallback refresh) {
     final List<Widget> body;
     if (_subtitleLoading) {
@@ -1062,7 +1031,7 @@ class _PlayerPageState extends State<PlayerPage> {
           Padding(
             padding: EdgeInsets.all(24),
             child: Center(
-              child: Text('该视频无可用字幕（可尝试下方「转写字幕」本地识别）',
+              child: Text('该视频无可用字幕（可尝试下方「实时转写」）',
                   style: TextStyle(color: Colors.white54, fontSize: 14)),
             ),
           ),
@@ -1071,8 +1040,6 @@ class _PlayerPageState extends State<PlayerPage> {
         trackPart = [
           _buildSubtitleTrackHeader('主字幕'),
           _buildSubtitleTrackTile(null, isMain: true, refresh: refresh),
-          // 已转写 → 主字幕选择里多一个「本地转写」选项（不占 B 站轨道项）
-          if (_whisperCues != null) _buildWhisperMainTile(refresh),
           for (final t in _subtitleTracks)
             _buildSubtitleTrackTile(t, isMain: true, refresh: refresh),
           _buildSubtitleTrackHeader('副字幕'),
@@ -1123,176 +1090,10 @@ class _PlayerPageState extends State<PlayerPage> {
           ),
       ];
     }
-    return [...body, _buildTranscribeSection(refresh), _buildRealtimeSection(refresh)];
+    return [...body, _buildRealtimeSection(refresh)];
   }
 
-  /// 「🎙 转写字幕」区块：轨道列表/翻译下方。状态机：
-  /// 转写中（进度+取消）→ 已转写（设为主字幕/重新转写）/ 未转写（主按钮）。
-  Widget _buildTranscribeSection(VoidCallback refresh) {
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      crossAxisAlignment: CrossAxisAlignment.stretch,
-      children: [
-        const Divider(height: 1),
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 10, 16, 2),
-          child: Text('🎙 转写字幕',
-              style: const TextStyle(color: Colors.white70, fontSize: 12)),
-        ),
-        ..._buildTranscribeStates(refresh),
-        const SizedBox(height: 8),
-      ],
-    );
-  }
-
-  /// 转写区块状态内容：进度（转写中）/ 错误行 / 主按钮区。
-  List<Widget> _buildTranscribeStates(VoidCallback refresh) {
-    if (_whisperTranscribing) {
-      return [
-        // 进度：整体 0~1 → 模型下载（0~0.1）→ 转写（0.1~1），分阶段显示 %
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 6, 16, 0),
-          child: ValueListenableBuilder<double>(
-            valueListenable: _whisperProgress,
-            builder: (context, p, _) {
-              final phase = p < 0.1 ? '模型下载' : '转写';
-              final pct = p < 0.1 ? p / 0.1 : (p - 0.1) / 0.9;
-              return Text(
-                '$phase ${(pct.clamp(0.0, 1.0) * 100).round()}%',
-                style: const TextStyle(color: Colors.white54, fontSize: 12),
-              );
-            },
-          ),
-        ),
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 6, 16, 0),
-          child: ValueListenableBuilder<double>(
-            valueListenable: _whisperProgress,
-            builder: (context, p, _) => LinearProgressIndicator(
-              value: p.clamp(0.0, 1.0).toDouble(),
-              color: Colors.pinkAccent,
-              backgroundColor: Colors.white12,
-              minHeight: 3,
-            ),
-          ),
-        ),
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 4, 16, 0),
-          child: Row(
-            children: [
-              const Expanded(
-                child: Text('本地识别中，请保持播放页打开',
-                    style: TextStyle(color: Colors.white38, fontSize: 12)),
-              ),
-              TextButton(
-                onPressed: _cancelTranscribe,
-                style: TextButton.styleFrom(foregroundColor: Colors.white70),
-                child: const Text('取消'),
-              ),
-            ],
-          ),
-        ),
-      ];
-    }
-    // 非转写中：错误行（红字，分类文案由各异常 message 携带）+ 已转写/未转写
-    final err = _whisperError;
-    final done = _whisperCues != null && _whisperCues!.isNotEmpty;
-    final isMain = _mainIsWhisper;
-    return [
-      if (err != null)
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 4, 16, 0),
-          child: Text(err,
-              style: const TextStyle(color: Colors.redAccent, fontSize: 12)),
-        ),
-      if (done)
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 6, 16, 0),
-          child: Row(
-            children: [
-              const Icon(Icons.check_circle,
-                  color: Colors.greenAccent, size: 16),
-              const SizedBox(width: 6),
-              Expanded(
-                child: Text(
-                  '✅ 已转写（${_whisperCues!.length} 条）',
-                  style: const TextStyle(
-                      color: Colors.greenAccent, fontSize: 13),
-                ),
-              ),
-              if (isMain)
-                const Text('主字幕',
-                    style:
-                        TextStyle(color: Colors.pinkAccent, fontSize: 13))
-              else
-                TextButton(
-                  onPressed: () {
-                    _selectWhisperMain();
-                    refresh();
-                  },
-                  style: TextButton.styleFrom(
-                      foregroundColor: Colors.pinkAccent),
-                  child: const Text('设为字幕'),
-                ),
-              TextButton(
-                onPressed: () => _retranscribe(refresh),
-                style: TextButton.styleFrom(
-                    foregroundColor: Colors.white70),
-                child: const Text('重新转写'),
-              ),
-            ],
-          ),
-        )
-      else
-        Padding(
-          padding: const EdgeInsets.fromLTRB(16, 6, 16, 0),
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              FilledButton(
-                onPressed: () => _startTranscribe(refresh),
-                style: FilledButton.styleFrom(
-                  backgroundColor: Colors.pinkAccent,
-                  foregroundColor: Colors.black,
-                ),
-                child: const Text('🎙 转写字幕'),
-              ),
-              const Padding(
-                padding: EdgeInsets.only(top: 6),
-                child: Text('本地识别音频生成字幕（首次需下载模型 142MB）',
-                    style:
-                        TextStyle(color: Colors.white38, fontSize: 12)),
-              ),
-            ],
-          ),
-        ),
-    ];
-  }
-
-  /// 主字幕选择里的「本地转写」选项（已转写才出现；选中即把转写结果设为主字幕）。
-  Widget _buildWhisperMainTile(VoidCallback refresh) {
-    final selected = _mainIsWhisper;
-    return ListTile(
-      dense: true,
-      title: Text(
-        '🎙 本地转写',
-        style: TextStyle(
-          color: selected ? Colors.pinkAccent : Colors.white,
-          fontSize: 14,
-          fontWeight: selected ? FontWeight.bold : FontWeight.normal,
-        ),
-      ),
-      trailing: selected
-          ? const Icon(Icons.check, color: Colors.pinkAccent, size: 18)
-          : const SizedBox(width: 18),
-      onTap: () {
-        _selectWhisperMain();
-        refresh();
-      },
-    );
-  }
-
-  /// 「🎙 实时转写（流式）」区块：与上方 whisper「转写字幕」并存。
+  /// 「🎙 实时转写（流式）」区块：轨道列表/翻译下方。
   ///
   /// 状态机（监听 [RealtimeTranscriber.stage]，ValueListenableBuilder 驱动，
   /// 面板内任意变化自动刷新，无需手动 refresh）：
@@ -1547,9 +1348,7 @@ class _PlayerPageState extends State<PlayerPage> {
     bool disabled = false,
   }) {
     final isSelected = track == null
-        ? (isMain
-            ? (_mainSubtitleTrack == null && !_mainIsWhisper)
-            : _secondarySubtitleTrack == null)
+        ? (isMain ? _mainSubtitleTrack == null : _secondarySubtitleTrack == null)
         : (isMain
             ? _mainSubtitleTrack?.lan == track.lan
             : _secondarySubtitleTrack?.lan == track.lan);
@@ -1610,12 +1409,8 @@ class _PlayerPageState extends State<PlayerPage> {
 
   /// 选择主字幕轨道：立即更新选中态 + 异步下载 cues；
   /// 副字幕若与主字幕同轨则自动清空（防止同轨双行）。
-  /// 选 B 站轨道/「无」→ 主字幕退出「本地转写」模式（转写结果仍在面板可切回）。
   void _selectMainSubtitle(SubtitleTrack? track) {
-    setState(() {
-      _mainSubtitleTrack = track;
-      _mainIsWhisper = false;
-    });
+    setState(() => _mainSubtitleTrack = track);
     if (track != null &&
         _secondarySubtitleTrack != null &&
         _secondarySubtitleTrack!.lan == track.lan) {
@@ -1626,19 +1421,6 @@ class _PlayerPageState extends State<PlayerPage> {
     if (_secondaryIsTranslation && track != null) {
       _runTranslation();
     }
-  }
-
-  /// 把主字幕设为「本地转写」结果（面板「设为字幕」/主字幕选择「本地转写」）。
-  /// 转写结果作为主字幕数据源，不占用 B 站轨道项。
-  void _selectWhisperMain() {
-    if (_whisperCues == null || _whisperCues!.isEmpty) return;
-    setState(() {
-      _mainIsWhisper = true;
-      _mainSubtitleTrack = null;
-      _subtitleEnabled = true; // 直接显示转写字幕
-    });
-    // 翻译模式下主字幕源变化 → 重新翻译新的主字幕内容
-    if (_secondaryIsTranslation) _runTranslation();
   }
 
   /// 选择副字幕轨道（面板侧已禁用与主字幕同轨的项）；
@@ -1654,12 +1436,12 @@ class _PlayerPageState extends State<PlayerPage> {
 
   /// 选中「翻译（中文）」：校验主字幕/翻译配置 → 启动翻译流程。
   ///
-  /// - 未选主字幕（B 站轨道或本地转写都没有）→ 提示先选主字幕
+  /// - 未选主字幕 → 提示先选主字幕
   /// - 未配置翻译服务 → 提示去管理面板配置（不选中）
   /// - 已配置 → 副字幕切到翻译模式，_runTranslation 负责缓存/翻译/渲染
   Future<void> _selectTranslationMode() async {
     final mainTrack = _mainSubtitleTrack;
-    final hasMain = mainTrack != null || _mainIsWhisper;
+    final hasMain = mainTrack != null;
     if (!hasMain) {
       _showSnack('请先选择主字幕轨道（需翻译的原文轨道）');
       return;
@@ -1681,24 +1463,20 @@ class _PlayerPageState extends State<PlayerPage> {
 
   /// 执行翻译流程：加载主字幕 cues → 查本地缓存 → 无缓存则批量翻译（进度回显）。
   ///
-  /// - 主字幕源支持两种：B 站轨道（按 bvid_cid_lan 缓存）与本地转写
-  ///   （lan='whisper'，转写结果翻译缓存独立命名，重转写后条数变化自动失效）
+  /// - 主字幕源为 B 站轨道（译文按 bvid_cid_lan 缓存）
   /// - 缓存命中（同源已翻译过）直接显示，不重复翻译
   /// - 翻译完成写缓存（切集/重进命中即显示）
   /// - 失败：面板/字幕层提示「翻译失败」+ SnackBar 具体错误（401 配置无效/网络）
   Future<void> _runTranslation() async {
     final mainTrack = _mainSubtitleTrack;
-    final isWhisper = _mainIsWhisper;
-    if (!isWhisper && mainTrack == null) return;
+    if (mainTrack == null) return;
     setState(() {
       _translationLoading = true;
       _translationError = null;
       _translationDone = 0;
       _translationTotal = 0;
     });
-    final cues = isWhisper
-        ? _whisperCues
-        : await _ensureSubtitleCuesFor(mainTrack!);
+    final cues = await _ensureSubtitleCuesFor(mainTrack);
     if (!mounted) return;
     if (cues == null || cues.isEmpty) {
       setState(() {
@@ -1710,7 +1488,7 @@ class _PlayerPageState extends State<PlayerPage> {
     }
     final bvid = widget.video.bvid;
     final cid = _currentCid;
-    final lan = isWhisper ? 'whisper' : mainTrack!.lan;
+    final lan = mainTrack.lan;
 
     // 1) 本地缓存命中：直接显示
     final cached = await _translateApi.getCachedTranslation(bvid, cid, lan);
@@ -1795,112 +1573,6 @@ class _PlayerPageState extends State<PlayerPage> {
       debugPrint('[player_page] 字幕下载失败 ${track.lan}: $e');
       return null;
     }
-  }
-
-  // -------------------------------------------------------------------------
-  // 本地转写（whisper）：缓存检查 / 开始 / 取消 / 重新转写
-  // -------------------------------------------------------------------------
-
-  /// 当前集转写缓存检查：命中则直接加载（面板显示「已转写」，无需重新转写）。
-  /// 无缓存/读取失败静默（面板显示「转写字幕」入口）。
-  Future<void> _loadWhisperCache() async {
-    final bvid = widget.video.bvid;
-    final pageIndex = _currentPageIndex;
-    try {
-      final cached =
-          await _transcriber.getCachedTranscription(bvid, pageIndex);
-      if (!mounted || _currentPageIndex != pageIndex) return;
-      if (cached != null && cached.isNotEmpty) {
-        setState(() => _whisperCues = cached);
-        debugPrint('[player_page] 转写缓存命中 $bvid#$pageIndex '
-            '${cached.length} 条');
-      }
-    } catch (_) {
-      // 缓存读取失败（存储异常等）：按未转写处理
-    }
-  }
-
-  /// 开始转写当前集：模型 → 音频 → whisper → cues → 写缓存。
-  /// 完成后主字幕自动设为转写结果、关闭面板并 SnackBar 提示。
-  /// 错误分类展示：模型下载 / 音频 / 转写分别抛中文异常（见 [TranscribeException]
-  /// 及 WhisperModelException / AudioSourceException 的 message）。
-  Future<void> _startTranscribe(VoidCallback refresh) async {
-    if (_whisperTranscribing) return;
-    final run = ++_transcribeRun;
-    final pageIndex = _currentPageIndex;
-    setState(() {
-      _whisperTranscribing = true;
-      _whisperError = null;
-      _whisperProgress.value = 0;
-    });
-    refresh();
-    try {
-      final cues = await _transcriber.transcribe(
-        widget.video,
-        pageIndex,
-        onProgress: (p) => _whisperProgress.value = p,
-      );
-      if (!mounted ||
-          run != _transcribeRun ||
-          _currentPageIndex != pageIndex) {
-        return; // 已切集/重进/重新开始：放弃本次结果（缓存已落盘，可复用）
-      }
-      setState(() {
-        _whisperCues = cues;
-        _whisperTranscribing = false;
-        // 主字幕自动设为转写结果（无 B 站轨道选中时仅显示转写字幕）
-        _mainIsWhisper = true;
-        _mainSubtitleTrack = null;
-        _subtitleEnabled = true;
-      });
-      // 先关面板再提示（SnackBar 不被 BottomSheet 遮挡）
-      if (_subtitleSheetOpen) Navigator.of(context).pop();
-      _showSnack('转写完成，已加载字幕');
-      // 翻译模式下主字幕源变化 → 重新翻译新的主字幕内容
-      if (_secondaryIsTranslation) _runTranslation();
-    } catch (e) {
-      if (!mounted ||
-          run != _transcribeRun ||
-          _currentPageIndex != pageIndex) {
-        return;
-      }
-      // 错误分类：模型下载 / 音频 / 转写异常均带用户可读 message
-      final msg = switch (e) {
-        WhisperModelException(:final message) => message,
-        AudioSourceException(:final message) => message,
-        TranscribeException(:final message) => message,
-        _ => '转写失败（$e）',
-      };
-      final cancelled = e is TranscribeException && e.message == '转写已取消';
-      setState(() {
-        _whisperTranscribing = false;
-        _whisperError = cancelled ? '转写已取消' : msg;
-      });
-      if (!cancelled) _showSnack('转写失败：$msg');
-    }
-  }
-
-  /// 取消当前转写（Transcriber 置取消标志，阶段边界生效；面板立即恢复按钮态，
-  /// 真正的终止由 transcribe 抛「转写已取消」兜底，此时旧 run 令牌已作废）。
-  void _cancelTranscribe() {
-    _transcriber.cancel();
-    setState(() {
-      _whisperTranscribing = false;
-      _whisperError = '转写已取消';
-    });
-  }
-
-  /// 重新转写：清缓存（保证下次不命中旧结果）→ 重新开始。
-  Future<void> _retranscribe(VoidCallback refresh) async {
-    final pageIndex = _currentPageIndex;
-    try {
-      await _transcriber.clearTranscription(widget.video.bvid, pageIndex);
-    } catch (_) {
-      // 缓存清除失败：直接转写（写缓存会覆盖旧结果）
-    }
-    setState(() => _whisperCues = null);
-    refresh();
-    await _startTranscribe(refresh);
   }
 
   // -------------------------------------------------------------------------
@@ -2196,8 +1868,6 @@ class _PlayerPageState extends State<PlayerPage> {
     debugPrint('[player_page] switchToPage ${index + 1}/${pages.length} '
         'cid=${pages[index].cid} part=${pages[index].part}');
     _pendingRestore = true; // 切集后 onPrepared 恢复新集记忆进度
-    // 切集：取消在途转写（转写状态随集重置，新集缓存由 _loadWhisperCache 恢复）
-    _transcriber.cancel();
     // 实时转写（sherpa）随集重置：停止 + 清句子（句子时间轴是当前集音频）
     _resetRealtime();
     setState(() {
@@ -2223,15 +1893,7 @@ class _PlayerPageState extends State<PlayerPage> {
       _mainSubtitleText = '';
       _secondarySubtitleText = '';
       _subtitleCues.clear();
-      // 转写状态：随集重置（缓存命中由 _loadWhisperCache 异步恢复）
-      _whisperCues = null;
-      _mainIsWhisper = false;
-      _whisperTranscribing = false;
-      _whisperError = null;
-      _whisperProgress.value = 0;
-      _transcribeRun++; // 作废旧转写的完成/失败回调
     });
-    _loadWhisperCache();
     try {
       await _loadStreamAndPlay(positionMs: 0);
       await _player?.setPlaybackSpeed(_speed);
@@ -2558,7 +2220,7 @@ class _PlayerPageState extends State<PlayerPage> {
     );
   }
 
-  /// 中心控制：快退 3 秒（左）+ 播放/暂停大按钮（中）+ 对称占位（右）。
+  /// 中心控制：快退 3 秒（左）+ 播放/暂停大按钮（中）+ 快进 3 秒（右，对称）。
   /// 固定大小 IconButton，位于点击层之上不会被手势层吞；横竖屏均居中不遮挡。
   Widget _buildCenterControls() {
     return Column(
@@ -2588,8 +2250,14 @@ class _PlayerPageState extends State<PlayerPage> {
                   _playing ? Icons.pause_circle_filled : Icons.play_circle_filled),
               onPressed: _player == null ? null : _togglePlay,
             ),
-            // 右侧同宽占位，保持播放/暂停按钮视觉居中
-            const SizedBox(width: 48),
+            // 快进 3 秒：Icons.forward_30 转圈箭头，与左侧快退对称
+            IconButton(
+              tooltip: '快进 3 秒',
+              iconSize: 40,
+              color: Colors.white,
+              icon: const Icon(Icons.forward_30),
+              onPressed: _player == null ? null : _forward3s,
+            ),
           ],
         ),
       ],
