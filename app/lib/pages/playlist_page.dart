@@ -311,6 +311,10 @@ class _PlaylistPageState extends State<PlaylistPage> {
   }
 
   /// 移动到合集：目标列表 = 未分类 + 各合集名。
+  ///
+  /// 合集多时列表会超出屏幕：与倍速弹窗同款修复（isScrollControlled +
+  /// constraints 限高 70% 屏高 + useSafeArea + Flexible+ListView 兜底滚动），
+  /// 保证任意方向下所有合集可达可选。
   void _showMoveSheet(WhitelistVideo video) {
     final targets = [
       kTabUncategorized,
@@ -320,6 +324,11 @@ class _PlaylistPageState extends State<PlaylistPage> {
         v.isUncategorized ? kTabUncategorized : v.collection;
     showModalBottomSheet<void>(
       context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      constraints: BoxConstraints(
+        maxHeight: MediaQuery.sizeOf(context).height * 0.7,
+      ),
       builder: (sheetCtx) => SafeArea(
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -331,27 +340,35 @@ class _PlaylistPageState extends State<PlaylistPage> {
               dense: true,
             ),
             const Divider(height: 1),
-            for (final t in targets)
-              ListTile(
-                title: Text(t),
-                trailing: labelOf(video) == t
-                    ? const Icon(Icons.check, size: 20)
-                    : null,
-                onTap: () async {
-                  Navigator.pop(sheetCtx);
-                  final target = t == kTabUncategorized ? '' : t;
-                  if (target == video.collection) return;
-                  final next = _data.copyWith(
-                    videos: [
-                      for (final v in _data.videos)
-                        v.bvid == video.bvid && v.cid == video.cid
-                            ? v.copyWith(collection: target)
-                            : v,
-                    ],
+            Flexible(
+              child: ListView.builder(
+                shrinkWrap: true,
+                itemCount: targets.length,
+                itemBuilder: (context, i) {
+                  final t = targets[i];
+                  return ListTile(
+                    title: Text(t),
+                    trailing: labelOf(video) == t
+                        ? const Icon(Icons.check, size: 20)
+                        : null,
+                    onTap: () async {
+                      Navigator.pop(sheetCtx);
+                      final target = t == kTabUncategorized ? '' : t;
+                      if (target == video.collection) return;
+                      final next = _data.copyWith(
+                        videos: [
+                          for (final v in _data.videos)
+                            v.bvid == video.bvid && v.cid == video.cid
+                                ? v.copyWith(collection: target)
+                                : v,
+                        ],
+                      );
+                      await _saveAndRefresh(next);
+                    },
                   );
-                  await _saveAndRefresh(next);
                 },
               ),
+            ),
           ],
         ),
       ),
@@ -512,6 +529,9 @@ class _PlaylistPageState extends State<PlaylistPage> {
   }
 
   /// 批量移动到合集：目标列表 = 未分类 + 各合集名。
+  ///
+  /// 合集多时列表会超出屏幕：与单视频移动弹窗同款修复（isScrollControlled +
+  /// constraints 限高 70% 屏高 + useSafeArea + Flexible+ListView 兜底滚动）。
   void _showBatchMoveSheet() {
     final targets = [
       kTabUncategorized,
@@ -519,6 +539,11 @@ class _PlaylistPageState extends State<PlaylistPage> {
     ];
     showModalBottomSheet<void>(
       context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      constraints: BoxConstraints(
+        maxHeight: MediaQuery.sizeOf(context).height * 0.7,
+      ),
       builder: (sheetCtx) => SafeArea(
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -530,23 +555,31 @@ class _PlaylistPageState extends State<PlaylistPage> {
               dense: true,
             ),
             const Divider(height: 1),
-            for (final t in targets)
-              ListTile(
-                title: Text(t),
-                onTap: () async {
-                  Navigator.pop(sheetCtx);
-                  final target = t == kTabUncategorized ? '' : t;
-                  final next = WhitelistWriter.moveVideosToCollection(
-                    _data,
-                    Set<String>.from(_selectedBvids),
-                    target,
+            Flexible(
+              child: ListView.builder(
+                shrinkWrap: true,
+                itemCount: targets.length,
+                itemBuilder: (context, i) {
+                  final t = targets[i];
+                  return ListTile(
+                    title: Text(t),
+                    onTap: () async {
+                      Navigator.pop(sheetCtx);
+                      final target = t == kTabUncategorized ? '' : t;
+                      final next = WhitelistWriter.moveVideosToCollection(
+                        _data,
+                        Set<String>.from(_selectedBvids),
+                        target,
+                      );
+                      final count = _selectedBvids.length;
+                      _exitSelect();
+                      await _saveAndRefresh(next);
+                      _showSnack('已移动 $count 个视频到「$t」');
+                    },
                   );
-                  final count = _selectedBvids.length;
-                  _exitSelect();
-                  await _saveAndRefresh(next);
-                  _showSnack('已移动 $count 个视频到「$t」');
                 },
               ),
+            ),
           ],
         ),
       ),
