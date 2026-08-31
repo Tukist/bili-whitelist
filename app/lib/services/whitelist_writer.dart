@@ -143,4 +143,31 @@ class WhitelistWriter {
       videos: data.videos.where((v) => !bvids.contains(v.bvid)).toList(),
     );
   }
+
+  /// 合集内视频重排（拖拽排序用）：把 [newOrderBvids]（该合集视频的新展示
+  /// 顺序，bvid 列表）映射为 order = 0..n-1，写回该合集所有视频。
+  ///
+  /// 策略（简单方案）：只把本合集的视频 order 重排为「连续区间 0..n-1」，
+  /// 其他合集视频的 order 一律不动。跨合集的全局 order 可能重叠/乱序，
+  /// 但展示一律经 `sortedVideos(collection)` 按合集过滤后再排序，
+  /// 因此本合集内顺序正确、各合集互不影响，满足拖拽排序需求。
+  /// [collectionName] 空串 = 未分类。
+  static WhitelistData reorderVideosInCollection(
+    WhitelistData data,
+    String collectionName,
+    List<String> newOrderBvids,
+  ) {
+    if (newOrderBvids.isEmpty) return data;
+    final orderOf = {
+      for (var i = 0; i < newOrderBvids.length; i++) newOrderBvids[i]: i,
+    };
+    return data.copyWith(
+      videos: [
+        for (final v in data.videos)
+          v.collection == collectionName
+              ? v.copyWith(order: orderOf[v.bvid] ?? v.order)
+              : v,
+      ],
+    );
+  }
 }

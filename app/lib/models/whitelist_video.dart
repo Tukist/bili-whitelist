@@ -40,6 +40,7 @@ class WhitelistVideo {
   final String addedAt; // ISO 8601
   final List<PageInfo>? pages; // v2 分 P 列表；缺失/为空 → 视为单 P
   final String collection; // v3 所属合集名；空串 = 未分类
+  final int order; // 合集内排序号（拖拽排序用）；旧数据缺省 0 = 按 added_at 倒序
 
   const WhitelistVideo({
     required this.bvid,
@@ -51,6 +52,7 @@ class WhitelistVideo {
     required this.addedAt,
     this.pages,
     this.collection = '',
+    this.order = 0,
   });
 
   factory WhitelistVideo.fromJson(Map<String, dynamic> json) {
@@ -67,6 +69,8 @@ class WhitelistVideo {
           .map(PageInfo.fromJson)
           .toList(),
       collection: json['collection'] as String? ?? '',
+      // 脏数据（非数字，如字符串）时按缺省 0 处理，不抛类型转换错误
+      order: json['order'] is num ? (json['order'] as num).toInt() : 0,
     );
   }
 
@@ -79,6 +83,7 @@ class WhitelistVideo {
         'up_name': upName,
         'added_at': addedAt,
         'collection': collection,
+        'order': order,
         if (pages != null)
           'pages': pages!.map((p) => p.toJson()).toList(),
       };
@@ -87,7 +92,7 @@ class WhitelistVideo {
   bool get isUncategorized => collection.isEmpty;
 
   /// 复制并修改合集归属（管理操作「移动到合集」用）。
-  WhitelistVideo copyWith({String? collection}) => WhitelistVideo(
+  WhitelistVideo copyWith({String? collection, int? order}) => WhitelistVideo(
         bvid: bvid,
         cid: cid,
         title: title,
@@ -97,6 +102,7 @@ class WhitelistVideo {
         addedAt: addedAt,
         pages: pages,
         collection: collection ?? this.collection,
+        order: order ?? this.order,
       );
 
   /// 分 P 数量：pages 缺失或为空 → 单 P（1）。
@@ -176,6 +182,25 @@ WhitelistData renameCollection(
       for (final v in data.videos)
         if (v.collection == old) v.copyWith(collection: neu) else v,
     ],
+  );
+}
+
+/// 合集重排（主页拖拽排序用）：按 [newOrderNames] 的顺序重排 collections。
+///
+/// - [newOrderNames] 必须与现有合集一一对应（同集合同数量、同名字，
+///   名字一致即不会混入「未分类」）；数量/名字不匹配 → 抛
+///   [CollectionException]，原数据不动
+/// - 只重排合集定义数组，视频归属（collection 引用）不受影响
+/// - 返回新数据，原数据不可变不修改。
+WhitelistData reorderCollections(WhitelistData data, List<String> newOrderNames) {
+  final names = data.collections.map((c) => c.name).toList();
+  final orderSet = newOrderNames.toSet();
+  if (newOrderNames.length != names.length || !orderSet.containsAll(names)) {
+    throw const CollectionException('合集列表不完整，重排已取消');
+  }
+  final byName = {for (final c in data.collections) c.name: c};
+  return data.copyWith(
+    collections: [for (final n in newOrderNames) byName[n]!],
   );
 }
 
@@ -274,4 +299,34 @@ class WhitelistData {
   /// 空白名单。
   static WhitelistData empty() =>
       const WhitelistData(version: 1, updatedAt: '', videos: []);
+
+  /// 取某合集下的视频，按展示顺序排序：**order 升序优先**，
+  /// order 相同（或旧数据全为 0）时按 added_at 倒序兜底（新加入的在前，
+  /// 与 PC 端 whitelist.py 写回语义一致）。返回新列表，原数据不变。
+  ///
+  /// - [collection] 为 null → 全部视频；空串 '' → 未分类；否则按合集名过滤
+  List<WhitelistVideo> sortedVideos([String? collection]) {
+    final matched = collection == null
+        ? videos
+        : videos.where((v) =>
+            collection.isEmpty ? v.isUncategorized : v.collection == collection);
+    final list = matched.toList()
+      ..sort((a, b) {
+        final byOrder = a.order.compareTo(b.order);
+        if (byOrder != 0) return byOrder;
+        return _compareAddedAtDesc(a.addedAt, b.addedAt);
+      });
+    return list;
+  }
+
+  /// added_at 倒序比较：ISO 8601 字符串优先转 DateTime 比较（兼容不同时区
+  /// 写法）；解析失败（空串/脏数据）视为最旧，排到最后。
+  static int _compareAddedAtDesc(String a, String b) {
+    final ta = DateTime.tryParse(a);
+    final tb = DateTime.tryParse(b);
+    if (ta == null && tb == null) return 0;
+    if (ta == null) return 1;
+    if (tb == null) return -1;
+    return tb.compareTo(ta);
+  }
 }

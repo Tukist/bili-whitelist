@@ -13,103 +13,61 @@ import '../models/whitelist_video.dart';
 import '../services/service_locator.dart';
 import '../services/whitelist_writer.dart';
 import '../utils/import_parser.dart';
-import '../widgets/cover_image.dart';
+import 'collection_page.dart';
 import 'login_page.dart';
-import 'player_page.dart';
 import 'search_page.dart';
 
-/// 时长格式化：秒 → `12:34` / `1:02:03`（与 M1 脚本 fmt_duration 一致）。
-String fmtDuration(int seconds) {
-  if (seconds < 0) return '?';
-  final h = seconds ~/ 3600;
-  final m = (seconds % 3600) ~/ 60;
-  final s = seconds % 60;
-  return h > 0
-      ? '$h:${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}'
-      : '$m:${s.toString().padLeft(2, '0')}';
-}
-
-/// 唯一首页：白名单视频列表。
+/// 唯一首页：合集卡片视图（两级导航第一级）。
 ///
-/// - 封面用 [CoverImage]（带防盗链头：Referer + 浏览器 UA）
-/// - 下拉刷新触发重新同步；AppBar 显示缓存数据时间
+/// - 每张卡片 = 一个合集（合集名 + 视频数 + 代表视觉）；「未分类」固定一张卡片
+/// - 点卡片 → [CollectionPage] 合集视频列表页（两级导航第二级）；
+///   长按/多选/移动/删除等管理操作迁移到合集页
+/// - 卡片封面带防盗链头（Referer + 浏览器 UA，与 [CoverImage] 同约定）
+/// - 下拉刷新触发重新同步；AppBar 下方显示缓存数据时间
 /// - **新增白名单的入口**：导入（解析 B 站分享链接/文本，与电脑端油猴脚本
 ///   等价）+ 搜索页「加入」（搜 B 站全网后一键加入，M7）
 /// - 管理功能仅限：新建/重命名/删除合集、移动/删除视频（防沉迷原则不变）
 /// - 右上角搜索入口：B 站全网搜索 + 白名单内过滤两个 Tab
 /// - 右上角导入入口：粘贴分享链接/文本（支持 b23.tv 短链和完整链接）
-/// - 右上角管理入口：GitHub token/gist_id 配置 + 新建合集
+/// - 右上角管理入口：GitHub token/gist_id 配置 + 新建合集 + 合集管理
+///   + 缓存管理 + 翻译服务配置
 /// - 右上角登录入口可进 WebView 登录页（解锁 1080P，M4 起内嵌官方登录页）
-/// - 长按视频进入多选模式：勾选多个 → 底部批量操作栏（批量移动合集 / 批量删除）；
-///   单视频管理菜单保留在每条右侧「更多」按钮
 /// - 启动时静默检查登录态：SESSDATA 距过期 < 7 天自动续期；
 ///   续期失败且已过期时提示重新登录
 class PlaylistPage extends StatefulWidget {
-  const PlaylistPage({super.key});
+  /// 测试注入：Gist 写操作替身（默认用真实实现）。
+  /// 拖动排序/导入等写操作统一走 [GithubApi.saveToGist]。
+  final GithubApi? github;
+
+  const PlaylistPage({super.key, this.github});
 
   @override
   State<PlaylistPage> createState() => _PlaylistPageState();
 }
 
-/// 合集 Tab 的「全部」与「未分类」固定项（未分类 = collection 为空串）。
-const String kTabAll = '全部';
-const String kTabUncategorized = '未分类';
-
 class _PlaylistPageState extends State<PlaylistPage> {
   WhitelistData _data = WhitelistData.empty();
-  String _selectedTab = kTabAll;
   DateTime? _fetchedAt;
   String? _sourceName;
   String? _error;
   bool _syncing = false;
-  final GithubApi _github = GithubApi();
+  late final GithubApi _github = widget.github ?? GithubApi();
 
   /// 白名单写入服务：导入 / 搜索「加入」共用（构造视频 + 查重 + 写 Gist）。
   final WhitelistWriter _writer = WhitelistWriter();
 
-  /// 多选模式状态：true 时列表项显示勾选框、点按切换勾选、底部出现批量操作栏。
-  bool _selectMode = false;
-
-  /// 多选模式下已勾选的 bvid 集合（白名单按 bvid 查重唯一，可作批量标识）。
-  final Set<String> _selectedBvids = {};
-
-  /// 列表滚动控制器：导入成功后滚动到新视频（列表末尾），
-  /// 保证用户立即可见导入结果，不用手动翻到列表底部。
-  final ScrollController _listScroll = ScrollController();
-
-  /// 离线缓存管理器（列表页显示已缓存标记；缓存状态变化时刷新）。
-  final DownloadManager _downloads = DownloadManager.instance;
-
   /// 底部显示的版本号：优先 package_info_plus 读 Android versionName，
   /// 异常（测试环境无原生通道）时回退 config.dart 的 kAppVersion。
   String _version = kAppVersion;
-
-  /// 当前 Tab 筛选后的视频（UI 直接消费；与 PC 端合集语义一致）。
-  List<WhitelistVideo> get _videos => _filterVideos();
 
   bool get _hasData => _data.videos.isNotEmpty;
 
   @override
   void initState() {
     super.initState();
-    // 缓存状态变化（下载完成/删除）→ 刷新列表的「已缓存」标记
-    _downloads.cached.addListener(_onCacheChanged);
-    // 异步加载缓存索引（完成后通过 notifier 触发刷新，不阻塞首帧）
-    unawaited(_downloads.init());
     _load();
     _maybeRefreshSession();
     _loadVersion();
-  }
-
-  @override
-  void dispose() {
-    _downloads.cached.removeListener(_onCacheChanged);
-    _listScroll.dispose();
-    super.dispose();
-  }
-
-  void _onCacheChanged() {
-    if (mounted) setState(() {});
   }
 
   /// 读取 App 版本号（插件方案，与 pubspec.yaml version 单源）。
@@ -122,34 +80,6 @@ class _PlaylistPageState extends State<PlaylistPage> {
     } catch (_) {
       // 无原生插件通道（测试环境等）时保持 kAppVersion 兜底值
     }
-  }
-
-  /// 按当前 Tab 过滤视频：全部 / 某合集 / 未分类。
-  List<WhitelistVideo> _filterVideos() {
-    final tab = _selectedTab;
-    if (tab == kTabAll) return _data.videos;
-    if (tab == kTabUncategorized) {
-      return _data.videos.where((v) => v.isUncategorized).toList();
-    }
-    return _data.videos.where((v) => v.collection == tab).toList();
-  }
-
-  /// Tab 栏项目：全部 + 各合集名 + （存在未分类视频时）未分类。
-  /// 「未分类」仅在无同名合集时追加，避免与合集 Tab 冲突。
-  List<String> _tabs() {
-    final names = _data.collections.map((c) => c.name).toList();
-    final hasUncategorized = _data.videos.any((v) => v.isUncategorized);
-    return [
-      kTabAll,
-      ...names,
-      if (hasUncategorized && !names.contains(kTabUncategorized))
-        kTabUncategorized,
-    ];
-  }
-
-  /// 数据变化后保证选中 Tab 仍存在，否则回落到「全部」。
-  void _ensureTab() {
-    if (!_tabs().contains(_selectedTab)) _selectedTab = kTabAll;
   }
 
   /// 启动续期（静默）：距 SESSDATA 过期 < 7 天 → 用 refresh_token 自动续期；
@@ -189,7 +119,6 @@ class _PlaylistPageState extends State<PlaylistPage> {
           _fetchedAt = result.fetchedAt;
           _sourceName = result.sourceName;
           _error = null;
-          _ensureTab();
         });
       }
     } catch (e) {
@@ -231,7 +160,6 @@ class _PlaylistPageState extends State<PlaylistPage> {
       if (mounted) {
         setState(() {
           _data = next;
-          _ensureTab();
         });
       }
       _showSnack('已保存');
@@ -249,8 +177,8 @@ class _PlaylistPageState extends State<PlaylistPage> {
       _showSnack('请输入合集名称');
       return;
     }
-    if (name == kTabAll || name == kTabUncategorized) {
-      _showSnack('合集名不能为「$kTabAll」或「$kTabUncategorized」');
+    if (name == kUncategorizedLabel) {
+      _showSnack('合集名不能为「$kUncategorizedLabel」');
       return;
     }
     if (_data.collections.any((c) => c.name == name)) {
@@ -262,144 +190,6 @@ class _PlaylistPageState extends State<PlaylistPage> {
         ..._data.collections,
         CollectionInfo(name: name, createdAt: DateTime.now().toIso8601String()),
       ],
-    );
-    await _saveAndRefresh(next);
-  }
-
-  /// 长按视频 → 管理菜单（移动/删除）。
-  void _showVideoMenu(WhitelistVideo video) {
-    final theme = Theme.of(context);
-    showModalBottomSheet<void>(
-      context: context,
-      builder: (sheetCtx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ListTile(
-              title: Text(
-                video.title,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: theme.textTheme.titleSmall,
-              ),
-              subtitle: const Text('管理操作会同步到 Gist'),
-              dense: true,
-            ),
-            const Divider(height: 1),
-            ListTile(
-              leading: const Icon(Icons.drive_file_move_outlined),
-              title: const Text('移动到合集…'),
-              onTap: () {
-                Navigator.pop(sheetCtx);
-                _showMoveSheet(video);
-              },
-            ),
-            ListTile(
-              leading: Icon(Icons.delete_outline,
-                  color: theme.colorScheme.error),
-              title: Text('删除',
-                  style: TextStyle(color: theme.colorScheme.error)),
-              onTap: () {
-                Navigator.pop(sheetCtx);
-                _confirmDelete(video);
-              },
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  /// 移动到合集：目标列表 = 未分类 + 各合集名。
-  ///
-  /// 合集多时列表会超出屏幕：与倍速弹窗同款修复（isScrollControlled +
-  /// constraints 限高 70% 屏高 + useSafeArea + Flexible+ListView 兜底滚动），
-  /// 保证任意方向下所有合集可达可选。
-  void _showMoveSheet(WhitelistVideo video) {
-    final targets = [
-      kTabUncategorized,
-      ..._data.collections.map((c) => c.name),
-    ];
-    String labelOf(WhitelistVideo v) =>
-        v.isUncategorized ? kTabUncategorized : v.collection;
-    showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      useSafeArea: true,
-      constraints: BoxConstraints(
-        maxHeight: MediaQuery.sizeOf(context).height * 0.7,
-      ),
-      builder: (sheetCtx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ListTile(
-              title: const Text('移动到合集'),
-              subtitle: Text(video.title,
-                  maxLines: 1, overflow: TextOverflow.ellipsis),
-              dense: true,
-            ),
-            const Divider(height: 1),
-            Flexible(
-              child: ListView.builder(
-                shrinkWrap: true,
-                itemCount: targets.length,
-                itemBuilder: (context, i) {
-                  final t = targets[i];
-                  return ListTile(
-                    title: Text(t),
-                    trailing: labelOf(video) == t
-                        ? const Icon(Icons.check, size: 20)
-                        : null,
-                    onTap: () async {
-                      Navigator.pop(sheetCtx);
-                      final target = t == kTabUncategorized ? '' : t;
-                      if (target == video.collection) return;
-                      final next = _data.copyWith(
-                        videos: [
-                          for (final v in _data.videos)
-                            v.bvid == video.bvid && v.cid == video.cid
-                                ? v.copyWith(collection: target)
-                                : v,
-                        ],
-                      );
-                      await _saveAndRefresh(next);
-                    },
-                  );
-                },
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  /// 删除：确认对话框 → 从 videos 移除 → 持久化。
-  Future<void> _confirmDelete(WhitelistVideo video) async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (dialogCtx) => AlertDialog(
-        title: const Text('删除视频'),
-        content: Text('确定从白名单删除《${video.title}》吗？\n'
-            '此操作会同步到 Gist，且无法在 App 内恢复。'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogCtx, false),
-            child: const Text('取消'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(dialogCtx, true),
-            child: const Text('删除', style: TextStyle(color: Colors.red)),
-          ),
-        ],
-      ),
-    );
-    if (confirmed != true || !mounted) return;
-    final next = _data.copyWith(
-      videos: _data.videos
-          .where((v) => !(v.bvid == video.bvid && v.cid == video.cid))
-          .toList(),
     );
     await _saveAndRefresh(next);
   }
@@ -458,23 +248,6 @@ class _PlaylistPageState extends State<PlaylistPage> {
     if (mounted) {
       setState(() {
         _data = next;
-        // 导入的视频固定为未分类：若用户当前停留在某个合集 Tab，
-        // 会被 Tab 过滤而看不到新视频（表现为「导入成功但列表不显示」），
-        // 因此导入成功后自动切回「全部」，确保立即可见。
-        if (video.isUncategorized && _selectedTab != kTabAll) {
-          _selectedTab = kTabAll;
-        }
-        _ensureTab();
-      });
-      // 列表帧更新后滚动到末尾（新视频追加在列表末尾），
-      // 让用户立刻看到导入结果，无需手动翻页。
-      WidgetsBinding.instance.addPostFrameCallback((_) {
-        if (!mounted || !_listScroll.hasClients) return;
-        _listScroll.animateTo(
-          _listScroll.position.maxScrollExtent,
-          duration: const Duration(milliseconds: 300),
-          curve: Curves.easeOut,
-        );
       });
     }
     final multi = countLinkTokens(input) > 1;
@@ -493,132 +266,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
     if (mounted) _load();
   }
 
-  /// 多选模式：切换指定视频的勾选状态（长按/点按共用）。
-  void _toggleSelect(String bvid) {
-    setState(() {
-      if (!_selectedBvids.add(bvid)) _selectedBvids.remove(bvid);
-    });
-  }
-
-  /// 进入多选模式并勾选当前项（长按触发）。
-  void _enterSelect(WhitelistVideo video) {
-    setState(() {
-      _selectMode = true;
-      _selectedBvids.add(video.bvid);
-    });
-  }
-
-  /// 退出多选模式（清空勾选）。
-  void _exitSelect() {
-    setState(() {
-      _selectMode = false;
-      _selectedBvids.clear();
-    });
-  }
-
-  /// 全选 / 取消全选（当前 Tab 过滤后的可见项）。
-  void _toggleSelectAll() {
-    final visible = _videos.map((v) => v.bvid).toSet();
-    setState(() {
-      if (_selectedBvids.containsAll(visible)) {
-        _selectedBvids.removeAll(visible);
-      } else {
-        _selectedBvids.addAll(visible);
-      }
-    });
-  }
-
-  /// 批量移动到合集：目标列表 = 未分类 + 各合集名。
-  ///
-  /// 合集多时列表会超出屏幕：与单视频移动弹窗同款修复（isScrollControlled +
-  /// constraints 限高 70% 屏高 + useSafeArea + Flexible+ListView 兜底滚动）。
-  void _showBatchMoveSheet() {
-    final targets = [
-      kTabUncategorized,
-      ..._data.collections.map((c) => c.name),
-    ];
-    showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      useSafeArea: true,
-      constraints: BoxConstraints(
-        maxHeight: MediaQuery.sizeOf(context).height * 0.7,
-      ),
-      builder: (sheetCtx) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            ListTile(
-              title: const Text('批量移动到合集'),
-              subtitle: Text('已选 ${_selectedBvids.length} 个视频',
-                  style: Theme.of(sheetCtx).textTheme.bodySmall),
-              dense: true,
-            ),
-            const Divider(height: 1),
-            Flexible(
-              child: ListView.builder(
-                shrinkWrap: true,
-                itemCount: targets.length,
-                itemBuilder: (context, i) {
-                  final t = targets[i];
-                  return ListTile(
-                    title: Text(t),
-                    onTap: () async {
-                      Navigator.pop(sheetCtx);
-                      final target = t == kTabUncategorized ? '' : t;
-                      final next = WhitelistWriter.moveVideosToCollection(
-                        _data,
-                        Set<String>.from(_selectedBvids),
-                        target,
-                      );
-                      final count = _selectedBvids.length;
-                      _exitSelect();
-                      await _saveAndRefresh(next);
-                      _showSnack('已移动 $count 个视频到「$t」');
-                    },
-                  );
-                },
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  /// 批量删除：确认对话框 → 移除 → 持久化。
-  Future<void> _confirmBatchDelete() async {
-    final count = _selectedBvids.length;
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (dialogCtx) => AlertDialog(
-        title: const Text('批量删除'),
-        content: Text('删除 $count 个视频？\n'
-            '此操作会同步到 Gist，且无法在 App 内恢复。'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogCtx, false),
-            child: const Text('取消'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(dialogCtx, true),
-            child: const Text('删除', style: TextStyle(color: Colors.red)),
-          ),
-        ],
-      ),
-    );
-    if (confirmed != true || !mounted) return;
-    final next = WhitelistWriter.removeVideos(
-      _data,
-      Set<String>.from(_selectedBvids),
-    );
-    final removed = _selectedBvids.length;
-    _exitSelect();
-    await _saveAndRefresh(next);
-    _showSnack('已删除 $removed 个视频');
-  }
-
-  /// 打开管理面板（GitHub 配置 + 新建合集）。
+  /// 打开管理面板（GitHub 配置 + 新建合集 + 合集管理 + 缓存管理 + 翻译服务）。
   void _openManage() {
     showModalBottomSheet<void>(
       context: context,
@@ -627,6 +275,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
       builder: (_) => _ManageSheet(
         github: _github,
         onCollectionCreated: _createCollection,
+        onManageCollections: _openCollectionManage,
       ),
     );
   }
@@ -655,8 +304,8 @@ class _PlaylistPageState extends State<PlaylistPage> {
       _showSnack('新旧名相同，未改动');
       return;
     }
-    if (neu == kTabAll || neu == kTabUncategorized) {
-      _showSnack('合集名不能为「$kTabAll」或「$kTabUncategorized」');
+    if (neu == kUncategorizedLabel) {
+      _showSnack('合集名不能为「$kUncategorizedLabel」');
       return;
     }
     try {
@@ -677,52 +326,89 @@ class _PlaylistPageState extends State<PlaylistPage> {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // 合集卡片数据：collections 数组顺序即展示顺序；「未分类」固定最后一张。
+  // ---------------------------------------------------------------------------
+
+  /// 卡片数据（构造时一次性生成，卡片本身是静态展示）。
+  List<({String name, int count, String cover})> _cards() {
+    final cards = <({String name, int count, String cover})>[];
+    for (final c in _data.collections) {
+      final vids = _data.sortedVideos(c.name);
+      cards.add((
+        name: c.name,
+        count: vids.length,
+        cover: vids.isNotEmpty ? vids.first.cover : '',
+      ));
+    }
+    // 「未分类」固定卡片：始终显示（含 0 个），让用户知道新导入视频的默认归处
+    final uncategorized = _data.sortedVideos('');
+    cards.add((
+      name: kUncategorizedLabel,
+      count: uncategorized.length,
+      cover: uncategorized.isNotEmpty ? uncategorized.first.cover : '',
+    ));
+    return cards;
+  }
+
+  /// 打开合集视频列表页（两级导航第二级）。
+  void _openCollection(String name) {
+    Navigator.of(context).push(MaterialPageRoute<void>(
+      builder: (_) => CollectionPage(
+        collectionName: name == kUncategorizedLabel ? '' : name,
+        data: _data,
+        saveAndRefresh: _saveAndRefresh,
+      ),
+    ));
+  }
+
+  /// 合集拖动排序：重排 collections（未分类固定最后、不可拖）→ 落库。
+  ///
+  /// 拖拽只影响 [WhitelistData.collections] 顺序，视频归属不变。
+  /// 保存失败时不 setState：ReorderableListView 的显示顺序由数据驱动，
+  /// 数据未变 → 列表视觉自动回弹原顺序（失败回滚，不破坏数据）。
+  void _onReorderCollections(int oldIndex, int newIndex) {
+    final total = _data.collections.length; // 卡片总长 = total + 1（未分类最后）
+    if (oldIndex < 0 || oldIndex >= total) return; // 未分类不可拖
+    if (newIndex > total) newIndex = total; // 最多拖到未分类之前
+    if (newIndex > oldIndex) newIndex -= 1;
+    final names = [for (final c in _data.collections) c.name];
+    final moved = names.removeAt(oldIndex);
+    names.insert(newIndex, moved);
+    final next = reorderCollections(_data, names);
+    if (identical(next.collections, _data.collections)) return; // 拖回原位
+    unawaited(_saveAndRefresh(next));
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final hasData = _videos.isNotEmpty;
-    final selectAllVisible = _selectMode &&
-        _videos.isNotEmpty &&
-        _selectedBvids.containsAll(_videos.map((v) => v.bvid));
+    final cards = _hasData ? _cards() : const <({String name, int count, String cover})>[];
     return Scaffold(
       appBar: AppBar(
-        title: Text(_selectMode ? '已选 ${_selectedBvids.length} 项' : '白名单点播'),
-        leading: _selectMode
-            ? IconButton(
-                tooltip: '退出多选',
-                icon: const Icon(Icons.close),
-                onPressed: _exitSelect,
-              )
-            : null,
-        actions: _selectMode
-            ? [
-                TextButton(
-                  onPressed: _videos.isEmpty ? null : _toggleSelectAll,
-                  child: Text(selectAllVisible ? '取消全选' : '全选'),
-                ),
-              ]
-            : [
-                IconButton(
-                  tooltip: '搜索（B 站全网 + 白名单内）',
-                  icon: const Icon(Icons.search),
-                  onPressed: _openSearch,
-                ),
-                IconButton(
-                  tooltip: '导入视频',
-                  icon: const Icon(Icons.add_link),
-                  onPressed: _openImport,
-                ),
-                IconButton(
-                  tooltip: '管理（GitHub 配置 / 合集）',
-                  icon: const Icon(Icons.settings_outlined),
-                  onPressed: _openManage,
-                ),
-                IconButton(
-                  tooltip: '登录（解锁 1080P）',
-                  icon: const Icon(Icons.login),
-                  onPressed: () => _openLogin(context),
-                ),
-              ],
+        title: const Text('白名单点播'),
+        actions: [
+          IconButton(
+            tooltip: '搜索（B 站全网 + 白名单内）',
+            icon: const Icon(Icons.search),
+            onPressed: _openSearch,
+          ),
+          IconButton(
+            tooltip: '导入视频',
+            icon: const Icon(Icons.add_link),
+            onPressed: _openImport,
+          ),
+          IconButton(
+            tooltip: '管理（GitHub 配置 / 合集）',
+            icon: const Icon(Icons.settings_outlined),
+            onPressed: _openManage,
+          ),
+          IconButton(
+            tooltip: '登录（解锁 1080P）',
+            icon: const Icon(Icons.login),
+            onPressed: () => _openLogin(context),
+          ),
+        ],
       ),
       body: Column(
         children: [
@@ -731,46 +417,37 @@ class _PlaylistPageState extends State<PlaylistPage> {
             sourceName: _sourceName,
             error: _error,
           ),
-          if (_tabs().length > 1 || _data.collections.isNotEmpty)
-            _buildTabs(),
           Expanded(
             child: RefreshIndicator(
               onRefresh: _load,
-              child: hasData
-                  ? ListView.separated(
-                      controller: _listScroll,
+              child: _hasData
+                  ? ReorderableListView.builder(
+                      padding: const EdgeInsets.all(12),
                       physics: const AlwaysScrollableScrollPhysics(),
-                      itemCount: _videos.length,
-                      separatorBuilder: (_, __) =>
-                          const Divider(height: 1, indent: 88),
-                      itemBuilder: (context, i) => _VideoTile(
-                        video: _videos[i],
-                        cachedCount: _downloads
-                            .cachedCount(_videos[i].bvid),
-                        selectMode: _selectMode,
-                        selected: _selectedBvids.contains(_videos[i].bvid),
-                        onTap: _selectMode
-                            ? () => _toggleSelect(_videos[i].bvid)
-                            : () {
-                                Navigator.of(context).push(
-                                  MaterialPageRoute<void>(
-                                    builder: (_) =>
-                                        PlayerPage(video: _videos[i]),
-                                  ),
-                                );
-                              },
-                        onLongPress: _selectMode
-                            ? () => _toggleSelect(_videos[i].bvid)
-                            : () => _enterSelect(_videos[i]),
-                        onMore: _selectMode
-                            ? null
-                            : () => _showVideoMenu(_videos[i]),
-                      ),
+                      // 长按拖动（卡片无其他长按行为）；未分类项 enabled=false
+                      // 完全无拖动手势（含视觉上也不会抬起）
+                      buildDefaultDragHandles: false,
+                      itemCount: cards.length,
+                      onReorder: _onReorderCollections,
+                      itemBuilder: (context, i) {
+                        final card = cards[i];
+                        final isUncategorized =
+                            card.name == kUncategorizedLabel;
+                        return ReorderableDelayedDragStartListener(
+                          key: ValueKey(card.name),
+                          index: i,
+                          enabled: !isUncategorized,
+                          child: _CollectionCard(
+                            name: card.name,
+                            count: card.count,
+                            cover: card.cover,
+                            draggable: !isUncategorized,
+                            onTap: () => _openCollection(card.name),
+                          ),
+                        );
+                      },
                     )
-                  : _EmptyView(
-                      syncing: _syncing,
-                      hint: _hasData ? '该合集暂无视频' : null,
-                    ),
+                  : _EmptyView(syncing: _syncing),
             ),
           ),
           // 底部版本号：灰色小字固定页脚，不遮挡列表操作
@@ -784,90 +461,128 @@ class _PlaylistPageState extends State<PlaylistPage> {
           ),
         ],
       ),
-      // 多选模式：底部批量操作栏（移动到合集 / 删除）
-      bottomNavigationBar: _selectMode
-          ? SafeArea(
-              child: Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
-                decoration: BoxDecoration(
-                  color: theme.colorScheme.surface,
-                  border: Border(
-                    top: BorderSide(
-                      color: theme.colorScheme.outlineVariant,
-                    ),
-                  ),
-                ),
-                child: Row(
-                  children: [
-                    Expanded(
-                      child: OutlinedButton.icon(
-                        onPressed: _selectedBvids.isEmpty
-                            ? null
-                            : _showBatchMoveSheet,
-                        icon: const Icon(Icons.drive_file_move_outlined,
-                            size: 18),
-                        label: const Text('移动到合集'),
-                      ),
-                    ),
-                    const SizedBox(width: 12),
-                    Expanded(
-                      child: FilledButton.icon(
-                        onPressed: _selectedBvids.isEmpty
-                            ? null
-                            : _confirmBatchDelete,
-                        style: FilledButton.styleFrom(
-                          backgroundColor: theme.colorScheme.error,
-                          foregroundColor: theme.colorScheme.onError,
-                        ),
-                        icon: const Icon(Icons.delete_outline, size: 18),
-                        label: const Text('删除'),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            )
-          : null,
-    );
-  }
-
-  /// 横向滚动的合集 Tab 栏：全部 + 各合集 + 未分类 + 末尾「管理合集」入口。
-  Widget _buildTabs() {
-    final tabs = _tabs();
-    return SizedBox(
-      height: 48,
-      child: ListView(
-        scrollDirection: Axis.horizontal,
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-        children: [
-          for (final t in tabs)
-            Padding(
-              padding: const EdgeInsets.only(right: 8),
-              child: ChoiceChip(
-                label: Text(t),
-                selected: _selectedTab == t,
-                onSelected: (_) => setState(() => _selectedTab = t),
-              ),
-            ),
-          // 合集管理入口：有合集时才出现（避免空 Tab 栏多一个无效按钮）
-          if (_data.collections.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.only(left: 4, right: 8),
-              child: ActionChip(
-                avatar: const Icon(Icons.edit_outlined, size: 16),
-                label: const Text('管理合集'),
-                onPressed: _openCollectionManage,
-              ),
-            ),
-        ],
-      ),
     );
   }
 
   void _openLogin(BuildContext context) {
     Navigator.of(context)
         .push(MaterialPageRoute<void>(builder: (_) => const LoginPage()));
+  }
+}
+
+/// 合集卡片（行式）：左侧代表视觉（封面 / 渐变底 + 图标），
+/// 右侧合集名 + 视频数，尾部拖动手柄提示（未分类不可拖不显示）。
+class _CollectionCard extends StatelessWidget {
+  final String name;
+  final int count;
+  final String cover; // 该合集首个视频封面（无视频/未分类 → 空串走图标）
+  final bool draggable; // 是否可拖动（未分类固定最后，不可拖）
+  final VoidCallback onTap;
+
+  const _CollectionCard({
+    required this.name,
+    required this.count,
+    required this.cover,
+    required this.draggable,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final isUncategorized = name == kUncategorizedLabel;
+    return Material(
+      color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: .5),
+      borderRadius: BorderRadius.circular(12),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.all(10),
+          child: Row(
+            children: [
+              // 代表视觉：未分类用固定渐变+图标；合集优先展示首个视频封面
+              ClipRRect(
+                borderRadius: BorderRadius.circular(8),
+                child: SizedBox(
+                  width: 64,
+                  height: 64,
+                  child: cover.isNotEmpty && !isUncategorized
+                      ? Image.network(
+                          cover,
+                          fit: BoxFit.cover,
+                          // 与 CoverImage 一致：必须带防盗链头，否则 B 站图床 403
+                          headers: {
+                            'User-Agent': kBrowserUA,
+                            'Referer': kBiliReferer,
+                          },
+                          errorBuilder: (_, __, ___) =>
+                              _coverPlaceholder(context),
+                          loadingBuilder: (context, child, progress) {
+                            if (progress == null) return child;
+                            return _coverPlaceholder(context);
+                          },
+                        )
+                      : _coverPlaceholder(context),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      name,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.titleSmall,
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      '$count 个视频',
+                      style: theme.textTheme.bodySmall
+                          ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+                    ),
+                  ],
+                ),
+              ),
+              // 拖动手柄提示（可拖动的合集才显示；未分类不可拖）
+              if (draggable)
+                Icon(
+                  Icons.drag_indicator,
+                  size: 20,
+                  color: theme.colorScheme.outline.withValues(alpha: .55),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 卡片视觉占位：渐变底 + 图标（未分类用 inbox，合集无封面用 video_library）。
+  Widget _coverPlaceholder(BuildContext context) {
+    final theme = Theme.of(context);
+    final isUncategorized = name == kUncategorizedLabel;
+    return Container(
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [
+            theme.colorScheme.primaryContainer,
+            theme.colorScheme.secondaryContainer,
+          ],
+        ),
+      ),
+      child: Center(
+        child: Icon(
+          isUncategorized ? Icons.inbox_outlined : Icons.video_library_outlined,
+          size: 32,
+          color: theme.colorScheme.onSecondaryContainer.withValues(alpha: .55),
+        ),
+      ),
+    );
   }
 }
 
@@ -989,129 +704,15 @@ class _CacheBar extends StatelessWidget {
   }
 }
 
-/// 单条视频：封面 + 标题 + 时长 + UP 主 + 已缓存角标。
-///
-/// 普通模式：点按进播放页、尾部「更多」弹管理菜单、长按进入多选模式；
-/// 多选模式：左侧勾选框 + 点按/长按切换勾选。
-class _VideoTile extends StatelessWidget {
-  final WhitelistVideo video;
-  final int cachedCount; // 该视频已缓存的集数（0 = 未缓存）
-  final bool selectMode;
-  final bool selected;
-  final VoidCallback? onTap;
-  final VoidCallback? onLongPress;
-  final VoidCallback? onMore; // 普通模式尾部「更多」按钮（管理菜单）
-
-  const _VideoTile({
-    required this.video,
-    this.cachedCount = 0,
-    this.selectMode = false,
-    this.selected = false,
-    this.onTap,
-    this.onLongPress,
-    this.onMore,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final cover = ClipRRect(
-      borderRadius: BorderRadius.circular(4),
-      child: Stack(
-        children: [
-          CoverImage(cover: video.cover),
-          // 已缓存角标（封面左上角，与右下角「共 N 集」角标风格一致）：
-          // 多 P 部分缓存显示 `已缓存 n/m`，全部/单 P 显示 `已缓存`
-          if (cachedCount > 0)
-            Positioned(
-              left: 4,
-              top: 4,
-              child: Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
-                decoration: BoxDecoration(
-                  color: const Color(0xFF0A7A4A).withValues(alpha: .88),
-                  borderRadius: BorderRadius.circular(3),
-                ),
-                child: Text(
-                  video.isMultiPage && cachedCount < video.pageCount
-                      ? '已缓存 $cachedCount/${video.pageCount}'
-                      : '已缓存',
-                  style: const TextStyle(color: Colors.white, fontSize: 10),
-                ),
-              ),
-            ),
-          // 多 P 视频：封面右下角「共 N 集」角标（单 P 不显示）
-          if (video.isMultiPage)
-            Positioned(
-              right: 4,
-              bottom: 4,
-              child: Container(
-                padding:
-                    const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
-                decoration: BoxDecoration(
-                  color: Colors.black.withValues(alpha: .72),
-                  borderRadius: BorderRadius.circular(3),
-                ),
-                child: Text(
-                  '共 ${video.pageCount} 集',
-                  style: const TextStyle(color: Colors.white, fontSize: 10),
-                ),
-              ),
-            ),
-        ],
-      ),
-    );
-    return ListTile(
-      onTap: onTap,
-      onLongPress: onLongPress,
-      leading: selectMode
-          ? Row(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Checkbox(
-                  value: selected,
-                  onChanged: (_) => onTap?.call(),
-                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-                ),
-                cover,
-              ],
-            )
-          : cover,
-      title: Text(
-        video.title,
-        maxLines: 2,
-        overflow: TextOverflow.ellipsis,
-        style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
-      ),
-      subtitle: Text(
-        '${fmtDuration(video.duration)} · ${video.upName}',
-        style: theme.textTheme.bodySmall
-            ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
-      ),
-      // 普通模式尾部「更多」按钮 = 单视频管理菜单（多选模式不显示，
-      // 多选模式下批量操作栏已覆盖移动/删除能力）
-      trailing: (!selectMode && onMore != null)
-          ? IconButton(
-              tooltip: '管理',
-              icon: const Icon(Icons.more_vert),
-              onPressed: onMore,
-            )
-          : null,
-    );
-  }
-}
-
-/// 空态视图（首次启动且无缓存/同步失败/某合集暂无视频）。
+/// 空态视图（首次启动且无缓存/同步失败）。
 class _EmptyView extends StatelessWidget {
   final bool syncing;
-  final String? hint; // 非空时显示替代文案（如「该合集暂无视频」）
 
-  const _EmptyView({required this.syncing, this.hint});
+  const _EmptyView({required this.syncing});
 
   @override
   Widget build(BuildContext context) {
-    final message = hint ?? (syncing ? '正在同步白名单…' : '白名单为空\n下拉刷新重新同步');
+    final message = syncing ? '正在同步白名单…' : '白名单为空\n下拉刷新重新同步';
     return ListView(
       physics: const AlwaysScrollableScrollPhysics(),
       children: [
@@ -1287,10 +888,12 @@ String _fmt(DateTime t) => t.toLocal().toString().substring(0, 16);
 class _ManageSheet extends StatefulWidget {
   final GithubApi github;
   final Future<void> Function(String name) onCollectionCreated;
+  final VoidCallback onManageCollections; // 打开合集管理面板（重命名/删除）
 
   const _ManageSheet({
     required this.github,
     required this.onCollectionCreated,
+    required this.onManageCollections,
   });
 
   @override
@@ -1474,6 +1077,26 @@ class _ManageSheetState extends State<_ManageSheet> {
                       )
                     : const Icon(Icons.create_new_folder_outlined, size: 18),
                 label: Text(_creating ? '创建中…' : '新建合集'),
+              ),
+            ),
+            const SizedBox(height: 16),
+            const Divider(height: 1),
+            const SizedBox(height: 16),
+            // ---- 合集管理（重命名 / 删除）----
+            Text('合集管理', style: theme.textTheme.titleMedium),
+            const SizedBox(height: 4),
+            Text(
+              '重命名会同步更新该合集下所有视频；删除会把视频移回未分类（不删视频）。',
+              style: theme.textTheme.bodySmall
+                  ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+            ),
+            const SizedBox(height: 8),
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: widget.onManageCollections,
+                icon: const Icon(Icons.edit_outlined, size: 18),
+                label: const Text('管理合集'),
               ),
             ),
             const SizedBox(height: 16),
