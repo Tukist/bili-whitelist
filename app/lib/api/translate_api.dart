@@ -17,6 +17,8 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import 'package:path_provider/path_provider.dart';
 
+import '../services/secure_store.dart';
+
 /// 翻译服务错误：message 可直接展示给用户。
 class TranslateApiException implements Exception {
   final String message;
@@ -75,7 +77,8 @@ class TranslateApi {
               connectTimeout: const Duration(seconds: 10),
               receiveTimeout: const Duration(seconds: 30),
             )),
-        _storage = storage ?? const FlutterSecureStorage(),
+        // vivo 等国产 ROM 兼容：显式 AndroidOptions（见 services/secure_store.dart）
+        _storage = storage ?? createSecureStorage(),
         _cacheDirOverride = cacheDirOverride;
 
   // -------------------------------------------------------------------------

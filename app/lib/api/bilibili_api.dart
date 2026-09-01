@@ -5,6 +5,7 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import '../config.dart';
 import '../models/search_result.dart';
 import '../models/subtitle.dart';
+import '../services/secure_store.dart';
 import '../wbi/wbi_signer.dart';
 
 /// B 站业务接口错误（带业务 code）。
@@ -24,6 +25,28 @@ class BiliApiException implements Exception {
 
   @override
   String toString() => 'BiliApiException(code=$code, message=$message, path=$path)';
+}
+
+/// 搜索结果分页响应（v2.12.1+ 起）。
+///
+/// 把单页结果 + 总条数 + 是否还有下一页打包，让 UI 层不用关心 numResults
+/// 的解析与兜底逻辑。`totalCount` 为 null 表示服务端没返回命中数（少数
+/// 排序/异常场景），此时 [hasMore] 走「已装满 20 → 还有」兜底。
+class SearchPageResult {
+  /// 当前页结果列表（已清洗）。
+  final List<SearchResult> results;
+
+  /// 服务端返回的总命中数（`data.numResults`）；null = 接口未返回。
+  final int? totalCount;
+
+  /// 「是否还有下一页」。UI 层据此控制上拉加载更多触发。
+  final bool hasMore;
+
+  const SearchPageResult({
+    required this.results,
+    required this.totalCount,
+    required this.hasMore,
+  });
 }
 
 /// 播放流接口返回的解析结果。
@@ -82,7 +105,8 @@ class BiliApi {
               receiveTimeout: const Duration(seconds: 10),
               headers: biliHeaders(),
             )),
-        _storage = storage ?? const FlutterSecureStorage();
+        // vivo 等国产 ROM 兼容：显式 AndroidOptions（见 services/secure_store.dart）
+        _storage = storage ?? createSecureStorage();
 
   static const _sessdataKey = 'bili_sessdata';
   static const _biliJctKey = 'bili_jct';
@@ -321,15 +345,27 @@ class BiliApi {
   /// 带 WBI 签名 + buvid 指纹 Cookie + 完整浏览器头（复用 [._injectAuth] /
   /// [._ensureWbiKeys]，登录态存在时也会注入 SESSDATA）。
   ///
-  /// 返回单页最多 20 条结果。错误处理（UI 据此提示）：
+  /// [order] 排序方式（B 站官方枚举）：
+  /// - `totalrank` 综合（默认）
+  /// - `click` 最多播放
+  /// - `pubdate` 最新发布
+  /// - `stow` 最多收藏
+  /// - `dm` 最多弹幕（UI 不暴露，供扩展）
+  ///
+  /// 返回单页结果 + 是否还有更多 + 总条数（[SearchPageResult]）。错误处理
+  /// （UI 据此提示）：
   /// - code=-412 → 抛 [BiliApiException]「搜索接口被风控拦截，请稍后再搜」
   /// - code=-352 或其他业务码 → 抛 [BiliApiException]（带接口 message）
   /// - 网络失败（[DioException]）→ 原样上抛（UI 提示网络失败）
-  /// - code=0 但结果为空 / result 不是 List → 返回空数组（视为无结果）
+  /// - code=0 但结果为空 / result 不是 List → 返回空 [SearchPageResult]
   ///
   /// ⚠️ 搜索接口风控严格：调用方必须控制频率（输入防抖或手动搜索按钮），
-  /// 不要高频连续搜索。
-  Future<List<SearchResult>> searchVideo(String keyword, {int page = 1}) async {
+  /// 不要高频连续搜索；切排序/翻页前最好让用户确认再触发。
+  Future<SearchPageResult> searchVideo(
+    String keyword, {
+    int page = 1,
+    String order = 'totalrank',
+  }) async {
     await _injectAuth();
     final (imgKey, subKey) = await _ensureWbiKeys();
     final params = WbiSigner.encodeWbi(
@@ -338,11 +374,12 @@ class BiliApi {
         'keyword': keyword,
         'page': '$page',
         'page_size': '20',
+        'order': order,
       },
       imgKey: imgKey,
       subKey: subKey,
     );
-    debugPrint('[bili_api] searchVideo keyword=$keyword page=$page');
+    debugPrint('[bili_api] searchVideo keyword=$keyword page=$page order=$order');
     final resp = await _dio.get<Map<String, dynamic>>(
       '/x/web-interface/wbi/search/type',
       queryParameters: params,
@@ -364,13 +401,41 @@ class BiliApi {
       );
     }
     final d = data?['data'] as Map<String, dynamic>?;
+    // 总条数：B 站返回 data.numResults（命中数；为 null 时视为「未知」，
+    // UI 层用「已加载 ≥ 20」兜底判断 hasMore，避免误判「没结果就结束」）。
+    final totalRaw = d?['numResults'];
+    final totalCount = (totalRaw is num) ? totalRaw.toInt() : null;
     final raw = d?['result'];
-    if (raw is! List) return const [];
-    return raw
+    if (raw is! List) {
+      return SearchPageResult(
+        results: const [],
+        totalCount: totalCount,
+        hasMore: false,
+      );
+    }
+    final results = raw
         .whereType<Map<String, dynamic>>()
         .map(SearchResult.fromSearchJson)
         .where((r) => r.bvid.isNotEmpty)
         .toList();
+    return SearchPageResult(
+      results: results,
+      totalCount: totalCount,
+      hasMore: _computeHasMore(loaded: results.length, totalCount: totalCount),
+    );
+  }
+
+  /// 「是否还有下一页」判断。
+  ///
+  /// 优先用 B 站返回的 [totalCount]（data.numResults）—— 服务端命中数，最准；
+  /// 若接口未返回（少数场景），回退到「本页装满 20 条就认为还有」——
+  /// 此兜底会多请求一次空页，但绝不会「明明有结果却提前停」。
+  static bool _computeHasMore({required int loaded, int? totalCount}) {
+    if (totalCount != null && totalCount >= 0) {
+      // totalCount 是「累计命中数」，已加载累计长度 < 命中数 → 还有更多
+      return loaded < totalCount;
+    }
+    return loaded >= 20;
   }
 
   /// 播放流（playurl 接口，带 WBI 签名），返回解析后的流地址。

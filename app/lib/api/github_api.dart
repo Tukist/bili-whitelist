@@ -11,6 +11,7 @@ import 'package:dio/dio.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import '../models/whitelist_video.dart';
+import '../services/secure_store.dart';
 
 /// GitHub 写操作/配置错误：message 可直接展示给用户。
 class GithubApiException implements Exception {
@@ -42,7 +43,8 @@ class GithubApi {
               receiveTimeout: const Duration(seconds: 15),
               headers: {'Accept': 'application/vnd.github+json'},
             )),
-        _storage = storage ?? const FlutterSecureStorage();
+        // vivo 等国产 ROM 兼容：显式 AndroidOptions（见 services/secure_store.dart）
+        _storage = storage ?? createSecureStorage();
 
   // --- 配置读写（仅本机 secure storage，不上传任何地方） ---
 

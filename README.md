@@ -374,6 +374,7 @@ python whitelist.py list
 - **Gist 公开 raw 有 CDN 缓存**：App 已用实时 API 规避，但极端情况仍可能读到旧数据
 - **B 站接口可能随时变化**：WBI 签名、playurl 风控策略都在演进，接口变更时需跟随 `probe.md` 的实测方法重新适配
 - App 仅支持 Android（iOS 未做）；播放依赖 B 站接口返回的 DASH 流可用性
+- **国产 ROM 兼容加固（v2.12.1+）**：`flutter_secure_storage` 9.x 默认走 Jetpack Security（Tink + Keystore）加密，与 vivo OriginOS、小米 MIUI、华为 EMUI 等深度定制 ROM 的 Keystore 实现不完全兼容（写入/读取会抛 `PlatformException`，表现为「登录态保存失败」「GitHub 配置保存失败」）。App 已显式切到插件自研 Keystore 加密（`encryptedSharedPreferences=false` + `resetOnError=true`，见 `app/lib/services/secure_store.dart`）。**如仍有问题请反馈设备型号 + Android 版本 + 系统 ROM 版本号**，但一般 v2.12.1+ 应可直接保存登录态与 GitHub 配置
 
 ---
 

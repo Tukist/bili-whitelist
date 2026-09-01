@@ -1,6 +1,8 @@
 // BiliApi.searchVideo 单元测试（mock dio）：
-// - 请求参数构造正确（WBI 签名参数 + search_type/keyword/page/page_size）
+// - 请求参数构造正确（WBI 签名参数 + search_type/keyword/page/page_size/order）
 // - 结果解析（清洗 title / 补全 cover / 时长 / 播放量）
+// - SearchPageResult 字段：results / totalCount / hasMore
+// - hasMore 两条判断路径：numResults 已知 / 未知（装满 20 兜底）
 // - 错误处理：-412 风控、-352 限流、空结果、网络失败
 // 不访问真实网络。
 import 'dart:convert';
@@ -109,23 +111,35 @@ Map<String, dynamic> _navBody() => {
       },
     };
 
-Map<String, dynamic> _searchBody({int code = 0, List? result}) => {
+Map<String, dynamic> _searchBody({
+  int code = 0,
+  List? result,
+  int? numResults,
+}) =>
+    {
       'code': code,
       'message': code == 0 ? 'OK' : '业务错误',
       'data': {
         'seid': 'x',
+        if (numResults != null) 'numResults': numResults,
         'result': result ?? <Map<String, dynamic>>[],
       },
     };
 
-Map<String, dynamic> _oneResult({Object play = 179906}) => {
-      'bvid': 'BV1g5411J7Lh',
-      'title': '旅人の唄 - <em class="keyword">无职转生</em> OP',
+Map<String, dynamic> _oneResult({
+  Object play = 179906,
+  String bvid = 'BV1g5411J7Lh',
+  String title = '旅人の唄 - <em class="keyword">无职转生</em> OP',
+  int pubdate = 1611978055,
+}) =>
+    {
+      'bvid': bvid,
+      'title': title,
       'pic': '//i0.hdslb.com/bfs/archive/a.jpg',
       'author': 'Zyglisfer',
       'duration': '4:45',
       'play': play,
-      'pubdate': 1611978055,
+      'pubdate': pubdate,
     };
 
 void main() {
@@ -136,7 +150,8 @@ void main() {
     _mockSecureStorage();
   });
 
-  test('搜索请求参数构造正确（WBI 签名 + 搜索参数）且结果解析清洗', () async {
+  test('搜索请求参数构造正确（WBI 签名 + 搜索参数 + 默认 order=totalrank）'
+      '且结果解析清洗', () async {
     final adapter = _RoutingAdapter({
       '/x/frontend/finger/spi': _spiBody,
       '/x/web-interface/nav': _navBody,
@@ -145,7 +160,7 @@ void main() {
     });
     final api = _api(adapter);
 
-    final results = await api.searchVideo('无职转生');
+    final page = await api.searchVideo('无职转生');
 
     // 请求参数断言
     final req = adapter.requests
@@ -154,13 +169,14 @@ void main() {
     expect(req.queryParameters['keyword'], '无职转生');
     expect(req.queryParameters['page'], '1');
     expect(req.queryParameters['page_size'], '20');
+    expect(req.queryParameters['order'], 'totalrank');
     expect(req.queryParameters['w_rid'], isNotEmpty);
     expect(req.queryParameters['wts'], isNotEmpty);
     expect(req.queryParameters['dm_img_list'], '[]');
 
-    // 结果解析断言
-    expect(results, hasLength(2));
-    final first = results.first;
+    // 结果解析断言（v2.12.1+ 返回 SearchPageResult）
+    expect(page.results, hasLength(2));
+    final first = page.results.first;
     expect(first.bvid, 'BV1g5411J7Lh');
     expect(first.title, '旅人の唄 - 无职转生 OP');
     expect(first.cover, 'https://i0.hdslb.com/bfs/archive/a.jpg');
@@ -169,7 +185,75 @@ void main() {
     expect(first.playCount, 179906);
     expect(first.pubDate, 1611978055);
     // 字符串播放量 "12.3万" → 123000
-    expect(results[1].playCount, 123000);
+    expect(page.results[1].playCount, 123000);
+    // 接口未返回 numResults → totalCount 为 null、hasMore 走「装满 20」兜底
+    expect(page.totalCount, isNull);
+    expect(page.hasMore, isFalse); // 仅 2 条 < 20
+  });
+
+  test('order 参数透传（click/pubdate/stow）', () async {
+    for (final order in ['click', 'pubdate', 'stow']) {
+      final adapter = _RoutingAdapter({
+        '/x/frontend/finger/spi': _spiBody,
+        '/x/web-interface/nav': _navBody,
+        '/x/web-interface/wbi/search/type': () => _searchBody(result: []),
+      });
+      await _api(adapter).searchVideo('test', order: order);
+      final req = adapter.requests
+          .lastWhere((r) => r.path == '/x/web-interface/wbi/search/type');
+      expect(req.queryParameters['order'], order, reason: 'order=$order 透传');
+    }
+  });
+
+  test('hasMore：numResults 已知且 loaded < total → hasMore=true', () async {
+    final results = List.generate(20, (i) => _oneResult(bvid: 'BVpage1_$i'));
+    final adapter = _RoutingAdapter({
+      '/x/frontend/finger/spi': _spiBody,
+      '/x/web-interface/nav': _navBody,
+      '/x/web-interface/wbi/search/type': () => _searchBody(
+          result: results, numResults: 85),
+    });
+    final page = await _api(adapter).searchVideo('k');
+    expect(page.results, hasLength(20));
+    expect(page.totalCount, 85);
+    expect(page.hasMore, isTrue);
+  });
+
+  test('hasMore：numResults 已知且 loaded == total → hasMore=false', () async {
+    final results = List.generate(10, (i) => _oneResult(bvid: 'BVonly_$i'));
+    final adapter = _RoutingAdapter({
+      '/x/frontend/finger/spi': _spiBody,
+      '/x/web-interface/nav': _navBody,
+      '/x/web-interface/wbi/search/type': () => _searchBody(
+          result: results, numResults: 10),
+    });
+    final page = await _api(adapter).searchVideo('k');
+    expect(page.totalCount, 10);
+    expect(page.hasMore, isFalse);
+  });
+
+  test('hasMore：numResults 未知 + 装满 20 条 → hasMore=true（兜底）', () async {
+    final results = List.generate(20, (i) => _oneResult(bvid: 'BVfull_$i'));
+    final adapter = _RoutingAdapter({
+      '/x/frontend/finger/spi': _spiBody,
+      '/x/web-interface/nav': _navBody,
+      '/x/web-interface/wbi/search/type': () => _searchBody(result: results),
+    });
+    final page = await _api(adapter).searchVideo('k');
+    expect(page.totalCount, isNull);
+    expect(page.hasMore, isTrue); // 兜底：本页满 20 条 → 还有更多
+  });
+
+  test('hasMore：numResults 未知 + 仅 5 条 → hasMore=false（兜底）', () async {
+    final results = List.generate(5, (i) => _oneResult(bvid: 'BVfew_$i'));
+    final adapter = _RoutingAdapter({
+      '/x/frontend/finger/spi': _spiBody,
+      '/x/web-interface/nav': _navBody,
+      '/x/web-interface/wbi/search/type': () => _searchBody(result: results),
+    });
+    final page = await _api(adapter).searchVideo('k');
+    expect(page.totalCount, isNull);
+    expect(page.hasMore, isFalse);
   });
 
   test('-412 → 抛风控异常（提示稍后再搜）', () async {
@@ -200,16 +284,19 @@ void main() {
     );
   });
 
-  test('code=0 但 result 为空数组 → 返回空列表（无结果）', () async {
+  test('code=0 但 result 为空数组 → 返回空 SearchPageResult', () async {
     final adapter = _RoutingAdapter({
       '/x/frontend/finger/spi': _spiBody,
       '/x/web-interface/nav': _navBody,
       '/x/web-interface/wbi/search/type': () => _searchBody(result: []),
     });
-    expect(await _api(adapter).searchVideo('不存在的关键词'), isEmpty);
+    final page = await _api(adapter).searchVideo('不存在的关键词');
+    expect(page.results, isEmpty);
+    expect(page.hasMore, isFalse);
   });
 
-  test('result 不是 List（异常结构）→ 返回空列表（不崩）', () async {
+  test('result 不是 List（异常结构）→ 返回空 SearchPageResult（不崩）',
+      () async {
     final adapter = _RoutingAdapter({
       '/x/frontend/finger/spi': _spiBody,
       '/x/web-interface/nav': _navBody,
@@ -219,7 +306,9 @@ void main() {
             'data': {'result': 'not-a-list'},
           },
     });
-    expect(await _api(adapter).searchVideo('x'), isEmpty);
+    final page = await _api(adapter).searchVideo('x');
+    expect(page.results, isEmpty);
+    expect(page.hasMore, isFalse);
   });
 
   test('网络连接失败 → 抛 DioException', () async {

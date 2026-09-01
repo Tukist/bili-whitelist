@@ -4,6 +4,12 @@
 ///
 /// 防风控：输入防抖 600ms 自动搜 + 手动搜索按钮；搜索失败分类提示
 /// （-412 风控 / -352 限流 / 网络失败），返回空数组时显示「无结果」。
+///
+/// 翻页与排序（v2.12.1）：
+/// - 排序 chip 行：综合 / 最多播放 / 最新发布 / 最多收藏；切换会取消防抖、
+///   重置分页状态并重新执行 page=1 搜索
+/// - 上拉加载更多：结果列表底部 ≤200px 触发，自动请求 page+1；按 bvid
+///   去重追加；`SearchPageResult.hasMore` 为 false 时显示「没有更多了」
 library;
 
 import 'dart:async';
@@ -19,6 +25,16 @@ import '../services/service_locator.dart';
 import '../services/whitelist_writer.dart';
 import '../widgets/cover_image.dart';
 import 'player_page.dart';
+
+/// B 站搜索排序选项（与 [BiliApi.searchVideo] order 参数对应）。
+///
+/// 显示顺序就是 chip 横排顺序；UI 只暴露前 4 个，最多弹幕未列出。
+const List<({String value, String label})> _kSearchOrders = [
+  (value: 'totalrank', label: '综合'),
+  (value: 'click', label: '最多播放'),
+  (value: 'pubdate', label: '最新发布'),
+  (value: 'stow', label: '最多收藏'),
+];
 
 /// 时长格式化（与首页列表一致）：秒 → `4:45` / `1:02:03`。
 String _fmtDuration(int seconds) {
@@ -67,6 +83,9 @@ class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateM
   /// 防抖自动搜索只在「全部 B 站」Tab 触发（白名单 Tab 是本地过滤，不耗接口）。
   late final TabController _tabCtrl;
 
+  /// 列表 ScrollController：监听上拉触底，触发加载下一页。
+  final ScrollController _scrollCtrl = ScrollController();
+
   /// 当前白名单快照：「我的白名单」Tab 的数据源 + 「已加入」判断依据。
   WhitelistData? _whitelist;
 
@@ -74,6 +93,16 @@ class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateM
   List<SearchResult>? _results;
   bool _searching = false;
   String? _searchError;
+
+  /// 翻页状态（v2.12.1+ 起）：
+  /// - [_page] 已加载到第几页（初次加载成功后置 1）
+  /// - [_hasMore] 是否还有下一页（由 [SearchPageResult.hasMore] 决定）
+  /// - [_loadingMore] 上拉加载下一页进行中，避免一次性触发多次
+  /// - [_currentOrder] 当前排序方式（默认 'totalrank' 综合）
+  int _page = 1;
+  bool _hasMore = true;
+  bool _loadingMore = false;
+  String _currentOrder = 'totalrank';
 
   /// 正在「加入」的 bvid 集合（防止连点重复提交）。
   final Set<String> _joining = {};
@@ -85,15 +114,27 @@ class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateM
   void initState() {
     super.initState();
     _tabCtrl = TabController(length: 2, vsync: this);
+    _scrollCtrl.addListener(_onScroll);
     _loadWhitelist();
   }
 
   @override
   void dispose() {
     _debounce?.cancel();
+    _scrollCtrl.removeListener(_onScroll);
+    _scrollCtrl.dispose();
     _keywordCtrl.dispose();
     _tabCtrl.dispose();
     super.dispose();
+  }
+
+  /// 滚动监听：距底部 ≤ 200px 触发加载下一页（仅「全部 B 站」Tab）。
+  void _onScroll() {
+    if (!_scrollCtrl.hasClients) return;
+    final pos = _scrollCtrl.position;
+    if (pos.pixels >= pos.maxScrollExtent - 200) {
+      _loadMore();
+    }
   }
 
   /// 加载白名单快照（与首页同一套同步逻辑：Gist → LAN → 本地文件 → 缓存）。
@@ -123,11 +164,20 @@ class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateM
         _results = null;
         _searchError = null;
         _searching = false;
+        _page = 1;
+        _hasMore = true;
+        _loadingMore = false;
       });
       return;
     }
     // 「我的白名单」Tab 只做本地过滤，不消耗搜索接口额度
     if (_tabCtrl.index != 0) return;
+    // 新关键词 → 重置翻页状态再触发防抖搜索
+    setState(() {
+      _page = 1;
+      _hasMore = true;
+      _loadingMore = false;
+    });
     _debounce = Timer(const Duration(milliseconds: 600), _doSearch);
   }
 
@@ -140,18 +190,25 @@ class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateM
         _results = null;
         _searchError = null;
         _searching = false;
+        _page = 1;
+        _hasMore = true;
+        _loadingMore = false;
       });
       return;
     }
     setState(() {
       _searching = true;
       _searchError = null;
+      _page = 1;
+      _hasMore = true;
+      _loadingMore = false;
     });
     try {
-      final results = await _api.searchVideo(keyword);
+      final page = await _api.searchVideo(keyword, order: _currentOrder);
       if (!mounted) return;
       setState(() {
-        _results = results;
+        _results = page.results;
+        _hasMore = page.hasMore;
         _searching = false;
       });
     } on BiliApiException catch (e) {
@@ -168,6 +225,63 @@ class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateM
         _searching = false;
         _searchError = '网络请求失败，请检查网络后重试';
       });
+    }
+  }
+
+  /// 切换排序 chip：取消防抖、重置翻页状态，从 page=1 重查。
+  void _switchOrder(String newOrder) {
+    if (newOrder == _currentOrder) return;
+    _debounce?.cancel();
+    setState(() {
+      _currentOrder = newOrder;
+      _results = null;
+      _page = 1;
+      _hasMore = true;
+      _loadingMore = false;
+      _searchError = null;
+    });
+    _doSearch();
+  }
+
+  /// 上拉加载下一页：守卫严格（搜索中/已在加载/已无更多/关键词为空都直接
+  /// return）；失败 SnackBar 提示且不前进 [_page]，保持当前页可重试。
+  Future<void> _loadMore() async {
+    if (_searching || _loadingMore || !_hasMore) return;
+    final base = _results;
+    if (base == null) return;
+    final keyword = _keywordCtrl.text.trim();
+    if (keyword.isEmpty) return;
+    setState(() => _loadingMore = true);
+    final nextPage = _page + 1;
+    try {
+      final page = await _api.searchVideo(
+        keyword,
+        page: nextPage,
+        order: _currentOrder,
+      );
+      if (!mounted) return;
+      // 按 bvid 去重追加（理论上一页 20 条、下一页 20 条不会撞，但切排序/
+      // 接口偶发重排时去重更稳）
+      final existing = base.map((r) => r.bvid).toSet();
+      final appended = <SearchResult>[
+        ...base,
+        for (final r in page.results)
+          if (!existing.contains(r.bvid)) r,
+      ];
+      setState(() {
+        _results = appended;
+        _page = nextPage;
+        _hasMore = page.hasMore;
+        _loadingMore = false;
+      });
+    } on BiliApiException catch (e) {
+      if (!mounted) return;
+      setState(() => _loadingMore = false);
+      _showSnack('加载失败：${e.message}，点击重试');
+    } on DioException {
+      if (!mounted) return;
+      setState(() => _loadingMore = false);
+      _showSnack('网络请求失败，请检查网络后重试');
     }
   }
 
@@ -273,6 +387,41 @@ class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateM
   // ---- 「全部 B 站」Tab ----
 
   Widget _buildGlobalTab() {
+    return Column(
+      children: [
+        _buildOrderBar(),
+        const Divider(height: 1),
+        Expanded(child: _buildGlobalResults()),
+      ],
+    );
+  }
+
+  /// 排序 chip 横行（综合/最多播放/最新发布/最多收藏）。
+  ///
+  /// 切 chip 即触发重查；不允许在搜索进行中禁用 chip——切到不同排序会
+  /// 取消搜索行为下重排，避免用户对「点了没反应」困惑。
+  Widget _buildOrderBar() {
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+      child: Row(
+        children: [
+          for (final o in _kSearchOrders) ...[
+            ChoiceChip(
+              label: Text(o.label),
+              selected: _currentOrder == o.value,
+              onSelected: (sel) {
+                if (sel) _switchOrder(o.value);
+              },
+            ),
+            const SizedBox(width: 6),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildGlobalResults() {
     if (_searching) {
       return const Center(child: CircularProgressIndicator());
     }
@@ -299,11 +448,51 @@ class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateM
       );
     }
     final theme = Theme.of(context);
+    final showLoadingMore = _loadingMore;
+    final showNoMore = !_hasMore && !showLoadingMore;
+    // 列表项 + 底部状态（加载中 / 没有更多了）
+    final extraSlots = (showLoadingMore || showNoMore) ? 1 : 0;
     return ListView.separated(
-      itemCount: results.length,
+      controller: _scrollCtrl,
+      itemCount: results.length + extraSlots,
       separatorBuilder: (_, __) => const Divider(height: 1, indent: 112),
-      itemBuilder: (context, i) => _buildResultTile(theme, results[i]),
+      itemBuilder: (context, i) {
+        if (i >= results.length) {
+          return _buildBottomStatus(showLoadingMore, showNoMore);
+        }
+        return _buildResultTile(theme, results[i]);
+      },
     );
+  }
+
+  /// 列表底部状态：加载中 / 没有更多了。
+  Widget _buildBottomStatus(bool showLoadingMore, bool showNoMore) {
+    if (showLoadingMore) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 16),
+        child: Center(
+          child: SizedBox(
+            width: 18,
+            height: 18,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+        ),
+      );
+    }
+    if (showNoMore) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 16),
+        child: Center(
+          child: Text(
+            '没有更多了',
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: Theme.of(context).colorScheme.outline,
+                ),
+          ),
+        ),
+      );
+    }
+    return const SizedBox.shrink();
   }
 
   Widget _buildResultTile(ThemeData theme, SearchResult r) {

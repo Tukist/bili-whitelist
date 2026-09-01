@@ -1,6 +1,12 @@
 // SearchResult 模型单元测试：标题清洗 / 封面补全 / 时长解析 / 播放量解析 / 整条解析。
+//
+// 顺带覆盖 SearchPageResult 字段契约（v2.12.1+ 引入）：
+// - results / totalCount / hasMore 三字段语义；
+// - hasMore 的两条判断路径（numResults 已知 / 未知）由 search_api_test
+//   走真实 mock adapter 验证；本文件只做模型层 shape 断言。
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:bili_whitelist_app/api/bilibili_api.dart';
 import 'package:bili_whitelist_app/models/search_result.dart';
 
 void main() {
@@ -76,6 +82,29 @@ void main() {
       expect(r.durationSec, 0);
       expect(r.playCount, 0);
       expect(r.pubDate, 0);
+    });
+  });
+
+  group('SearchPageResult', () {
+    test('构造：results / totalCount / hasMore 字段透传', () {
+      const page = SearchPageResult(
+        results: [],
+        totalCount: 100,
+        hasMore: true,
+      );
+      expect(page.results, isEmpty);
+      expect(page.totalCount, 100);
+      expect(page.hasMore, isTrue);
+    });
+
+    test('totalCount 为 null 表示「未知命中数」（hasMore 由调用方判定）', () {
+      const page = SearchPageResult(
+        results: [],
+        totalCount: null,
+        hasMore: false,
+      );
+      expect(page.totalCount, isNull);
+      expect(page.hasMore, isFalse);
     });
   });
 }
