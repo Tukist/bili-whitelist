@@ -37,7 +37,9 @@ class _FakeAdapter implements HttpClientAdapter {
     return ResponseBody.fromString(
       jsonEncode(body),
       statusCode,
-      headers: const {'content-type': ['application/json']},
+      headers: const {
+        'content-type': ['application/json'],
+      },
     );
   }
 
@@ -76,7 +78,7 @@ void main() {
       expect(info.sha256, 'abcdef');
     });
 
-    test('404 → 抛 UpdateException(尚未发版)', () async {
+    test('404 → 抛 UpdateException(没有可用更新/仓库不可访问)', () async {
       final dio = Dio();
       dio.httpClientAdapter = _FakeAdapter(statusCode: 404, body: {});
       final svc = _svc(dio: dio, storage: UpdateStorage(await _memPrefs()));
@@ -86,7 +88,7 @@ void main() {
           isA<UpdateException>().having(
             (e) => e.message,
             'message',
-            contains('尚未发版'),
+            allOf(contains('没有可用更新'), contains('仓库当前不可访问')),
           ),
         ),
       );
@@ -112,16 +114,10 @@ void main() {
       final dio = Dio();
       dio.httpClientAdapter = _FakeAdapter(
         statusCode: 200,
-        body: {
-          'tag_name': 'v2.14.0+26',
-          'assets': [],
-        },
+        body: {'tag_name': 'v2.14.0+26', 'assets': []},
       );
       final svc = _svc(dio: dio, storage: UpdateStorage(await _memPrefs()));
-      expect(
-        () => svc.fetchLatest(),
-        throwsA(isA<UpdateException>()),
-      );
+      expect(() => svc.fetchLatest(), throwsA(isA<UpdateException>()));
     });
 
     test('请求 header 含 User-Agent / Accept', () async {

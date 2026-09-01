@@ -26,7 +26,8 @@ class BiliApiException implements Exception {
   });
 
   @override
-  String toString() => 'BiliApiException(code=$code, message=$message, path=$path)';
+  String toString() =>
+      'BiliApiException(code=$code, message=$message, path=$path)';
 }
 
 /// 搜索结果分页响应（v2.12.1+ 起）。
@@ -150,15 +151,18 @@ class BiliApi {
   final Map<String, List<SubtitleCue>> _subtitleCache = {};
 
   BiliApi({Dio? dio, FlutterSecureStorage? storage})
-      : _dio = dio ??
-            Dio(BaseOptions(
+    : _dio =
+          dio ??
+          Dio(
+            BaseOptions(
               baseUrl: kBiliApi,
               connectTimeout: const Duration(seconds: 10),
               receiveTimeout: const Duration(seconds: 10),
               headers: biliHeaders(),
-            )),
-        // vivo 等国产 ROM 兼容：显式 AndroidOptions（见 services/secure_store.dart）
-        _storage = storage ?? createSecureStorage();
+            ),
+          ),
+      // vivo 等国产 ROM 兼容：显式 AndroidOptions（见 services/secure_store.dart）
+      _storage = storage ?? createSecureStorage();
 
   static const _sessdataKey = 'bili_sessdata';
   static const _biliJctKey = 'bili_jct';
@@ -305,8 +309,9 @@ class BiliApi {
   Future<void> _ensureBuvid() async {
     if (_buvid3 != null) return;
     try {
-      final resp =
-          await _dio.get<Map<String, dynamic>>('/x/frontend/finger/spi');
+      final resp = await _dio.get<Map<String, dynamic>>(
+        '/x/frontend/finger/spi',
+      );
       final d = resp.data?['data'] as Map<String, dynamic>? ?? {};
       final b3 = d['b_3'] as String?;
       final b4 = d['b_4'] as String?;
@@ -327,7 +332,8 @@ class BiliApi {
     await _injectAuth();
     final resp = await _dio.get<Map<String, dynamic>>('/x/web-interface/nav');
     final data = resp.data;
-    final wbiImg = (data?['data'] as Map<String, dynamic>?)?['wbi_img']
+    final wbiImg =
+        (data?['data'] as Map<String, dynamic>?)?['wbi_img']
             as Map<String, dynamic>? ??
         {};
     final imgKey = WbiSigner.getKeyFromUrl(wbiImg['img_url'] as String? ?? '');
@@ -364,9 +370,10 @@ class BiliApi {
       withDm: true,
     );
     for (var attempt = 0; attempt < 2; attempt++) {
-      final resp =
-          await _dio.get<Map<String, dynamic>>('/x/web-interface/view',
-              queryParameters: params);
+      final resp = await _dio.get<Map<String, dynamic>>(
+        '/x/web-interface/view',
+        queryParameters: params,
+      );
       final data = resp.data;
       final code = data?['code'] as int?;
       if (code == -412 && attempt == 0) {
@@ -384,8 +391,9 @@ class BiliApi {
       final info = data?['data'] as Map<String, dynamic>?;
       if (info == null) {
         throw DioException(
-            requestOptions: resp.requestOptions,
-            message: 'view 接口未返回数据（$bvid）');
+          requestOptions: resp.requestOptions,
+          message: 'view 接口未返回数据（$bvid）',
+        );
       }
       return info;
     }
@@ -431,7 +439,9 @@ class BiliApi {
       imgKey: imgKey,
       subKey: subKey,
     );
-    debugPrint('[bili_api] searchVideo keyword=$keyword page=$page order=$order');
+    debugPrint(
+      '[bili_api] searchVideo keyword=$keyword page=$page order=$order',
+    );
     final resp = await _dio.get<Map<String, dynamic>>(
       '/x/web-interface/wbi/search/type',
       queryParameters: params,
@@ -518,11 +528,14 @@ class BiliApi {
       subKey: subKey,
       withDm: true,
     );
-    debugPrint('[bili_api] fetchPlayUrl bvid=$bvid cid=$cid qn=$qn fnval=$fnval');
+    debugPrint(
+      '[bili_api] fetchPlayUrl bvid=$bvid cid=$cid qn=$qn fnval=$fnval',
+    );
     for (var attempt = 0; attempt < 2; attempt++) {
       final resp = await _dio.get<Map<String, dynamic>>(
-          '/x/player/wbi/playurl',
-          queryParameters: params);
+        '/x/player/wbi/playurl',
+        queryParameters: params,
+      );
       final data = resp.data;
       final code = data?['code'] as int?;
       if (code == -412 && attempt == 0) {
@@ -540,8 +553,10 @@ class BiliApi {
       // B 站软风控/限流特征：code=0 但 data 只带 v_voucher（或整体为空），
       // 没有任何 dash/durl 流。不识别的话 App 会误报「视频不可播放」。
       if (d.containsKey('v_voucher') || d.isEmpty) {
-        debugPrint('[bili_api] fetchPlayUrl 风控空响应 data=$d '
-            '(bvid=$bvid fnval=$fnval)');
+        debugPrint(
+          '[bili_api] fetchPlayUrl 风控空响应 data=$d '
+          '(bvid=$bvid fnval=$fnval)',
+        );
         throw BiliApiException(
           code: -352,
           message: '接口被限流，请稍后重试',
@@ -570,9 +585,11 @@ class BiliApi {
           if (url != null && url.isNotEmpty) audioUrls.add(url);
         }
       }
-      debugPrint('[bili_api] fetchPlayUrl fnval=$fnval ok: quality=$quality '
-          'dashV=${videoUrls.length} dashA=${audioUrls.length} '
-          'mp4=${mp4Url != null} (bvid=$bvid)');
+      debugPrint(
+        '[bili_api] fetchPlayUrl fnval=$fnval ok: quality=$quality '
+        'dashV=${videoUrls.length} dashA=${audioUrls.length} '
+        'mp4=${mp4Url != null} (bvid=$bvid)',
+      );
       return PlayUrlResult(
         quality: quality,
         mp4Url: mp4Url,
@@ -651,9 +668,11 @@ class BiliApi {
           .map(SubtitleTrack.fromJson)
           .where((t) => t.lan.isNotEmpty && t.subtitleUrl.isNotEmpty)
           .toList();
-      debugPrint('[bili_api] fetchSubtitles ok: ${tracks.length} tracks '
-          '${tracks.map((t) => '${t.lan}:${t.lanDoc}').join(', ')} '
-          '(bvid=$bvid)');
+      debugPrint(
+        '[bili_api] fetchSubtitles ok: ${tracks.length} tracks '
+        '${tracks.map((t) => '${t.lan}:${t.lanDoc}').join(', ')} '
+        '(bvid=$bvid)',
+      );
       return tracks;
     }
     throw StateError('字幕接口重试后仍失败（$bvid/$cid）');
@@ -689,7 +708,9 @@ class BiliApi {
     );
     final text = resp.data ?? '';
     final cues = parseSubtitleCues(text);
-    debugPrint('[bili_api] downloadSubtitle lan=${track.lan} cues=${cues.length}');
+    debugPrint(
+      '[bili_api] downloadSubtitle lan=${track.lan} cues=${cues.length}',
+    );
     _subtitleCache[key] = cues;
     return cues;
   }
@@ -804,10 +825,11 @@ class BiliApi {
     );
   }
 
-  /// UP 主投稿视频列表（`x/space/wbi/arc/search?mid=&pn=&ps=&order=`）。
+  /// UP 主投稿视频列表（`x/space/wbi/arc/search?mid=&pn=&ps=&order=&keyword=`）。
   ///
   /// - [order] 排序方式（与 [searchVideo] 同套枚举）：
   ///   `pubdate` 最新发布（默认）/ `click` 最多播放 / `stow` 最多收藏
+  /// - [keyword] 只在当前 UP 主投稿内搜索；空串表示不过滤
   /// - 返回的 [WhitelistVideo] 用 `addedAt = 当前时间`、`collection = ''`、
   ///   `order = 0`，**不写 Gist**（UP 主视频不入库，仅供点播用）
   /// - 缺 cid 时填 0：播放页 [PlayerPage] 会用 view 接口补 cid
@@ -817,20 +839,25 @@ class BiliApi {
     int pn = 1,
     int ps = 20,
     String order = 'pubdate',
+    String keyword = '',
   }) async {
     await _injectAuth();
     final (imgKey, subKey) = await _ensureWbiKeys();
+    final cleanKeyword = keyword.trim();
     final params = WbiSigner.encodeWbi(
       {
         'mid': '$mid',
         'pn': '$pn',
         'ps': '$ps',
         'order': order,
+        if (cleanKeyword.isNotEmpty) 'keyword': cleanKeyword,
       },
       imgKey: imgKey,
       subKey: subKey,
     );
-    debugPrint('[bili_api] fetchUpownerVideos mid=$mid pn=$pn ps=$ps order=$order');
+    debugPrint(
+      '[bili_api] fetchUpownerVideos mid=$mid pn=$pn ps=$ps order=$order keyword=$cleanKeyword',
+    );
     final resp = await _dio.get<Map<String, dynamic>>(
       '/x/space/wbi/arc/search',
       queryParameters: params,
@@ -892,9 +919,9 @@ class BiliApi {
     final secs = _parseLength(length);
     final created = (j['created'] as num?)?.toInt() ?? 0;
     final addedAt = created > 0
-        ? DateTime.fromMillisecondsSinceEpoch(created * 1000)
-            .toUtc()
-            .toIso8601String()
+        ? DateTime.fromMillisecondsSinceEpoch(
+            created * 1000,
+          ).toUtc().toIso8601String()
         : DateTime.now().toUtc().toIso8601String();
     return WhitelistVideo(
       bvid: j['bvid'] as String? ?? '',

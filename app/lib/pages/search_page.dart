@@ -77,13 +77,16 @@ String _fmtPubDate(int unixSec) {
 }
 
 class SearchPage extends StatefulWidget {
-  const SearchPage({super.key});
+  final int initialTab;
+
+  const SearchPage({super.key, this.initialTab = 0});
 
   @override
   State<SearchPage> createState() => _SearchPageState();
 }
 
-class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateMixin {
+class _SearchPageState extends State<SearchPage>
+    with SingleTickerProviderStateMixin {
   final TextEditingController _keywordCtrl = TextEditingController();
   final BiliApi _api = BiliApi();
   final WhitelistWriter _writer = WhitelistWriter();
@@ -138,7 +141,9 @@ class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateM
   @override
   void initState() {
     super.initState();
-    _tabCtrl = TabController(length: 3, vsync: this);
+    final initial = widget.initialTab.clamp(0, 2);
+    _tabCtrl = TabController(length: 3, vsync: this, initialIndex: initial);
+    _lastTabIndex = initial;
     _tabCtrl.addListener(_onTabChanged);
     _scrollCtrl.addListener(_onScroll);
     _loadWhitelist();
@@ -496,9 +501,11 @@ class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateM
     final q = _keywordCtrl.text.trim().toLowerCase();
     if (q.isEmpty) return videos;
     return videos
-        .where((v) =>
-            v.title.toLowerCase().contains(q) ||
-            v.upName.toLowerCase().contains(q))
+        .where(
+          (v) =>
+              v.title.toLowerCase().contains(q) ||
+              v.upName.toLowerCase().contains(q),
+        )
         .toList();
   }
 
@@ -547,11 +554,7 @@ class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateM
       ),
       body: TabBarView(
         controller: _tabCtrl,
-        children: [
-          _buildGlobalTab(),
-          _buildWhitelistTab(),
-          _buildUpownerTab(),
-        ],
+        children: [_buildGlobalTab(), _buildWhitelistTab(), _buildUpownerTab()],
       ),
     );
   }
@@ -609,7 +612,8 @@ class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateM
     if (results == null) {
       return const _MessageView(
         icon: Icons.search,
-        message: '输入关键词，搜索 B 站全网视频\n'
+        message:
+            '输入关键词，搜索 B 站全网视频\n'
             '结果可一键加入白名单（加入前会查重）',
       );
     }
@@ -658,8 +662,8 @@ class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateM
           child: Text(
             '没有更多了',
             style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: Theme.of(context).colorScheme.outline,
-                ),
+              color: Theme.of(context).colorScheme.outline,
+            ),
           ),
         ),
       );
@@ -688,22 +692,21 @@ class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateM
             '${r.author} · ${_fmtDuration(r.durationSec)}',
             maxLines: 1,
             overflow: TextOverflow.ellipsis,
-            style: theme.textTheme.bodySmall
-                ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
           ),
           Text(
             '${_fmtPlay(r.playCount)} 播放 · ${_fmtPubDate(r.pubDate)}',
             maxLines: 1,
-            style: theme.textTheme.bodySmall
-                ?.copyWith(color: theme.colorScheme.outline),
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: theme.colorScheme.outline,
+            ),
           ),
         ],
       ),
       trailing: added
-          ? const FilledButton.tonal(
-              onPressed: null,
-              child: Text('已加入'),
-            )
+          ? const FilledButton.tonal(onPressed: null, child: Text('已加入'))
           : FilledButton(
               onPressed: joining ? null : () => _join(r),
               child: joining
@@ -752,13 +755,14 @@ class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateM
           ),
           subtitle: Text(
             '${_fmtDuration(v.duration)} · ${v.upName}',
-            style: theme.textTheme.bodySmall
-                ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
           ),
           onTap: () {
-            Navigator.of(context).push(MaterialPageRoute<void>(
-              builder: (_) => PlayerPage(video: v),
-            ));
+            Navigator.of(context).push(
+              MaterialPageRoute<void>(builder: (_) => PlayerPage(video: v)),
+            );
           },
         );
       },
@@ -787,7 +791,8 @@ class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateM
     if (results == null) {
       return const _MessageView(
         icon: Icons.person_search,
-        message: '输入 UP 主昵称，搜索 B 站用户\n'
+        message:
+            '输入 UP 主昵称，搜索 B 站用户\n'
             '结果可一键加入白名单（加入前会查重）',
       );
     }
@@ -816,13 +821,15 @@ class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateM
           onJoin: () => _joinUpowner(up),
           onTap: () {
             // 跳 UP 主详情页（v2.13.0+）：展示 UP 主信息 + 视频列表
-            Navigator.of(context).push(MaterialPageRoute<void>(
-              builder: (_) => UpownerPage(
-                mid: up.mid,
-                initial: up,
-                isInWhitelist: _isUpownerAdded(up.mid),
+            Navigator.of(context).push(
+              MaterialPageRoute<void>(
+                builder: (_) => UpownerPage(
+                  mid: up.mid,
+                  initial: up,
+                  isInWhitelist: _isUpownerAdded(up.mid),
+                ),
               ),
-            ));
+            );
           },
         );
       },
@@ -850,8 +857,8 @@ class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateM
           child: Text(
             '没有更多了',
             style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: Theme.of(context).colorScheme.outline,
-                ),
+              color: Theme.of(context).colorScheme.outline,
+            ),
           ),
         ),
       );
@@ -888,16 +895,14 @@ class _MessageView extends StatelessWidget {
             child: Text(
               message,
               textAlign: TextAlign.center,
-              style: theme.textTheme.bodyMedium
-                  ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+              style: theme.textTheme.bodyMedium?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
             ),
           ),
           if (actionLabel != null && onAction != null) ...[
             const SizedBox(height: 16),
-            FilledButton.tonal(
-              onPressed: onAction,
-              child: Text(actionLabel!),
-            ),
+            FilledButton.tonal(onPressed: onAction, child: Text(actionLabel!)),
           ],
         ],
       ),

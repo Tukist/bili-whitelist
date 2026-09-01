@@ -35,8 +35,8 @@ class UpdateService {
   final UpdateStorage _storage;
 
   UpdateService({Dio? dio, required UpdateStorage storage})
-      : _dio = dio ?? Dio(),
-        _storage = storage;
+    : _dio = dio ?? Dio(),
+      _storage = storage;
 
   /// 拉最新 Release 元数据。失败抛 [UpdateException]。
   Future<UpdateInfo> fetchLatest() async {
@@ -129,7 +129,9 @@ class UpdateService {
     } on DioException catch (e) {
       // 半成品清理
       if (await apk.exists()) {
-        try { await apk.delete(); } catch (_) {}
+        try {
+          await apk.delete();
+        } catch (_) {}
       }
       if (CancelToken.isCancel(e)) {
         throw UpdateException('下载已取消');
@@ -137,7 +139,9 @@ class UpdateService {
       throw UpdateException(_mapDioError(e));
     } catch (e) {
       if (await apk.exists()) {
-        try { await apk.delete(); } catch (_) {}
+        try {
+          await apk.delete();
+        } catch (_) {}
       }
       throw UpdateException('下载失败：$e');
     }
@@ -155,7 +159,9 @@ class UpdateService {
         rethrow;
       } catch (e) {
         if (await apk.exists()) {
-          try { await apk.delete(); } catch (_) {}
+          try {
+            await apk.delete();
+          } catch (_) {}
         }
         throw UpdateException('APK 校验出错：$e');
       }
@@ -173,7 +179,9 @@ class UpdateService {
       case DioExceptionType.badResponse:
         final code = e.response?.statusCode;
         if (code == 403) return 'GitHub API 速率限制（403），稍后再试';
-        if (code == 404) return '版本仓库不存在或尚未发版';
+        if (code == 404) {
+          return '暂时没有可用更新：可能还没有创建 GitHub Release，或版本仓库当前不可访问';
+        }
         return '版本信息接口返回 $code';
       case DioExceptionType.cancel:
         return '请求已取消';

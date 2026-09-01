@@ -18,6 +18,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:bili_whitelist_app/api/github_api.dart';
 import 'package:bili_whitelist_app/main.dart';
+import 'package:bili_whitelist_app/models/upowner.dart';
 import 'package:bili_whitelist_app/models/whitelist_video.dart';
 import 'package:bili_whitelist_app/pages/playlist_page.dart';
 import 'package:bili_whitelist_app/services/service_locator.dart';
@@ -32,11 +33,11 @@ class _FakeSyncService extends WhitelistSyncService {
 
   @override
   Future<SyncResult> sync() async => SyncResult(
-        data: data,
-        sourceName: 'fake',
-        fetchedAt: DateTime(2026, 1, 1),
-        fromNetwork: false,
-      );
+    data: data,
+    sourceName: 'fake',
+    fetchedAt: DateTime(2026, 1, 1),
+    fromNetwork: false,
+  );
 
   @override
   Future<void> saveToCache(WhitelistData data) async {}
@@ -47,30 +48,32 @@ WhitelistVideo _video(
   String title, {
   String collection = '',
   int order = 0,
-}) =>
-    WhitelistVideo(
-      bvid: bvid,
-      cid: 100,
-      title: title,
-      cover: '',
-      duration: 90,
-      upName: 'UP主',
-      addedAt: '2026-08-01T00:00:00Z',
-      collection: collection,
-      order: order,
-    );
+}) => WhitelistVideo(
+  bvid: bvid,
+  cid: 100,
+  title: title,
+  cover: '',
+  duration: 90,
+  upName: 'UP主',
+  addedAt: '2026-08-01T00:00:00Z',
+  collection: collection,
+  order: order,
+);
 
-WhitelistData _dataWith(List<WhitelistVideo> videos,
-        {List<String> collectionNames = const []}) =>
-    WhitelistData(
-      version: 3,
-      updatedAt: '2026-08-20T00:00:00Z',
-      videos: videos,
-      collections: [
-        for (final n in collectionNames)
-          CollectionInfo(name: n, createdAt: '2026-08-01T00:00:00Z'),
-      ],
-    );
+WhitelistData _dataWith(
+  List<WhitelistVideo> videos, {
+  List<String> collectionNames = const [],
+  List<Upowner> upowners = const [],
+}) => WhitelistData(
+  version: 4,
+  updatedAt: '2026-08-20T00:00:00Z',
+  videos: videos,
+  collections: [
+    for (final n in collectionNames)
+      CollectionInfo(name: n, createdAt: '2026-08-01T00:00:00Z'),
+  ],
+  upowners: upowners,
+);
 
 // ---------------------------------------------------------------------------
 // 拖拽排序测试基建：mock secure storage 通道 + fake HttpClientAdapter，
@@ -85,28 +88,28 @@ void _mockSecureStorage() {
   const channel = MethodChannel('plugins.it_nomads.com/flutter_secure_storage');
   TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
       .setMockMethodCallHandler(channel, (call) async {
-    final args = (call.arguments as Map?) ?? const {};
-    switch (call.method) {
-      case 'read':
-        return _store[args['key'] as String?];
-      case 'write':
-        final key = args['key'] as String?;
-        if (key == null) return false;
-        final value = args['value'] as String? ?? '';
-        _store[key] = value;
-        return true;
-      case 'delete':
-        _store.remove(args['key'] as String?);
-        return true;
-      case 'readAll':
-        return Map<String, String>.from(_store);
-      case 'deleteAll':
-        _store.clear();
-        return true;
-      default:
-        return null;
-    }
-  });
+        final args = (call.arguments as Map?) ?? const {};
+        switch (call.method) {
+          case 'read':
+            return _store[args['key'] as String?];
+          case 'write':
+            final key = args['key'] as String?;
+            if (key == null) return false;
+            final value = args['value'] as String? ?? '';
+            _store[key] = value;
+            return true;
+          case 'delete':
+            _store.remove(args['key'] as String?);
+            return true;
+          case 'readAll':
+            return Map<String, String>.from(_store);
+          case 'deleteAll':
+            _store.clear();
+            return true;
+          default:
+            return null;
+        }
+      });
 }
 
 /// 固定 200 的 fake adapter：记录每次请求（含 PATCH 请求体），不触网。
@@ -114,12 +117,19 @@ class _FakeAdapter implements HttpClientAdapter {
   final List<RequestOptions> requests = [];
 
   @override
-  Future<ResponseBody> fetch(RequestOptions options,
-      Stream<Uint8List>? requestStream, Future<void>? cancelFuture) async {
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
     requests.add(options);
-    return ResponseBody.fromString('{}', 200, headers: {
-      'content-type': ['application/json; charset=utf-8'],
-    });
+    return ResponseBody.fromString(
+      '{}',
+      200,
+      headers: {
+        'content-type': ['application/json; charset=utf-8'],
+      },
+    );
   }
 
   @override
@@ -153,11 +163,7 @@ Future<({_FakeAdapter adapter, GithubApi github})> _pumpHomeWithGithub(
 /// ⚠ ReorderableListView 插入语义：moveTo(目标中心) 产生
 /// onReorder(old, 目标index) = 「插到目标前面」。要真正越位重排，
 /// 调用方需把目标选为「被拖项想要落位处后一项」（本测试选列表尾部锚点）。
-Future<void> _longPressDrag(
-  WidgetTester tester,
-  Finder from,
-  Finder to,
-) async {
+Future<void> _longPressDrag(WidgetTester tester, Finder from, Finder to) async {
   final gesture = await tester.startGesture(tester.getCenter(from));
   await tester.pump(kLongPressTimeout + const Duration(milliseconds: 100));
   await gesture.moveTo(tester.getCenter(to));
@@ -168,11 +174,7 @@ Future<void> _longPressDrag(
 /// 按住拖拽把手立即拖动（ReorderableDragStartListener 是 Immediate 识别器，
 /// 按下即拖，无需长按）：startGesture → moveTo 目标点 → 抬起。
 /// 目标点传绝对 Offset（如列表底部 = 移到末尾，确定性最强）。
-Future<void> _dragHandle(
-  WidgetTester tester,
-  Finder from,
-  Offset to,
-) async {
+Future<void> _dragHandle(WidgetTester tester, Finder from, Offset to) async {
   final gesture = await tester.startGesture(tester.getCenter(from));
   await tester.pump();
   await gesture.moveTo(to);
@@ -204,8 +206,7 @@ List<String> _savedCollectionNames(_FakeAdapter adapter) {
 Map<String, int> _savedOrders(_FakeAdapter adapter, String collection) {
   final json = _savedGistJson(adapter);
   return {
-    for (final v
-        in (json['videos'] as List).cast<Map<String, dynamic>>())
+    for (final v in (json['videos'] as List).cast<Map<String, dynamic>>())
       if (v['collection'] == collection)
         v['bvid'] as String: (v['order'] as num).toInt(),
   };
@@ -258,6 +259,32 @@ void main() {
       expect(find.text('0 个视频'), findsOneWidget);
     });
 
+    testWidgets('右滑进入白名单 UP 主管理页，显示已加入 UP 和搜索入口', (tester) async {
+      await _pumpHome(
+        tester,
+        _dataWith(
+          [_video('BV1', '视频A')],
+          upowners: [
+            Upowner(
+              mid: 100,
+              name: '测试UP主',
+              face: '',
+              fans: 12345,
+              addedAt: DateTime.utc(2026, 9, 1),
+            ),
+          ],
+        ),
+      );
+
+      await tester.drag(find.byType(PageView), const Offset(-500, 0));
+      await tester.pumpAndSettle();
+
+      expect(find.text('白名单 UP 主'), findsOneWidget);
+      expect(find.text('测试UP主'), findsOneWidget);
+      expect(find.text('搜索 UP 主'), findsOneWidget);
+      expect(find.byIcon(Icons.bookmark_remove_outlined), findsOneWidget);
+    });
+
     testWidgets('无任何视频时显示空态（白名单为空）', (tester) async {
       await _pumpHome(tester, _dataWith([], collectionNames: []));
       expect(find.textContaining('白名单为空'), findsOneWidget);
@@ -296,10 +323,7 @@ void main() {
       await _pumpHome(
         tester,
         _dataWith(
-          [
-            _video('BV1', '视频A', collection: '动画'),
-            _video('BV3', '视频C'),
-          ],
+          [_video('BV1', '视频A', collection: '动画'), _video('BV3', '视频C')],
           collectionNames: ['动画'],
         ),
       );

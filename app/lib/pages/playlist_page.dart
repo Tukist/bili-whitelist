@@ -11,6 +11,7 @@ import '../api/translate_api.dart';
 import '../cache/download_manager.dart';
 import '../config.dart';
 import '../models/update_info.dart';
+import '../models/upowner.dart';
 import '../models/whitelist_video.dart';
 import '../services/apk_installer.dart';
 import '../services/service_locator.dart';
@@ -23,6 +24,7 @@ import 'inbox_page.dart';
 import 'login_page.dart';
 import 'search_page.dart';
 import 'update_dialog.dart';
+import 'upowner_page.dart';
 
 /// 唯一首页：合集卡片视图（两级导航第一级）。
 ///
@@ -67,7 +69,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
   /// 异常（测试环境无原生通道）时回退 config.dart 的 kAppVersion。
   String _version = kAppVersion;
 
-/// 信箱未读数（顶部 AppBar 红点用；0 = 不显示红点）。
+  /// 信箱未读数（顶部 AppBar 红点用；0 = 不显示红点）。
   int _inboxUnseen = 0;
 
   /// 应用内版本更新服务（T3）。懒加载：仅首次检查时构造。
@@ -87,7 +89,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
     _load();
     _maybeRefreshSession();
     _loadVersion();
-// 启动 5s 后静默检查更新 + 信箱检查；两者都失败静默不打扰。
+    // 启动 5s 后静默检查更新 + 信箱检查；两者都失败静默不打扰。
     _refreshInboxCount();
     _scheduleInboxCheck();
     _startupUpdateTimer = Timer(const Duration(seconds: 5), () {
@@ -97,7 +99,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
 
   @override
   void dispose() {
-_startupUpdateTimer?.cancel();
+    _startupUpdateTimer?.cancel();
     _inboxCheckTimer?.cancel();
     super.dispose();
   }
@@ -140,7 +142,7 @@ _startupUpdateTimer?.cancel();
     }
   }
 
-/// 获取（或懒构造）UpdateService。
+  /// 获取（或懒构造）UpdateService。
   Future<UpdateService> _ensureUpdateService() async {
     if (_updateService != null) return _updateService!;
     final prefs = await SharedPreferences.getInstance();
@@ -171,9 +173,7 @@ _startupUpdateTimer?.cancel();
       if (info == null) {
         // 已是最新：用 PackageInfo 读当前 version 显示
         final current = _version;
-        messenger.showSnackBar(
-          SnackBar(content: Text('已是最新 v$current')),
-        );
+        messenger.showSnackBar(SnackBar(content: Text('已是最新 v$current')));
         return;
       }
       _showUpdateDialog(info);
@@ -226,9 +226,9 @@ _startupUpdateTimer?.cancel();
 
   /// 跳到 InboxPage；返回时重新读未读数（用户可能已点过「全部标记已读」）。
   Future<void> _openInbox() async {
-    await Navigator.of(context).push(MaterialPageRoute<void>(
-      builder: (_) => const InboxPage(),
-    ));
+    await Navigator.of(
+      context,
+    ).push(MaterialPageRoute<void>(builder: (_) => const InboxPage()));
     if (mounted) await _refreshInboxCount();
   }
 
@@ -375,18 +375,18 @@ _startupUpdateTimer?.cancel();
       });
     }
     final multi = countLinkTokens(input) > 1;
-    _showSnack(
-      '已导入：$displayTitle${multi ? '（检测到多个链接，仅导入第一个）' : ''}',
-    );
+    _showSnack('已导入：$displayTitle${multi ? '（检测到多个链接，仅导入第一个）' : ''}');
   }
 
   /// 打开搜索页（B 站全网搜索 + 白名单内过滤两个 Tab）。
   ///
   /// 搜索页「加入」会写 Gist，返回后重新同步一次，保证列表立即反映新增。
-  Future<void> _openSearch() async {
-    await Navigator.of(context).push(MaterialPageRoute<void>(
-      builder: (_) => const SearchPage(),
-    ));
+  Future<void> _openSearch({int initialTab = 0}) async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => SearchPage(initialTab: initialTab),
+      ),
+    );
     if (mounted) _load();
   }
 
@@ -478,13 +478,54 @@ _startupUpdateTimer?.cancel();
 
   /// 打开合集视频列表页（两级导航第二级）。
   void _openCollection(String name) {
-    Navigator.of(context).push(MaterialPageRoute<void>(
-      builder: (_) => CollectionPage(
-        collectionName: name == kUncategorizedLabel ? '' : name,
-        data: _data,
-        saveAndRefresh: _saveAndRefresh,
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => CollectionPage(
+          collectionName: name == kUncategorizedLabel ? '' : name,
+          data: _data,
+          saveAndRefresh: _saveAndRefresh,
+        ),
       ),
-    ));
+    );
+  }
+
+  /// 打开白名单 UP 主详情页；返回 true 时刷新首页数据。
+  Future<void> _openUpowner(Upowner up) async {
+    final changed = await Navigator.of(context).push<bool>(
+      MaterialPageRoute(
+        builder: (_) =>
+            UpownerPage(mid: up.mid, initial: up, isInWhitelist: true),
+      ),
+    );
+    if (changed == true && mounted) _load();
+  }
+
+  /// 从首页 UP 管理页移除白名单 UP 主。
+  Future<void> _removeUpowner(Upowner up) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        title: Text('从白名单移除「${up.name}」？'),
+        content: const Text('移除后将不再检查该 UP 主的新视频，不影响已加入的白名单视频。'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogCtx, false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(dialogCtx, true),
+            child: const Text('移除', style: TextStyle(color: Colors.red)),
+          ),
+        ],
+      ),
+    );
+    if (ok != true) return;
+    final next = removeUpowner(_data, up.mid);
+    if (identical(next, _data)) {
+      _showSnack('UP 主不在白名单中');
+      return;
+    }
+    await _saveAndRefresh(next);
   }
 
   /// 合集拖动排序：重排 collections（未分类固定最后、不可拖）→ 落库。
@@ -508,7 +549,9 @@ _startupUpdateTimer?.cancel();
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final cards = _hasData ? _cards() : const <({String name, int count, String cover})>[];
+    final cards = _hasData
+        ? _cards()
+        : const <({String name, int count, String cover})>[];
     return Scaffold(
       appBar: AppBar(
         title: const Text('白名单点播'),
@@ -524,28 +567,32 @@ _startupUpdateTimer?.cancel();
               ),
               if (_inboxUnseen > 0)
                 Positioned(
-                      right: 6,
-                      top: 6,
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                            horizontal: 5, vertical: 1),
-                        constraints: const BoxConstraints(
-                            minWidth: 16, minHeight: 16),
-                        decoration: BoxDecoration(
-                          color: Theme.of(context).colorScheme.error,
-                          borderRadius: BorderRadius.circular(8),
-                        ),
-                        alignment: Alignment.center,
-                        child: Text(
-                          _inboxUnseen > 99 ? '99+' : '$_inboxUnseen',
-                          style: const TextStyle(
-                            color: Colors.white,
-                            fontSize: 10,
-                            fontWeight: FontWeight.bold,
-                          ),
-                        ),
+                  right: 6,
+                  top: 6,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 5,
+                      vertical: 1,
+                    ),
+                    constraints: const BoxConstraints(
+                      minWidth: 16,
+                      minHeight: 16,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Theme.of(context).colorScheme.error,
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    alignment: Alignment.center,
+                    child: Text(
+                      _inboxUnseen > 99 ? '99+' : '$_inboxUnseen',
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 10,
+                        fontWeight: FontWeight.bold,
                       ),
                     ),
+                  ),
+                ),
             ],
           ),
           IconButton(
@@ -570,65 +617,301 @@ _startupUpdateTimer?.cancel();
           ),
         ],
       ),
-      body: Column(
+      body: PageView(
         children: [
-          _CacheBar(
-            fetchedAt: _fetchedAt,
-            sourceName: _sourceName,
-            error: _error,
-          ),
-          Expanded(
-            child: RefreshIndicator(
-              onRefresh: _load,
-              child: _hasData
-                  ? ReorderableListView.builder(
-                      padding: const EdgeInsets.all(12),
-                      physics: const AlwaysScrollableScrollPhysics(),
-                      // 长按拖动（卡片无其他长按行为）；未分类项 enabled=false
-                      // 完全无拖动手势（含视觉上也不会抬起）
-                      buildDefaultDragHandles: false,
-                      itemCount: cards.length,
-                      onReorder: _onReorderCollections,
-                      itemBuilder: (context, i) {
-                        final card = cards[i];
-                        final isUncategorized =
-                            card.name == kUncategorizedLabel;
-                        return ReorderableDelayedDragStartListener(
-                          key: ValueKey(card.name),
-                          index: i,
-                          enabled: !isUncategorized,
-                          child: _CollectionCard(
-                            name: card.name,
-                            count: card.count,
-                            cover: card.cover,
-                            draggable: !isUncategorized,
-                            onTap: () => _openCollection(card.name),
-                          ),
-                        );
-                      },
-                    )
-                  : _EmptyView(syncing: _syncing),
-            ),
-          ),
-          // 底部版本号：灰色小字固定页脚，不遮挡列表操作
-          Padding(
-            padding: const EdgeInsets.symmetric(vertical: 4),
-            child: Text(
-              'v$_version',
-              style: theme.textTheme.labelSmall
-                  ?.copyWith(color: theme.colorScheme.outline),
-            ),
+          _buildCollectionHome(theme, cards),
+          _UpownerManagePage(
+            upowners: _data.upowners,
+            syncing: _syncing,
+            onRefresh: _load,
+            onSearch: () => _openSearch(initialTab: 2),
+            onOpen: _openUpowner,
+            onRemove: _removeUpowner,
           ),
         ],
       ),
     );
   }
 
+  Widget _buildCollectionHome(
+    ThemeData theme,
+    List<({String name, int count, String cover})> cards,
+  ) {
+    return Column(
+      children: [
+        _CacheBar(
+          fetchedAt: _fetchedAt,
+          sourceName: _sourceName,
+          error: _error,
+        ),
+        Expanded(
+          child: RefreshIndicator(
+            onRefresh: _load,
+            child: _hasData
+                ? ReorderableListView.builder(
+                    padding: const EdgeInsets.all(12),
+                    physics: const AlwaysScrollableScrollPhysics(),
+                    buildDefaultDragHandles: false,
+                    itemCount: cards.length,
+                    onReorder: _onReorderCollections,
+                    itemBuilder: (context, i) {
+                      final card = cards[i];
+                      final isUncategorized = card.name == kUncategorizedLabel;
+                      return ReorderableDelayedDragStartListener(
+                        key: ValueKey(card.name),
+                        index: i,
+                        enabled: !isUncategorized,
+                        child: _CollectionCard(
+                          name: card.name,
+                          count: card.count,
+                          cover: card.cover,
+                          draggable: !isUncategorized,
+                          onTap: () => _openCollection(card.name),
+                        ),
+                      );
+                    },
+                  )
+                : _EmptyView(syncing: _syncing),
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.symmetric(vertical: 4),
+          child: Text(
+            'v$_version · 左右滑动切换视频 / UP 主',
+            style: theme.textTheme.labelSmall?.copyWith(
+              color: theme.colorScheme.outline,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
   void _openLogin(BuildContext context) {
-    Navigator.of(context)
-        .push(MaterialPageRoute<void>(builder: (_) => const LoginPage()));
+    Navigator.of(
+      context,
+    ).push(MaterialPageRoute<void>(builder: (_) => const LoginPage()));
   }
 }
+
+/// 首页右滑第二页：白名单 UP 主管理。
+class _UpownerManagePage extends StatelessWidget {
+  final List<Upowner> upowners;
+  final bool syncing;
+  final Future<void> Function() onRefresh;
+  final VoidCallback onSearch;
+  final void Function(Upowner upowner) onOpen;
+  final void Function(Upowner upowner) onRemove;
+
+  const _UpownerManagePage({
+    required this.upowners,
+    required this.syncing,
+    required this.onRefresh,
+    required this.onSearch,
+    required this.onOpen,
+    required this.onRemove,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Column(
+      children: [
+        Container(
+          width: double.infinity,
+          padding: const EdgeInsets.fromLTRB(16, 10, 16, 8),
+          color: theme.colorScheme.surfaceContainerHighest.withValues(
+            alpha: .4,
+          ),
+          child: Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text('白名单 UP 主', style: theme.textTheme.titleSmall),
+                    const SizedBox(height: 2),
+                    Text(
+                      '右滑到这里管理已加入的 UP 主',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              FilledButton.icon(
+                onPressed: onSearch,
+                icon: const Icon(Icons.person_search, size: 18),
+                label: const Text('搜索 UP 主'),
+              ),
+            ],
+          ),
+        ),
+        Expanded(
+          child: RefreshIndicator(
+            onRefresh: onRefresh,
+            child: upowners.isEmpty
+                ? _EmptyUpownerList(syncing: syncing, onSearch: onSearch)
+                : ListView.separated(
+                    physics: const AlwaysScrollableScrollPhysics(),
+                    padding: const EdgeInsets.all(12),
+                    itemCount: upowners.length,
+                    separatorBuilder: (_, __) => const SizedBox(height: 8),
+                    itemBuilder: (context, i) {
+                      final up = upowners[i];
+                      return _UpownerManageTile(
+                        upowner: up,
+                        onTap: () => onOpen(up),
+                        onRemove: () => onRemove(up),
+                      );
+                    },
+                  ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _EmptyUpownerList extends StatelessWidget {
+  final bool syncing;
+  final VoidCallback onSearch;
+
+  const _EmptyUpownerList({required this.syncing, required this.onSearch});
+
+  @override
+  Widget build(BuildContext context) {
+    return ListView(
+      physics: const AlwaysScrollableScrollPhysics(),
+      children: [
+        const SizedBox(height: 120),
+        Icon(
+          syncing ? Icons.sync : Icons.person_search,
+          size: 56,
+          color: Theme.of(context).colorScheme.outline,
+        ),
+        const SizedBox(height: 12),
+        Center(child: Text(syncing ? '正在同步白名单…' : '还没有白名单 UP 主')),
+        const SizedBox(height: 16),
+        Center(
+          child: FilledButton.icon(
+            onPressed: onSearch,
+            icon: const Icon(Icons.person_add_alt_1),
+            label: const Text('搜索并加入 UP 主'),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _UpownerManageTile extends StatelessWidget {
+  final Upowner upowner;
+  final VoidCallback onTap;
+  final VoidCallback onRemove;
+
+  const _UpownerManageTile({
+    required this.upowner,
+    required this.onTap,
+    required this.onRemove,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Material(
+      color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: .45),
+      borderRadius: BorderRadius.circular(12),
+      clipBehavior: Clip.antiAlias,
+      child: ListTile(
+        onTap: onTap,
+        leading: _UpownerAvatar(upowner: upowner),
+        title: Text(
+          upowner.name,
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
+        ),
+        subtitle: Text(
+          _fmtUpownerMeta(upowner),
+          maxLines: 1,
+          overflow: TextOverflow.ellipsis,
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+        trailing: IconButton(
+          tooltip: '移除 UP 主',
+          icon: const Icon(Icons.bookmark_remove_outlined),
+          onPressed: onRemove,
+        ),
+      ),
+    );
+  }
+}
+
+class _UpownerAvatar extends StatelessWidget {
+  final Upowner upowner;
+
+  const _UpownerAvatar({required this.upowner});
+
+  @override
+  Widget build(BuildContext context) {
+    if (upowner.face.isEmpty) return _placeholder(context);
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(24),
+      child: Image.network(
+        upowner.face,
+        width: 48,
+        height: 48,
+        fit: BoxFit.cover,
+        headers: {'User-Agent': kBrowserUA, 'Referer': kBiliReferer},
+        errorBuilder: (_, __, ___) => _placeholder(context),
+      ),
+    );
+  }
+
+  Widget _placeholder(BuildContext context) {
+    final theme = Theme.of(context);
+    final initial = upowner.name.isNotEmpty
+        ? upowner.name.characters.first
+        : '?';
+    return Container(
+      width: 48,
+      height: 48,
+      decoration: BoxDecoration(
+        color: theme.colorScheme.primaryContainer,
+        borderRadius: BorderRadius.circular(24),
+      ),
+      alignment: Alignment.center,
+      child: Text(
+        initial,
+        style: theme.textTheme.titleMedium?.copyWith(
+          color: theme.colorScheme.onPrimaryContainer,
+        ),
+      ),
+    );
+  }
+}
+
+String _fmtUpownerMeta(Upowner upowner) {
+  final fans = upowner.fans;
+  final fansText = fans == null
+      ? '— 粉丝'
+      : fans >= 100000000
+      ? '${_trimNumber(fans / 100000000)}亿 粉丝'
+      : fans >= 10000
+      ? '${_trimNumber(fans / 10000)}万 粉丝'
+      : '$fans 粉丝';
+  final date = upowner.addedAt.toLocal();
+  final m = date.month.toString().padLeft(2, '0');
+  final d = date.day.toString().padLeft(2, '0');
+  return '$fansText · 加入于 ${date.year}-$m-$d';
+}
+
+String _trimNumber(double v) =>
+    v == v.roundToDouble() ? v.toInt().toString() : v.toStringAsFixed(1);
 
 /// 合集卡片（行式）：左侧代表视觉（封面 / 渐变底 + 图标），
 /// 右侧合集名 + 视频数，尾部拖动手柄提示（未分类不可拖不显示）。
@@ -700,8 +983,9 @@ class _CollectionCard extends StatelessWidget {
                     const SizedBox(height: 4),
                     Text(
                       '$count 个视频',
-                      style: theme.textTheme.bodySmall
-                          ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
                     ),
                   ],
                 ),
@@ -801,8 +1085,9 @@ class _ImportDialogState extends State<_ImportDialog> {
           const SizedBox(height: 8),
           Text(
             '导入即加入白名单（与电脑端等价）',
-            style: theme.textTheme.bodySmall
-                ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
           ),
         ],
       ),
@@ -841,16 +1126,18 @@ class _CacheBar extends StatelessWidget {
     if (error != null) {
       content = Text(
         error!,
-        style: theme.textTheme.bodySmall
-            ?.copyWith(color: theme.colorScheme.error),
+        style: theme.textTheme.bodySmall?.copyWith(
+          color: theme.colorScheme.error,
+        ),
         maxLines: 2,
         overflow: TextOverflow.ellipsis,
       );
     } else if (fetchedAt != null) {
       content = Text(
         '数据时间 ${_fmt(fetchedAt!)}（来源: ${sourceName ?? '?'}）',
-        style: theme.textTheme.bodySmall
-            ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+        style: theme.textTheme.bodySmall?.copyWith(
+          color: theme.colorScheme.onSurfaceVariant,
+        ),
       );
     } else {
       content = Text('暂无数据，下拉刷新同步', style: theme.textTheme.bodySmall);
@@ -954,8 +1241,10 @@ class _CollectionManageSheetState extends State<_CollectionManageSheet> {
       context: context,
       builder: (dialogCtx) => AlertDialog(
         title: Text('删除合集「${collection.name}」'),
-        content: Text('确定删除合集「${collection.name}」吗？\n'
-            '该合集下 $count 个视频将移回未分类（视频本身不会被删除）。'),
+        content: Text(
+          '确定删除合集「${collection.name}」吗？\n'
+          '该合集下 $count 个视频将移回未分类（视频本身不会被删除）。',
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx, false),
@@ -993,8 +1282,9 @@ class _CollectionManageSheetState extends State<_CollectionManageSheet> {
             padding: const EdgeInsets.fromLTRB(20, 0, 20, 8),
             child: Text(
               '重命名会同步更新该合集下所有视频；删除会把视频移回未分类（不删视频）。',
-              style: theme.textTheme.bodySmall
-                  ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
             ),
           ),
           const Divider(height: 1),
@@ -1023,8 +1313,11 @@ class _CollectionManageSheetState extends State<_CollectionManageSheet> {
                         ),
                         IconButton(
                           tooltip: '删除',
-                          icon: Icon(Icons.delete_outline,
-                              size: 20, color: theme.colorScheme.error),
+                          icon: Icon(
+                            Icons.delete_outline,
+                            size: 20,
+                            color: theme.colorScheme.error,
+                          ),
                           onPressed: () => _delete(c),
                         ),
                       ],
@@ -1153,8 +1446,9 @@ class _ManageSheetState extends State<_ManageSheet> {
             Text(
               '管理功能只允许：新建 / 重命名 / 删除合集，移动 / 删除视频。'
               '新增白名单走右上角「导入」或「搜索」入口（加入前会查重）。',
-              style: theme.textTheme.bodySmall
-                  ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
             ),
             const SizedBox(height: 16),
             // ---- GitHub 配置 ----
@@ -1162,8 +1456,9 @@ class _ManageSheetState extends State<_ManageSheet> {
             const SizedBox(height: 4),
             Text(
               '用于把管理操作写入 Gist：token 需 gist 权限，仅保存在本机安全存储。',
-              style: theme.textTheme.bodySmall
-                  ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
             ),
             const SizedBox(height: 8),
             TextField(
@@ -1176,9 +1471,11 @@ class _ManageSheetState extends State<_ManageSheet> {
                 border: const OutlineInputBorder(),
                 isDense: true,
                 suffixIcon: IconButton(
-                  icon: Icon(_obscureToken
-                      ? Icons.visibility_outlined
-                      : Icons.visibility_off_outlined),
+                  icon: Icon(
+                    _obscureToken
+                        ? Icons.visibility_outlined
+                        : Icons.visibility_off_outlined,
+                  ),
                   tooltip: _obscureToken ? '显示 Token' : '隐藏 Token',
                   onPressed: () =>
                       setState(() => _obscureToken = !_obscureToken),
@@ -1249,8 +1546,9 @@ class _ManageSheetState extends State<_ManageSheet> {
             const SizedBox(height: 4),
             Text(
               '重命名会同步更新该合集下所有视频；删除会把视频移回未分类（不删视频）。',
-              style: theme.textTheme.bodySmall
-                  ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
             ),
             const SizedBox(height: 8),
             SizedBox(
@@ -1269,8 +1567,9 @@ class _ManageSheetState extends State<_ManageSheet> {
             const SizedBox(height: 4),
             Text(
               '下载过的视频缓存在本机，断网也能播放；大小只受手机存储限制。',
-              style: theme.textTheme.bodySmall
-                  ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
             ),
             const SizedBox(height: 8),
             SizedBox(
@@ -1290,8 +1589,9 @@ class _ManageSheetState extends State<_ManageSheet> {
             Text(
               'OpenAI 兼容翻译服务，用于字幕副字幕翻译（「翻译（中文）」）；'
               'key 仅存本机，可留空=不启用翻译。',
-              style: theme.textTheme.bodySmall
-                  ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
             ),
             const SizedBox(height: 8),
             SizedBox(
@@ -1311,8 +1611,9 @@ class _ManageSheetState extends State<_ManageSheet> {
             Text(
               '手动检查 GitHub Releases：发现新版本弹窗 → 下载 → 一键安装。'
               '启动 5s 后也会自动静默检查（24h 节流）。',
-              style: theme.textTheme.bodySmall
-                  ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
             ),
             const SizedBox(height: 8),
             SizedBox(
@@ -1460,9 +1761,11 @@ class _TranslateConfigDialogState extends State<_TranslateConfigDialog> {
                 border: const OutlineInputBorder(),
                 isDense: true,
                 suffixIcon: IconButton(
-                  icon: Icon(_obscureKey
-                      ? Icons.visibility_outlined
-                      : Icons.visibility_off_outlined),
+                  icon: Icon(
+                    _obscureKey
+                        ? Icons.visibility_outlined
+                        : Icons.visibility_off_outlined,
+                  ),
                   tooltip: _obscureKey ? '显示 Key' : '隐藏 Key',
                   onPressed: () => setState(() => _obscureKey = !_obscureKey),
                 ),
@@ -1565,9 +1868,11 @@ class _CacheManageSheetState extends State<_CacheManageSheet> {
       context: context,
       builder: (dialogCtx) => AlertDialog(
         title: const Text('清空缓存'),
-        content: Text('确定清空全部 $total 个视频的缓存吗？'
-            '将删除所有已下载的视频文件（${fmtBytes(_downloads.totalCacheSize())}），'
-            '离线将无法播放。'),
+        content: Text(
+          '确定清空全部 $total 个视频的缓存吗？'
+          '将删除所有已下载的视频文件（${fmtBytes(_downloads.totalCacheSize())}），'
+          '离线将无法播放。',
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx, false),
@@ -1614,9 +1919,10 @@ class _CacheManageSheetState extends State<_CacheManageSheet> {
               items.isEmpty
                   ? '暂无缓存视频（在播放页点「下载」即可离线观看）'
                   : '共 ${items.length} 个视频 · ${fmtBytes(total)}'
-                      '（下载中的任务不会显示在列表里）',
-              style: theme.textTheme.bodySmall
-                  ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+                        '（下载中的任务不会显示在列表里）',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
             ),
           ),
           const Divider(height: 1),
@@ -1634,10 +1940,15 @@ class _CacheManageSheetState extends State<_CacheManageSheet> {
                     children: [
                       for (final c in items)
                         ListTile(
-                          leading: const Icon(Icons.check_circle_outline,
-                              color: Color(0xFF0A7A4A)),
-                          title: Text(c.title,
-                              maxLines: 1, overflow: TextOverflow.ellipsis),
+                          leading: const Icon(
+                            Icons.check_circle_outline,
+                            color: Color(0xFF0A7A4A),
+                          ),
+                          title: Text(
+                            c.title,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
                           subtitle: Text(
                             _partLabel(c).isEmpty
                                 ? fmtBytes(c.sizeBytes)
@@ -1647,8 +1958,11 @@ class _CacheManageSheetState extends State<_CacheManageSheet> {
                           ),
                           trailing: IconButton(
                             tooltip: '删除缓存',
-                            icon: Icon(Icons.delete_outline,
-                                size: 20, color: theme.colorScheme.error),
+                            icon: Icon(
+                              Icons.delete_outline,
+                              size: 20,
+                              color: theme.colorScheme.error,
+                            ),
                             onPressed: () => _deleteOne(c),
                           ),
                         ),

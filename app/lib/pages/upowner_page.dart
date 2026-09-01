@@ -79,6 +79,8 @@ class UpownerPage extends StatefulWidget {
 class _UpownerPageState extends State<UpownerPage> {
   final BiliApi _api = BiliApi();
   final ScrollController _scrollCtrl = ScrollController();
+  final TextEditingController _searchCtrl = TextEditingController();
+  Timer? _searchDebounce;
 
   /// UP 主信息（头部卡片用）：先用 [widget.initial] 预填；fetch 后覆盖。
   UpownerInfo? _info;
@@ -117,8 +119,10 @@ class _UpownerPageState extends State<UpownerPage> {
 
   @override
   void dispose() {
+    _searchDebounce?.cancel();
     _scrollCtrl.removeListener(_onScroll);
     _scrollCtrl.dispose();
+    _searchCtrl.dispose();
     super.dispose();
   }
 
@@ -165,6 +169,22 @@ class _UpownerPageState extends State<UpownerPage> {
     await _loadPage(1);
   }
 
+  String get _currentKeyword => _searchCtrl.text.trim();
+
+  /// 搜索框变化：防抖 500ms 后按当前关键词重拉第一页。
+  void _onSearchChanged(String _) {
+    _searchDebounce?.cancel();
+    _searchDebounce = Timer(const Duration(milliseconds: 500), _loadFirstPage);
+  }
+
+  /// 清空当前 UP 主内的视频搜索。
+  void _clearSearch() {
+    if (_currentKeyword.isEmpty) return;
+    _searchDebounce?.cancel();
+    _searchCtrl.clear();
+    _loadFirstPage();
+  }
+
   /// 加载指定页视频（page=1 时也走这里，_videos 已在 _loadFirstPage 清空）。
   Future<void> _loadPage(int pn) async {
     setState(() => _loadingMore = true);
@@ -173,6 +193,7 @@ class _UpownerPageState extends State<UpownerPage> {
         widget.mid,
         pn: pn,
         order: _order,
+        keyword: _currentKeyword,
       );
       if (!mounted) return;
       // 去重（按 bvid）
@@ -222,9 +243,9 @@ class _UpownerPageState extends State<UpownerPage> {
         final fixed = WhitelistWriter.videoFromMeta(meta, fallbackBvid: v.bvid);
         if (!mounted) return;
         setState(() => _fetchingMeta = false);
-        Navigator.of(context).push(MaterialPageRoute<void>(
-          builder: (_) => PlayerPage(video: fixed),
-        ));
+        Navigator.of(context).push(
+          MaterialPageRoute<void>(builder: (_) => PlayerPage(video: fixed)),
+        );
       } on BiliApiException catch (e) {
         if (!mounted) return;
         setState(() => _fetchingMeta = false);
@@ -235,9 +256,9 @@ class _UpownerPageState extends State<UpownerPage> {
         _showSnack('网络请求失败，请重试');
       }
     } else {
-      Navigator.of(context).push(MaterialPageRoute<void>(
-        builder: (_) => PlayerPage(video: v),
-      ));
+      Navigator.of(
+        context,
+      ).push(MaterialPageRoute<void>(builder: (_) => PlayerPage(video: v)));
     }
   }
 
@@ -315,6 +336,7 @@ class _UpownerPageState extends State<UpownerPage> {
       body: Column(
         children: [
           _buildHeader(theme),
+          _buildVideoSearchBar(),
           _buildOrderBar(),
           const Divider(height: 1),
           Expanded(child: _buildVideoList()),
@@ -414,6 +436,35 @@ class _UpownerPageState extends State<UpownerPage> {
     );
   }
 
+  /// UP 主内视频搜索框：只搜索当前 UP 主投稿，不切出白名单范围。
+  Widget _buildVideoSearchBar() {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(12, 10, 12, 4),
+      child: TextField(
+        controller: _searchCtrl,
+        textInputAction: TextInputAction.search,
+        onChanged: _onSearchChanged,
+        onSubmitted: (_) {
+          _searchDebounce?.cancel();
+          _loadFirstPage();
+        },
+        decoration: InputDecoration(
+          isDense: true,
+          prefixIcon: const Icon(Icons.search),
+          hintText: '在该 UP 主的视频中搜索',
+          suffixIcon: _currentKeyword.isEmpty
+              ? null
+              : IconButton(
+                  tooltip: '清空搜索',
+                  icon: const Icon(Icons.clear),
+                  onPressed: _clearSearch,
+                ),
+          border: const OutlineInputBorder(),
+        ),
+      ),
+    );
+  }
+
   /// 排序 chip 行。
   Widget _buildOrderBar() {
     return SingleChildScrollView(
@@ -442,10 +493,7 @@ class _UpownerPageState extends State<UpownerPage> {
       return const Center(child: CircularProgressIndicator());
     }
     if (_error != null && _videos.isEmpty) {
-      return _ErrorView(
-        message: _error!,
-        onRetry: _loadFirstPage,
-      );
+      return _ErrorView(message: _error!, onRetry: _loadFirstPage);
     }
     if (_videos.isEmpty) {
       return const Center(
@@ -477,8 +525,8 @@ class _UpownerPageState extends State<UpownerPage> {
               child: Text(
                 '没有更多了',
                 style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                      color: Theme.of(context).colorScheme.outline,
-                    ),
+                  color: Theme.of(context).colorScheme.outline,
+                ),
               ),
             ),
           );
@@ -498,8 +546,8 @@ class _UpownerPageState extends State<UpownerPage> {
           subtitle: Text(
             _fmtDuration(v.duration),
             style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: Theme.of(context).colorScheme.onSurfaceVariant,
-                ),
+              color: Theme.of(context).colorScheme.onSurfaceVariant,
+            ),
           ),
           onTap: () => _openVideo(v),
           onLongPress: () => _onLongPress(v),
@@ -558,10 +606,7 @@ class _ErrorView extends StatelessWidget {
           const SizedBox(height: 12),
           Text(message),
           const SizedBox(height: 16),
-          FilledButton.tonal(
-            onPressed: onRetry,
-            child: const Text('重试'),
-          ),
+          FilledButton.tonal(onPressed: onRetry, child: const Text('重试')),
         ],
       ),
     );
