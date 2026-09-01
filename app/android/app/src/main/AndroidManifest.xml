@@ -2,6 +2,8 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <!-- 播放流 / API 请求 / 白名单同步都需要网络（debug/profile 清单自带，主清单必须声明，否则 release 断网） -->
     <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- 应用内版本更新（M1.3）：下载 APK 后通过系统安装器触发安装流程。min_sdk=26 → FileProvider 强制走。 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
     <application
         android:label="ビリビリ"
         android:name="${applicationName}"
@@ -19,6 +21,18 @@
         <meta-data
             android:name="io.flutter.embedding.android.EnableImpeller"
             android:value="false" />
+        <!-- 应用内版本更新（M1.3）：FileProvider 暴露 ApplicationSupport/updates 目录
+             给系统安装器，避免直接传 file:// URI（API 24+ 抛 FileUriExposedException）。
+             authority 用 ${applicationId}.fileprovider，与 Kotlin ApkInstaller 硬编码保持一致。 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
         <activity
             android:name=".MainActivity"
             android:exported="true"
@@ -56,6 +70,11 @@
         <intent>
             <action android:name="android.intent.action.PROCESS_TEXT"/>
             <data android:mimeType="text/plain"/>
+        </intent>
+        <!-- 应用内版本更新（M1.3）：需要能查系统安装器（package-archive MIME）。 -->
+        <intent>
+            <action android:name="android.intent.action.VIEW"/>
+            <data android:mimeType="application/vnd.android.package-archive"/>
         </intent>
     </queries>
 </manifest>

@@ -16,6 +16,8 @@ class MainActivity : FlutterActivity() {
         super.configureFlutterEngine(flutterEngine)
         flutterEngine.plugins.add(BiliDashPlayerPlugin())
         setupCookieChannel(flutterEngine)
+        // 应用内版本更新（M1.3）：注册 APK 安装 MethodChannel
+        ApkInstaller(applicationContext).register(flutterEngine)
     }
 
     /**

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  FileProvider 路径白名单（M1.3）：暴露 ApplicationSupport/files（即 path_provider
+  的 getApplicationSupportDirectory()）子目录给系统安装器。
+
+  - `files-path` 对应 Context.getFilesDir() 根，name="support" 把 files 根映射为
+    content://{authority}/support/... 的 URI 前缀。
+  - UpdateService 下载到 {ApplicationSupport}/updates/app-update.apk，对应 URI 为
+    content://{applicationId}.fileprovider/support/updates/app-update.apk。
+-->
+<paths>
+    <files-path name="support" path="."/>
+</paths>

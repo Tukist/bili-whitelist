@@ -3,19 +3,25 @@ import 'dart:async';
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:package_info_plus/package_info_plus.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../api/bilibili_api.dart';
 import '../api/github_api.dart';
 import '../api/translate_api.dart';
 import '../cache/download_manager.dart';
 import '../config.dart';
+import '../models/update_info.dart';
 import '../models/whitelist_video.dart';
+import '../services/apk_installer.dart';
 import '../services/service_locator.dart';
+import '../services/update_service.dart';
+import '../services/update_storage.dart';
 import '../services/whitelist_writer.dart';
 import '../utils/import_parser.dart';
 import 'collection_page.dart';
 import 'login_page.dart';
 import 'search_page.dart';
+import 'update_dialog.dart';
 
 /// 唯一首页：合集卡片视图（两级导航第一级）。
 ///
@@ -60,6 +66,12 @@ class _PlaylistPageState extends State<PlaylistPage> {
   /// 异常（测试环境无原生通道）时回退 config.dart 的 kAppVersion。
   String _version = kAppVersion;
 
+  /// 应用内版本更新服务（M1.2）。懒加载：仅首次检查时构造。
+  UpdateService? _updateService;
+
+  /// 启动 5s 后静默检查定时器，组件销毁时取消。
+  Timer? _startupUpdateTimer;
+
   bool get _hasData => _data.videos.isNotEmpty;
 
   @override
@@ -68,6 +80,16 @@ class _PlaylistPageState extends State<PlaylistPage> {
     _load();
     _maybeRefreshSession();
     _loadVersion();
+    // 启动 5s 后静默检查更新；失败静默，不打扰用户。
+    _startupUpdateTimer = Timer(const Duration(seconds: 5), () {
+      _silentCheckUpdate();
+    });
+  }
+
+  @override
+  void dispose() {
+    _startupUpdateTimer?.cancel();
+    super.dispose();
   }
 
   /// 读取 App 版本号（插件方案，与 pubspec.yaml version 单源）。
@@ -106,6 +128,63 @@ class _PlaylistPageState extends State<PlaylistPage> {
     } catch (_) {
       // 测试环境无 secure storage 原生插件等，静默
     }
+  }
+
+  /// 获取（或懒构造）UpdateService。
+  Future<UpdateService> _ensureUpdateService() async {
+    if (_updateService != null) return _updateService!;
+    final prefs = await SharedPreferences.getInstance();
+    _updateService = UpdateService(storage: UpdateStorage(prefs));
+    return _updateService!;
+  }
+
+  /// 启动静默检查（M1.2）：节流 24h；失败静默；有新版且非强制 → 弹 UpdateDialog。
+  Future<void> _silentCheckUpdate() async {
+    try {
+      final svc = await _ensureUpdateService();
+      final info = await svc.check();
+      if (info == null || !mounted) return;
+      if (info.isMandatory(0)) return; // 强制更新走单独通道（首版不启用）
+      _showUpdateDialog(info);
+    } catch (_) {
+      // 启动检查失败一律静默，不打扰用户。
+    }
+  }
+
+  /// 管理面板「检查更新」按钮调用：force=true 跳过节流。
+  Future<void> _manualCheckUpdate() async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final svc = await _ensureUpdateService();
+      final info = await svc.check(force: true);
+      if (!mounted) return;
+      if (info == null) {
+        // 已是最新：用 PackageInfo 读当前 version 显示
+        final current = _version;
+        messenger.showSnackBar(
+          SnackBar(content: Text('已是最新 v$current')),
+        );
+        return;
+      }
+      _showUpdateDialog(info);
+    } on UpdateException catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text(e.message)));
+    } catch (e) {
+      messenger.showSnackBar(SnackBar(content: Text('检查更新失败：$e')));
+    }
+  }
+
+  /// 弹出更新对话框。
+  void _showUpdateDialog(UpdateInfo info) {
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => UpdateDialog(
+        info: info,
+        service: _updateService!,
+        installer: ApkInstallerChannel(),
+      ),
+    );
   }
 
   /// 读取本地缓存 + 尝试网络同步（两者并行，UI 立即展示缓存）。
@@ -266,7 +345,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
     if (mounted) _load();
   }
 
-  /// 打开管理面板（GitHub 配置 + 新建合集 + 合集管理 + 缓存管理 + 翻译服务）。
+  /// 打开管理面板（GitHub 配置 + 新建合集 + 合集管理 + 缓存管理 + 翻译服务 + 检查更新）。
   void _openManage() {
     showModalBottomSheet<void>(
       context: context,
@@ -276,6 +355,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
         github: _github,
         onCollectionCreated: _createCollection,
         onManageCollections: _openCollectionManage,
+        onCheckUpdate: _manualCheckUpdate,
       ),
     );
   }
@@ -889,11 +969,13 @@ class _ManageSheet extends StatefulWidget {
   final GithubApi github;
   final Future<void> Function(String name) onCollectionCreated;
   final VoidCallback onManageCollections; // 打开合集管理面板（重命名/删除）
+  final VoidCallback onCheckUpdate; // M1.2 检查更新入口
 
   const _ManageSheet({
     required this.github,
     required this.onCollectionCreated,
     required this.onManageCollections,
+    required this.onCheckUpdate,
   });
 
   @override
@@ -1138,6 +1220,31 @@ class _ManageSheetState extends State<_ManageSheet> {
                 onPressed: () => _showTranslateConfig(context),
                 icon: const Icon(Icons.translate, size: 18),
                 label: const Text('翻译服务配置'),
+              ),
+            ),
+            const SizedBox(height: 16),
+            const Divider(height: 1),
+            const SizedBox(height: 16),
+            // ---- 版本更新 ----
+            Text('版本更新', style: theme.textTheme.titleMedium),
+            const SizedBox(height: 4),
+            Text(
+              '手动检查 GitHub Releases：发现新版本弹窗 → 下载 → 一键安装。'
+              '启动 5s 后也会自动静默检查（24h 节流）。',
+              style: theme.textTheme.bodySmall
+                  ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+            ),
+            const SizedBox(height: 8),
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: () {
+                  // 关闭面板再检查，让 SnackBar / Dialog 显示在干净上下文。
+                  Navigator.of(context).pop();
+                  widget.onCheckUpdate();
+                },
+                icon: const Icon(Icons.system_update_alt_outlined, size: 18),
+                label: const Text('检查更新'),
               ),
             ),
           ],
