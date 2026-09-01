@@ -70,17 +70,17 @@ void main() {
       expect(data.collections, isEmpty);
     });
 
-    test('normalizedForSave：version 固定 3、updated_at 刷新、collections 必出', () {
+    test('normalizedForSave：version 固定 4、updated_at 刷新、collections 必出', () {
       final old = WhitelistData.fromJson({
         'version': 2,
         'videos': [_v2Video('BV6')],
       });
       final v3 = old.normalizedForSave();
-      expect(v3.version, 3);
+      expect(v3.version, 4);
       expect(v3.updatedAt, isNotEmpty);
       expect(DateTime.tryParse(v3.updatedAt), isNotNull);
       final json = v3.toJson();
-      expect(json['version'], 3);
+      expect(json['version'], 4);
       expect(json.containsKey('collections'), isTrue);
     });
   });

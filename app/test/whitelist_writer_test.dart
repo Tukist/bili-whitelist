@@ -152,7 +152,7 @@ void main() {
           ((patch.data as Map)['files'] as Map)['whitelist.json'] as Map;
       final parsed =
           jsonDecode(content['content'] as String) as Map<String, dynamic>;
-      expect(parsed['version'], 3);
+      expect(parsed['version'], 4);
       expect((parsed['videos'] as List), hasLength(3));
     });
   });
