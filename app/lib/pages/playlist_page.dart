@@ -20,6 +20,7 @@ import '../services/update_storage.dart';
 import '../services/whitelist_writer.dart';
 import '../utils/import_parser.dart';
 import 'collection_page.dart';
+import 'history_page.dart';
 import 'inbox_page.dart';
 import 'login_page.dart';
 import 'search_page.dart';
@@ -43,6 +44,9 @@ import 'upowner_page.dart';
 /// - 右上角登录入口可进 WebView 登录页（解锁 1080P，M4 起内嵌官方登录页）
 /// - 启动时静默检查登录态：SESSDATA 距过期 < 7 天自动续期；
 ///   续期失败且已过期时提示重新登录
+/// - **主页 PageView 三页**（初始停在主页合集页，左右滑动切换）：
+///   右滑 → 历史记录页（播放历史，点击续播；顶部历史图标可直达）；
+///   左滑 → 白名单 UP 主管理页
 class PlaylistPage extends StatefulWidget {
   /// 测试注入：Gist 写操作替身（默认用真实实现）。
   /// 拖动排序/导入等写操作统一走 [GithubApi.saveToGist]。
@@ -83,6 +87,22 @@ class _PlaylistPageState extends State<PlaylistPage> {
 
   bool get _hasData => _data.videos.isNotEmpty;
 
+  /// 主页 PageView（三页：历史记录 / 合集主页 / UP 主管理），初始停在主页。
+  final PageController _pageController = PageController(initialPage: 1);
+
+  /// 历史页 State 的全局 key：切到历史页时刷新数据（PageView 相邻页存活，
+  /// 用户可能刚从别处播放回来，需要重新读表）。
+  final GlobalKey<HistoryPageState> _historyKey = GlobalKey<HistoryPageState>();
+
+  /// 顶部历史图标入口：动画切到历史页（第 0 页）。
+  void _goToHistory() {
+    _pageController.animateToPage(
+      0,
+      duration: const Duration(milliseconds: 250),
+      curve: Curves.easeOut,
+    );
+  }
+
   @override
   void initState() {
     super.initState();
@@ -101,6 +121,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
   void dispose() {
     _startupUpdateTimer?.cancel();
     _inboxCheckTimer?.cancel();
+    _pageController.dispose();
     super.dispose();
   }
 
@@ -556,6 +577,12 @@ class _PlaylistPageState extends State<PlaylistPage> {
       appBar: AppBar(
         title: const Text('白名单点播'),
         actions: [
+          // 历史记录入口：右滑可到历史页，图标直达
+          IconButton(
+            tooltip: '历史记录',
+            icon: const Icon(Icons.history),
+            onPressed: _goToHistory,
+          ),
           // 信箱入口：未读 > 0 时图标右上角显示小红点
           Stack(
             clipBehavior: Clip.none,
@@ -618,7 +645,13 @@ class _PlaylistPageState extends State<PlaylistPage> {
         ],
       ),
       body: PageView(
+        controller: _pageController,
+        onPageChanged: (index) {
+          // 切到历史页时重新读取（播放返回/时间推移后列表可能已变化）
+          if (index == 0) _historyKey.currentState?.reload();
+        },
         children: [
+          HistoryPage(key: _historyKey),
           _buildCollectionHome(theme, cards),
           _UpownerManagePage(
             upowners: _data.upowners,
@@ -677,7 +710,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
         Padding(
           padding: const EdgeInsets.symmetric(vertical: 4),
           child: Text(
-            'v$_version · 左右滑动切换视频 / UP 主',
+            'v$_version · 左右滑动切换合集 / 历史 / UP 主',
             style: theme.textTheme.labelSmall?.copyWith(
               color: theme.colorScheme.outline,
             ),

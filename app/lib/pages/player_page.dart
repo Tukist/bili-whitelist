@@ -12,6 +12,7 @@ import '../config.dart';
 import '../models/subtitle.dart';
 import '../models/whitelist_video.dart';
 import '../player/bili_dash_player.dart';
+import '../services/history_store.dart';
 import '../services/realtime_transcriber.dart';
 import 'login_page.dart';
 
@@ -40,7 +41,15 @@ const double kLongPressSpeed = 2.0;
 class PlayerPage extends StatefulWidget {
   final WhitelistVideo video;
 
-  const PlayerPage({super.key, required this.video});
+  /// 初始播放的分 P 下标（历史记录续播用：直接定位到上次看的那一集；
+  /// 默认 0 = 第一集/单 P）。
+  final int initialPageIndex;
+
+  const PlayerPage({
+    super.key,
+    required this.video,
+    this.initialPageIndex = 0,
+  });
 
   @override
   State<PlayerPage> createState() => _PlayerPageState();
@@ -187,6 +196,13 @@ class _PlayerPageState extends State<PlayerPage> {
   @override
   void initState() {
     super.initState();
+    // 历史记录续播：初始定位到对应分 P（越界 / 单 P 回落第 0 集）。
+    // 必须在 _init 之前设置，_maybeRestoreProgress 按 _currentPageIndex 取进度。
+    final pages = widget.video.pages;
+    final maxIdx = (pages == null || pages.isEmpty) ? 0 : pages.length - 1;
+    _currentPageIndex = widget.initialPageIndex < 0
+        ? 0
+        : (widget.initialPageIndex > maxIdx ? maxIdx : widget.initialPageIndex);
     // 监听缓存状态变化（下载进度/完成/删除），驱动下载按钮与进度刷新
     _downloads.cached.addListener(_onCacheStateChanged);
     _downloads.tasks.addListener(_onCacheStateChanged);
@@ -207,14 +223,18 @@ class _PlayerPageState extends State<PlayerPage> {
     _realtime.sentences.removeListener(_onRealtimeSentencesChanged);
     // 退出播放页：停止实时转写（标志位在块边界生效，不打断引擎单步）
     _realtime.stop();
-    // 退出前保存一次进度（fire-and-forget，防杀进程/直接返回丢失进度）。
-    // 播放器尚未释放，getPosition 可用；看完（_completed）已清记忆，跳过。
+    // 退出前保存一次进度 + 写入历史（fire-and-forget，防杀进程/直接返回
+    // 丢失进度）。播放器尚未释放，getPosition 可用；看完（_completed）
+    // 已清记忆，跳过进度保存（历史仍记录「看过」，位置=结尾无妨）。
     final store = _progressStore;
     final player = _player;
-    if (store != null && player != null && !_completed) {
+    if (player != null) {
       player.getPosition().then((pos) {
         if (pos > 0) {
-          store.saveProgress(widget.video.bvid, _currentPageIndex, pos);
+          if (store != null && !_completed) {
+            store.saveProgress(widget.video.bvid, _currentPageIndex, pos);
+          }
+          unawaited(_writeHistory(pos));
         }
       }).catchError((Object _) {
         // 原生通道异常：忽略，进度最多丢一次
@@ -727,6 +747,33 @@ class _PlayerPageState extends State<PlayerPage> {
     await store.saveProgress(widget.video.bvid, _currentPageIndex, pos);
     debugPrint('[player_page] 保存进度 '
         '${widget.video.bvid}#$_currentPageIndex $pos ms');
+    // 与进度保存同节奏写历史（_tick 每 10s / 暂停 / 快进快退 / dispose 触发）
+    await _writeHistory(pos);
+  }
+
+  /// 写入播放历史：记录当前视频信息 + 进度 + 观看时间。
+  /// 与进度保存同节奏（见 [_saveProgress]），失败静默不影响播放。
+  Future<void> _writeHistory(int positionMs) async {
+    try {
+      await HistoryStore.instance.addOrUpdate(
+        HistoryEntry(
+          bvid: widget.video.bvid,
+          pageIndex: _currentPageIndex,
+          cid: _currentCid,
+          title: widget.video.title,
+          cover: widget.video.cover,
+          upName: widget.video.upName,
+          durationMs: _durationMs > 0
+              ? _durationMs
+              : widget.video.duration * 1000,
+          positionMs: positionMs,
+          watchedAt: DateTime.now(),
+          pages: widget.video.pages,
+        ),
+      );
+    } catch (_) {
+      // 历史写入失败静默（不阻塞播放/退出）
+    }
   }
 
   /// 清除当前集进度记忆（观看完成 / 从头播放时）。
