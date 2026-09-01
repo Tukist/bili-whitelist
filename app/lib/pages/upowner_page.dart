@@ -60,6 +60,21 @@ String _fmtFans(int? fans) {
 String _trimDot(double v) =>
     v == v.roundToDouble() ? v.toInt().toString() : v.toStringAsFixed(1);
 
+/// 客户端标题过滤：接口 keyword 兜底（大小写不敏感的子串匹配）。
+///
+/// 空白关键词不过滤（返回原列表）。注意：只过滤已加载的当前页，
+/// 跨页匹配需继续滚动加载（受 [_loadPage] 分页限制）。
+List<WhitelistVideo> filterUpownerVideosByKeyword(
+  List<WhitelistVideo> videos,
+  String keyword,
+) {
+  final kw = keyword.trim().toLowerCase();
+  if (kw.isEmpty) return videos;
+  return videos
+      .where((v) => v.title.toLowerCase().contains(kw))
+      .toList();
+}
+
 class UpownerPage extends StatefulWidget {
   final int mid;
   final Upowner? initial; // 搜索结果跳过来时预填信息（可缺省走 fetchUpownerInfo）
@@ -196,11 +211,17 @@ class _UpownerPageState extends State<UpownerPage> {
         keyword: _currentKeyword,
       );
       if (!mounted) return;
+      // 接口 keyword 参数在部分环境下不生效（B 站风控/接口行为变化，实测
+      // keyword=AI 仍返回未过滤列表），客户端按标题子串兜底过滤，保证搜索可用。
+      final filtered = filterUpownerVideosByKeyword(
+        result.videos,
+        _currentKeyword,
+      );
       // 去重（按 bvid）
       final existing = _videos.map((v) => v.bvid).toSet();
       final appended = [
         ..._videos,
-        for (final v in result.videos)
+        for (final v in filtered)
           if (!existing.contains(v.bvid)) v,
       ];
       setState(() {
