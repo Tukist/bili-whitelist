@@ -1,6 +1,8 @@
-/// 搜索页：两个 Tab ——
-/// - 「全部 B 站」：搜 B 站全网（[BiliApi.searchVideo]），结果可一键「加入」白名单
+/// 搜索页：三个 Tab ——
+/// - 「全部 B 站」：搜 B 站全网视频（[BiliApi.searchVideo]），结果可一键「加入」白名单
 /// - 「我的白名单」：对当前白名单数据本地过滤（标题 / UP 主包含关键词）
+/// - 「搜索 UP 主」（v2.13.0+）：搜 B 站全网用户（[BiliApi.searchUpowner]），
+///   结果可一键「加入白名单 UP 主」
 ///
 /// 防风控：输入防抖 600ms 自动搜 + 手动搜索按钮；搜索失败分类提示
 /// （-412 风控 / -352 限流 / 网络失败），返回空数组时显示「无结果」。
@@ -10,6 +12,9 @@
 ///   重置分页状态并重新执行 page=1 搜索
 /// - 上拉加载更多：结果列表底部 ≤200px 触发，自动请求 page+1；按 bvid
 ///   去重追加；`SearchPageResult.hasMore` 为 false 时显示「没有更多了」
+///
+/// UP 主 Tab：复用同一套防抖逻辑（不分页排序 chip，因为 search_type=bili_user
+/// 接口只支持默认排序），结果列表用 [UpownerTile] 展示，点整行跳 [UpownerPage]。
 library;
 
 import 'dart:async';
@@ -20,11 +25,15 @@ import 'package:flutter/material.dart';
 import '../api/bilibili_api.dart';
 import '../api/github_api.dart';
 import '../models/search_result.dart';
+import '../models/upowner.dart';
 import '../models/whitelist_video.dart';
 import '../services/service_locator.dart';
+import '../services/upowner_writer.dart';
 import '../services/whitelist_writer.dart';
 import '../widgets/cover_image.dart';
+import '../widgets/upowner_tile.dart';
 import 'player_page.dart';
+import 'upowner_page.dart';
 
 /// B 站搜索排序选项（与 [BiliApi.searchVideo] order 参数对应）。
 ///
@@ -78,9 +87,11 @@ class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateM
   final TextEditingController _keywordCtrl = TextEditingController();
   final BiliApi _api = BiliApi();
   final WhitelistWriter _writer = WhitelistWriter();
+  final UpownerWriter _upwriter = UpownerWriter();
 
-  /// Tab 控制器：区分「全部 B 站」(0) / 「我的白名单」(1)，
-  /// 防抖自动搜索只在「全部 B 站」Tab 触发（白名单 Tab 是本地过滤，不耗接口）。
+  /// Tab 控制器：区分「全部 B 站」(0) / 「我的白名单」(1) / 「搜索 UP 主」(2)，
+  /// 防抖自动搜索只在「全部 B 站」和「搜索 UP 主」Tab 触发
+  /// （白名单 Tab 是本地过滤，不耗接口）。
   late final TabController _tabCtrl;
 
   /// 列表 ScrollController：监听上拉触底，触发加载下一页。
@@ -104,18 +115,43 @@ class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateM
   bool _loadingMore = false;
   String _currentOrder = 'totalrank';
 
-  /// 正在「加入」的 bvid 集合（防止连点重复提交）。
+  /// UP 主搜索状态（v2.13.0+）：与视频搜索共享防抖触发，但独立的结果/翻页
+  /// 状态，不与视频搜索混。
+  List<Upowner>? _upownerResults;
+  bool _upownerSearching = false;
+  String? _upownerError;
+  int _upownerPage = 1;
+  bool _upownerHasMore = true;
+  bool _upownerLoadingMore = false;
+
+  /// 正在「加入」的 bvid / mid 集合（防止连点重复提交）。
   final Set<String> _joining = {};
+  final Set<int> _joiningUpowners = {};
 
   /// 输入防抖 Timer（搜索接口风控严格，不高频连续搜索）。
   Timer? _debounce;
 
+  /// 标记「切换 Tab 后第一次进 Tab 时是否需要重置结果」——切到 UP 主 Tab 时
+  /// 如果没有结果，触发一次空状态展示（输入框非空但还没搜过）。
+  int _lastTabIndex = -1;
+
   @override
   void initState() {
     super.initState();
-    _tabCtrl = TabController(length: 2, vsync: this);
+    _tabCtrl = TabController(length: 3, vsync: this);
+    _tabCtrl.addListener(_onTabChanged);
     _scrollCtrl.addListener(_onScroll);
     _loadWhitelist();
+  }
+
+  /// Tab 切换：切到「我的白名单」时 scroll 监听暂停（不影响功能，但能避免
+  /// 视错觉）；切到 UP 主 Tab 时清空视频搜索的错误状态，避免两 Tab 错误信息
+  /// 互相串味。
+  void _onTabChanged() {
+    if (!_tabCtrl.indexIsChanging && _tabCtrl.index != _lastTabIndex) {
+      _lastTabIndex = _tabCtrl.index;
+      if (mounted) setState(() {});
+    }
   }
 
   @override
@@ -156,7 +192,8 @@ class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateM
   // 搜索
   // ---------------------------------------------------------------------------
 
-  /// 输入变化 → 防抖 600ms 自动搜索（仅「全部 B 站」Tab；关键词为空则重置）。
+  /// 输入变化 → 防抖 600ms 自动搜索（仅「全部 B 站」和「搜索 UP 主」Tab 触发；
+  /// 关键词为空则重置所有 Tab 的状态）。
   void _onKeywordChanged(String _) {
     _debounce?.cancel();
     if (_keywordCtrl.text.trim().isEmpty) {
@@ -167,21 +204,35 @@ class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateM
         _page = 1;
         _hasMore = true;
         _loadingMore = false;
+        _upownerResults = null;
+        _upownerError = null;
+        _upownerSearching = false;
+        _upownerPage = 1;
+        _upownerHasMore = true;
+        _upownerLoadingMore = false;
       });
       return;
     }
     // 「我的白名单」Tab 只做本地过滤，不消耗搜索接口额度
-    if (_tabCtrl.index != 0) return;
-    // 新关键词 → 重置翻页状态再触发防抖搜索
-    setState(() {
-      _page = 1;
-      _hasMore = true;
-      _loadingMore = false;
-    });
+    final idx = _tabCtrl.index;
+    if (idx != 0 && idx != 2) return;
+    if (idx == 0) {
+      setState(() {
+        _page = 1;
+        _hasMore = true;
+        _loadingMore = false;
+      });
+    } else {
+      setState(() {
+        _upownerPage = 1;
+        _upownerHasMore = true;
+        _upownerLoadingMore = false;
+      });
+    }
     _debounce = Timer(const Duration(milliseconds: 600), _doSearch);
   }
 
-  /// 手动搜索（按钮 / 键盘搜索键）：立即执行并取消未触发的防抖。
+  /// 手动搜索（按钮 / 键盘搜索键）：根据当前 Tab 分发到视频或 UP 主搜索。
   Future<void> _doSearch() async {
     final keyword = _keywordCtrl.text.trim();
     _debounce?.cancel();
@@ -193,9 +244,25 @@ class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateM
         _page = 1;
         _hasMore = true;
         _loadingMore = false;
+        _upownerResults = null;
+        _upownerError = null;
+        _upownerSearching = false;
+        _upownerPage = 1;
+        _upownerHasMore = true;
+        _upownerLoadingMore = false;
       });
       return;
     }
+    if (_tabCtrl.index == 2) {
+      await _doUpownerSearch();
+    } else {
+      await _doVideoSearch();
+    }
+  }
+
+  /// 视频搜索（Tab=0）。
+  Future<void> _doVideoSearch() async {
+    final keyword = _keywordCtrl.text.trim();
     setState(() {
       _searching = true;
       _searchError = null;
@@ -228,6 +295,41 @@ class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateM
     }
   }
 
+  /// UP 主搜索（Tab=2）：search_type=bili_user，不带排序 chip。
+  Future<void> _doUpownerSearch() async {
+    final keyword = _keywordCtrl.text.trim();
+    setState(() {
+      _upownerSearching = true;
+      _upownerError = null;
+      _upownerPage = 1;
+      _upownerHasMore = true;
+      _upownerLoadingMore = false;
+    });
+    try {
+      final result = await _api.searchUpowner(keyword);
+      if (!mounted) return;
+      setState(() {
+        _upownerResults = result.upowners;
+        _upownerHasMore = result.hasMore;
+        _upownerSearching = false;
+      });
+    } on BiliApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _upownerResults = null;
+        _upownerSearching = false;
+        _upownerError = '搜索失败：${e.message}';
+      });
+    } on DioException {
+      if (!mounted) return;
+      setState(() {
+        _upownerResults = null;
+        _upownerSearching = false;
+        _upownerError = '网络请求失败，请检查网络后重试';
+      });
+    }
+  }
+
   /// 切换排序 chip：取消防抖、重置翻页状态，从 page=1 重查。
   void _switchOrder(String newOrder) {
     if (newOrder == _currentOrder) return;
@@ -243,9 +345,18 @@ class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateM
     _doSearch();
   }
 
-  /// 上拉加载下一页：守卫严格（搜索中/已在加载/已无更多/关键词为空都直接
-  /// return）；失败 SnackBar 提示且不前进 [_page]，保持当前页可重试。
+  /// 上拉加载下一页：根据当前 Tab 分发到视频或 UP 主翻页。
   Future<void> _loadMore() async {
+    if (_tabCtrl.index == 2) {
+      await _loadMoreUpowner();
+    } else {
+      await _loadMoreVideo();
+    }
+  }
+
+  /// 视频翻页：守卫严格（搜索中/已在加载/已无更多/关键词为空都直接 return）；
+  /// 失败 SnackBar 提示且不前进 [_page]，保持当前页可重试。
+  Future<void> _loadMoreVideo() async {
     if (_searching || _loadingMore || !_hasMore) return;
     final base = _results;
     if (base == null) return;
@@ -285,6 +396,41 @@ class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateM
     }
   }
 
+  /// UP 主翻页：与视频同模式，按 mid 去重追加。
+  Future<void> _loadMoreUpowner() async {
+    if (_upownerSearching || _upownerLoadingMore || !_upownerHasMore) return;
+    final base = _upownerResults;
+    if (base == null) return;
+    final keyword = _keywordCtrl.text.trim();
+    if (keyword.isEmpty) return;
+    setState(() => _upownerLoadingMore = true);
+    final nextPage = _upownerPage + 1;
+    try {
+      final result = await _api.searchUpowner(keyword, page: nextPage);
+      if (!mounted) return;
+      final existing = base.map((u) => u.mid).toSet();
+      final appended = <Upowner>[
+        ...base,
+        for (final u in result.upowners)
+          if (!existing.contains(u.mid)) u,
+      ];
+      setState(() {
+        _upownerResults = appended;
+        _upownerPage = nextPage;
+        _upownerHasMore = result.hasMore;
+        _upownerLoadingMore = false;
+      });
+    } on BiliApiException catch (e) {
+      if (!mounted) return;
+      setState(() => _upownerLoadingMore = false);
+      _showSnack('加载失败：${e.message}，点击重试');
+    } on DioException {
+      if (!mounted) return;
+      setState(() => _upownerLoadingMore = false);
+      _showSnack('网络请求失败，请检查网络后重试');
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // 加入白名单（与首页「导入」共用 WhitelistWriter：构造视频 + 查重 + 写 Gist）
   // ---------------------------------------------------------------------------
@@ -314,6 +460,28 @@ class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateM
       if (mounted) setState(() => _joining.remove(r.bvid));
     }
   }
+
+  /// UP 主加入白名单（搜索页 UP 主 Tab 用）。
+  Future<void> _joinUpowner(Upowner up) async {
+    if (_joiningUpowners.contains(up.mid)) return;
+    setState(() => _joiningUpowners.add(up.mid));
+    try {
+      final result = await _upwriter.add(up);
+      if (!mounted) return;
+      setState(() {
+        if (result.data != null) _whitelist = result.data;
+      });
+      _showSnack(result.message);
+    } on GithubApiException catch (e) {
+      _showSnack('加入失败：${e.message}');
+    } finally {
+      if (mounted) setState(() => _joiningUpowners.remove(up.mid));
+    }
+  }
+
+  /// 该 mid 是否已在白名单（搜索页 UP 主 Tab「已加入」判断）。
+  bool _isUpownerAdded(int mid) =>
+      _whitelist?.upowners.any((u) => u.mid == mid) ?? false;
 
   void _showSnack(String message) {
     if (!mounted) return;
@@ -352,8 +520,10 @@ class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateM
                 textInputAction: TextInputAction.search,
                 onChanged: _onKeywordChanged,
                 onSubmitted: (_) => _doSearch(),
-                decoration: const InputDecoration(
-                  hintText: '搜索 B 站视频或白名单',
+                decoration: InputDecoration(
+                  hintText: _tabCtrl.index == 2
+                      ? '搜索 B 站 UP 主（昵称 / 认证名）'
+                      : '搜索 B 站视频或白名单',
                   border: InputBorder.none,
                   isDense: true,
                 ),
@@ -371,6 +541,7 @@ class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateM
           tabs: const [
             Tab(text: '全部 B 站'),
             Tab(text: '我的白名单'),
+            Tab(text: '搜索 UP 主'),
           ],
         ),
       ),
@@ -379,6 +550,7 @@ class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateM
         children: [
           _buildGlobalTab(),
           _buildWhitelistTab(),
+          _buildUpownerTab(),
         ],
       ),
     );
@@ -591,6 +763,100 @@ class _SearchPageState extends State<SearchPage> with SingleTickerProviderStateM
         );
       },
     );
+  }
+
+  // ---- 「搜索 UP 主」Tab ----
+
+  Widget _buildUpownerTab() {
+    return _buildUpownerResults();
+  }
+
+  Widget _buildUpownerResults() {
+    if (_upownerSearching) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (_upownerError != null) {
+      return _MessageView(
+        icon: Icons.error_outline,
+        message: _upownerError!,
+        actionLabel: '重试',
+        onAction: _doSearch,
+      );
+    }
+    final results = _upownerResults;
+    if (results == null) {
+      return const _MessageView(
+        icon: Icons.person_search,
+        message: '输入 UP 主昵称，搜索 B 站用户\n'
+            '结果可一键加入白名单（加入前会查重）',
+      );
+    }
+    if (results.isEmpty) {
+      return const _MessageView(
+        icon: Icons.search_off,
+        message: '没有找到相关 UP 主，换个关键词试试',
+      );
+    }
+    final showLoadingMore = _upownerLoadingMore;
+    final showNoMore = !_upownerHasMore && !showLoadingMore;
+    final extraSlots = (showLoadingMore || showNoMore) ? 1 : 0;
+    return ListView.separated(
+      controller: _scrollCtrl,
+      itemCount: results.length + extraSlots,
+      separatorBuilder: (_, __) => const Divider(height: 1, indent: 80),
+      itemBuilder: (context, i) {
+        if (i >= results.length) {
+          return _buildUpownerBottomStatus(showLoadingMore, showNoMore);
+        }
+        final up = results[i];
+        return UpownerTile(
+          upowner: up,
+          added: _isUpownerAdded(up.mid),
+          joining: _joiningUpowners.contains(up.mid),
+          onJoin: () => _joinUpowner(up),
+          onTap: () {
+            // 跳 UP 主详情页（v2.13.0+）：展示 UP 主信息 + 视频列表
+            Navigator.of(context).push(MaterialPageRoute<void>(
+              builder: (_) => UpownerPage(
+                mid: up.mid,
+                initial: up,
+                isInWhitelist: _isUpownerAdded(up.mid),
+              ),
+            ));
+          },
+        );
+      },
+    );
+  }
+
+  /// UP 主列表底部状态：加载中 / 没有更多了。
+  Widget _buildUpownerBottomStatus(bool showLoadingMore, bool showNoMore) {
+    if (showLoadingMore) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 16),
+        child: Center(
+          child: SizedBox(
+            width: 18,
+            height: 18,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+        ),
+      );
+    }
+    if (showNoMore) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(vertical: 16),
+        child: Center(
+          child: Text(
+            '没有更多了',
+            style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                  color: Theme.of(context).colorScheme.outline,
+                ),
+          ),
+        ),
+      );
+    }
+    return const SizedBox.shrink();
   }
 }
 

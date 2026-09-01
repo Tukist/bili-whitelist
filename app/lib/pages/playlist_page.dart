@@ -14,6 +14,7 @@ import '../services/service_locator.dart';
 import '../services/whitelist_writer.dart';
 import '../utils/import_parser.dart';
 import 'collection_page.dart';
+import 'inbox_page.dart';
 import 'login_page.dart';
 import 'search_page.dart';
 
@@ -60,6 +61,12 @@ class _PlaylistPageState extends State<PlaylistPage> {
   /// 异常（测试环境无原生通道）时回退 config.dart 的 kAppVersion。
   String _version = kAppVersion;
 
+  /// 信箱未读数（顶部 AppBar 红点用；0 = 不显示红点）。
+  int _inboxUnseen = 0;
+
+  /// 启动 5 秒后触发信箱检查的定时器（dispose 时取消，避免测试报错）。
+  Timer? _inboxCheckTimer;
+
   bool get _hasData => _data.videos.isNotEmpty;
 
   @override
@@ -68,6 +75,14 @@ class _PlaylistPageState extends State<PlaylistPage> {
     _load();
     _maybeRefreshSession();
     _loadVersion();
+    _refreshInboxCount();
+    _scheduleInboxCheck();
+  }
+
+  @override
+  void dispose() {
+    _inboxCheckTimer?.cancel();
+    super.dispose();
   }
 
   /// 读取 App 版本号（插件方案，与 pubspec.yaml version 单源）。
@@ -106,6 +121,41 @@ class _PlaylistPageState extends State<PlaylistPage> {
     } catch (_) {
       // 测试环境无 secure storage 原生插件等，静默
     }
+  }
+
+  /// 启动后立即读一次信箱未读数（仅本地缓存，不触网），让红点尽快可见。
+  Future<void> _refreshInboxCount() async {
+    try {
+      final n = await ServiceLocator.inboxService.getUnseenCount();
+      if (!mounted) return;
+      setState(() => _inboxUnseen = n);
+    } catch (_) {
+      // inbox 静默失败不阻塞首页
+    }
+  }
+
+  /// 启动 5 秒后触发一次信箱检查（带 30min 节流，重复启动不会连发）。
+  /// 静默失败不提示；与 T3 启动检查风格一致。
+  void _scheduleInboxCheck() {
+    _inboxCheckTimer?.cancel();
+    _inboxCheckTimer = Timer(const Duration(seconds: 5), () async {
+      if (!mounted) return;
+      try {
+        final result = await ServiceLocator.inboxService.checkAll();
+        if (!mounted) return;
+        setState(() => _inboxUnseen = result.unseen);
+      } catch (e) {
+        debugPrint('[inbox] 启动检查失败: $e');
+      }
+    });
+  }
+
+  /// 跳到 InboxPage；返回时重新读未读数（用户可能已点过「全部标记已读」）。
+  Future<void> _openInbox() async {
+    await Navigator.of(context).push(MaterialPageRoute<void>(
+      builder: (_) => const InboxPage(),
+    ));
+    if (mounted) await _refreshInboxCount();
   }
 
   /// 读取本地缓存 + 尝试网络同步（两者并行，UI 立即展示缓存）。
@@ -388,8 +438,43 @@ class _PlaylistPageState extends State<PlaylistPage> {
       appBar: AppBar(
         title: const Text('白名单点播'),
         actions: [
+          // 信箱入口：未读 > 0 时图标右上角显示小红点
+          Stack(
+            clipBehavior: Clip.none,
+            children: [
+              IconButton(
+                tooltip: '信箱（白名单 UP 主新视频）',
+                icon: const Icon(Icons.inbox_outlined),
+                onPressed: _openInbox,
+              ),
+              if (_inboxUnseen > 0)
+                Positioned(
+                      right: 6,
+                      top: 6,
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 5, vertical: 1),
+                        constraints: const BoxConstraints(
+                            minWidth: 16, minHeight: 16),
+                        decoration: BoxDecoration(
+                          color: Theme.of(context).colorScheme.error,
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        alignment: Alignment.center,
+                        child: Text(
+                          _inboxUnseen > 99 ? '99+' : '$_inboxUnseen',
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 10,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                      ),
+                    ),
+            ],
+          ),
           IconButton(
-            tooltip: '搜索（B 站全网 + 白名单内）',
+            tooltip: '搜索（B 站全网 + 白名单内 + UP 主）',
             icon: const Icon(Icons.search),
             onPressed: _openSearch,
           ),

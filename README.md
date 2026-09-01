@@ -21,6 +21,7 @@
 - [使用方法](#使用方法)
 - [构建与测试](#构建与测试)
 - [数据模型 v3](#数据模型-v3)
+- [UP 主白名单与信箱（v2.13.0+）](#up-主白名单与信箱v2130)
 - [安全与合规声明](#安全与合规声明)
 - [已知限制](#已知限制)
 - [许可证](#许可证)
@@ -351,6 +352,73 @@ python whitelist.py list
 - 老版本数据（v1/v2）读取兼容：缺 `pages` 视为单 P，缺 `collection` 视为未分类
 - 任何端写回 Gist 时统一规范化：`version=3`、刷新 `updated_at`、`collections` 必出
 - 字段含义见 `app/lib/models/whitelist_video.dart` 与 `whitelist.py` 头部注释
+
+---
+
+## UP 主白名单与信箱（v2.13.0+）
+
+> T2 里程碑：除了「把单条视频加进白名单」，现在可以**把整个 UP 主加进白名单**——一次关注，TA 的所有投稿都能自由浏览；同时启动时自动检查新视频，「信箱」里能看到 TA 发布了什么。
+
+### 核心功能
+
+| 功能 | 入口 | 说明 |
+|------|------|------|
+| **搜索 UP 主** | 搜索页「搜索 UP 主」Tab | 复用 B 站全网用户搜索（`x/web-interface/wbi/search/type`，`search_type=bili_user`），头像/名字/认证描述/粉丝数，结果可一键加入白名单 |
+| **UP 主详情页** | 搜索结果点 UP 主 | 头部信息卡（头像 + 名字 + 粉丝 + 简介）+ 视频列表（最新发布 / 最多播放 / 最多收藏 三种排序，分页 20 条/页），点视频直接播放（不写 Gist） |
+| **信箱** | 首页 AppBar 最左侧图标 | 启动 5s 后自动检查所有白名单 UP 主的新视频（带 30min 节流 + 1.5s 间隔），未读数 ≥ 1 时显示小红点；下拉刷新强制重检；顶部「全部标记已读」一键清空 |
+
+### 设计取舍
+
+- **不冗余存储 UP 主视频**：UP 主视频不写入 `videos[]` 列表（数据模型 v3 的视频列表保持精简），只在用户**显式加单条视频进白名单**时才走 `WhitelistWriter.addByBvid` 写 Gist
+- **信箱增量靠 `lastSeenBvid`**：每个 UP 主记录最近一次见过的 bvid，下次检查时拿到首页 5 条最新视频，对比找到未读部分（首页已按 `pubdate` 倒序）
+- **本地优先**：未读列表写 SharedPreferences（每 UP 主一份 unseen），`lastSeenBvid` 写 Gist（批量 `updateLastSeenBatch`）；检查期间断网/失败不影响下次重试
+- **风控降级**：任何 UP 主遇 -412/-352 → 间隔从 1.5s 自动升级到 3s，跳过该 UP 主不抛错；最多检查 100 个 UP 主（超出按前 100）
+
+### 数据模型 v4
+
+`whitelist.json` v4 = v3 + 顶层 `upowners[]` 数组（兼容 v3：缺字段视为 `[]`）：
+
+```json
+{
+  "version": 4,
+  "updated_at": "ISO 8601 UTC",
+  "collections": [...],
+  "upowners": [                          // v4 新增：白名单 UP 主
+    {
+      "mid": 12345,                       // B 站用户 ID（主键）
+      "name": "UP主昵称 · 认证描述",      // 搜索时拼接 official_verify.desc
+      "face": "https://头像url",
+      "fans": 9999,                       // 可选，缓存展示
+      "added_at": "ISO 8601 UTC",
+      "last_seen_bvid": "BV1xxx",          // 信箱增量对照
+      "last_seen_at": "ISO 8601 UTC"      // 上次检查时间
+    }
+  ],
+  "videos": [...]                         // 与 v3 完全一致
+}
+```
+
+- 任何端写回 Gist 时统一规范化：`version=4`、刷新 `updated_at`、`upowners` 必出
+- 字段含义见 `app/lib/models/upowner.dart` 与 `app/lib/services/inbox_service.dart`
+
+### 风控与限制
+
+| 场景 | 行为 |
+|------|------|
+| B 站 -412 风控 | 抛 `BiliApiException`，UI 显示「搜索失败：接口被风控拦截」+ 重试按钮 |
+| B 站 -352 限流 | 同上：抛 `BiliApiException`，提示稍后再试 |
+| 信箱某 UP 主连续风控 | 自动降级：间隔从 1.5s 升级到 3s，跳过该 UP 主不阻塞后续 |
+| 超过 100 个 UP 主 | 只检查前 100 个（按 `WhitelistData.upowners` 顺序） |
+| 网络断开/异常 | 静默跳过本次检查，下次启动或用户下拉刷新重试 |
+
+### 代码入口
+
+- 模型：`app/lib/models/upowner.dart`（`Upowner` / `addUpowner` / `removeUpowner` / `UpownerException`）
+- 写入：`app/lib/services/upowner_writer.dart`（`UpownerWriter.add` / `removeByMid` / `updateLastSeenBatch`）
+- 信箱：`app/lib/services/inbox_service.dart`（`InboxService.checkAll` / `markAllRead` / `getUnseenCount` / `getItems`）
+- 页面：`app/lib/pages/upowner_page.dart`（详情页）/ `app/lib/pages/inbox_page.dart`（信箱页）
+- 入口：`app/lib/widgets/upowner_tile.dart`（搜索结果列表项）
+- B 站接口：`app/lib/api/bilibili_api.dart` 的 `searchUpowner` / `fetchUpownerVideos` / `fetchUpownerInfo`
 
 ---
 

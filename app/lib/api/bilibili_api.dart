@@ -5,6 +5,8 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 import '../config.dart';
 import '../models/search_result.dart';
 import '../models/subtitle.dart';
+import '../models/upowner.dart';
+import '../models/whitelist_video.dart';
 import '../services/secure_store.dart';
 import '../wbi/wbi_signer.dart';
 
@@ -72,6 +74,56 @@ class PlayUrlResult {
 
   /// 是否拿到至少一条可播放的流。
   bool get hasStream => mp4Url != null || dashVideoUrls.isNotEmpty;
+}
+
+/// 「搜索 UP 主」结果分页响应（`x/web-interface/wbi/search/type`，
+/// search_type=bili_user）。
+///
+/// 与 [SearchPageResult] 同构：单页 + 总条数 + 是否还有下一页，
+/// UI 层据此控制上拉加载更多。
+class SearchUpownerResult {
+  /// 当前页 UP 主列表（已清洗）。
+  final List<Upowner> upowners;
+
+  /// 服务端返回的总命中数（`data.numResults`）；null = 接口未返回。
+  final int? totalCount;
+
+  /// 「是否还有下一页」。UI 层据此控制上拉加载更多触发。
+  final bool hasMore;
+
+  const SearchUpownerResult({
+    required this.upowners,
+    required this.totalCount,
+    required this.hasMore,
+  });
+}
+
+/// UP 主视频列表分页响应（`x/space/wbi/arc/search`）。
+class UpownerVideosPage {
+  final List<WhitelistVideo> videos;
+  final int? totalCount;
+  final bool hasMore;
+
+  const UpownerVideosPage({
+    required this.videos,
+    required this.totalCount,
+    required this.hasMore,
+  });
+}
+
+/// UP 主详情数据（`x/space/wbi/acc/info` 返回的常用字段集合）。
+class UpownerInfo {
+  final String name;
+  final String face;
+  final int? fans;
+  final String sign; // 个人简介
+
+  const UpownerInfo({
+    required this.name,
+    required this.face,
+    this.fans,
+    required this.sign,
+  });
 }
 
 /// B 站 API 客户端（dio 封装）。
@@ -640,5 +692,289 @@ class BiliApi {
     debugPrint('[bili_api] downloadSubtitle lan=${track.lan} cues=${cues.length}');
     _subtitleCache[key] = cues;
     return cues;
+  }
+
+  // -------------------------------------------------------------------------
+  // UP 主功能（v2.13.0+ 起）：搜索 UP 主 / UP 主视频列表 / UP 主详情
+  // -------------------------------------------------------------------------
+
+  /// 搜索 UP 主（B 站全网用户搜索）。
+  ///
+  /// - `x/web-interface/wbi/search/type?search_type=bili_user&keyword=&page=`
+  /// - 带 WBI 签名 + buvid 指纹 Cookie + 完整浏览器头（复用 [._injectAuth] /
+  ///   [._ensureWbiKeys]，登录态存在时也会注入 SESSDATA）
+  /// - 错误分类与 [searchVideo] 一致：code=-412 / -352 / 其他业务码抛
+  ///   [BiliApiException]，网络失败抛 [DioException]
+  /// - `result[]` 单项含 `mid` / `uname` / `upic` / `fans` / `official_verify.type`
+  ///   / `official_verify.desc` 等；缺少必要字段时该条被丢弃
+  /// - [page] 从 1 起；单页 20 条；hasMore 优先用 numResults，否则装满 20 兜底
+  Future<SearchUpownerResult> searchUpowner(
+    String keyword, {
+    int page = 1,
+  }) async {
+    await _injectAuth();
+    final (imgKey, subKey) = await _ensureWbiKeys();
+    final params = WbiSigner.encodeWbi(
+      {
+        'search_type': 'bili_user',
+        'keyword': keyword,
+        'page': '$page',
+        'page_size': '20',
+      },
+      imgKey: imgKey,
+      subKey: subKey,
+    );
+    debugPrint('[bili_api] searchUpowner keyword=$keyword page=$page');
+    final resp = await _dio.get<Map<String, dynamic>>(
+      '/x/web-interface/wbi/search/type',
+      queryParameters: params,
+    );
+    final data = resp.data;
+    final code = data?['code'] as int?;
+    if (code == -412) {
+      throw const BiliApiException(
+        code: -412,
+        message: '搜索 UP 主接口被风控拦截，请稍后再搜',
+        path: '/x/web-interface/wbi/search/type',
+      );
+    }
+    if (code == -352) {
+      throw const BiliApiException(
+        code: -352,
+        message: '搜索 UP 主接口被限流，请稍后再试',
+        path: '/x/web-interface/wbi/search/type',
+      );
+    }
+    if (code != 0) {
+      throw BiliApiException(
+        code: code ?? -1,
+        message: data?['message'] as String? ?? '搜索 UP 主失败',
+        path: '/x/web-interface/wbi/search/type',
+      );
+    }
+    final d = data?['data'] as Map<String, dynamic>?;
+    final totalRaw = d?['numResults'];
+    final totalCount = (totalRaw is num) ? totalRaw.toInt() : null;
+    final raw = d?['result'];
+    if (raw is! List) {
+      return SearchUpownerResult(
+        upowners: const [],
+        totalCount: totalCount,
+        hasMore: false,
+      );
+    }
+    final upowners = raw
+        .whereType<Map<String, dynamic>>()
+        .map(_parseUpownerFromSearch)
+        .where((u) => u.mid != 0) // 缺 mid 的视为脏数据丢弃
+        .toList();
+    return SearchUpownerResult(
+      upowners: upowners,
+      totalCount: totalCount,
+      hasMore: _computeHasMore(loaded: upowners.length, totalCount: totalCount),
+    );
+  }
+
+  /// 解析搜索接口 result[] 单项为 [Upowner]。
+  ///
+  /// B 站搜索 bili_user 单项字段：
+  /// - `mid` int
+  /// - `uname` String（昵称）
+  /// - `upic` String（头像 URL，可能 `//` 开头）
+  /// - `fans` int
+  /// - `official_verify.type` int（-1=无 0=个人 1=企业 等）
+  /// - `official_verify.desc` String（认证描述）
+  /// - `level_info.current_level` int（等级，暂不展示）
+  Upowner _parseUpownerFromSearch(Map<String, dynamic> json) {
+    final verify = json['official_verify'] as Map<String, dynamic>? ?? const {};
+    // 拼接 desc（type > 0 时才有意义）；空 desc 时不显示
+    final type = (verify['type'] as num?)?.toInt() ?? -1;
+    final desc = verify['desc'] as String? ?? '';
+    final displayName = desc.isNotEmpty && type > 0
+        ? '${json['uname']} · $desc'
+        : (json['uname'] as String? ?? '');
+    var face = json['upic'] as String? ?? '';
+    if (face.startsWith('//')) face = 'https:$face';
+    return Upowner(
+      mid: (json['mid'] as num?)?.toInt() ?? 0,
+      name: displayName,
+      face: face,
+      fans: (json['fans'] as num?)?.toInt(),
+      addedAt: DateTime.now().toUtc(),
+    );
+  }
+
+  /// UP 主投稿视频列表（`x/space/wbi/arc/search?mid=&pn=&ps=&order=`）。
+  ///
+  /// - [order] 排序方式（与 [searchVideo] 同套枚举）：
+  ///   `pubdate` 最新发布（默认）/ `click` 最多播放 / `stow` 最多收藏
+  /// - 返回的 [WhitelistVideo] 用 `addedAt = 当前时间`、`collection = ''`、
+  ///   `order = 0`，**不写 Gist**（UP 主视频不入库，仅供点播用）
+  /// - 缺 cid 时填 0：播放页 [PlayerPage] 会用 view 接口补 cid
+  /// - 错误分类与 [searchVideo] 一致
+  Future<UpownerVideosPage> fetchUpownerVideos(
+    int mid, {
+    int pn = 1,
+    int ps = 20,
+    String order = 'pubdate',
+  }) async {
+    await _injectAuth();
+    final (imgKey, subKey) = await _ensureWbiKeys();
+    final params = WbiSigner.encodeWbi(
+      {
+        'mid': '$mid',
+        'pn': '$pn',
+        'ps': '$ps',
+        'order': order,
+      },
+      imgKey: imgKey,
+      subKey: subKey,
+    );
+    debugPrint('[bili_api] fetchUpownerVideos mid=$mid pn=$pn ps=$ps order=$order');
+    final resp = await _dio.get<Map<String, dynamic>>(
+      '/x/space/wbi/arc/search',
+      queryParameters: params,
+    );
+    final data = resp.data;
+    final code = data?['code'] as int?;
+    if (code == -412) {
+      throw const BiliApiException(
+        code: -412,
+        message: 'UP 主视频列表接口被风控拦截，请稍后再试',
+        path: '/x/space/wbi/arc/search',
+      );
+    }
+    if (code == -352) {
+      throw const BiliApiException(
+        code: -352,
+        message: 'UP 主视频列表接口被限流，请稍后再试',
+        path: '/x/space/wbi/arc/search',
+      );
+    }
+    if (code != 0) {
+      throw BiliApiException(
+        code: code ?? -1,
+        message: data?['message'] as String? ?? 'UP 主视频列表获取失败',
+        path: '/x/space/wbi/arc/search',
+      );
+    }
+    final d = data?['data'] as Map<String, dynamic>?;
+    final list = d?['list'] as Map<String, dynamic>?;
+    final vlist = list?['vlist'];
+    final totalRaw = list?['count'];
+    final totalCount = (totalRaw is num) ? totalRaw.toInt() : null;
+    if (vlist is! List) {
+      return UpownerVideosPage(
+        videos: const [],
+        totalCount: totalCount,
+        hasMore: false,
+      );
+    }
+    final videos = vlist
+        .whereType<Map<String, dynamic>>()
+        .map((j) => _videoFromVlist(j, mid))
+        .where((v) => v.bvid.isNotEmpty)
+        .toList();
+    return UpownerVideosPage(
+      videos: videos,
+      totalCount: totalCount,
+      hasMore: _computeHasMore(loaded: videos.length, totalCount: totalCount),
+    );
+  }
+
+  /// 从 `x/space/wbi/arc/search` 返回的 vlist[] 单项构造 [WhitelistVideo]。
+  ///
+  /// vlist 字段：`bvid` / `title` / `pic` / `length`(秒) / `author` / `mid` /
+  /// `created`(Unix 秒) / `play` / `favorites`。其中 `length` 是「mm:ss」
+  /// 字符串而非秒数，需解析。
+  WhitelistVideo _videoFromVlist(Map<String, dynamic> j, int mid) {
+    final length = j['length'] as String? ?? '';
+    final secs = _parseLength(length);
+    final created = (j['created'] as num?)?.toInt() ?? 0;
+    final addedAt = created > 0
+        ? DateTime.fromMillisecondsSinceEpoch(created * 1000)
+            .toUtc()
+            .toIso8601String()
+        : DateTime.now().toUtc().toIso8601String();
+    return WhitelistVideo(
+      bvid: j['bvid'] as String? ?? '',
+      cid: 0, // 详情页会调 view 补 cid
+      title: j['title'] as String? ?? '',
+      cover: SearchResult.normalizeCover(j['pic'] as String? ?? ''),
+      duration: secs,
+      upName: j['author'] as String? ?? '',
+      addedAt: addedAt,
+      collection: '',
+      order: 0,
+    );
+  }
+
+  /// 解析 B 站 mm:ss / h:mm:ss 时长字符串为秒。空串/非法 → 0。
+  int _parseLength(String raw) {
+    if (raw.isEmpty) return 0;
+    final parts = raw.split(':');
+    if (parts.length < 2 || parts.length > 3) return 0;
+    final nums = parts.map(int.tryParse).toList();
+    if (nums.any((n) => n == null)) return 0;
+    if (parts.length == 3) return nums[0]! * 3600 + nums[1]! * 60 + nums[2]!;
+    return nums[0]! * 60 + nums[1]!;
+  }
+
+  /// UP 主详情（`x/space/wbi/acc/info?mid=`）。
+  ///
+  /// 字段：`name` / `face` / `fans` / `sign` / `level_info.current_level` /
+  /// `official_verify.desc` / `official_verify.type`。我们只取常用字段。
+  Future<UpownerInfo> fetchUpownerInfo(int mid) async {
+    await _injectAuth();
+    final (imgKey, subKey) = await _ensureWbiKeys();
+    final params = WbiSigner.encodeWbi(
+      {'mid': '$mid'},
+      imgKey: imgKey,
+      subKey: subKey,
+    );
+    debugPrint('[bili_api] fetchUpownerInfo mid=$mid');
+    final resp = await _dio.get<Map<String, dynamic>>(
+      '/x/space/wbi/acc/info',
+      queryParameters: params,
+    );
+    final data = resp.data;
+    final code = data?['code'] as int?;
+    if (code == -412) {
+      throw const BiliApiException(
+        code: -412,
+        message: 'UP 主详情接口被风控拦截，请稍后再试',
+        path: '/x/space/wbi/acc/info',
+      );
+    }
+    if (code == -352) {
+      throw const BiliApiException(
+        code: -352,
+        message: 'UP 主详情接口被限流，请稍后再试',
+        path: '/x/space/wbi/acc/info',
+      );
+    }
+    if (code != 0) {
+      throw BiliApiException(
+        code: code ?? -1,
+        message: data?['message'] as String? ?? 'UP 主详情获取失败',
+        path: '/x/space/wbi/acc/info',
+      );
+    }
+    final d = data?['data'] as Map<String, dynamic>?;
+    if (d == null) {
+      throw const BiliApiException(
+        code: -1,
+        message: 'UP 主详情接口未返回数据',
+        path: '/x/space/wbi/acc/info',
+      );
+    }
+    var face = d['face'] as String? ?? '';
+    if (face.startsWith('//')) face = 'https:$face';
+    return UpownerInfo(
+      name: d['name'] as String? ?? '',
+      face: face,
+      fans: (d['fans'] as num?)?.toInt(),
+      sign: d['sign'] as String? ?? '',
+    );
   }
 }

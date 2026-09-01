@@ -1,6 +1,9 @@
 /// 白名单数据模型（whitelist.json v1 结构；v2 起每条视频带 pages 分 P 信息；
-/// v3 起支持合集：顶层 collections 列表 + 每条视频的 collection 归属）。
+/// v3 起支持合集：顶层 collections 列表 + 每条视频的 collection 归属；
+/// v4 起支持 UP 主：顶层 upowners 列表，UP 主视频不在 videos[] 冗余存）。
 library;
+
+import 'upowner.dart';
 
 /// 视频分 P 信息（whitelist.json v2 的 pages 数组项）。
 class PageInfo {
@@ -229,18 +232,23 @@ WhitelistData deleteCollection(WhitelistData data, String name) {
   );
 }
 
-/// 白名单整体（v1 结构 + videos 列表；v3 增加 collections）。
+/// 白名单整体（v1 结构 + videos 列表；v3 增加 collections；v4 增加 upowners）。
 class WhitelistData {
   final int version;
   final String updatedAt; // 服务端更新时间（PC 端写入）
   final List<WhitelistVideo> videos;
   final List<CollectionInfo> collections; // v3；旧数据缺省为 []
+  final List<Upowner> upowners; // v4；旧数据缺省为 []
+
+  /// 当前存储版本号（写回 Gist 时统一规范化到此版本）。
+  static const int currentVersion = 4;
 
   const WhitelistData({
     required this.version,
     required this.updatedAt,
     required this.videos,
     this.collections = const [],
+    this.upowners = const [],
   });
 
   factory WhitelistData.fromJson(Map<String, dynamic> json) {
@@ -258,11 +266,19 @@ class WhitelistData {
             .map(CollectionInfo.fromJson)
             .toList()
         : <CollectionInfo>[];
+    final rawUpowners = json['upowners'];
+    final upowners = rawUpowners is List
+        ? rawUpowners
+            .whereType<Map<String, dynamic>>()
+            .map(Upowner.fromJson)
+            .toList()
+        : <Upowner>[];
     return WhitelistData(
       version: (json['version'] as num?)?.toInt() ?? 1,
       updatedAt: json['updated_at'] as String? ?? '',
       videos: videos,
       collections: collections,
+      upowners: upowners,
     );
   }
 
@@ -270,35 +286,42 @@ class WhitelistData {
         'version': version,
         'updated_at': updatedAt,
         'collections': collections.map((c) => c.toJson()).toList(),
+        'upowners': upowners.map((u) => u.toJson()).toList(),
         'videos': videos.map((v) => v.toJson()).toList(),
       };
 
-  /// 复制并替换 videos / collections（管理操作生成新数据用）。
+  /// 复制并替换 videos / collections / upowners（管理操作生成新数据用）。
   WhitelistData copyWith({
     int? version,
     String? updatedAt,
     List<WhitelistVideo>? videos,
     List<CollectionInfo>? collections,
+    List<Upowner>? upowners,
   }) =>
       WhitelistData(
         version: version ?? this.version,
         updatedAt: updatedAt ?? this.updatedAt,
         videos: videos ?? this.videos,
         collections: collections ?? this.collections,
+        upowners: upowners ?? this.upowners,
       );
 
-  /// 管理操作保存前规范化：version 固定 3、updated_at 刷新、collections 必出。
-  /// （读入任意版本数据，写回 Gist 时统一为 v3。）
+  /// 管理操作保存前规范化：version 固定 4、updated_at 刷新、collections 必出、
+  /// upowners 必出。（读入任意版本数据，写回 Gist 时统一为 v4。）
   WhitelistData normalizedForSave() => WhitelistData(
-        version: 3,
+        version: currentVersion,
         updatedAt: DateTime.now().toUtc().toIso8601String(),
         videos: videos,
         collections: collections,
+        upowners: upowners,
       );
 
   /// 空白名单。
-  static WhitelistData empty() =>
-      const WhitelistData(version: 1, updatedAt: '', videos: []);
+  static WhitelistData empty() => const WhitelistData(
+        version: currentVersion,
+        updatedAt: '',
+        videos: [],
+      );
 
   /// 取某合集下的视频，按展示顺序排序：**order 升序优先**，
   /// order 相同（或旧数据全为 0）时按 added_at 倒序兜底（新加入的在前，

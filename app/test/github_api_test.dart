@@ -220,11 +220,12 @@ void main() {
         (payload['files'] as Map)['whitelist.json'] as Map;
     final raw = content['content'] as String;
     final parsed = jsonDecode(raw) as Map<String, dynamic>;
-    expect(parsed['version'], 3); // 保存统一 v3
+    expect(parsed['version'], 4); // 保存统一 v4（含 upowners 字段）
     expect(parsed.containsKey('collections'), isTrue);
+    expect(parsed.containsKey('upowners'), isTrue);
     expect((parsed['videos'] as List).first as Map, contains('collection'));
     // 2 空格缩进（dart jsonEncode indent:2 输出逐层 2 空格）
-    expect(raw.contains('\n  "version": 3'), isTrue);
+    expect(raw.contains('\n  "version": 4'), isTrue);
   });
 }
 
