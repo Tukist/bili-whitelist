@@ -164,10 +164,16 @@ class _PlaylistPageState extends State<PlaylistPage> {
   }
 
   /// 获取（或懒构造）UpdateService。
+  ///
+  /// tokenProvider 接 GitHub 配置里已存的 token：仓库是私有的，
+  /// Release 元数据与 APK 资产下载都需要带它鉴权。
   Future<UpdateService> _ensureUpdateService() async {
     if (_updateService != null) return _updateService!;
     final prefs = await SharedPreferences.getInstance();
-    _updateService = UpdateService(storage: UpdateStorage(prefs));
+    _updateService = UpdateService(
+      storage: UpdateStorage(prefs),
+      tokenProvider: () => _github.getToken(),
+    );
     return _updateService!;
   }
 

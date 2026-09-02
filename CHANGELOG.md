@@ -8,6 +8,26 @@
 
 ---
 
+## v2.16.1 (2026-09-02)
+
+**修复**
+
+- **应用内更新在私有仓库下完全不可用**：仓库是私有的且从未创建过 GitHub Release，`releases/latest` 匿名访问永远 404。
+  - `UpdateService` 新增 `tokenProvider`（主页接管理页已配置的 GitHub token）：`fetchLatest` 带 `Authorization` 头访问 Releases API。
+  - 私有仓库 APK 资产下载改为两段式：先带 token + `Accept: application/octet-stream` 请求资产 API 地址，手动跟随 302 到签名 CDN 地址后再下载——鉴权头不随跳转转发（否则 S3 双重鉴权报 400）。
+  - `UpdateInfo` 新增 `apkApiUrl` 字段（资产 `url`）；资产选择按设备 ABI 匹配（arm64-v8a / armeabi-v7a / x86_64 / x86），无匹配回退 arm64-v8a。
+  - GitHub 401 单独提示「token 无效或已过期」。
+
+---
+
+## v2.16.0 (2026-09-02)
+
+**新增**
+
+- **观看历史**：主页左滑进入历史记录界面，AppBar 也有入口图标；播放页自动写入观看进度，历史列表可按进度续播。
+
+---
+
 ## v2.15.1 (2026-09-01)
 
 **新增**

@@ -11,8 +11,13 @@
 #   - 设置国内镜像 + JDK 环境变量，flutter build apk --release --split-per-abi
 #   - 产物复制为带版本号文件名：app-<abi>-v<主版本号>-release.apk
 #   - 打印产物清单 + 时间戳；重复执行只覆盖同名文件，无副作用
-#   - 若设置了 GH_REPO_TOKEN，则创建 GitHub Release（tag=v主版本号）+ 上传 3 ABI
+#   - 若设置了 GH_REPO_TOKEN，则创建 GitHub Release（tag=v主版本号+构建号，如
+#     v2.16.1+31）+ 上传 3 ABI
 #     changelog 从 ../CHANGELOG.md 第一个 v主版本号 段提取
+#
+# 注意：tag 必须带 +构建号——App 的 UpdateInfo._parseCodeFromTag 优先从 tag 的
+# `+数字` 解析 versionCode；若 tag 只有主版本号，会退化为发布日期数字（如
+# 260902），比任何真实 versionCode 都大，导致已安装最新版仍反复弹更新。
 # ============================================================
 set -euo pipefail
 
@@ -77,7 +82,7 @@ if [ -n "${GH_REPO_TOKEN:-}" ]; then
 
   OWNER="Tukist"
   REPO="bili-whitelist"
-  TAG="v$MAJOR_VER"
+  TAG="v$FULL_VER"   # 必须带 +构建号：App 从 tag 解析 versionCode 判新旧
 
   # 6.1 读 CHANGELOG.md 里 v$MAJOR_VER 那一段（首个 ## v开头 段）
   CHANGELOG_PATH="$(cd .. && pwd)/CHANGELOG.md"

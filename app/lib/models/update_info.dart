@@ -10,6 +10,8 @@
 /// - [isMandatory] 走 [minSupportedCode]（强制更新阈值），首版不启用。
 library;
 
+import 'dart:ffi' show Abi;
+
 class UpdateInfo {
   /// 主版本号（如 "2.14.0"），无 `v` 前缀。
   final String version;
@@ -24,8 +26,15 @@ class UpdateInfo {
   /// 更新日志（markdown / 纯文本，UI 自行渲染）。
   final String changelog;
 
-  /// APK 下载地址（MVP：单 ABI，arm64-v8a）。
+  /// APK 下载地址（browser_download_url，公开仓库可直接下载）。
   final String apkUrl;
+
+  /// APK 资产的 API 地址（asset `url` 字段）。
+  ///
+  /// 私有仓库的 `browser_download_url` 不允许匿名访问，必须走该地址
+  /// 带 token + `Accept: application/octet-stream` 请求（GitHub 302 到
+  /// 签名 CDN 地址）。公开仓库 / 无 token 时可以为 null，不影响 [apkUrl] 路径。
+  final String? apkApiUrl;
 
   /// APK 期望 SHA-256（十六进制小写）。null 时跳过完整性校验。
   final String? sha256;
@@ -37,6 +46,7 @@ class UpdateInfo {
     required this.version,
     required this.code,
     required this.apkUrl,
+    this.apkApiUrl,
     this.minSupportedCode,
     this.changelog = '',
     this.sha256,
@@ -83,15 +93,20 @@ class UpdateInfo {
   ///
   /// 解析约定：
   /// - `tag_name` 去 `v` 前缀作为 [version]
-  /// - 从 `assets[]` 筛出 `name` 含 `arm64-v8a` 的第一个 → `apkUrl`
+  /// - 从 `assets[]` 按设备 ABI 选资产（`abiMarker` 可注入，默认取
+  ///   `Abi.current()`；找不到对应 ABI 时回退 `arm64-v8a`）→ [apkUrl]，
+  ///   同时读资产 `url` 字段 → [apkApiUrl]（私有仓库带 token 下载用）
   /// - 同上资产的 `digest` 形如 `sha256:abc...`，取十六进制部分作为 [sha256]
   /// - `body` 作为 [changelog]
   /// - `size` / `minSupportedCode` 优先从 `assets[].size` / Release 元数据
   ///   （自定义 `min_supported_code`）读，缺失时为 null
   ///
-  /// 解析失败（缺 tag / 无 arm64 资产等）抛 [FormatException]，由
+  /// 解析失败（缺 tag / 无可选 ABI 资产等）抛 [FormatException]，由
   /// [UpdateService] 捕获后包装为 [UpdateException] 抛出。
-  factory UpdateInfo.fromGitHubReleaseJson(Map<String, dynamic> json) {
+  factory UpdateInfo.fromGitHubReleaseJson(
+    Map<String, dynamic> json, {
+    String? abiMarker,
+  }) {
     final tag = (json['tag_name'] as String?) ?? '';
     if (tag.isEmpty) {
       throw const FormatException('GitHub Release 缺少 tag_name');
@@ -108,28 +123,35 @@ class UpdateInfo {
     final minCode = (json['min_supported_code'] as num?)?.toInt();
 
     final assets = (json['assets'] as List?) ?? const [];
-    Map<String, dynamic>? armAsset;
-    for (final raw in assets) {
-      if (raw is! Map) continue;
-      final name = (raw['name'] as String?) ?? '';
-      if (name.contains('arm64-v8a')) {
-        armAsset = raw.cast<String, dynamic>();
-        break;
+    final marker = abiMarker ?? _deviceAbiMarker();
+    Map<String, dynamic>? pick(String abi) {
+      for (final raw in assets) {
+        if (raw is! Map) continue;
+        final name = (raw['name'] as String?) ?? '';
+        if (name.contains(abi)) return raw.cast<String, dynamic>();
       }
+      return null;
     }
-    if (armAsset == null) {
-      throw const FormatException('GitHub Release assets 缺少 arm64-v8a APK');
+
+    // 优先匹配当前设备 ABI（如模拟器 x86_64），回退主流 arm64-v8a。
+    final asset = pick(marker) ?? pick('arm64-v8a');
+    if (asset == null) {
+      throw FormatException(
+          'GitHub Release assets 缺少 $marker/arm64-v8a APK');
     }
-    final browserUrl = armAsset['browser_download_url'] as String? ?? '';
+    final browserUrl = asset['browser_download_url'] as String? ?? '';
     if (browserUrl.isEmpty) {
-      throw const FormatException('arm64-v8a asset 缺少 browser_download_url');
+      throw const FormatException('APK asset 缺少 browser_download_url');
     }
+    final apiUrl = (asset['url'] as String? ?? '').isEmpty
+        ? null
+        : asset['url'] as String;
     String? sha256;
-    final digest = armAsset['digest'] as String?;
+    final digest = asset['digest'] as String?;
     if (digest != null && digest.startsWith('sha256:')) {
       sha256 = digest.substring('sha256:'.length).toLowerCase();
     }
-    final size = (armAsset['size'] as num?)?.toInt();
+    final size = (asset['size'] as num?)?.toInt();
 
     return UpdateInfo(
       version: version,
@@ -137,9 +159,25 @@ class UpdateInfo {
       minSupportedCode: minCode,
       changelog: (json['body'] as String?) ?? '',
       apkUrl: browserUrl,
+      apkApiUrl: apiUrl,
       sha256: sha256,
       size: size,
     );
+  }
+
+  /// 设备 ABI → Release 资产名中的标记串。测试/桌面宿主回退 arm64-v8a。
+  static String _deviceAbiMarker() {
+    switch (Abi.current()) {
+      case Abi.androidArm:
+        return 'armeabi-v7a';
+      case Abi.androidX64:
+        return 'x86_64';
+      case Abi.androidIA32:
+        return 'x86';
+      case Abi.androidArm64:
+      default:
+        return 'arm64-v8a';
+    }
   }
 
   /// 从 `tag_name`（如 `v2.14.0` 或 `v2.14.0+26`）取 versionCode。

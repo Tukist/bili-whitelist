@@ -237,10 +237,12 @@ B 站部分接口（如 `playurl`）要求 WBI 签名：
 - **触发时机**：
   - **启动静默检查**：App 启动 5s 后调 `UpdateService.check(force=false)`，24h 节流；失败 / 已是最新 / 节流命中 → 完全静默；发现新版本且非强制 → 弹 `UpdateDialog`
   - **手动检查**：管理面板（首页右上角⚙️）底部 → 「检查更新」按钮，调 `check(force=true)` 跳过节流；三种结果 SnackBar 提示（已是最新 vX.Y.Z / 错误 message / 弹更新弹窗）
+- **私有仓库鉴权（v2.16.1+）**：仓库是私有的，Release 元数据与资产下载都需带管理页已配置的 GitHub token（`UpdateService(tokenProvider:)`；无 token 时按公开仓库匿名请求，向后兼容）。下载走两段式：带 token + `Accept: application/octet-stream` 请求资产 API 地址 → 手动跟随 302 到签名 CDN 地址后下载（鉴权头不随跳转转发，否则 S3 双重鉴权报 400）
 - **下载流程**：`UpdateService.download(info)` 把 APK 下载到 `<应用支持目录>/updates/app-update.apk`；dio `onReceiveProgress` 0~1 实时回调驱动进度条；可选 SHA-256 流式校验（`info.sha256 != null` 时启用，失败删半成品 + 抛 `UpdateException`）
 - **安装跳转**：下载完成自动调 `ApkInstallerChannel.install(path)` → 原生 `ApkInstaller.kt` 通过 `FileProvider`（authority=`${applicationId}.fileprovider`）暴露 `content://` URI 给系统安装器，触发 `Intent.ACTION_VIEW` + `application/vnd.android.package-archive`；min_sdk=26 强制走 FileProvider（避免 API 24+ `FileUriExposedException`）
 - **强制更新策略**（`UpdateInfo.minSupported_code`）：当前 code 严格小于该阈值时弹窗屏蔽返回（`PopScope(canPop: false)`），只显示「立即更新」按钮；首版不启用（默认 null），保留机制备用
-- **MVP 限制**：当前只发 arm64-v8a APK；armeabi-v7a / x86_64 字段已建模但暂不发布；多 ABI 后端扩展时只需把 `UpdateInfo.apkUrl` 改成 Map<ABI, String> + UI 多按钮
+- **多 ABI（v2.16.1+）**：Release 同时发 arm64-v8a / armeabi-v7a / x86_64 三 ABI；`UpdateInfo` 按设备 ABI 选资产（`Abi.current()`），无匹配回退 arm64-v8a
+- **Release tag 约定**：tag 必须是 `v主版本号+构建号`（如 `v2.16.1+31`）——App 从 tag 的 `+数字` 解析 versionCode 判新旧；缺构建号会退化为发布日期数字（如 260902），比任何真实 versionCode 都大，导致已装最新版仍反复弹更新
 - **Android 权限**：新增 `android.permission.REQUEST_INSTALL_PACKAGES` + `<provider>` + `res/xml/file_paths.xml`，完整见 `app/android/app/src/main/AndroidManifest.xml`
 
 ---
@@ -331,18 +333,18 @@ python whitelist.py list
 ### 如何发版（自动创建 GitHub Release）
 
 ```bash
-# 在 app/ 目录跑，带 PAT（repo 权限）即自动创建 v主版本号 Release + 上传 3 ABI
+# 在 app/ 目录跑，带 PAT（repo 权限）即自动创建 Release（tag=v主版本号+构建号）+ 上传 3 ABI
 cd D:/pythoncode/bili-whitelist/app
 GH_REPO_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx bash build_release.sh
 ```
 
 脚本会：
 
-1. 解析 `pubspec.yaml` 的 `version: 2.14.0+26` → 主版本号 `2.14.0`
+1. 解析 `pubspec.yaml` 的 `version: 2.16.1+31` → 主版本号 `2.16.1`（文件名用）、完整版本 `2.16.1+31`（tag 用）
 2. 跑 `flutter build apk --release --split-per-abi` 产出 3 ABI
-3. 复制为 `app-<abi>-v2.14.0-release.apk`
-4. **如果 `GH_REPO_TOKEN` 已设置**：从 `../CHANGELOG.md` 提取 `## v2.14.0` 段作为 body，调 GitHub Releases API 创建 release（tag=`v2.14.0`），再循环上传 3 ABI
-5. 打印 Release 链接 `https://github.com/Tukist/bili-whitelist/releases/tag/v2.14.0`
+3. 复制为 `app-<abi>-v2.16.1-release.apk`
+4. **如果 `GH_REPO_TOKEN` 已设置**：从 `../CHANGELOG.md` 提取 `## v2.16.1` 段作为 body，调 GitHub Releases API 创建 release（tag=`v2.16.1+31`，**必须带构建号**，App 从 tag 解析 versionCode 判新旧），再循环上传 3 ABI
+5. 打印 Release 链接 `https://github.com/Tukist/bili-whitelist/releases/tag/v2.16.1+31`
 
 > 没设 `GH_REPO_TOKEN` 时只到第 3 步停下，APK 留在本地可手动拖到 web。
 > `jq` 不可用会自动降级到 `python -c "import json..."`（Windows Git Bash 自带）。
@@ -474,7 +476,7 @@ GH_REPO_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx bash build_release.sh
 - **B 站接口可能随时变化**：WBI 签名、playurl 风控策略都在演进，接口变更时需跟随 `probe.md` 的实测方法重新适配
 - App 仅支持 Android（iOS 未做）；播放依赖 B 站接口返回的 DASH 流可用性
 - **国产 ROM 兼容加固（v2.12.1+）**：`flutter_secure_storage` 9.x 默认走 Jetpack Security（Tink + Keystore）加密，与 vivo OriginOS、小米 MIUI、华为 EMUI 等深度定制 ROM 的 Keystore 实现不完全兼容（写入/读取会抛 `PlatformException`，表现为「登录态保存失败」「GitHub 配置保存失败」）。App 已显式切到插件自研 Keystore 加密（`encryptedSharedPreferences=false` + `resetOnError=true`，见 `app/lib/services/secure_store.dart`）。**如仍有问题请反馈设备型号 + Android 版本 + 系统 ROM 版本号**，但一般 v2.12.1+ 应可直接保存登录态与 GitHub 配置
-- **应用内更新仅发 arm64-v8a（v2.14.0+）**：MVP 简化只发单 ABI；armeabi-v7a / x86_64 用户无法通过 App 内更新升级，需走手动下载 APK 路径
+- **应用内更新依赖管理页已配置的 GitHub token（v2.16.1+）**：版本仓库是私有的，未配置 token 时「检查更新」会提示暂时没有可用更新（404）；v2.14.0~v2.16.0 版本的 App 不带 token 检查，无法发现新版本，需手动装一次 v2.16.1+ 才能用上应用内更新
 
 ---
 

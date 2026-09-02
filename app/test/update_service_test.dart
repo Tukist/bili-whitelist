@@ -23,9 +23,14 @@ import 'package:bili_whitelist_app/services/update_storage.dart';
 class _FakeAdapter implements HttpClientAdapter {
   final int statusCode;
   final Map<String, dynamic> body;
+  final Map<String, List<String>> headers;
   final List<RequestOptions> requests = [];
 
-  _FakeAdapter({required this.statusCode, required this.body});
+  _FakeAdapter({
+    required this.statusCode,
+    required this.body,
+    Map<String, List<String>>? headers,
+  }) : headers = headers ?? const {'content-type': ['application/json']};
 
   @override
   Future<ResponseBody> fetch(
@@ -37,9 +42,7 @@ class _FakeAdapter implements HttpClientAdapter {
     return ResponseBody.fromString(
       jsonEncode(body),
       statusCode,
-      headers: const {
-        'content-type': ['application/json'],
-      },
+      headers: headers,
     );
   }
 
@@ -47,8 +50,11 @@ class _FakeAdapter implements HttpClientAdapter {
   void close({bool force = false}) {}
 }
 
-UpdateService _svc({required Dio dio, required UpdateStorage storage}) =>
-    UpdateService(dio: dio, storage: storage);
+UpdateService _svc({
+  required Dio dio,
+  required UpdateStorage storage,
+  Future<String?> Function()? tokenProvider,
+}) => UpdateService(dio: dio, storage: storage, tokenProvider: tokenProvider);
 
 void main() {
   group('fetchLatest', () {
@@ -141,6 +147,165 @@ void main() {
       final h = adapter.requests.first.headers;
       expect(h['User-Agent'], 'bili-whitelist-app');
       expect(h['Accept'], contains('github'));
+    });
+
+    test('tokenProvider 有 token → 请求带 Authorization 头', () async {
+      final dio = Dio();
+      final adapter = _FakeAdapter(
+        statusCode: 200,
+        body: {
+          'tag_name': 'v2.14.0+26',
+          'assets': [
+            {
+              'name': 'app-arm64-v8a-v2.14.0-release.apk',
+              'browser_download_url': 'https://example.com/a.apk',
+            },
+          ],
+        },
+      );
+      dio.httpClientAdapter = adapter;
+      final svc = _svc(
+        dio: dio,
+        storage: UpdateStorage(await _memPrefs()),
+        tokenProvider: () async => 'ghp_test_token',
+      );
+      await svc.fetchLatest();
+      final h = adapter.requests.first.headers;
+      expect(h['Authorization'], 'Bearer ghp_test_token');
+    });
+
+    test('tokenProvider 返回空 → 不带 Authorization 头', () async {
+      final dio = Dio();
+      final adapter = _FakeAdapter(
+        statusCode: 200,
+        body: {
+          'tag_name': 'v2.14.0+26',
+          'assets': [
+            {
+              'name': 'app-arm64-v8a-v2.14.0-release.apk',
+              'browser_download_url': 'https://example.com/a.apk',
+            },
+          ],
+        },
+      );
+      dio.httpClientAdapter = adapter;
+      final svc = _svc(
+        dio: dio,
+        storage: UpdateStorage(await _memPrefs()),
+        tokenProvider: () async => '   ',
+      );
+      await svc.fetchLatest();
+      expect(adapter.requests.first.headers.containsKey('Authorization'), isFalse);
+    });
+
+    test('tokenProvider 抛异常 → 按无 token 处理，不阻塞检查', () async {
+      final dio = Dio();
+      final adapter = _FakeAdapter(
+        statusCode: 200,
+        body: {
+          'tag_name': 'v2.14.0+26',
+          'assets': [
+            {
+              'name': 'app-arm64-v8a-v2.14.0-release.apk',
+              'browser_download_url': 'https://example.com/a.apk',
+            },
+          ],
+        },
+      );
+      dio.httpClientAdapter = adapter;
+      final svc = _svc(
+        dio: dio,
+        storage: UpdateStorage(await _memPrefs()),
+        tokenProvider: () async => throw StateError('storage broken'),
+      );
+      final info = await svc.fetchLatest();
+      expect(info.version, '2.14.0');
+      expect(adapter.requests.first.headers.containsKey('Authorization'), isFalse);
+    });
+  });
+
+  group('resolveDownloadUrl（私有仓库两段式下载）', () {
+    const info = UpdateInfo(
+      version: '2.14.0',
+      code: 26,
+      apkUrl: 'https://github.com/x/releases/download/v2.14.0/a.apk',
+      apkApiUrl: 'https://api.github.com/repos/x/y/releases/assets/123',
+    );
+
+    test('无 token → 直接返回 browser_download_url，不发请求', () async {
+      final dio = Dio();
+      final adapter = _FakeAdapter(statusCode: 200, body: const {});
+      dio.httpClientAdapter = adapter;
+      final svc = _svc(dio: dio, storage: UpdateStorage(await _memPrefs()));
+      final url = await svc.resolveDownloadUrl(info);
+      expect(url, info.apkUrl);
+      expect(adapter.requests, isEmpty);
+    });
+
+    test('有 token → 带鉴权请求资产 API，302 → 返回 location（鉴权头不转发）',
+        () async {
+      final dio = Dio();
+      final adapter = _FakeAdapter(
+        statusCode: 302,
+        body: const {},
+        headers: const {
+          'location': ['https://objects.githubusercontent.com/signed-url'],
+        },
+      );
+      dio.httpClientAdapter = adapter;
+      final svc = _svc(
+        dio: dio,
+        storage: UpdateStorage(await _memPrefs()),
+        tokenProvider: () async => 'ghp_test_token',
+      );
+      final url = await svc.resolveDownloadUrl(info);
+      expect(url, 'https://objects.githubusercontent.com/signed-url');
+      expect(adapter.requests, hasLength(1));
+      final req = adapter.requests.first;
+      expect(req.uri.toString(), info.apkApiUrl);
+      expect(req.headers['Authorization'], 'Bearer ghp_test_token');
+      expect(req.headers['Accept'], 'application/octet-stream');
+      expect(req.followRedirects, isFalse);
+    });
+
+    test('有 token 但无 apkApiUrl → 回退 browser_download_url', () async {
+      const noApi = UpdateInfo(
+        version: '2.14.0',
+        code: 26,
+        apkUrl: 'https://example.com/a.apk',
+      );
+      final dio = Dio();
+      final adapter = _FakeAdapter(statusCode: 200, body: const {});
+      dio.httpClientAdapter = adapter;
+      final svc = _svc(
+        dio: dio,
+        storage: UpdateStorage(await _memPrefs()),
+        tokenProvider: () async => 'ghp_test_token',
+      );
+      final url = await svc.resolveDownloadUrl(noApi);
+      expect(url, noApi.apkUrl);
+      expect(adapter.requests, isEmpty);
+    });
+
+    test('资产 API 返回 200（无跳转）→ 抛 UpdateException', () async {
+      final dio = Dio();
+      final adapter = _FakeAdapter(statusCode: 200, body: const {});
+      dio.httpClientAdapter = adapter;
+      final svc = _svc(
+        dio: dio,
+        storage: UpdateStorage(await _memPrefs()),
+        tokenProvider: () async => 'ghp_test_token',
+      );
+      expect(
+        () => svc.resolveDownloadUrl(info),
+        throwsA(
+          isA<UpdateException>().having(
+            (e) => e.message,
+            'message',
+            contains('下载地址获取失败'),
+          ),
+        ),
+      );
     });
   });
 

@@ -109,6 +109,69 @@ void main() {
       final info = UpdateInfo.fromGitHubReleaseJson(json);
       expect(info.minSupportedCode, 20);
     });
+
+    test('资产 url 字段解析为 apkApiUrl（私有仓库下载用）', () {
+      final json = {
+        'tag_name': 'v2.14.0+26',
+        'assets': [
+          {
+            'name': 'app-arm64-v8a-v2.14.0-release.apk',
+            'browser_download_url': 'https://example.com/a.apk',
+            'url':
+                'https://api.github.com/repos/Tukist/bili-whitelist/releases/assets/123',
+          },
+        ],
+      };
+      final info = UpdateInfo.fromGitHubReleaseJson(json);
+      expect(info.apkApiUrl, contains('releases/assets/123'));
+    });
+
+    test('资产缺 url 字段时 apkApiUrl 为 null', () {
+      final json = {
+        'tag_name': 'v2.14.0+26',
+        'assets': [
+          {
+            'name': 'app-arm64-v8a-v2.14.0-release.apk',
+            'browser_download_url': 'https://example.com/a.apk',
+          },
+        ],
+      };
+      final info = UpdateInfo.fromGitHubReleaseJson(json);
+      expect(info.apkApiUrl, isNull);
+    });
+
+    test('abiMarker 匹配对应 ABI 资产（x86_64）', () {
+      final json = {
+        'tag_name': 'v2.14.0+26',
+        'assets': [
+          {
+            'name': 'app-arm64-v8a-v2.14.0-release.apk',
+            'browser_download_url': 'https://example.com/arm.apk',
+          },
+          {
+            'name': 'app-x86_64-v2.14.0-release.apk',
+            'browser_download_url': 'https://example.com/x86.apk',
+          },
+        ],
+      };
+      final info = UpdateInfo.fromGitHubReleaseJson(json, abiMarker: 'x86_64');
+      expect(info.apkUrl, 'https://example.com/x86.apk');
+    });
+
+    test('abiMarker 无匹配资产时回退 arm64-v8a', () {
+      final json = {
+        'tag_name': 'v2.14.0+26',
+        'assets': [
+          {
+            'name': 'app-arm64-v8a-v2.14.0-release.apk',
+            'browser_download_url': 'https://example.com/arm.apk',
+          },
+        ],
+      };
+      // 测试宿主（Windows/macOS）默认 marker 也不会命中，走回退
+      final info = UpdateInfo.fromGitHubReleaseJson(json, abiMarker: 'x86_64');
+      expect(info.apkUrl, 'https://example.com/arm.apk');
+    });
   });
 
   group('isNewerThan', () {
