@@ -1,6 +1,8 @@
 // WhitelistWriter 单元测试：
 // - addVideo：查重（重复不写 Gist）/ 新增（PATCH 写 v3 规范化 JSON）
 // - videoFromMeta：从 B 站 view 元数据构造 WhitelistVideo
+// - 番剧（pgc）：videoFromPgcEpisode / pgcEpisodeTitle / episodeLabelOf
+//   纯构造；顺序逐集 addVideo 的「查重跳过 + 落盘」导入流程
 // - moveVideosToCollection / removeVideos：批量操作的纯函数（可单测）
 // 不访问真实网络；ServiceLocator.syncService 换成假实现（跳过 path_provider）。
 import 'dart:convert';
@@ -9,6 +11,7 @@ import 'package:dio/dio.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:bili_whitelist_app/api/bilibili_api.dart';
 import 'package:bili_whitelist_app/api/github_api.dart';
 import 'package:bili_whitelist_app/models/whitelist_video.dart';
 import 'package:bili_whitelist_app/services/service_locator.dart';
@@ -92,6 +95,69 @@ Map<String, dynamic> _gistBody() => {
         'whitelist.json': {'content': _v3Gist},
       },
     };
+
+/// 空白 v4 Gist 内容（番剧导入流程测试初始态）。
+const _emptyGistV4 =
+    '{"version":4,"updated_at":"2026-09-01T00:00:00Z",'
+    '"collections":[],"upowners":[],"videos":[]}';
+
+/// 仅含给定 bvid 的 v4 Gist 内容（预置「已在白名单」状态）。
+String _v4GistWith(List<String> bvids) {
+  final videos = bvids
+      .map((b) => '{"bvid":"$b","cid":1,"title":"旧视频","cover":"",'
+          '"duration":60,"up_name":"old","added_at":"2026-01-01T00:00:00Z",'
+          '"collection":"","order":0}')
+      .join(',');
+  return '{"version":4,"updated_at":"2026-09-01T00:00:00Z",'
+      '"collections":[],"upowners":[],"videos":[$videos]}';
+}
+
+/// 状态化 Gist adapter：GET 返回 [read] 的当前内容，PATCH 用请求体里
+/// 的新内容调 [write] 更新。让「下一次 addVideo 的 GET 能看到上一次
+/// PATCH 结果」，模拟真实 Gist 顺序写入。
+class _MutableGistAdapter implements HttpClientAdapter {
+  final String Function() read;
+  final void Function(String content) write;
+  final List<RequestOptions> requests = [];
+
+  _MutableGistAdapter({required this.read, required this.write});
+
+  @override
+  Future<ResponseBody> fetch(RequestOptions options,
+      Stream<Uint8List>? requestStream, Future<void>? cancelFuture) async {
+    requests.add(options);
+    if (options.method == 'PATCH') {
+      final data = options.data as Map;
+      final file = (data['files'] as Map)['whitelist.json'] as Map;
+      final content = file['content'] as String;
+      write(content);
+      return ResponseBody.fromString(
+        jsonEncode({
+          'id': 'gist1',
+          'files': {'whitelist.json': {'content': content}},
+        }),
+        200,
+        headers: {
+          'content-type': ['application/json; charset=utf-8'],
+        },
+      );
+    }
+    // GET /gists/:id
+    return ResponseBody.fromString(
+      jsonEncode({
+        'id': 'gist1',
+        'files': {'whitelist.json': {'content': read()}},
+      }),
+      200,
+      headers: {
+        'content-type': ['application/json; charset=utf-8'],
+      },
+    );
+  }
+
+  @override
+  void close({bool force = false}) {}
+}
 
 WhitelistVideo _video(String bvid, String title, {int cid = 1}) =>
     WhitelistVideo(
@@ -188,6 +254,169 @@ void main() {
       final v = WhitelistWriter.videoFromMeta(meta, fallbackBvid: 'BV1');
       expect(v.pageCount, 1);
       expect(v.pages, isNull);
+    });
+  });
+
+  group('番剧（pgc）单集 → WhitelistVideo', () {
+    final season = PgcSeason.fromResult({
+      'title': '小林家的龙女仆',
+      'cover': 'http://i0.hdslb.com/a.png',
+      'season_id': 5800,
+      'episodes': [
+        {
+          'ep_id': 98603,
+          'aid': 7961887,
+          'cid': 481327329,
+          'bvid': 'BV1gs411h7DE',
+          'title': '1',
+          'long_title': '史上最强女仆、托尔！',
+          'cover': 'http://i0.hdslb.com/b.jpg',
+          'badge': '',
+          'duration': 1377000,
+        },
+        {
+          'ep_id': 318143,
+          'aid': 1,
+          'cid': 2,
+          'bvid': 'BV18C4y147xR',
+          'title': '14(OVA)',
+          'long_title': '情人节，然后泡温泉!',
+          'cover': '',
+          'badge': '会员',
+          'duration': 1500000,
+        },
+      ],
+    });
+
+    test('episodeLabelOf：纯数字 → 第X话；带后缀原样', () {
+      expect(WhitelistWriter.episodeLabelOf('1'), '第1话');
+      expect(WhitelistWriter.episodeLabelOf('14(OVA)'), '14(OVA)');
+      expect(WhitelistWriter.episodeLabelOf(''), '');
+      expect(WhitelistWriter.episodeLabelOf(' 2 '), '第2话');
+    });
+
+    test('pgcEpisodeTitle：剧名 + 第X话 + 副标题', () {
+      expect(
+        WhitelistWriter.pgcEpisodeTitle(season, season.episodes[0]),
+        '小林家的龙女仆 第1话 史上最强女仆、托尔！',
+      );
+      // OVA：集数带后缀不套「话」
+      expect(
+        WhitelistWriter.pgcEpisodeTitle(season, season.episodes[1]),
+        '小林家的龙女仆 14(OVA) 情人节，然后泡温泉!',
+      );
+    });
+
+    test('videoFromPgcEpisode：up_name/时长秒/pages 单集/未分类', () {
+      final v = WhitelistWriter.videoFromPgcEpisode(season, season.episodes[0],
+          now: DateTime.utc(2026, 9, 1));
+      expect(v.bvid, 'BV1gs411h7DE');
+      expect(v.cid, 481327329);
+      expect(v.title, '小林家的龙女仆 第1话 史上最强女仆、托尔！');
+      expect(v.duration, 1377); // 毫秒已换算为秒
+      expect(v.upName, '番剧/官方');
+      expect(v.collection, '');
+      expect(v.isUncategorized, isTrue);
+      expect(v.pageCount, 1);
+      expect(v.pages!.single.cid, 481327329);
+      expect(v.pages!.single.part, '第1话 史上最强女仆、托尔！');
+      expect(v.addedAt, '2026-09-01T00:00:00.000Z');
+    });
+  });
+
+  group('番剧整季顺序导入流程（逐集 addVideo：查重跳过 + 增量落盘）', () {
+    /// 状态化 Gist：GET 返回 currentContent，PATCH 用 body 更新 currentContent。
+    /// 模拟连续多次 addVideo 时「下一次 GET 能看到上一次 PATCH 结果」。
+    Dio statefulGistDio(String initialJson) {
+      var current = initialJson;
+      final dio = Dio(BaseOptions(baseUrl: 'https://api.github.com'));
+      dio.httpClientAdapter = _MutableGistAdapter(
+        read: () => current,
+        write: (String c) => current = c,
+      );
+      return dio;
+    }
+
+    final season = PgcSeason.fromResult({
+      'title': '测试番',
+      'cover': '',
+      'season_id': 1,
+      'episodes': [
+        {
+          'ep_id': 1,
+          'aid': 1,
+          'cid': 11,
+          'bvid': 'BVpgc1',
+          'title': '1',
+          'long_title': '第一集',
+          'cover': '',
+          'badge': '',
+          'duration': 60000,
+        },
+        {
+          'ep_id': 2,
+          'aid': 2,
+          'cid': 22,
+          'bvid': 'BVpgc2',
+          'title': '2',
+          'long_title': '第二集',
+          'cover': '',
+          'badge': '会员',
+          'duration': 70000,
+        },
+      ],
+    });
+
+    test('空白名单逐集导入 → 2 集全新增', () async {
+      final dio = statefulGistDio(_emptyGistV4);
+      final writer = WhitelistWriter(
+        github: _githubApi(dio.httpClientAdapter),
+      );
+      _store[GithubApi.kTokenKey] = 'ghp_fake';
+      _store[GithubApi.kGistIdKey] = 'gist1';
+
+      var added = 0, skipped = 0;
+      for (final ep in season.episodes) {
+        final r = await writer.addVideo(
+            WhitelistWriter.videoFromPgcEpisode(season, ep));
+        if (r.added) {
+          added++;
+        } else if (r.message.contains('已在白名单')) {
+          skipped++;
+        }
+      }
+      expect(added, 2);
+      expect(skipped, 0);
+    });
+
+    test('白名单已有其中 1 集 → 跳过已存在、只新增 1 集（bvids 不重复）', () async {
+      // 初始 Gist 已含 BVpgc1（第 1 集）
+      final initial = _v4GistWith(['BVpgc1']);
+      final dio = statefulGistDio(initial);
+      final writer = WhitelistWriter(
+        github: _githubApi(dio.httpClientAdapter),
+      );
+      _store[GithubApi.kTokenKey] = 'ghp_fake';
+      _store[GithubApi.kGistIdKey] = 'gist1';
+
+      var added = 0, skipped = 0;
+      for (final ep in season.episodes) {
+        final r = await writer.addVideo(
+            WhitelistWriter.videoFromPgcEpisode(season, ep));
+        if (r.added) {
+          added++;
+        } else if (r.message.contains('已在白名单')) {
+          skipped++;
+        }
+      }
+      expect(added, 1);
+      expect(skipped, 1);
+
+      // 最终 Gist 数据核对：bvids 去重
+      final finalData = await writer.github.fetchFromGist();
+      expect(finalData!.videos, hasLength(2));
+      expect(finalData.videos.map((v) => v.bvid).toSet(),
+          {'BVpgc1', 'BVpgc2'});
     });
   });
 

@@ -260,4 +260,152 @@ void main() {
     );
     expect(countLinkTokens('没有链接'), 0);
   });
+
+  group('parsePgcRef 番剧引用解析（本地正则，不走网络）', () {
+    test('ep 完整链接 → PgcRef(ep, id)', () async {
+      expect(
+        await parsePgcRef('https://www.bilibili.com/bangumi/play/ep98603'),
+        const PgcRef(kind: PgcKind.ep, id: 98603),
+      );
+    });
+
+    test('ss 完整链接 → PgcRef(ss, id)', () async {
+      expect(
+        await parsePgcRef('https://www.bilibili.com/bangumi/play/ss5800'),
+        const PgcRef(kind: PgcKind.ss, id: 5800),
+      );
+    });
+
+    test('m. 前缀 + 分享 query 的番剧链接', () async {
+      expect(
+        await parsePgcRef(
+            'https://m.bilibili.com/bangumi/play/ep98603?from=search&seid=1'),
+        const PgcRef(kind: PgcKind.ep, id: 98603),
+      );
+    });
+
+    test('夹杂标题文本的番剧链接', () async {
+      expect(
+        await parsePgcRef('【安利】这部番超好看 '
+            'https://www.bilibili.com/bangumi/play/ss5800 快去看'),
+        const PgcRef(kind: PgcKind.ss, id: 5800),
+      );
+    });
+
+    test('裸 ep 号 / 裸 ss 号', () async {
+      expect(await parsePgcRef('ep98603'),
+          const PgcRef(kind: PgcKind.ep, id: 98603));
+      expect(await parsePgcRef('ss5800'),
+          const PgcRef(kind: PgcKind.ss, id: 5800));
+      expect(await parsePgcRef('文本里的 ss5800 结尾'),
+          const PgcRef(kind: PgcKind.ss, id: 5800));
+    });
+
+    test('b23.tv/ep|ss 番剧短码 → 本地取 id，不请求网络', () async {
+      // adapter 无 finalLocation：若方法尝试发请求会抛连接错误 ——
+      // 断言不请求即证明番剧短码无需网络重定向
+      final adapter = _RedirectAdapter(finalLocation: null);
+      final dio = _dioWith(adapter);
+      expect(await parsePgcRef('https://b23.tv/ep98603', dio: dio),
+          const PgcRef(kind: PgcKind.ep, id: 98603));
+      expect(await parsePgcRef('b23.tv/ss5800', dio: dio),
+          const PgcRef(kind: PgcKind.ss, id: 5800));
+      expect(adapter.requests, isEmpty);
+    });
+
+    test('随机短码重定向到 bangumi → 提取 ep/ss', () async {
+      final adapter = _RedirectAdapter(
+        finalLocation: Uri.parse(
+            'https://www.bilibili.com/bangumi/play/ep98603?from=search'),
+      );
+      expect(
+        await parsePgcRef('https://b23.tv/spVKBAi', dio: _dioWith(adapter)),
+        const PgcRef(kind: PgcKind.ep, id: 98603),
+      );
+      expect(adapter.requests, hasLength(1));
+      expect(adapter.requests.single.uri.toString(), 'https://b23.tv/spVKBAi');
+    });
+
+    test('随机短码重定向到 ss 整季', () async {
+      final adapter = _RedirectAdapter(
+        finalLocation: Uri.parse('https://www.bilibili.com/bangumi/play/ss5800'),
+      );
+      expect(
+        await parsePgcRef('b23.tv/abcdef', dio: _dioWith(adapter)),
+        const PgcRef(kind: PgcKind.ss, id: 5800),
+      );
+    });
+
+    test('随机短码重定向到普通视频 → 返回 null（交给 parseBvid）', () async {
+      final adapter = _RedirectAdapter(
+        finalLocation: Uri.parse('https://www.bilibili.com/video/$_bv1'),
+      );
+      expect(
+        await parsePgcRef('https://b23.tv/spVKBAi', dio: _dioWith(adapter)),
+        isNull,
+      );
+    });
+
+    test('纯 BV / 普通视频链接 → null（不误判为番剧）', () async {
+      expect(await parsePgcRef(_bv1), isNull);
+      expect(
+        await parsePgcRef('https://www.bilibili.com/video/$_bv1?p=2'),
+        isNull,
+      );
+      expect(await parsePgcRef('https://www.bilibili.com/'), isNull);
+    });
+
+    test('无法识别的文本 → null（不抛错）', () async {
+      expect(await parsePgcRef('随便一段没有链接的文字'), isNull);
+      expect(await parsePgcRef('   '), isNull);
+    });
+
+    test('extractPgcRefFromText 单词内嵌 ep/ss 不误命中', () {
+      // step123 / ess123 / b23 随机码含 ep 但不带数字后缀 → 都不是番剧
+      expect(extractPgcRefFromText('step1234'), isNull);
+      expect(extractPgcRefFromText('ess1234'), isNull);
+      expect(extractPgcRefFromText('b23.tv/spVKBAi'), isNull);
+      // b23 番剧短码是独立 ep|ss+数字 → 命中
+      expect(extractPgcRefFromText('b23.tv/ep98603'),
+          const PgcRef(kind: PgcKind.ep, id: 98603));
+    });
+  });
+
+  group('parseBvid 番剧防护', () {
+    test('番剧完整链接 → 抛「番剧」提示而非「未识别」', () async {
+      await expectLater(
+        parseBvid('https://www.bilibili.com/bangumi/play/ep98603'),
+        throwsA(isA<ImportParseException>().having(
+          (e) => e.message,
+          'message',
+          contains('番剧/电影'),
+        )),
+      );
+    });
+
+    test('裸 ep 号 → 抛「番剧」提示', () async {
+      await expectLater(
+        parseBvid('ep98603'),
+        throwsA(isA<ImportParseException>().having(
+          (e) => e.message,
+          'message',
+          contains('番剧/电影'),
+        )),
+      );
+    });
+
+    test('随机短链重定向到番剧 → 抛「番剧」提示（而非短链解析失败）', () async {
+      final adapter = _RedirectAdapter(
+        finalLocation: Uri.parse('https://www.bilibili.com/bangumi/play/ss5800'),
+      );
+      await expectLater(
+        parseBvid('https://b23.tv/spVKBAi', dio: _dioWith(adapter)),
+        throwsA(isA<ImportParseException>().having(
+          (e) => e.message,
+          'message',
+          contains('番剧/电影'),
+        )),
+      );
+    });
+  });
 }

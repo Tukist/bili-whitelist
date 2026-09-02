@@ -80,6 +80,67 @@ class WhitelistWriter {
     return addVideo(videoFromMeta(meta, fallbackBvid: bvid));
   }
 
+  // ---------------------------------------------------------------------------
+  // 番剧 / 电影（pgc）整季导入：单集 → WhitelistVideo 的纯构造（可单测）
+  // ---------------------------------------------------------------------------
+
+  /// 番剧单集标题里的集数标签：纯数字集数 → 「第X话」，其余原样。
+  ///
+  /// 例：`1` → `第1话`；`14(OVA)` → `14(OVA)`；空 → 空串。
+  static String episodeLabelOf(String epTitle) {
+    final t = epTitle.trim();
+    if (t.isEmpty) return '';
+    final n = int.tryParse(t);
+    return (n != null && n > 0) ? '第$t话' : t;
+  }
+
+  /// 番剧单集 → 完整标题：`剧名 + 集数标签 + 副标题`。
+  ///
+  /// 例：`小林家的龙女仆 第1话 史上最强女仆、托尔！`。
+  /// 副标题与剧名/集数重复时不重复拼接（电影等单集场景防「电影名 正片 电影名」）。
+  static String pgcEpisodeTitle(PgcSeason season, PgcEpisode ep) {
+    final label = episodeLabelOf(ep.title);
+    final parts = <String>[
+      season.title,
+      if (label.isNotEmpty) label,
+    ];
+    final long = ep.longTitle.trim();
+    if (long.isNotEmpty &&
+        long != season.title &&
+        long != label &&
+        long != ep.title) {
+      parts.add(long);
+    }
+    return parts.join(' ');
+  }
+
+  /// 番剧单集 → [WhitelistVideo]（整季逐集导入用）。
+  ///
+  /// - 标题 = 剧名 + 第X话 + 副标题（见 [pgcEpisodeTitle]）
+  /// - up_name = `番剧/官方`；collection 空（未分类）；pages = 该集单 P；
+  ///   added_at = [now]（可注入测试用，缺省当前 UTC）
+  static WhitelistVideo videoFromPgcEpisode(
+    PgcSeason season,
+    PgcEpisode ep, {
+    DateTime? now,
+  }) {
+    final label = episodeLabelOf(ep.title);
+    final long = ep.longTitle.trim();
+    final part = [if (label.isNotEmpty) label, if (long.isNotEmpty) long]
+        .join(' ');
+    return WhitelistVideo(
+      bvid: ep.bvid,
+      cid: ep.cid,
+      title: pgcEpisodeTitle(season, ep),
+      cover: ep.cover,
+      duration: ep.durationSec,
+      upName: '番剧/官方',
+      addedAt: (now ?? DateTime.now()).toUtc().toIso8601String(),
+      pages: [PageInfo(cid: ep.cid, part: part, duration: ep.durationSec)],
+      collection: '',
+    );
+  }
+
   /// 把已构造好的视频加入白名单：拉当前 Gist → 按 bvid 查重 → 合并 →
   /// saveToGist → 写本地缓存。重复/失败不写盘，返回 [AddResult] 说明原因。
   Future<AddResult> addVideo(WhitelistVideo video) async {

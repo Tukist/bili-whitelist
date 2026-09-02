@@ -482,6 +482,15 @@ class _PlayerPageState extends State<PlayerPage> {
       });
       return;
     }
+    // -404：番剧会员/付费集经普通 playurl 接口返回 -404（需 pgc 端点 + 登录态
+    // 才能取流）；普通视频该码也可能是稿件被删/下架。统一友好提示、不可重试。
+    if (e is BiliApiException && e.code == -404) {
+      setState(() {
+        _error = '该集可能为大会员/付费内容或已下架';
+        _canRetry = false;
+      });
+      return;
+    }
     _showFatal(e);
   }
 

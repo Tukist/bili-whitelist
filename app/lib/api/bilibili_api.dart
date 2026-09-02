@@ -77,6 +77,94 @@ class PlayUrlResult {
   bool get hasStream => mp4Url != null || dashVideoUrls.isNotEmpty;
 }
 
+/// 番剧单集信息（`pgc/view/web/season` 的 `result.episodes[]` 单项）。
+///
+/// 2026-08 实测字段：`ep_id` / `aid` / `cid` / `bvid`（每集都有真实 bvid）/
+/// `title`（集数文本，如 `1`、`14(OVA)`）/ `long_title`（副标题）/
+/// `cover` / `badge`（空 = 免费可播；`会员`/`付费` = 受限）/
+/// `duration`（**毫秒**，需换算为秒）。
+class PgcEpisode {
+  final int epId;
+  final int aid;
+  final int cid;
+  final String bvid;
+  final String title; // 集数文本：'1'、'2'…；OVA 形如 '14(OVA)'
+  final String longTitle; // 该集副标题
+  final String cover;
+  final int durationSec; // 已由毫秒换算为秒
+  final String badge; // '' = 免费可播；'会员'/'付费' 等非空 = 受限
+
+  const PgcEpisode({
+    required this.epId,
+    required this.aid,
+    required this.cid,
+    required this.bvid,
+    required this.title,
+    required this.longTitle,
+    required this.cover,
+    required this.durationSec,
+    required this.badge,
+  });
+
+  /// 是否为会员/付费（或其它受限）内容。
+  bool get isVipOrPay => badge.isNotEmpty;
+
+  factory PgcEpisode.fromJson(Map<String, dynamic> json) {
+    final ms = (json['duration'] as num?)?.toInt() ?? 0;
+    return PgcEpisode(
+      epId: (json['ep_id'] as num?)?.toInt() ?? 0,
+      aid: (json['aid'] as num?)?.toInt() ?? 0,
+      cid: (json['cid'] as num?)?.toInt() ?? 0,
+      bvid: json['bvid'] as String? ?? '',
+      title: json['title'] as String? ?? '',
+      longTitle: json['long_title'] as String? ?? '',
+      cover: SearchResult.normalizeCover(json['cover'] as String? ?? ''),
+      durationSec: (ms / 1000).round(), // duration 单位是毫秒
+      badge: json['badge'] as String? ?? '',
+    );
+  }
+}
+
+/// 番剧整季信息（`pgc/view/web/season` 的 `result` 对象；**注意包装层是
+/// `result` 而非普通接口的 `data`**）。
+class PgcSeason {
+  final String title;
+  final String cover;
+  final int seasonId;
+  final List<PgcEpisode> episodes;
+
+  const PgcSeason({
+    required this.title,
+    required this.cover,
+    required this.seasonId,
+    required this.episodes,
+  });
+
+  /// 会员/付费（受限）集数量。
+  int get vipCount => episodes.where((e) => e.isVipOrPay).length;
+
+  /// 是否含会员/付费集。
+  bool get hasVipOrPay => vipCount > 0;
+
+  factory PgcSeason.fromResult(Map<String, dynamic> result) {
+    final raw = result['episodes'];
+    final episodes = raw is List
+        ? raw
+            .whereType<Map<String, dynamic>>()
+            .map(PgcEpisode.fromJson)
+            // 丢弃无 bvid 的脏条目（预告/占位），保证逐集可导入可播放
+            .where((e) => e.bvid.isNotEmpty)
+            .toList()
+        : const <PgcEpisode>[];
+    return PgcSeason(
+      title: result['title'] as String? ?? '',
+      cover: SearchResult.normalizeCover(result['cover'] as String? ?? ''),
+      seasonId: (result['season_id'] as num?)?.toInt() ?? 0,
+      episodes: episodes,
+    );
+  }
+}
+
 /// 「搜索 UP 主」结果分页响应（`x/web-interface/wbi/search/type`，
 /// search_type=bili_user）。
 ///
@@ -398,6 +486,65 @@ class BiliApi {
       return info;
     }
     throw StateError('view 接口重试后仍失败（$bvid）');
+  }
+
+  /// 番剧/电影整季信息（`pgc/view/web/season`，**匿名 + 完整浏览器头即可，
+  /// 无需 WBI 签名**；登录态存在时也会注入 SESSDATA 解锁会员集标题等）。
+  ///
+  /// - [epId] / [seasonId] 二选一传（对应链接里的 `ep<id>` / `ss<id>`）；
+  ///   两个都为空 → 抛 [ArgumentError]
+  /// - 响应包装层是 `result`（不是普通接口的 `data`），解析为 [PgcSeason]：
+  ///   标题/封面/season_id + episodes[]（每集真实 bvid、duration 毫秒换算秒、
+  ///   badge 非空 = 会员/付费）
+  /// - 错误分类（UI 据此提示）：
+  ///   - code=-404（剧不存在/未上架）→ [BiliApiException]（带友好 message）
+  ///   - code=-412 → [BiliApiException]（风控）
+  ///   - 其他业务码 → [BiliApiException]（带接口 message）
+  ///   - 网络失败（[DioException]）→ 原样上抛
+  Future<PgcSeason> fetchPgcSeason({int? epId, int? seasonId}) async {
+    if (epId == null && seasonId == null) {
+      throw ArgumentError('fetchPgcSeason 需要 ep_id 或 season_id 之一');
+    }
+    await _injectAuth();
+    final params =
+        epId != null ? {'ep_id': '$epId'} : {'season_id': '$seasonId'};
+    debugPrint('[bili_api] fetchPgcSeason $params');
+    final resp = await _dio.get<Map<String, dynamic>>(
+      '/pgc/view/web/season',
+      queryParameters: params,
+    );
+    final data = resp.data;
+    final code = data?['code'] as int?;
+    if (code == -404) {
+      throw const BiliApiException(
+        code: -404,
+        message: '剧集不存在或已下架',
+        path: '/pgc/view/web/season',
+      );
+    }
+    if (code == -412) {
+      throw const BiliApiException(
+        code: -412,
+        message: '番剧接口被风控拦截，请稍后再试',
+        path: '/pgc/view/web/season',
+      );
+    }
+    if (code != 0) {
+      throw BiliApiException(
+        code: code ?? -1,
+        message: data?['message'] as String? ?? '番剧信息获取失败',
+        path: '/pgc/view/web/season',
+      );
+    }
+    final result = data?['result'] as Map<String, dynamic>?;
+    if (result == null) {
+      throw const BiliApiException(
+        code: -404,
+        message: '番剧信息未返回，剧集可能不存在或已下架',
+        path: '/pgc/view/web/season',
+      );
+    }
+    return PgcSeason.fromResult(result);
   }
 
   /// 搜索 B 站视频（`x/web-interface/wbi/search/type`，search_type=video）。
