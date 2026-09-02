@@ -88,12 +88,29 @@ class UpdateService {
     } on UpdateException {
       rethrow;
     } on DioException catch (e) {
-      throw UpdateException(_mapDioError(e));
+      throw UpdateException(await _mapFetchError(e));
     } on FormatException catch (e) {
       throw UpdateException('版本信息格式异常：${e.message}');
     } catch (e) {
       throw UpdateException('检查更新失败：$e');
     }
+  }
+
+  /// 把「拉最新 Release 元数据」时的异常转成用户可读提示。
+  ///
+  /// 404 分两种（其余走 [_mapDioError] 通用文案）：
+  /// - 未配 token：私有仓库的 `releases/latest` 匿名访问必然 404（GitHub
+  ///   不暴露私有仓库存在性）→ 提示先去管理面板配 token。
+  /// - 已配 token 仍 404：token 有效但仓库还没有 Release → 提示暂无发布。
+  Future<String> _mapFetchError(DioException e) async {
+    final code = e.response?.statusCode;
+    if (code == 404) {
+      final token = await _readToken();
+      return token == null
+          ? '检查更新失败：请先在管理面板配置 GitHub token（私有仓库需要）'
+          : '已是最新：仓库暂无 Release（没有比当前更新的发布版本）';
+    }
+    return _mapDioError(e);
   }
 
   /// 检查更新（节流版）。

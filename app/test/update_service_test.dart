@@ -84,7 +84,7 @@ void main() {
       expect(info.sha256, 'abcdef');
     });
 
-    test('404 → 抛 UpdateException(没有可用更新/仓库不可访问)', () async {
+    test('404 且未配 token → 提示先配置 GitHub token', () async {
       final dio = Dio();
       dio.httpClientAdapter = _FakeAdapter(statusCode: 404, body: {});
       final svc = _svc(dio: dio, storage: UpdateStorage(await _memPrefs()));
@@ -94,7 +94,27 @@ void main() {
           isA<UpdateException>().having(
             (e) => e.message,
             'message',
-            allOf(contains('没有可用更新'), contains('仓库当前不可访问')),
+            contains('请先在管理面板配置 GitHub token'),
+          ),
+        ),
+      );
+    });
+
+    test('404 且已配 token → 提示仓库暂无 Release', () async {
+      final dio = Dio();
+      dio.httpClientAdapter = _FakeAdapter(statusCode: 404, body: {});
+      final svc = _svc(
+        dio: dio,
+        storage: UpdateStorage(await _memPrefs()),
+        tokenProvider: () async => 'ghp_test_token',
+      );
+      expect(
+        () => svc.fetchLatest(),
+        throwsA(
+          isA<UpdateException>().having(
+            (e) => e.message,
+            'message',
+            contains('仓库暂无 Release'),
           ),
         ),
       );

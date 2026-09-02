@@ -332,13 +332,25 @@ python whitelist.py list
 
 ### 如何发版（自动创建 GitHub Release）
 
+推荐用 `release.sh`（gh CLI 已登录即可，幂等可重复执行）：
+
+```bash
+# 在 app/ 目录跑：构建 3 ABI + 创建/更新 GitHub Release + 上传 APK
+cd D:/pythoncode/bili-whitelist/app
+bash release.sh
+```
+
+`release.sh` 会：解析 `pubspec.yaml` 的 `version: 2.16.1+31` → 先跑 `bash build_release.sh` 产出 3 ABI，再从 `../CHANGELOG.md` 提取 `## v2.16.1` 段作 notes；tag=`v2.16.1+31`（**必须带构建号**，App 从 tag 解析 versionCode 判新旧）——tag 不存在则 `gh release create`，已存在则 `gh release upload --clobber` 补资产 + `gh release edit` 更新 notes，重复执行无副作用。
+
+备选（不依赖 gh，用 PAT）：
+
 ```bash
 # 在 app/ 目录跑，带 PAT（repo 权限）即自动创建 Release（tag=v主版本号+构建号）+ 上传 3 ABI
 cd D:/pythoncode/bili-whitelist/app
 GH_REPO_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx bash build_release.sh
 ```
 
-脚本会：
+`build_release.sh` 步骤：
 
 1. 解析 `pubspec.yaml` 的 `version: 2.16.1+31` → 主版本号 `2.16.1`（文件名用）、完整版本 `2.16.1+31`（tag 用）
 2. 跑 `flutter build apk --release --split-per-abi` 产出 3 ABI
