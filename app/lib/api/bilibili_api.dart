@@ -1,8 +1,12 @@
+import 'dart:convert';
+import 'dart:io';
+
 import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import '../config.dart';
+import '../models/danmaku.dart';
 import '../models/search_result.dart';
 import '../models/subtitle.dart';
 import '../models/upowner.dart';
@@ -860,6 +864,88 @@ class BiliApi {
     );
     _subtitleCache[key] = cues;
     return cues;
+  }
+
+  // -------------------------------------------------------------------------
+  // 弹幕（播放页弹幕层）
+  // -------------------------------------------------------------------------
+
+  /// 拉取视频弹幕（`x/v1/dm/list.so?oid=<cid>`，匿名可得，无防盗链）。
+  ///
+  /// 2026-09 curl 实测结论：
+  /// - 接口对匿名 + 无 Referer/UA 也返回 200（无防盗链要求），但仍带完整头
+  /// - 响应体固定 `Content-Encoding: deflate`（**raw deflate**，非 zlib 包装），
+  ///   dio 只自动解 gzip，故按 bytes 取回后手动解压（gzip / raw / zlib 兜底）
+  /// - 老视频被关闭弹幕（state=2）或空弹幕 → 无 `<d>` 节点 → 返回空列表
+  ///
+  /// 语义：**失败静默返回空**（弹幕是增强功能，失败不阻塞播放）——网络错误、
+  /// 解压失败、非 XML 内容一律返回空列表并 debugPrint 留痕。
+  Future<List<Danmaku>> fetchDanmaku(int cid) async {
+    final url = '/x/v1/dm/list.so';
+    try {
+      final resp = await _dio.get<List<int>>(
+        url,
+        queryParameters: {'oid': '$cid'},
+        options: Options(
+          responseType: ResponseType.bytes,
+          // list.so 防盗链要求低，但仍带浏览器头保险
+          headers: {'Referer': kBiliReferer, 'User-Agent': kBrowserUA},
+        ),
+      );
+      final bytes = resp.data ?? const <int>[];
+      final encoding = resp.headers.value('content-encoding');
+      final text = _decodeDanmakuBody(bytes, encoding);
+      final list = parseDanmakuXml(text);
+      debugPrint('[bili_api] fetchDanmaku cid=$cid ok: ${list.length} 条');
+      return list;
+    } catch (e) {
+      debugPrint('[bili_api] fetchDanmaku cid=$cid 失败（静默返回空）: $e');
+      return const [];
+    }
+  }
+
+  /// 按 Content-Encoding 解压并 utf8 解码弹幕 XML body。
+  ///
+  /// B 站实测返回 raw deflate（无 zlib 头）；个别代理/CDN 可能回 gzip 或明文，
+  /// 按头分发 + 解压失败兜底，保证不抛（抛则上层整体返回空）。
+  static String _decodeDanmakuBody(List<int> bytes, String? encoding) {
+    final enc = (encoding ?? '').toLowerCase();
+    String utf8Safe(List<int> data) =>
+        utf8.decode(data, allowMalformed: true);
+    if (enc.contains('gzip')) {
+      try {
+        return utf8Safe(gzip.decode(bytes));
+      } catch (_) {
+        return '';
+      }
+    }
+    if (enc.contains('deflate')) {
+      // raw deflate（RFC1951，无 zlib 头）
+      try {
+        return utf8Safe(ZLibCodec(raw: true).decode(bytes));
+      } catch (_) {
+        // zlib 包装（RFC1950，带 0x78 头）兜底
+        try {
+          return utf8Safe(zlib.decode(bytes));
+        } catch (_) {
+          return '';
+        }
+      }
+    }
+    // 无压缩头：可能明文 XML，也可能 header 缺失但内容仍压缩——先按明文解，
+    // 若明显不是 XML（无 <i>/<d 标记）再试压缩。
+    final plain = utf8Safe(bytes);
+    if (plain.contains('<d ') || plain.contains('<i>') ||
+        plain.contains('<?xml')) {
+      return plain;
+    }
+    try {
+      return utf8Safe(gzip.decode(bytes));
+    } catch (_) {}
+    try {
+      return utf8Safe(ZLibCodec(raw: true).decode(bytes));
+    } catch (_) {}
+    return plain;
   }
 
   // -------------------------------------------------------------------------

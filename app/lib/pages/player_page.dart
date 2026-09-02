@@ -9,11 +9,13 @@ import '../api/translate_api.dart';
 import '../cache/download_manager.dart';
 import '../cache/playback_progress.dart';
 import '../config.dart';
+import '../models/danmaku.dart';
 import '../models/subtitle.dart';
 import '../models/whitelist_video.dart';
 import '../player/bili_dash_player.dart';
 import '../services/history_store.dart';
 import '../services/realtime_transcriber.dart';
+import '../widgets/danmaku_overlay.dart';
 import 'login_page.dart';
 
 /// 可选的播放倍速档位（默认 1.0，均落在原生支持区间 0.25~4.0 内）。
@@ -152,6 +154,21 @@ class _PlayerPageState extends State<PlayerPage> {
   // 多 P 选集：_currentPageIndex 指向 pages 中的当前集
   // （无 pages 数据 → 单 P，不展示选集 UI）
   int _currentPageIndex = 0;
+
+  // 弹幕（播放页弹幕层，v2.16.3+）
+  // ---------------------------------------------------------------------
+  // 开关默认关；开启时按当前集 cid 拉取弹幕 XML（fetchDanmaku，失败静默
+  // 返回空不阻塞播放）→ 交给 DanmakuOverlay 随时间发射渲染。
+  // 渲染层只在「开关开 && 有数据」时构建，关闭无任何开销。
+
+  /// 弹幕总开关（默认关；开启才拉取并显示）。
+  bool _danmakuEnabled = false;
+
+  /// 当前集（cid）的全量弹幕（按 timeSec 升序）；切集/关闭时清空。
+  List<Danmaku> _danmaku = const [];
+
+  /// 弹幕缓存（cid → 全量列表）：切集后同 cid 再开秒显示，不重复请求。
+  final Map<int, List<Danmaku>> _danmakuCache = {};
 
   /// pages 列表：空/缺失视为单 P（返回 null）。
   List<PageInfo>? get _pages {
@@ -947,6 +964,53 @@ class _PlayerPageState extends State<PlayerPage> {
   void _toggleListenMode() {
     debugPrint('[player_page] toggle listenMode -> ${!_listenMode}');
     setState(() => _listenMode = !_listenMode);
+  }
+
+  // -------------------------------------------------------------------------
+  // 弹幕（v2.16.3+）
+  // -------------------------------------------------------------------------
+
+  /// 弹幕开关：开 → 拉取当前 cid 弹幕并显示；关 → 清空显示数据（缓存保留）。
+  void _toggleDanmaku() {
+    final on = !_danmakuEnabled;
+    debugPrint('[player_page] 弹幕开关 -> ${on ? '开' : '关'} cid=$_currentCid');
+    setState(() {
+      _danmakuEnabled = on;
+      if (!on) {
+        _danmaku = const []; // 关闭：清空渲染数据（cache 保留，重开秒显示）
+      }
+    });
+    if (on) _loadDanmaku();
+  }
+
+  /// 拉取当前视频（当前集 cid）弹幕。
+  ///
+  /// - 命中页面缓存（同 cid 重复开）→ 直接显示，不重复请求
+  /// - fetchDanmaku 本身失败静默返回空（接口异常不阻塞播放）
+  /// - 拉取为空（视频无弹幕 / 老视频弹幕被关闭 / 接口异常）→ 轻提示一次，
+  ///   开关保持开启但无数据可渲染（不打扰播放）
+  Future<void> _loadDanmaku() async {
+    final cid = _currentCid;
+    final cached = _danmakuCache[cid];
+    if (cached != null) {
+      debugPrint('[player_page] 弹幕缓存命中 cid=$cid ${cached.length} 条');
+      if (mounted) setState(() => _danmaku = cached);
+      return;
+    }
+    final list = await _api.fetchDanmaku(cid);
+    if (!mounted) return;
+    // 拉取期间切了集 → 丢弃过期结果（新集 _loadDanmaku 会再触发）
+    if (_currentCid != cid) return;
+    _danmakuCache[cid] = list;
+    debugPrint('[player_page] 弹幕拉取完成 cid=$cid ${list.length} 条'
+        ' enabled=$_danmakuEnabled');
+    setState(() {
+      // 仅开关仍开启时挂载渲染数据（用户期间已关闭则保持空）
+      _danmaku = _danmakuEnabled ? list : const [];
+    });
+    if (list.isEmpty && _danmakuEnabled) {
+      _showSnack('该视频暂无弹幕');
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -1949,11 +2013,16 @@ class _PlayerPageState extends State<PlayerPage> {
       _mainSubtitleText = '';
       _secondarySubtitleText = '';
       _subtitleCues.clear();
+      // 弹幕：切集清空渲染数据（缓存按 cid 保留）；开关状态保留，
+      // 下方 _loadStreamAndPlay 成功后若开关仍开则自动拉新集弹幕
+      _danmaku = const [];
     });
     try {
       await _loadStreamAndPlay(positionMs: 0);
       await _player?.setPlaybackSpeed(_speed);
       if (mounted) setState(() => _buffering = false);
+      // 切集后弹幕开关仍开 → 自动拉取新集弹幕（新 cid 数据）
+      if (_danmakuEnabled) await _loadDanmaku();
     } catch (e) {
       if (!mounted) return;
       await _handleLoadFailure(e);
@@ -2145,6 +2214,22 @@ class _PlayerPageState extends State<PlayerPage> {
             ),
           // 2. 听视频占位界面（封面 + 标题 + 提示，点按恢复画面）
           if (_listenMode) _buildListenPlaceholder(),
+          // 2.25 弹幕层：Texture 之上、字幕层之下（字幕可读优先）。
+          // 仅「开关开 && 有数据 && 已加载」才构建——关闭时零开销；
+          // 无弹幕（空数据）不构建，不产生任何绘制。
+          if (!_listenMode &&
+              _danmakuEnabled &&
+              _danmaku.isNotEmpty &&
+              _loaded)
+            Positioned.fill(
+              child: IgnorePointer(
+                child: DanmakuOverlay(
+                  danmaku: _danmaku,
+                  playing: _playing,
+                  positionMs: _positionMs,
+                ),
+              ),
+            ),
           // 2.5 字幕层：Texture 之上、控制层之下（听视频模式隐藏）。
           // 底部控制行约 80px（进度条行 36 + 按钮行 44），字幕悬浮在其上方。
           // 主字幕大号在上，副字幕小号在其下（见 _SubtitleOverlay）。
@@ -2507,6 +2592,40 @@ class _PlayerPageState extends State<PlayerPage> {
                               overflow: TextOverflow.ellipsis,
                               style: TextStyle(
                                 color: _subtitleEnabled
+                                    ? Colors.pinkAccent
+                                    : Colors.white,
+                                fontSize: 14,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  // 弹幕按钮：图标 + 状态反馈（开启时高亮），点按切换弹幕层
+                  Expanded(
+                    child: InkWell(
+                      onTap: _player == null ? null : _toggleDanmaku,
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(
+                            _danmakuEnabled
+                                ? Icons.chat_bubble
+                                : Icons.chat_bubble_outline,
+                            color: _danmakuEnabled
+                                ? Colors.pinkAccent
+                                : Colors.white,
+                            size: 18,
+                          ),
+                          const SizedBox(width: 4),
+                          Flexible(
+                            child: Text(
+                              '弹幕',
+                              softWrap: false,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                color: _danmakuEnabled
                                     ? Colors.pinkAccent
                                     : Colors.white,
                                 fontSize: 14,
