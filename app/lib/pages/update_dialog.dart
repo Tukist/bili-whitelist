@@ -4,7 +4,8 @@
 /// - 强制更新模式（[UpdateInfo.isMandatory]）：[PopScope] 屏蔽返回；只显示「立即更新」按钮
 /// - changelog 渲染：解析 markdown 简单行（标题 + 列表），固定 240px 高度内
 ///   不够时外层 ListView 滚动
-/// - 下载中：底部 LinearProgressIndicator + 百分比 + 「取消下载」（删半成品）
+/// - 下载中：底部 LinearProgressIndicator + 百分比 + 「取消下载」（取消/失败都
+///   保留 .part 进度，下次点「立即更新/重试」从断点自动续传）
 /// - 下载完成：自动 dismiss + [ApkInstallerChannel.install] 触发系统安装
 library;
 

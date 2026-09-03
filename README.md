@@ -253,7 +253,8 @@ B 站部分接口（如 `playurl`）要求 WBI 签名：
   - **启动静默检查**：App 启动 5s 后调 `UpdateService.check(force=false)`，24h 节流；失败 / 已是最新 / 节流命中 → 完全静默；发现新版本且非强制 → 弹 `UpdateDialog`
   - **手动检查**：管理面板（首页右上角⚙️）底部 → 「检查更新」按钮，调 `check(force=true)` 跳过节流；三种结果 SnackBar 提示（已是最新 vX.Y.Z / 错误 message / 弹更新弹窗）
 - **私有仓库鉴权（v2.16.1+）**：仓库是私有的，Release 元数据与资产下载都需带管理页已配置的 GitHub token（`UpdateService(tokenProvider:)`；无 token 时按公开仓库匿名请求，向后兼容）。下载走两段式：带 token + `Accept: application/octet-stream` 请求资产 API 地址 → 手动跟随 302 到签名 CDN 地址后下载（鉴权头不随跳转转发，否则 S3 双重鉴权报 400）
-- **下载流程**：`UpdateService.download(info)` 把 APK 下载到 `<应用支持目录>/updates/app-update.apk`；dio `onReceiveProgress` 0~1 实时回调驱动进度条；可选 SHA-256 流式校验（`info.sha256 != null` 时启用，失败删半成品 + 抛 `UpdateException`）
+- **下载流程**：`UpdateService.download(info)` 把 APK 下载到 `<应用支持目录>/updates/app-update-<code>.apk`
+- **断点续传 + 网络异常友好提示（v2.16.8+）**：下载先写半成品 `app-update-<code>.apk.part`——存在 `.part` 时按已下载字节数带 `Range: bytes=N-` 续传（服务器 206 追加 / 200 不支持 Range 则全量重写），**下载完成才改名成正式 APK**；跳转手动跟随，保证 Range 命中签名 CDN。**失败 / 取消都保留 `.part`**，下次点「重试 / 立即更新」自动从断点继续；瞬时网络错误（断网 / 连接被重置 / 超时）自动重试 2 次（1s→2s 退避）并附「将自动从断点继续」的友好中文提示——不再出现「未知错误」裸文案（下载一半断网也不会整体重下）。可选 SHA-256 流式校验（`info.sha256 != null` 时启用，校验失败删文件抛「完整性校验失败」）
 - **安装跳转**：下载完成自动调 `ApkInstallerChannel.install(path)` → 原生 `ApkInstaller.kt` 通过 `FileProvider`（authority=`${applicationId}.fileprovider`）暴露 `content://` URI 给系统安装器，触发 `Intent.ACTION_VIEW` + `application/vnd.android.package-archive`；min_sdk=26 强制走 FileProvider（避免 API 24+ `FileUriExposedException`）
 - **强制更新策略**（`UpdateInfo.minSupported_code`）：当前 code 严格小于该阈值时弹窗屏蔽返回（`PopScope(canPop: false)`），只显示「立即更新」按钮；首版不启用（默认 null），保留机制备用
 - **多 ABI（v2.16.1+）**：Release 同时发 arm64-v8a / armeabi-v7a / x86_64 三 ABI；`UpdateInfo` 按设备 ABI 选资产（`Abi.current()`），无匹配回退 arm64-v8a
