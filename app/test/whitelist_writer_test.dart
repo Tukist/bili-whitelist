@@ -322,6 +322,21 @@ void main() {
       expect(v.pages!.single.part, '第1话 史上最强女仆、托尔！');
       expect(v.addedAt, '2026-09-01T00:00:00.000Z');
     });
+
+    test('videoFromPgcEpisode：写入 epId（免费集与会员集），toJson 往返保留', () {
+      final free = WhitelistWriter.videoFromPgcEpisode(
+          season, season.episodes[0],
+          now: DateTime.utc(2026, 9, 1));
+      expect(free.epId, 98603); // 透传 ep_id
+      final vip = WhitelistWriter.videoFromPgcEpisode(season, season.episodes[1],
+          now: DateTime.utc(2026, 9, 1));
+      expect(vip.epId, 318143);
+
+      // 写回 Gist 的 JSON 里带 epId，读回来仍在（整季导入 → 播放回退链路不丢）
+      final back = WhitelistVideo.fromJson(free.toJson());
+      expect(back.epId, 98603);
+      expect(back.title, '小林家的龙女仆 第1话 史上最强女仆、托尔！');
+    });
   });
 
   group('番剧整季顺序导入流程（逐集 addVideo：查重跳过 + 增量落盘）', () {

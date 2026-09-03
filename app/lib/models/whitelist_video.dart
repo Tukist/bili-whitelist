@@ -1,6 +1,8 @@
 /// 白名单数据模型（whitelist.json v1 结构；v2 起每条视频带 pages 分 P 信息；
 /// v3 起支持合集：顶层 collections 列表 + 每条视频的 collection 归属；
 /// v4 起支持 UP 主：顶层 upowners 列表，UP 主视频不在 videos[] 冗余存）。
+/// v2.16.4 起番剧/电影导入的视频带可选 `epId`（视频级附加字段，向后兼容，
+/// 不升顶层 version——旧读者忽略该键，新读者缺省 null = 普通视频）。
 library;
 
 import 'upowner.dart';
@@ -44,6 +46,7 @@ class WhitelistVideo {
   final List<PageInfo>? pages; // v2 分 P 列表；缺失/为空 → 视为单 P
   final String collection; // v3 所属合集名；空串 = 未分类
   final int order; // 合集内排序号（拖拽排序用）；旧数据缺省 0 = 按 added_at 倒序
+  final int? epId; // 番剧/电影集 ep_id（v2.16.4+ 番剧导入写入；普通视频/旧数据 = null）
 
   const WhitelistVideo({
     required this.bvid,
@@ -56,6 +59,7 @@ class WhitelistVideo {
     this.pages,
     this.collection = '',
     this.order = 0,
+    this.epId,
   });
 
   factory WhitelistVideo.fromJson(Map<String, dynamic> json) {
@@ -74,6 +78,8 @@ class WhitelistVideo {
       collection: json['collection'] as String? ?? '',
       // 脏数据（非数字，如字符串）时按缺省 0 处理，不抛类型转换错误
       order: json['order'] is num ? (json['order'] as num).toInt() : 0,
+      // 旧数据无 epId / 脏类型 → null（不崩；播放回退逻辑按 null 视为普通视频）
+      epId: json['epId'] is num ? (json['epId'] as num).toInt() : null,
     );
   }
 
@@ -87,6 +93,8 @@ class WhitelistVideo {
         'added_at': addedAt,
         'collection': collection,
         'order': order,
+        // epId 非空才输出（普通视频/旧数据不回写多余字段）
+        if (epId != null) 'epId': epId,
         if (pages != null)
           'pages': pages!.map((p) => p.toJson()).toList(),
       };
@@ -95,7 +103,10 @@ class WhitelistVideo {
   bool get isUncategorized => collection.isEmpty;
 
   /// 复制并修改合集归属（管理操作「移动到合集」用）。
-  WhitelistVideo copyWith({String? collection, int? order}) => WhitelistVideo(
+  ///
+  /// epId 不被本方法修改：未传时沿用原值（合集移动/重排不丢番剧集标识）。
+  WhitelistVideo copyWith({String? collection, int? order, int? epId}) =>
+      WhitelistVideo(
         bvid: bvid,
         cid: cid,
         title: title,
@@ -106,6 +117,7 @@ class WhitelistVideo {
         pages: pages,
         collection: collection ?? this.collection,
         order: order ?? this.order,
+        epId: epId ?? this.epId,
       );
 
   /// 分 P 数量：pages 缺失或为空 → 单 P（1）。

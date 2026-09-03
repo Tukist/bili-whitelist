@@ -96,4 +96,40 @@ void main() {
       expect(v.collection, 'A');
     });
   });
+
+  group('WhitelistVideo.epId（v2.16.4 番剧集标识）', () {
+    test('fromJson 解析 epId + toJson 序列化（非空才输出）', () {
+      final v = WhitelistVideo.fromJson({..._v2Video('BVpgc'), 'epId': 98603});
+      expect(v.epId, 98603);
+      final json = v.toJson();
+      expect(json['epId'], 98603);
+    });
+
+    test('旧数据无 epId → null，toJson 不回写多余字段（向后兼容）', () {
+      final v = WhitelistVideo.fromJson(_v2Video('BV1'));
+      expect(v.epId, isNull);
+      expect(v.toJson().containsKey('epId'), isFalse);
+    });
+
+    test('epId 脏类型（字符串）→ null 不崩', () {
+      final v =
+          WhitelistVideo.fromJson({..._v2Video('BVdirty'), 'epId': '123'});
+      expect(v.epId, isNull);
+    });
+
+    test('fromJson → toJson 往返保留 epId', () {
+      final original = WhitelistVideo.fromJson(
+          {..._v2Video('BVpgc'), 'epId': 318143, 'collection': '动画'});
+      final back = WhitelistVideo.fromJson(original.toJson());
+      expect(back.epId, 318143);
+      expect(back.bvid, 'BVpgc');
+      expect(back.collection, '动画');
+    });
+
+    test('copyWith 改合集不丢 epId（合集移动后番剧集仍可回退 pgc）', () {
+      final v = WhitelistVideo.fromJson({..._v2Video('BVpgc'), 'epId': 98603});
+      expect(v.copyWith(collection: '动画').epId, 98603);
+      expect(v.copyWith().epId, 98603);
+    });
+  });
 }

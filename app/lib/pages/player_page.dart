@@ -26,6 +26,64 @@ const List<double> kPlaybackSpeeds = [
 /// 长按视频画面时强制使用的倍速。
 const double kLongPressSpeed = 2.0;
 
+// -------------------------------------------------------------------------
+// 会员集播放回退决策（纯函数，便于单测）
+//
+// 背景：番剧每集有真实 bvid/cid；会员集经普通 `x/player/wbi/playurl`
+// 实测返回 -404（非稿件失效），需回退 pgc 端点 `pgc/player/web/playurl`
+// 取流（匿名只给试看流，完整播放需登录态 + 大会员）。
+// -------------------------------------------------------------------------
+
+/// pgc 回退取流后的播放动作。
+enum PgcFallbackAction {
+  /// 拿到非试看完整流 → 交给播放器正常播放。
+  play,
+
+  /// 只拿到试看流（会员集未解锁，仅前几分钟）→ 提示并停止（不播试看防误导）。
+  trialOnly,
+
+  /// 取流失败（抛异常）→ 提示登录大会员后观看。
+  failed,
+}
+
+/// 普通 playurl 取流失败 → 是否应回退 pgc 端点（纯函数）。
+///
+/// - 有 [epId]（番剧集，v2.16.4+ 导入写入）且失败码是会员集特征
+///   （-404 实测 / -10403 无权限）→ 回退
+/// - 无 epId（普通视频 / 旧版导入的番剧数据）→ 不回退，走原有提示
+bool shouldFallbackToPgc({required int? epId, required Object error}) {
+  if (epId == null) return false;
+  return error is BiliApiException &&
+      (error.code == -404 || error.code == -10403);
+}
+
+/// pgc 回退取流结果 → 播放动作（纯函数）。
+///
+/// 决策：拿到非试看流 → [PgcFallbackAction.play]；拿到试看流
+/// （[PgcPlayUrlResult.isPreview]=true）→ [PgcFallbackAction.trialOnly]；
+/// 抛异常 → [PgcFallbackAction.failed]。
+PgcFallbackAction pgcFallbackAction({
+  PgcPlayUrlResult? result,
+  Object? error,
+}) {
+  if (result != null) {
+    return result.isPreview ? PgcFallbackAction.trialOnly : PgcFallbackAction.play;
+  }
+  return PgcFallbackAction.failed;
+}
+
+/// 会员集各回退动作对应的用户文案（纯函数）。
+String pgcFallbackMessage(PgcFallbackAction action) {
+  switch (action) {
+    case PgcFallbackAction.trialOnly:
+      return '该集为大会员内容，当前为试看（仅前几分钟），请登录大会员账号完整观看';
+    case PgcFallbackAction.failed:
+      return '该集为大会员/付费内容，请登录大会员账号后观看';
+    case PgcFallbackAction.play:
+      return '';
+  }
+}
+
 /// 播放页：进入即取流（DASH 双流 fnval=16，老视频降级 mp4 单流），
 /// 原生 ExoPlayer MergingMediaSource 合并播放。
 ///
@@ -36,6 +94,10 @@ const double kLongPressSpeed = 2.0;
 ///   续播后按当前倍速/听视频状态恢复；重试 1 次仍失败显示「视频流过期，请重试」+ 重试按钮
 /// - 错误分类：403 防盗链异常 / -412 风控（指数退避 1s→2s→4s 重试）/ 62002 稿件失效 /
 ///   -101 登录失效（引导去登录页）
+/// - 会员集播放（v2.16.4+）：番剧导入的视频带 epId，播放时**先走普通 playurl**（免费集
+///   更清晰），会员集普通接口返回 -404 → **自动回退 pgc 端点**（fetchPgcPlayUrl）：
+///   拿到非试看完整流直接播；匿名只有试看流时**不播试看**，提示「大会员内容请登录
+///   大会员账号完整观看」并引导登录（防误导）；无 epId 的旧数据保持原 -404 友好提示
 /// - 登录过期提醒：SESSDATA 到期 < 7 天时顶部横幅提示重新登录
 ///
 /// 听视频模式：只隐藏/显示画面（Offstage），不调 pause/play，音频持续播放；
@@ -398,26 +460,60 @@ class _PlayerPageState extends State<PlayerPage> {
       );
       return;
     }
-    debugPrint('[player_page] 取流 bvid=${widget.video.bvid} cid=$_currentCid');
-    var result = await _api.fetchPlayUrl(
-      bvid: widget.video.bvid,
-      cid: _currentCid,
-      qn: 80,
-      fnval: 16, // DASH 双流（M2.1 实测定案：1080P 走路线 A）
-    );
-    // 老视频无 DASH → 重取 fnval=0 拿 durl[0].url（fnval=16 的响应里没有 durl）
-    if (result.dashVideoUrls.isEmpty) {
-      debugPrint('[player_page] fnval=16 无 DASH，降级 fnval=0');
-      result = await _api.fetchPlayUrl(
+    final epId = widget.video.epId; // 番剧集 ep_id（普通视频/旧番剧数据 = null）
+    debugPrint(
+        '[player_page] 取流 bvid=${widget.video.bvid} cid=$_currentCid epId=$epId');
+    try {
+      // 1) 普通 playurl（WBI）：普通视频/免费番剧集走这里（免费集普通接口
+      //    720P 比 pgc 端点的更清晰，优先）
+      var result = await _api.fetchPlayUrl(
         bvid: widget.video.bvid,
         cid: _currentCid,
         qn: 80,
-        fnval: 0,
+        fnval: 16, // DASH 双流（M2.1 实测定案：1080P 走路线 A）
       );
+      // 老视频无 DASH → 重取 fnval=0 拿 durl[0].url（fnval=16 的响应里没有 durl）
+      if (result.dashVideoUrls.isEmpty) {
+        debugPrint('[player_page] fnval=16 无 DASH，降级 fnval=0');
+        result = await _api.fetchPlayUrl(
+          bvid: widget.video.bvid,
+          cid: _currentCid,
+          qn: 80,
+          fnval: 0,
+        );
+      }
+      if (!result.hasStream) {
+        // 普通接口空流（番剧会员集可能不给流直接空响应）：
+        // 带 epId → 回退 pgc 端点；普通视频 → 保持原样报错
+        if (epId == null) {
+          throw StateError('未拿到可播放的流（可能视频不可播放）');
+        }
+        debugPrint('[player_page] 普通 playurl 空流 epId=$epId → 回退 pgc');
+        await _playPgcFallback(epId, positionMs);
+        return;
+      }
+      await _playStream(result, positionMs: positionMs);
+    } on BiliApiException catch (e) {
+      // 2) 普通 playurl -404（番剧会员集实测特征）且带 epId → 回退 pgc 端点；
+      //    无 epId（普通视频/旧番剧数据）→ 原样上抛走 _handleLoadFailure 提示
+      if (shouldFallbackToPgc(epId: epId, error: e)) {
+        debugPrint(
+            '[player_page] 普通 playurl 失败 code=${e.code} epId=$epId → 回退 pgc');
+        // shouldFallbackToPgc 已保证 epId 非空（catch 作用域内无法做类型提升）
+        await _playPgcFallback(epId!, positionMs);
+        return;
+      }
+      rethrow;
     }
-    if (!result.hasStream) {
-      throw StateError('未拿到可播放的流（可能视频不可播放）');
-    }
+  }
+
+  /// 把解析好的流交给播放器播放（dash 双流 / mp4 单流）。
+  ///
+  /// [result] 须 [PlayUrlResult.hasStream] 为真（调用方保证）。
+  Future<void> _playStream(PlayUrlResult result,
+      {required int positionMs}) async {
+    final player = _player;
+    if (player == null) return;
     if (result.dashVideoUrls.isNotEmpty) {
       await player.setDataSource(
         result.dashVideoUrls.first,
@@ -428,6 +524,54 @@ class _PlayerPageState extends State<PlayerPage> {
     } else {
       await player.setDataSource(result.mp4Url!, positionMs: positionMs);
     }
+  }
+
+  /// 番剧集回退 pgc 端点取流（普通 playurl -404/空流后调用）。
+  ///
+  /// 决策纯函数 [pgcFallbackAction]/[pgcFallbackMessage]（可单测）：
+  /// - 拿到非试看完整流 → 正常播放
+  /// - 试看流（会员集未解锁，仅前几分钟）→ **不播试看**，提示大会员并停止
+  ///   （避免"能播但只有几分钟"的误导）；引导去登录（登录大会员后回来可解锁）
+  /// - 取流抛异常 → -412/-352 风控/限流按可重试提示；其余（-10403 无权限/
+  ///   网络失败等）提示登录大会员账号后观看
+  Future<void> _playPgcFallback(int epId, int positionMs) async {
+    PgcPlayUrlResult? result;
+    Object? error;
+    try {
+      result = await _api.fetchPgcPlayUrl(epId);
+    } catch (e) {
+      error = e;
+      debugPrint('[player_page] pgc 回退取流失败 epId=$epId error=$e');
+    }
+    final action = pgcFallbackAction(result: result, error: error);
+    if (action == PgcFallbackAction.play) {
+      final r = result!;
+      debugPrint('[player_page] pgc 完整流 epId=$epId '
+          'dash=${r.dashVideoUrls.length} mp4=${r.mp4Url != null} → 播放');
+      if (!r.hasStream) {
+        // 完整标记但无流（极端场景，如接口给空 dash/durl）：不播放，明示
+        if (!mounted) return;
+        setState(() {
+          _error = '该集未返回可播放的流（可能需大会员/付费）';
+          _canRetry = false;
+        });
+        return;
+      }
+      await _playStream(r, positionMs: positionMs);
+      return;
+    }
+    final msg = pgcFallbackMessage(action);
+    if (!mounted) return;
+    // 风控/限流（-412/-352）不是权限问题：保留可重试、不引导登录；
+    // 试看/无权限失败 → 提示大会员 + 引导去登录（登录大会员后重进可解锁）
+    final err = error;
+    final isRisk = err is BiliApiException &&
+        (err.code == -412 || err.code == -352);
+    setState(() {
+      _error = isRisk ? _errMsg(err) : msg;
+      _canRetry = isRisk;
+      _loginPrompt = !isRisk;
+    });
   }
 
   /// 取流失败分类处理。
@@ -499,8 +643,10 @@ class _PlayerPageState extends State<PlayerPage> {
       });
       return;
     }
-    // -404：番剧会员/付费集经普通 playurl 接口返回 -404（需 pgc 端点 + 登录态
-    // 才能取流）；普通视频该码也可能是稿件被删/下架。统一友好提示、不可重试。
+    // -404：普通 playurl 对番剧会员/付费集返回 -404（v2.16.4+ 带 epId 的
+    // 番剧集已在 _loadStreamAndPlay 内回退 pgc 端点，不会走到这里）；能走到
+    // 此分支的只有**无 epId** 的视频（普通视频该码 = 稿件被删/下架；旧版导入
+    // 的番剧数据没有 epId 无法回退）。统一友好提示、不可重试。
     if (e is BiliApiException && e.code == -404) {
       setState(() {
         _error = '该集可能为大会员/付费内容或已下架';

@@ -81,6 +81,24 @@ class PlayUrlResult {
   bool get hasStream => mp4Url != null || dashVideoUrls.isNotEmpty;
 }
 
+/// 番剧/电影（pgc）取流接口（`pgc/player/web/playurl`）的解析结果。
+///
+/// 与普通 [PlayUrlResult] 同构（durl/dash 结构与普通 playurl 一致，
+/// 播放器 MergingMediaSource 直接复用现有播放逻辑），另带试看标志。
+class PgcPlayUrlResult extends PlayUrlResult {
+  /// 是否试看流（响应 `is_preview=1`）：大会员/付费集未解锁时只给前几分钟
+  /// 试看，完整播放需登录态 + 大会员。
+  final bool isPreview;
+
+  const PgcPlayUrlResult({
+    required super.quality,
+    super.mp4Url,
+    super.dashVideoUrls = const [],
+    super.dashAudioUrls = const [],
+    required this.isPreview,
+  });
+}
+
 /// 番剧单集信息（`pgc/view/web/season` 的 `result.episodes[]` 单项）。
 ///
 /// 2026-08 实测字段：`ep_id` / `aid` / `cid` / `bvid`（每集都有真实 bvid）/
@@ -714,41 +732,147 @@ class BiliApi {
           path: '/x/player/wbi/playurl',
         );
       }
-      final quality = (d['quality'] as num?)?.toInt() ?? 0;
-      // 传统 mp4：durl[0].url
-      final durl = d['durl'] as List?;
-      String? mp4Url;
-      if (durl != null && durl.isNotEmpty) {
-        final first = durl.first as Map<String, dynamic>?;
-        mp4Url = first?['url'] as String?;
-      }
-      // DASH：dash.video[] / dash.audio[]
-      final dash = d['dash'] as Map<String, dynamic>?;
-      final videoUrls = <String>[];
-      final audioUrls = <String>[];
-      if (dash != null) {
-        for (final v in (dash['video'] as List? ?? const [])) {
-          final url = (v as Map<String, dynamic>)['baseUrl'] as String?;
-          if (url != null && url.isNotEmpty) videoUrls.add(url);
-        }
-        for (final a in (dash['audio'] as List? ?? const [])) {
-          final url = (a as Map<String, dynamic>)['baseUrl'] as String?;
-          if (url != null && url.isNotEmpty) audioUrls.add(url);
-        }
-      }
+      final result = _parsePlayUrlData(d);
       debugPrint(
-        '[bili_api] fetchPlayUrl fnval=$fnval ok: quality=$quality '
-        'dashV=${videoUrls.length} dashA=${audioUrls.length} '
-        'mp4=${mp4Url != null} (bvid=$bvid)',
+        '[bili_api] fetchPlayUrl fnval=$fnval ok: quality=${result.quality} '
+        'dashV=${result.dashVideoUrls.length} '
+        'dashA=${result.dashAudioUrls.length} '
+        'mp4=${result.mp4Url != null} (bvid=$bvid)',
       );
-      return PlayUrlResult(
-        quality: quality,
-        mp4Url: mp4Url,
-        dashVideoUrls: videoUrls,
-        dashAudioUrls: audioUrls,
-      );
+      return result;
     }
     throw StateError('playurl 接口重试后仍失败（$bvid/$cid）');
+  }
+
+  /// 解析 playurl 响应 `data`/`result` 里的流信息（普通接口与 pgc 接口共用，
+  /// 两者 dash/durl 结构一致）。
+  ///
+  /// 返回：quality（下发清晰度）+ durl[0].url（mp4 单流）+ dash 双流列表。
+  static PlayUrlResult _parsePlayUrlData(Map<String, dynamic> d) {
+    final quality = (d['quality'] as num?)?.toInt() ?? 0;
+    // 传统 mp4：durl[0].url
+    final durl = d['durl'] as List?;
+    String? mp4Url;
+    if (durl != null && durl.isNotEmpty) {
+      final first = durl.first as Map<String, dynamic>?;
+      mp4Url = first?['url'] as String?;
+    }
+    // DASH：dash.video[] / dash.audio[]
+    final dash = d['dash'] as Map<String, dynamic>?;
+    final videoUrls = <String>[];
+    final audioUrls = <String>[];
+    if (dash != null) {
+      for (final v in (dash['video'] as List? ?? const [])) {
+        final url = (v as Map<String, dynamic>)['baseUrl'] as String?;
+        if (url != null && url.isNotEmpty) videoUrls.add(url);
+      }
+      for (final a in (dash['audio'] as List? ?? const [])) {
+        final url = (a as Map<String, dynamic>)['baseUrl'] as String?;
+        if (url != null && url.isNotEmpty) audioUrls.add(url);
+      }
+    }
+    return PlayUrlResult(
+      quality: quality,
+      mp4Url: mp4Url,
+      dashVideoUrls: videoUrls,
+      dashAudioUrls: audioUrls,
+    );
+  }
+
+  /// 番剧/电影单集取流（`pgc/player/web/playurl`，**无需 WBI 签名**：
+  /// 匿名 + 完整浏览器头即可；登录态存在时复用 [_injectAuth] 注入 SESSDATA）。
+  ///
+  /// 会员/付费集播放路径：普通 `x/player/wbi/playurl` 对会员集返回 -404，
+  /// 需回退本接口。⚠️ **匿名只返回试看流**（[PgcPlayUrlResult.isPreview]
+  /// = true，仅前几分钟；实测会员集匿名给的是 mp4 试看 durl）；完整播放需
+  /// 登录态 + 大会员。
+  ///
+  /// [qn]/[fnval] 语义同 [fetchPlayUrl]（80=1080P、16=DASH）。
+  /// 错误分类（调用方 UI 据此提示）：
+  /// - code=-404 → [BiliApiException]「该集不可播放（可能已下架或无观看权限）」
+  /// - code=-10403 → [BiliApiException]「未登录或非大会员，无法获取完整播放流」
+  /// - code=-412 → [BiliApiException]（风控）
+  /// - code=0 但 result 空/仅 v_voucher → [BiliApiException](-352)（限流特征）
+  /// - 其他业务码 → [BiliApiException]（带接口 message）
+  /// - 网络失败（[DioException]）→ 原样上抛
+  Future<PgcPlayUrlResult> fetchPgcPlayUrl(
+    int epId, {
+    int qn = 80,
+    int fnval = 16,
+  }) async {
+    await _injectAuth();
+    final params = {
+      'ep_id': '$epId',
+      'qn': '$qn',
+      'fnval': '$fnval',
+      'fnver': '0',
+      'fourk': '1',
+    };
+    debugPrint('[bili_api] fetchPgcPlayUrl epId=$epId qn=$qn fnval=$fnval');
+    final resp = await _dio.get<Map<String, dynamic>>(
+      '/pgc/player/web/playurl',
+      queryParameters: params,
+    );
+    final data = resp.data;
+    final code = data?['code'] as int?;
+    if (code == -404) {
+      // 实测：不存在的 ep 返回 code=-404 message=「啥都木有」
+      throw const BiliApiException(
+        code: -404,
+        message: '该集不可播放（可能已下架或无观看权限）',
+        path: '/pgc/player/web/playurl',
+      );
+    }
+    if (code == -10403) {
+      throw const BiliApiException(
+        code: -10403,
+        message: '未登录或非大会员，无法获取完整播放流，请登录大会员账号后观看',
+        path: '/pgc/player/web/playurl',
+      );
+    }
+    if (code == -412) {
+      throw const BiliApiException(
+        code: -412,
+        message: '番剧取流接口被风控拦截，请稍后再试',
+        path: '/pgc/player/web/playurl',
+      );
+    }
+    if (code != 0) {
+      throw BiliApiException(
+        code: code ?? -1,
+        message: data?['message'] as String? ?? '番剧取流失败',
+        path: '/pgc/player/web/playurl',
+      );
+    }
+    // ⚠️ pgc 接口包装层是 `result`（与 pgc/view/web/season 一致），不是普通
+    // 接口的 `data`（2026-09 实测确认）
+    final d = data?['result'] as Map<String, dynamic>? ?? {};
+    // B 站软风控/限流特征（与普通 playurl 一致）：code=0 但 result 空/仅
+    // v_voucher，没有任何 dash/durl 流。
+    if (d.containsKey('v_voucher') || d.isEmpty) {
+      debugPrint(
+        '[bili_api] fetchPgcPlayUrl 风控空响应 result=$d (epId=$epId)',
+      );
+      throw const BiliApiException(
+        code: -352,
+        message: '番剧取流接口被限流，请稍后重试',
+        path: '/pgc/player/web/playurl',
+      );
+    }
+    final result = _parsePlayUrlData(d);
+    final isPreview = (d['is_preview'] as num?)?.toInt() == 1;
+    debugPrint(
+      '[bili_api] fetchPgcPlayUrl epId=$epId ok: quality=${result.quality} '
+      'isPreview=$isPreview dashV=${result.dashVideoUrls.length} '
+      'dashA=${result.dashAudioUrls.length} mp4=${result.mp4Url != null}',
+    );
+    return PgcPlayUrlResult(
+      quality: result.quality,
+      mp4Url: result.mp4Url,
+      dashVideoUrls: result.dashVideoUrls,
+      dashAudioUrls: result.dashAudioUrls,
+      isPreview: isPreview,
+    );
   }
 
   // -------------------------------------------------------------------------

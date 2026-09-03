@@ -118,6 +118,7 @@ class WhitelistWriter {
   ///
   /// - 标题 = 剧名 + 第X话 + 副标题（见 [pgcEpisodeTitle]）
   /// - up_name = `番剧/官方`；collection 空（未分类）；pages = 该集单 P；
+  ///   epId = 该集 ep_id（播放会员集时据此回退 pgc 取流）
   ///   added_at = [now]（可注入测试用，缺省当前 UTC）
   static WhitelistVideo videoFromPgcEpisode(
     PgcSeason season,
@@ -138,6 +139,8 @@ class WhitelistWriter {
       addedAt: (now ?? DateTime.now()).toUtc().toIso8601String(),
       pages: [PageInfo(cid: ep.cid, part: part, duration: ep.durationSec)],
       collection: '',
+      // ep_id 脏数据（0）不写入，视为无 epId 的普通视频
+      epId: ep.epId > 0 ? ep.epId : null,
     );
   }
 
