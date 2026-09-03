@@ -8,6 +8,26 @@
 
 ---
 
+## v2.16.7 (2026-09-03)
+
+**新增**
+
+- **播放页 B 站式快捷手势**（参照 B 站手机端播放器）：
+  - **双击播放 / 暂停**：画面任意处快速双击切换播放 / 暂停（与单击显隐共存——单击因等待双击窗口判定延迟 ~300ms 触发显隐；双击赢得手势时延迟的单击自动取消，不误触显隐）
+  - **横屏左右滑 seek（全屏）**：全屏横屏下画面左右滑动按**位移比例**拖动进度（滑满一屏 ≈ 100% 时长），滑动中浮层实时显示「当前进度 / 总时长」（如 `12:34 / 56:78`），**松手 seekTo** 并保存进度；方向与进度条一致（右滑前进、左滑后退）
+  - **竖屏半屏上下滑调亮度 / 音量**：竖屏（非全屏）左半屏纵向滑动调**应用内亮度**、右半屏调**媒体音量**——滑满一屏 ≈ 0↔100%，**调节即时生效、松手不恢复**，滑动中浮层显示图标 + 百分比
+  - **手势冲突处理**：单击显隐 / 双击暂停 / 长按 2x / 横屏 seek / 竖屏亮度·音量 / 进度条拖动 / 控制层按钮——横向与纵向手势**按屏幕方向分道注册**（全屏只注册横向、竖屏只注册纵向，另一方向不存在即不会抢判定）；控制层按钮与进度条位于 Stack 上层，其区域内点击 / 拖动天然优先（按钮优先）
+
+**原生通道（新增）**
+
+- `bili_whitelist/media` MethodChannel（android/app/src/main/kotlin/.../MediaController.kt）：`getVolume` / `setVolume`（AudioManager STREAM_MUSIC，按档精确设置且不弹系统音量 UI）+ `getBrightness` / `setBrightness`（应用内亮度——WindowManager LayoutParams.screenBrightness 0~1，仅当前 Activity、退出播放恢复系统亮度；下限钳 5% 防全黑时浮层不可见）；Dart 侧封装 `lib/services/device_media.dart`，通道不可用 / 异常静默放弃本次手势（不打断播放）
+
+**重构**
+
+- 播放页手势纯逻辑抽为可单测顶层函数：`verticalSlideKind`（半屏判定）/ `slideFraction`（位移→比例，拖满一屏=±100%）/ `seekTargetMs`（seek 目标，钳制 0..时长）/ `volumeTargetLevel` / `adjustPercent` / `brightnessPercent`（亮度下限 5%），单测 `test/player_gesture_test.dart`（14 用例）
+
+---
+
 ## v2.16.6 (2026-09-03)
 
 **新增**

@@ -15,6 +15,7 @@ import '../models/subtitle.dart';
 import '../models/whitelist_video.dart';
 import '../player/bili_dash_player.dart';
 import '../services/danmaku_settings_store.dart';
+import '../services/device_media.dart';
 import '../services/history_store.dart';
 import '../services/realtime_transcriber.dart';
 import '../widgets/danmaku_overlay.dart';
@@ -87,12 +88,95 @@ String pgcFallbackMessage(PgcFallbackAction action) {
   }
 }
 
+// -------------------------------------------------------------------------
+// B 站式播放快捷手势（v2.16.7+）纯函数（便于单测）
+//
+// 手势总览（参照 B 站手机端播放器；冲突处理见 build 中手势层注释）：
+// - 双击：播放 / 暂停（与单击显隐共存，单击延迟 ~300ms 等双击判定）
+// - 全屏横屏：横向滑动 seek——位移 / 屏宽 = 时长比例，松手 seekTo
+// - 竖屏：纵向滑动调亮度 / 音量——左半屏亮度、右半屏音量（原生通道
+//   bili_whitelist/media，见 services/device_media.dart）
+//
+// 滑动量换算统一走 [slideFraction]：滑满一屏 = ±100%（比例），
+// 方向约定：向右 / 向上为「前进 / 增大」。
+// -------------------------------------------------------------------------
+
+/// 手势提示浮层的类型（也即竖屏半屏判定可产生的目标）。
+enum PlayerSlideKind {
+  /// 横屏 seek（浮层显示 当前进度 / 总时长）。
+  seek,
+
+  /// 亮度（竖屏左半屏纵向滑动）。
+  brightness,
+
+  /// 音量（竖屏右半屏纵向滑动）。
+  volume,
+}
+
+/// 竖屏半屏判定：滑动起点 x ≤ 屏宽一半 → 亮度，否则 → 音量。
+PlayerSlideKind verticalSlideKind(double x, double width) =>
+    x <= width / 2 ? PlayerSlideKind.brightness : PlayerSlideKind.volume;
+
+/// 位移 → 滑动比例：delta / span，钳制 -1..1（拖满一屏 = ±100%）。
+/// span <= 0（测试 / 极端布局）按 0 处理，避免除零。
+double slideFraction(double delta, double span) {
+  if (span <= 0) return 0;
+  final f = delta / span;
+  return f < -1 ? -1 : (f > 1 ? 1 : f);
+}
+
+/// seek 目标位置：基准进度 + 滑动比例 × 视频时长（钳制 0..时长）。
+/// 无时长（未加载 / 时长未知）→ 0（此时不应发起 seek，纯防御）。
+/// 方向：向右滑（正比例）= 前进，与进度条拖动方向一致。
+int seekTargetMs({
+  required int baseMs,
+  required double fraction,
+  required int durationMs,
+}) {
+  if (durationMs <= 0) return 0;
+  var target = baseMs + (fraction * durationMs).round();
+  if (target < 0) target = 0;
+  if (target > durationMs) target = durationMs;
+  return target;
+}
+
+/// 音量目标档位：基准档 + 滑动比例 × 最大档（钳制 0..max）。
+/// 最大档 <= 0（无音量设备 / 防御）→ 0。
+int volumeTargetLevel({
+  required int baseLevel,
+  required double fraction,
+  required int maxLevel,
+}) {
+  if (maxLevel <= 0) return 0;
+  final t = baseLevel + (fraction * maxLevel).round();
+  return t < 0 ? 0 : (t > maxLevel ? maxLevel : t);
+}
+
+/// 纵向调节当前百分比（0..100）：基准百分比 + 滑动比例 × 100（钳制）。
+double adjustPercent({required double basePercent, required double fraction}) {
+  final v = basePercent + fraction * 100;
+  return v < 0 ? 0 : (v > 100 ? 100 : v);
+}
+
+/// 亮度百分比（带下限 5%）：全黑时手势浮层与画面同窗口会不可见、误以为
+/// 失效——下限与原生侧 MediaController 一致。
+double brightnessPercent({
+  required double basePercent,
+  required double fraction,
+}) {
+  final v = adjustPercent(basePercent: basePercent, fraction: fraction);
+  return v < 5 ? 5 : v;
+}
+
 /// 播放页：进入即取流（DASH 双流 fnval=16，老视频降级 mp4 单流），
 /// 原生 ExoPlayer MergingMediaSource 合并播放。
 ///
 /// - 控制层：播放/暂停、进度条（500ms 轮询 getPosition）、当前/总时长、
 ///   倍速选择（九档 0.5~3x）、听视频（纯音频）开关、全屏切换；
-///   点击画面切换控制层显隐，长按画面 2x、松手恢复长按前倍速；进入自动播放
+///   点击画面切换控制层显隐，长按画面 2x、松手恢复长按前倍速；进入自动播放；
+///   B 站式快捷手势（v2.16.7+）：双击播放/暂停（单击显隐延迟 ~300ms 防误触）、
+///   全屏横屏横向滑动 seek（时间浮层 + 松手 seekTo）、竖屏左/右半屏上下滑调
+///   亮度/音量（原生通道 bili_whitelist/media，仅当前 Activity 内生效）
 /// - URL 过期（onUrlExpired）：重取 playurl → 记位置 → setDataSource(新流, 位置) 续播，
 ///   续播后按当前倍速/听视频状态恢复；重试 1 次仍失败显示「视频流过期，请重试」+ 重试按钮
 /// - 错误分类：403 防盗链异常 / -412 风控（指数退避 1s→2s→4s 重试）/ 62002 稿件失效 /
@@ -150,6 +234,28 @@ class _PlayerPageState extends State<PlayerPage> {
   bool _controlsVisible = true;
   bool _fullscreen = false;
   bool _dragging = false;
+
+  // B 站式快捷手势（v2.16.7+）
+  // -------------------------------------------------------------------
+  // 双击播放/暂停：GestureDetector onDoubleTap；单击显隐因与双击共存自动
+  // 延迟 ~300ms（等双击窗口判定，双击赢得则单击取消，不误触显隐）。
+  // 横屏 seek 拖动中暂停 tick 位置刷新（松手 seek 后恢复）。
+  bool _seekDragging = false; // 横屏 seek 拖动中
+  int _seekDragBaseMs = 0; // seek 起点基准位置（拖动开始时）
+  double _seekDragDx = 0; // 累计横向位移（px，向右为正）
+  double _seekDragSpan = 1; // 拖满一屏对应的屏宽（px）
+  // 竖屏纵向调节（亮度/音量）：起点半屏定类型，滑动量按屏高换算比例。
+  PlayerSlideKind? _adjustKind; // 纵向调节类型（null = 未进行）
+  bool _adjustReady = false; // 基准值已从原生取到（取到前忽略滑动）
+  double _adjustBase = 0; // 基准：亮度=百分比 / 音量=当前档
+  double _adjustSpan = 1; // 纵向拖满一屏对应的屏高（px）
+  double _adjustDy = 0; // 累计纵向位移（px，向下为正）
+  int _volumeMax = 0; // 音量最大档（本次手势开始时取）
+  // 手势提示浮层（hud）：seek 时间 / 亮度 / 音量
+  PlayerSlideKind? _hudKind;
+  double _hudValue = 0; // 亮度/音量百分比（0..100；seek 类型不用）
+  int _hudSeekPosMs = 0; // seek 当前目标位置（仅 seek 类型）
+  Timer? _hudTimer; // 浮层自动消失计时（手势结束后延迟隐藏）
 
   // 倍速 / 长按 2x
   double _speed = 1.0;
@@ -330,6 +436,7 @@ class _PlayerPageState extends State<PlayerPage> {
       });
     }
     _timer?.cancel();
+    _hudTimer?.cancel();
     _eventSub?.cancel();
     _eventSub = null;
     _player?.dispose();
@@ -777,7 +884,7 @@ class _PlayerPageState extends State<PlayerPage> {
 
   Future<void> _tick() async {
     final player = _player;
-    if (player == null || _dragging) return;
+    if (player == null || _dragging || _seekDragging) return;
     final pos = await player.getPosition();
     if (mounted) setState(() => _positionMs = pos);
     if (mounted) _updateSubtitleText(pos);
@@ -1026,6 +1133,171 @@ class _PlayerPageState extends State<PlayerPage> {
     debugPrint('[player_page] _toggleControls called, '
         'visible=$_controlsVisible -> ${!_controlsVisible}');
     setState(() => _controlsVisible = !_controlsVisible);
+  }
+
+  // -------------------------------------------------------------------------
+  // B 站式快捷手势（v2.16.7+）：双击 / 横屏 seek / 竖屏亮度·音量
+  //
+  // 判定与冲突处理汇总（详见 build 手势层注释）：
+  // - 双击 = 播放/暂停；单击 = 显隐（延迟 ~300ms 等双击窗口判定）
+  // - 横屏（_fullscreen）横向滑动 = seek：位移比例 = 时长比例，松手 seekTo
+  // - 竖屏（!_fullscreen）纵向滑动 = 亮度（左半屏）/ 音量（右半屏），
+  //   原生通道调节（device_media.dart），调节即生效、松手不恢复
+  // - 控制层按钮 / 进度条在 Stack 上层，其区域内的点击与拖动天然优先
+  // -------------------------------------------------------------------------
+
+  /// 双击 → 播放 / 暂停。单击显隐因双击共存自动延迟，双击赢得手势时
+  /// 延迟的单击会取消 → 双击不会误触显隐。
+  Future<void> _onDoubleTap() async {
+    debugPrint('[player_page] doubleTap → 播放/暂停');
+    await _togglePlay();
+  }
+
+  // ---------- 全屏横屏横向滑动 seek ----------
+
+  void _onSeekDragStart(DragStartDetails _) {
+    if (_player == null || _durationMs <= 0) return;
+    _seekDragging = true;
+    _seekDragBaseMs = _positionMs;
+    _seekDragDx = 0;
+    _seekDragSpan = MediaQuery.sizeOf(context).width;
+    _showSeekHud(_positionMs);
+    debugPrint('[player_page] 横屏 seek 开始 base=${_positionMs}ms '
+        'span=${_seekDragSpan}px');
+  }
+
+  void _onSeekDragUpdate(DragUpdateDetails d) {
+    if (!_seekDragging) return;
+    _seekDragDx += d.delta.dx;
+    final target = seekTargetMs(
+      baseMs: _seekDragBaseMs,
+      fraction: slideFraction(_seekDragDx, _seekDragSpan),
+      durationMs: _durationMs,
+    );
+    _showSeekHud(target);
+  }
+
+  void _onSeekDragEnd(DragEndDetails _) async {
+    if (!_seekDragging) return;
+    _seekDragging = false;
+    final fraction = slideFraction(_seekDragDx, _seekDragSpan);
+    final target = seekTargetMs(
+      baseMs: _seekDragBaseMs,
+      fraction: fraction,
+      durationMs: _durationMs,
+    );
+    debugPrint('[player_page] 横屏 seekTo ${target}ms'
+        '（比例 ${fraction.toStringAsFixed(2)}）');
+    await _player?.seekTo(target);
+    if (mounted) setState(() => _positionMs = target);
+    _saveProgress(); // seek 后保存，防滑到新位置丢进度
+    _scheduleHudHide(const Duration(milliseconds: 600));
+  }
+
+  // ---------- 竖屏纵向滑动调亮度 / 音量 ----------
+
+  /// 纵向手势开始：按起点 x 半屏判定类型，再异步取原生基准值
+  /// （取到前 _adjustReady=false，期间忽略滑动；通道失败则本次手势作废）。
+  void _onVerticalDragStart(DragStartDetails d) {
+    if (_player == null) return;
+    final width = MediaQuery.sizeOf(context).width;
+    final kind = verticalSlideKind(d.localPosition.dx, width);
+    debugPrint('[player_page] 纵向手势开始 kind=${kind.name} '
+        'x=${d.localPosition.dx.toStringAsFixed(0)}px');
+    _adjustKind = kind;
+    _adjustReady = false;
+    _adjustDy = 0;
+    _adjustSpan = MediaQuery.sizeOf(context).height;
+    if (kind == PlayerSlideKind.volume) {
+      _volumeMax = 0;
+      DeviceMedia.getVolume().then((v) {
+        if (!mounted || _adjustKind != kind || v == null) return;
+        _volumeMax = v.max;
+        _adjustBase = v.current.toDouble();
+        _adjustReady = true;
+        _showValueHud(kind, _percentOfLevel(v.current, v.max));
+      });
+    } else {
+      DeviceMedia.getBrightness().then((b) {
+        if (!mounted || _adjustKind != kind || b == null) return;
+        // 0..1 → 百分比；下限 5%（与原生 / brightnessPercent 一致）
+        _adjustBase = (b * 100).clamp(5.0, 100.0).toDouble();
+        _adjustReady = true;
+        _showValueHud(kind, _adjustBase);
+      });
+    }
+  }
+
+  /// 纵向滑动更新：上滑（dy 为负）→ 增大。换算为比例后按类型调音量 /
+  /// 亮度，变化达阈值才写原生（避免每帧刷通道）并刷新浮层。
+  void _onVerticalDragUpdate(DragUpdateDetails d) {
+    final kind = _adjustKind;
+    if (kind == null || !_adjustReady) return;
+    _adjustDy += d.delta.dy;
+    final fraction = slideFraction(-_adjustDy, _adjustSpan);
+    if (kind == PlayerSlideKind.volume) {
+      final level = volumeTargetLevel(
+        baseLevel: _adjustBase.round(),
+        fraction: fraction,
+        maxLevel: _volumeMax,
+      );
+      if (level != _adjustBase.round()) {
+        DeviceMedia.setVolume(level);
+        _adjustBase = level.toDouble();
+        _showValueHud(kind, _percentOfLevel(level, _volumeMax));
+      }
+    } else {
+      final pct = brightnessPercent(basePercent: _adjustBase, fraction: fraction);
+      if ((pct - _adjustBase).abs() >= 1) {
+        DeviceMedia.setBrightness(pct / 100);
+        _adjustBase = pct;
+        _showValueHud(kind, pct);
+      }
+    }
+  }
+
+  /// 纵向手势结束：类型复位（调节已即时生效，不恢复），浮层延迟隐藏。
+  void _onVerticalDragEnd(DragEndDetails _) {
+    if (_adjustKind == null) return;
+    debugPrint('[player_page] 纵向手势结束 kind=${_adjustKind!.name} '
+        'base=${_adjustBase.toStringAsFixed(1)}');
+    _adjustKind = null;
+    _adjustReady = false;
+    _scheduleHudHide(const Duration(milliseconds: 700));
+  }
+
+  double _percentOfLevel(int level, int max) => max <= 0
+      ? 0
+      : (level * 100 / max).roundToDouble();
+
+  // ---------- 手势提示浮层（hud） ----------
+
+  /// 显示 seek 时间浮层（当前进度 / 总时长），先取消待隐藏计时。
+  void _showSeekHud(int posMs) {
+    if (!mounted) return;
+    _hudTimer?.cancel();
+    setState(() {
+      _hudKind = PlayerSlideKind.seek;
+      _hudSeekPosMs = posMs;
+    });
+  }
+
+  /// 显示亮度 / 音量百分比浮层。
+  void _showValueHud(PlayerSlideKind kind, double percent) {
+    if (!mounted) return;
+    _hudTimer?.cancel();
+    setState(() {
+      _hudKind = kind;
+      _hudValue = percent;
+    });
+  }
+
+  /// 手势结束后延迟隐藏浮层（seek / 亮度 / 音量共用）。
+  void _scheduleHudHide(Duration delay) {
+    _hudTimer?.cancel();
+    _hudTimer = Timer(delay, () {
+      if (mounted) setState(() => _hudKind = null);
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -2457,8 +2729,18 @@ class _PlayerPageState extends State<PlayerPage> {
                 onTap: _goLogin,
               ),
             ),
-          // 4. 点击画面切换控制层显隐 + 长按 2x（onTap 与 onLongPress 可共存；
-          //    长按赢得手势后 onTap 自动取消，不会误触切换）
+          // 4. 点击画面切换控制层显隐 + 长按 2x + B 站式快捷手势（v2.16.7+）。
+          //    onTap 与 onLongPress 可共存：长按赢得手势后 onTap 自动取消。
+          //    手势冲突面（识别器在同一竞技场竞争，由 Flutter 判定谁赢）：
+          //    - 单击（显隐）vs 双击（播放/暂停）：onDoubleTap 与 onTap 共存时，
+          //      Tap 需等双击窗口（~300ms）判定——双击赢得 → 单击自动取消
+          //      （双击不误触显隐）；单击赢得 → 显隐延迟 ~300ms 触发
+          //    - 长按 2x：按住不动 500ms 赢得，期间不响应滑动（松开再滑）
+          //    - 横屏 seek 与竖屏亮度/音量**按方向分屏注册**：仅 _fullscreen 注册
+          //      HorizontalDrag、仅竖屏注册 VerticalDrag（GestureDetector 对 null
+          //      回调不建识别器）→ 不存在方向的手势不会抢判定
+          //    - 控制层按钮 / 进度条在本层**之后**渲染（Stack 上层），其区域内
+          //      点击与拖动天然拦截（按钮优先）；弹幕层 IgnorePointer 不参与命中
           //    听视频模式下让位给占位层（其自己处理点按恢复画面 + 长按 2x），
           //    否则本 opaque 层会拦截占位层的点击。
           if (!_listenMode)
@@ -2466,12 +2748,29 @@ class _PlayerPageState extends State<PlayerPage> {
               child: GestureDetector(
                 behavior: HitTestBehavior.opaque,
                 onTap: _toggleControls,
+                onDoubleTap: _player == null ? null : _onDoubleTap,
                 onLongPressStart: _player == null ? null : _onLongPressStart,
                 onLongPressEnd: _player == null ? null : _onLongPressEnd,
+                // 横屏 seek（仅全屏注册；拖满一屏 ≈ 滑过 100% 时长）
+                onHorizontalDragStart:
+                    _fullscreen ? _onSeekDragStart : null,
+                onHorizontalDragUpdate:
+                    _fullscreen ? _onSeekDragUpdate : null,
+                onHorizontalDragEnd: _fullscreen ? _onSeekDragEnd : null,
+                // 竖屏亮度/音量（仅非全屏注册）
+                onVerticalDragStart:
+                    !_fullscreen ? _onVerticalDragStart : null,
+                onVerticalDragUpdate:
+                    !_fullscreen ? _onVerticalDragUpdate : null,
+                onVerticalDragEnd: !_fullscreen ? _onVerticalDragEnd : null,
               ),
             ),
           // 5. 控制层（置于点击层之上）
           if (_controlsVisible || !_loaded) _buildControls(),
+          // 5.5 手势提示浮层（B 站式快捷手势）：seek 时间 / 亮度 / 音量，
+          //     中心偏上、不拦截任何点击（IgnorePointer）。
+          if (_hudKind != null)
+            Positioned.fill(child: _buildGestureHud()),
           // 6. 缓冲指示
           if (_buffering)
             const Center(
@@ -2490,6 +2789,55 @@ class _PlayerPageState extends State<PlayerPage> {
         Center(child: _buildCenterControls()),
         Align(alignment: Alignment.bottomCenter, child: _buildBottomBar()),
       ],
+    );
+  }
+
+  /// 手势提示浮层（seek 时间 / 亮度 / 音量）：半透明黑底圆角小条，居中偏上。
+  /// 整体包 IgnorePointer——纯展示，不拦截下方任何点击/拖动。
+  Widget _buildGestureHud() {
+    final kind = _hudKind!;
+    final String text;
+    final IconData icon;
+    switch (kind) {
+      case PlayerSlideKind.seek:
+        text = '${_fmtMs(_hudSeekPosMs)} / ${_fmtMs(_durationMs)}';
+        icon = Icons.access_time;
+      case PlayerSlideKind.brightness:
+        text = '亮度 ${_hudValue.round()}%';
+        icon = Icons.brightness_6;
+      case PlayerSlideKind.volume:
+        text = '音量 ${_hudValue.round()}%';
+        final v = _hudValue;
+        icon = v <= 0
+            ? Icons.volume_off
+            : (v < 50 ? Icons.volume_down : Icons.volume_up);
+    }
+    return IgnorePointer(
+      child: Align(
+        alignment: const Alignment(0, -0.28),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
+          decoration: BoxDecoration(
+            color: Colors.black.withValues(alpha: 0.55),
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, color: Colors.white, size: 22),
+              const SizedBox(width: 8),
+              Text(
+                text,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 16,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
     );
   }
 

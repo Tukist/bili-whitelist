@@ -18,6 +18,8 @@ class MainActivity : FlutterActivity() {
         setupCookieChannel(flutterEngine)
         // 应用内版本更新（M1.3）：注册 APK 安装 MethodChannel
         ApkInstaller(applicationContext).register(flutterEngine)
+        // 播放页 B 站式快捷手势（v2.16.7+）：音量 + 应用内亮度 MethodChannel
+        MediaController(this).register(flutterEngine)
     }
 
     /**
