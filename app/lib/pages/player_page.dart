@@ -10,12 +10,15 @@ import '../cache/download_manager.dart';
 import '../cache/playback_progress.dart';
 import '../config.dart';
 import '../models/danmaku.dart';
+import '../models/danmaku_settings.dart';
 import '../models/subtitle.dart';
 import '../models/whitelist_video.dart';
 import '../player/bili_dash_player.dart';
+import '../services/danmaku_settings_store.dart';
 import '../services/history_store.dart';
 import '../services/realtime_transcriber.dart';
 import '../widgets/danmaku_overlay.dart';
+import '../widgets/danmaku_settings_sheet.dart';
 import 'login_page.dart';
 
 /// 可选的播放倍速档位（默认 1.0，均落在原生支持区间 0.25~4.0 内）。
@@ -217,14 +220,20 @@ class _PlayerPageState extends State<PlayerPage> {
   // （无 pages 数据 → 单 P，不展示选集 UI）
   int _currentPageIndex = 0;
 
-  // 弹幕（播放页弹幕层，v2.16.3+）
+  // 弹幕（播放页弹幕层，v2.16.3+ → v2.16.6+ 屏蔽/透明度）
   // ---------------------------------------------------------------------
   // 开关默认关；开启时按当前集 cid 拉取弹幕 XML（fetchDanmaku，失败静默
   // 返回空不阻塞播放）→ 交给 DanmakuOverlay 随时间发射渲染。
   // 渲染层只在「开关开 && 有数据」时构建，关闭无任何开销。
+  // 弹幕设置（屏蔽词/屏蔽类型/透明度）：进页异步加载本地持久化值；改动
+  // 经 _showDanmakuSettings 回写 state（overlay 收到新 settings 实例即时
+  // 重载生效）并保存。
 
   /// 弹幕总开关（默认关；开启才拉取并显示）。
   bool _danmakuEnabled = false;
+
+  /// 弹幕显示设置（屏蔽词/类型/透明度；overlay 渲染与发射过滤用）。
+  DanmakuSettings _danmakuSettings = const DanmakuSettings();
 
   /// 当前集（cid）的全量弹幕（按 timeSec 升序）；切集/关闭时清空。
   List<Danmaku> _danmaku = const [];
@@ -290,6 +299,7 @@ class _PlayerPageState extends State<PlayerPage> {
     _realtime.stage.addListener(_onRealtimeStageChanged);
     _realtime.sentences.addListener(_onRealtimeSentencesChanged);
     _realtimeModelDirHint();
+    _loadDanmakuSettings();
     _checkLoginExpiry();
     _init();
   }
@@ -1127,6 +1137,44 @@ class _PlayerPageState extends State<PlayerPage> {
       }
     });
     if (on) _loadDanmaku();
+  }
+
+  /// 异步加载弹幕设置（屏蔽词/类型/透明度）。带超时保护：测试环境无
+  /// shared_preferences 原生通道时 getInstance 永不返回，不能阻塞播放
+  /// 初始化（与 PlaybackProgress.load 同模式）；超时/异常保持默认设置。
+  Future<void> _loadDanmakuSettings() async {
+    try {
+      final s = await DanmakuSettingsStore.instance
+          .get()
+          .timeout(const Duration(milliseconds: 500));
+      if (mounted) setState(() => _danmakuSettings = s);
+    } catch (_) {
+      // 超时/存储异常：保持默认设置（不影响播放）
+    }
+  }
+
+  /// 弹幕设置面板（弹幕按钮**长按**触发）：屏蔽词/屏蔽类型/透明度集中管理。
+  /// 面板内任何改动即回调 → setState（overlay 收到新 settings 实例即时
+  /// 清屏按当前位置重载，屏蔽/透明度立刻生效）+ 本地持久化（自动保存）。
+  Future<void> _showDanmakuSettings() async {
+    debugPrint('[player_page] show danmaku settings sheet');
+    await showModalBottomSheet<void>(
+      context: context,
+      backgroundColor: const Color(0xFF202023),
+      isScrollControlled: true,
+      useSafeArea: true,
+      constraints: BoxConstraints(
+        maxHeight: MediaQuery.sizeOf(context).height * 0.75,
+      ),
+      builder: (sheetContext) => DanmakuSettingsSheet(
+        initial: _danmakuSettings,
+        onChanged: (s) {
+          setState(() => _danmakuSettings = s);
+          // 持久化（fire-and-forget：失败静默，下次进页读不到用默认）
+          DanmakuSettingsStore.instance.save(s);
+        },
+      ),
+    );
   }
 
   /// 拉取当前视频（当前集 cid）弹幕。
@@ -2373,6 +2421,7 @@ class _PlayerPageState extends State<PlayerPage> {
                   danmaku: _danmaku,
                   playing: _playing,
                   positionMs: _positionMs,
+                  settings: _danmakuSettings,
                 ),
               ),
             ),
@@ -2748,10 +2797,13 @@ class _PlayerPageState extends State<PlayerPage> {
                       ),
                     ),
                   ),
-                  // 弹幕按钮：图标 + 状态反馈（开启时高亮），点按切换弹幕层
+                  // 弹幕按钮：图标 + 状态反馈（开启时高亮）。
+                  // 点按 = 开关；长按 = 弹幕设置（屏蔽词/类型/透明度）。
                   Expanded(
                     child: InkWell(
                       onTap: _player == null ? null : _toggleDanmaku,
+                      onLongPress:
+                          _player == null ? null : _showDanmakuSettings,
                       child: Row(
                         mainAxisAlignment: MainAxisAlignment.center,
                         children: [

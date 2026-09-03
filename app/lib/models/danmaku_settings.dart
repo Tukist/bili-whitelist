@@ -1,0 +1,152 @@
+/// 弹幕显示设置（v2.16.6+）：屏蔽词 / 屏蔽类型 / 全局透明度。
+///
+/// 纯数据 + 纯逻辑（无 Flutter UI 依赖，可单测）：
+/// - [shouldBlock]：发射前过滤判定（命中任一屏蔽词 或 所属类型被屏蔽 → 不显示）
+/// - [opacity]：全局绘制透明度系数（0.2~1.0），CustomPaint 绘制时乘到颜色 alpha
+/// - 序列化 toJson/fromJson 供 [DanmakuSettingsStore] 持久化（损坏容错回默认）
+library;
+
+import 'danmaku.dart';
+
+/// 透明度滑杆下限（20%）。
+const double kDanmakuOpacityMin = 0.2;
+
+/// 透明度滑杆上限（100%）。
+const double kDanmakuOpacityMax = 1.0;
+
+/// 单条弹幕的屏蔽命中结果（供日志/测试区分原因）。
+enum DanmakuBlockReason {
+  /// 未被屏蔽。
+  none,
+
+  /// 弹幕文本命中屏蔽关键词。
+  keyword,
+
+  /// 弹幕所属类型（滚动/顶部/底部）被屏蔽。
+  type,
+}
+
+/// 弹幕显示设置。不可变：任何修改经 [copyWith] 产生新实例（渲染层据此
+/// 感知"设置变了"并即时重载，详见 danmaku_overlay.dart）。
+///
+/// 构造为 const 可用（默认值）；[blockWords] 约定已由 [normalizeWords]
+/// 清洗（trim + 去空），UI 与存储层统一走该入口，不合法输入不会进入实例。
+class DanmakuSettings {
+  /// 屏蔽关键词列表（条目已 trim、空串剔除；命中 = 弹幕文本 substring 包含）。
+  final List<String> blockWords;
+
+  /// 是否屏蔽滚动弹幕（默认显示）。
+  final bool blockScroll;
+
+  /// 是否屏蔽顶部弹幕。
+  final bool blockTop;
+
+  /// 是否屏蔽底部弹幕。
+  final bool blockBottom;
+
+  /// 全局透明度（0.2~1.0，1.0=完全不透明，绘制时乘到弹幕颜色 alpha）。
+  final double opacity;
+
+  const DanmakuSettings({
+    this.blockWords = const [],
+    this.blockScroll = false,
+    this.blockTop = false,
+    this.blockBottom = false,
+    this.opacity = kDanmakuOpacityMax,
+  });
+
+  /// 构造时的入参约束依赖调用方传入已清洗的词；本方法提供标准清洗入口
+  /// （trim + 去空 + 去重保序），UI 添加词/解析旧数据时统一走这里。
+  static List<String> normalizeWords(Iterable<String> raw) {
+    final seen = <String>{};
+    final out = <String>[];
+    for (final w in raw) {
+      final t = w.trim();
+      if (t.isEmpty || seen.contains(t)) continue;
+      seen.add(t);
+      out.add(t);
+    }
+    return List.unmodifiable(out);
+  }
+
+  /// 弹幕所属类型是否被屏蔽。
+  bool isTypeBlocked(Danmaku d) {
+    if (d.isTop) return blockTop;
+    if (d.isBottom) return blockBottom;
+    return blockScroll;
+  }
+
+  /// 弹幕文本是否命中任一屏蔽词（substring 匹配，大小写不敏感）。
+  bool isTextBlocked(String text) {
+    if (blockWords.isEmpty) return false;
+    final lower = text.toLowerCase();
+    for (final w in blockWords) {
+      if (lower.contains(w.toLowerCase())) return true;
+    }
+    return false;
+  }
+
+  /// 发射前过滤判定：命中返回原因，未命中返回 [DanmakuBlockReason.none]。
+  /// 类型屏蔽优先（type），其次关键词（keyword）。
+  DanmakuBlockReason blockReason(Danmaku d) {
+    if (isTypeBlocked(d)) return DanmakuBlockReason.type;
+    if (isTextBlocked(d.text)) return DanmakuBlockReason.keyword;
+    return DanmakuBlockReason.none;
+  }
+
+  /// 是否应屏蔽该弹幕（[blockReason] != none 的简写）。
+  bool shouldBlock(Danmaku d) => blockReason(d) != DanmakuBlockReason.none;
+
+  /// 复制并改指定字段（blockWords 传 null 表示保持不变；传值需已清洗）。
+  DanmakuSettings copyWith({
+    List<String>? blockWords,
+    bool? blockScroll,
+    bool? blockTop,
+    bool? blockBottom,
+    double? opacity,
+  }) {
+    return DanmakuSettings(
+      blockWords: blockWords ?? this.blockWords,
+      blockScroll: blockScroll ?? this.blockScroll,
+      blockTop: blockTop ?? this.blockTop,
+      blockBottom: blockBottom ?? this.blockBottom,
+      opacity: (opacity ?? this.opacity)
+          .clamp(kDanmakuOpacityMin, kDanmakuOpacityMax)
+          .toDouble(),
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+        'blockWords': blockWords,
+        'blockScroll': blockScroll,
+        'blockTop': blockTop,
+        'blockBottom': blockBottom,
+        // 存 0~1 浮点，四舍五入到万分位避免重复读写的二进制尾巴
+        'opacity': (opacity * 10000).round() / 10000.0,
+      };
+
+  /// 反序列化：字段缺失/类型非法回退默认；blockWords 走 [normalizeWords]
+  /// 清洗（兼容手改脏数据）。整体异常（非 Map 等）由调用方兜底。
+  factory DanmakuSettings.fromJson(Map<String, dynamic> json) {
+    // bool 字段容错：值不是 bool（脏数据，如字符串）→ 回退默认 false
+    bool flag(String key) => json[key] is bool ? json[key] as bool : false;
+    return DanmakuSettings(
+      blockWords: normalizeWords(
+        (json['blockWords'] as List?)?.whereType<String>() ?? const [],
+      ),
+      blockScroll: flag('blockScroll'),
+      blockTop: flag('blockTop'),
+      blockBottom: flag('blockBottom'),
+      opacity: ((json['opacity'] as num?)?.toDouble() ??
+              kDanmakuOpacityMax)
+          .clamp(kDanmakuOpacityMin, kDanmakuOpacityMax)
+          .toDouble(),
+    );
+  }
+
+  @override
+  String toString() =>
+      'DanmakuSettings(words=$blockWords scroll=${blockScroll ? 'X' : '·'}'
+      ' top=${blockTop ? 'X' : '·'} bottom=${blockBottom ? 'X' : '·'}'
+      ' opacity=${(opacity * 100).round()}%)';
+}
