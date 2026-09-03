@@ -1,7 +1,6 @@
 import 'dart:async';
 
 import 'package:dio/dio.dart';
-import 'package:flutter/foundation.dart' show ValueListenable, ValueNotifier;
 import 'package:flutter/material.dart';
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -20,6 +19,7 @@ import '../services/update_service.dart';
 import '../services/update_storage.dart';
 import '../services/whitelist_writer.dart';
 import '../utils/import_parser.dart';
+import '../widgets/pgc_import_dialog.dart';
 import 'collection_page.dart';
 import 'history_page.dart';
 import 'inbox_page.dart';
@@ -70,9 +70,6 @@ class _PlaylistPageState extends State<PlaylistPage> {
 
   /// 白名单写入服务：导入 / 搜索「加入」共用（构造视频 + 查重 + 写 Gist）。
   final WhitelistWriter _writer = WhitelistWriter();
-
-  /// B 站 API：番剧（pgc）整季信息获取（导入番剧/电影用）。
-  final BiliApi _bili = BiliApi();
 
   /// 底部显示的版本号：优先 package_info_plus 读 Android versionName，
   /// 异常（测试环境无原生通道）时回退 config.dart 的 kAppVersion。
@@ -380,98 +377,17 @@ class _PlaylistPageState extends State<PlaylistPage> {
 
   /// 番剧/电影整季导入：拉整季 → 逐集写白名单（addVideo 按 bvid 查重自动跳过）。
   ///
-  /// - 进度对话框逐集提示「导入中 i/N」；不可点穿/返回
-  /// - 结果反馈「已导入 N 集番剧，跳过 M 集（已在白名单）」；
-  ///   全季含会员/付费集时注明（会员集可入白名单，播放时提示）
-  /// - 中途失败（保存 Gist 失败/网络）中断，提示已导入数
+  /// 逻辑与进度 UI 抽到 [runPgcSeasonImport]（与搜索页 media 结果导入共用，
+  /// v2.16.5+），此处只负责把解析出的 ep/ss 引用转成参数，导入完成后刷新列表。
   Future<void> _importPgcSeason(PgcRef ref) async {
-    // 1) 配置门禁（避免拉完整季才发现没配置 token/gist_id）
-    if (!await _github.hasConfig()) {
-      _showSnack('请先到右上角管理入口配置 GitHub token 与 Gist ID');
-      return;
-    }
-
-    // 2) 拉整季信息（ep/ss 引用都返回全季 episodes 列表）
-    final PgcSeason season;
-    try {
-      season = await _bili.fetchPgcSeason(
-        epId: ref.kind == PgcKind.ep ? ref.id : null,
-        seasonId: ref.kind == PgcKind.ss ? ref.id : null,
-      );
-    } on BiliApiException catch (e) {
-      _showSnack('获取番剧信息失败：${e.message}');
-      return;
-    } on DioException {
-      _showSnack('网络请求失败，请检查网络后重试');
-      return;
-    }
-    final eps = season.episodes;
-    if (eps.isEmpty) {
-      _showSnack('「${season.title}」暂无可导入的正片剧集');
-      return;
-    }
-    debugPrint('[import-pgc] $ref ${season.title}: '
-        'episodes=${eps.length} vip=${season.vipCount}');
-    if (!mounted) return;
-
-    // 3) 进度对话框（逐集提示，导入期间不可点穿/返回）
-    final status = ValueNotifier<String>('准备导入「${season.title}」，共 ${eps.length} 集…');
-    final navigator = Navigator.of(context);
-    showDialog<void>(
+    await runPgcSeasonImport(
       context: context,
-      barrierDismissible: false,
-      builder: (_) => _PgcImportDialog(status: status),
+      writer: _writer,
+      configHint: '请先到右上角管理入口配置 GitHub token 与 Gist ID',
+      epId: ref.kind == PgcKind.ep ? ref.id : null,
+      seasonId: ref.kind == PgcKind.ss ? ref.id : null,
+      onDone: (_) async => _load(),
     );
-
-    // 4) 逐集构造 WhitelistVideo 并写入（每集独立拉 Gist 查重 + 追加）
-    var added = 0, skipped = 0;
-    var interrupted = false;
-    var interruptReason = '';
-    for (var i = 0; i < eps.length; i++) {
-      final ep = eps[i];
-      if (ep.bvid.isEmpty) continue; // 防御：无 bvid 的脏条目跳过
-      final video = WhitelistWriter.videoFromPgcEpisode(season, ep);
-      status.value = '导入中 ${i + 1}/${eps.length}：${video.title}';
-      try {
-        final result = await _writer.addVideo(video);
-        if (result.added) {
-          added++;
-        } else if (result.message.contains('已在白名单')) {
-          skipped++;
-        } else {
-          // 保存失败等非重复原因 → 中断（其余集不写）
-          interrupted = true;
-          interruptReason = result.message;
-          break;
-        }
-      } on DioException {
-        interrupted = true;
-        interruptReason = '网络请求失败';
-        break;
-      } on GithubApiException catch (e) {
-        interrupted = true;
-        interruptReason = e.message;
-        break;
-      }
-    }
-    status.value = interrupted
-        ? '导入中断，已导入 $added 集'
-        : '导入完成，共新增 $added 集';
-    if (mounted) navigator.pop();
-
-    // 5) 刷新列表（写操作已落 Gist + 本地缓存）+ 结果反馈
-    if (mounted) _load();
-    if (interrupted) {
-      _showSnack('导入中断：已导入 $added 集（$interruptReason）');
-      return;
-    }
-    final buf = StringBuffer('已导入 $added 集番剧');
-    if (skipped > 0) buf.write('，跳过 $skipped 集（已在白名单）');
-    if (season.hasVipOrPay) {
-      buf.write('；全季含 ${season.vipCount} 集大会员/付费内容，'
-          '会员集播放时需大会员（免费集可直接播放）');
-    }
-    _showSnack(buf.toString());
   }
 
   /// 单视频导入（原流程）：解析 BV → 取元数据 → 写 Gist（按 bvid 查重）。
@@ -1265,47 +1181,6 @@ class _ImportDialogState extends State<_ImportDialog> {
               : const Text('导入'),
         ),
       ],
-    );
-  }
-}
-
-/// 番剧整季导入进度对话框：逐集提示「导入中 i/N」，不可点穿/返回，
-/// 由页面在导入结束（成功/中断）后统一关闭。
-class _PgcImportDialog extends StatelessWidget {
-  final ValueListenable<String> status;
-
-  const _PgcImportDialog({required this.status});
-
-  @override
-  Widget build(BuildContext context) {
-    return PopScope(
-      canPop: false,
-      child: AlertDialog(
-        title: const Text('番剧导入'),
-        content: SizedBox(
-          width: 280,
-          child: Row(
-            children: [
-              const SizedBox(
-                width: 22,
-                height: 22,
-                child: CircularProgressIndicator(strokeWidth: 2.5),
-              ),
-              const SizedBox(width: 16),
-              Expanded(
-                child: ValueListenableBuilder<String>(
-                  valueListenable: status,
-                  builder: (_, value, __) => Text(
-                    value,
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                  ),
-                ),
-              ),
-            ],
-          ),
-        ),
-      ),
     );
   }
 }

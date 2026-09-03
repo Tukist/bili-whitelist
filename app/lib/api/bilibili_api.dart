@@ -7,6 +7,7 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import '../config.dart';
 import '../models/danmaku.dart';
+import '../models/media_search_result.dart';
 import '../models/search_result.dart';
 import '../models/subtitle.dart';
 import '../models/upowner.dart';
@@ -209,6 +210,29 @@ class SearchUpownerResult {
   });
 }
 
+/// media（番剧/电影/电视剧/纪录片）搜索结果分页响应
+/// （`x/web-interface/wbi/search/type`，search_type=media_*）。
+///
+/// 与 [SearchPageResult] 同构：单页 + 总条数 + 是否还有下一页。
+/// 2026-09 实测 media 接口同样返回 `data.numResults` / `data.numPages`，
+/// hasMore 沿用「已加载累计 < numResults」判断。
+class MediaSearchPageResult {
+  /// 当前页结果列表（已清洗；缺 season_id/title 的脏条目已过滤）。
+  final List<MediaSearchResult> results;
+
+  /// 服务端返回的总命中数（`data.numResults`）；null = 接口未返回。
+  final int? totalCount;
+
+  /// 「是否还有下一页」。UI 层据此控制上拉加载更多触发。
+  final bool hasMore;
+
+  const MediaSearchPageResult({
+    required this.results,
+    required this.totalCount,
+    required this.hasMore,
+  });
+}
+
 /// UP 主视频列表分页响应（`x/space/wbi/arc/search`）。
 class UpownerVideosPage {
   final List<WhitelistVideo> videos;
@@ -235,6 +259,27 @@ class UpownerInfo {
     this.fans,
     required this.sign,
   });
+}
+
+/// B 站 media 搜索类型（`wbi/search/type` 的 search_type 取值，v2.16.5+）。
+///
+/// 2026-09 匿名实测：
+/// - [bangumi]（media_bangumi）/ [film]（media_ft）：匿名 + wbi 签名即可用，
+///   返回 result[] 含 season_id（整季导入钥匙）
+/// - [tv]（media_tv）/ [doc]（media_doc）：匿名请求返回 code=-1200
+///   「被降级过滤的请求」（疑似需登录态），App 注入 SESSDATA 后行为待验证
+abstract final class MediaSearchTypes {
+  /// 番剧。
+  static const bangumi = 'media_bangumi';
+
+  /// 电影。
+  static const film = 'media_ft';
+
+  /// 电视剧。
+  static const tv = 'media_tv';
+
+  /// 纪录片。
+  static const doc = 'media_doc';
 }
 
 /// B 站 API 客户端（dio 封装）。
@@ -655,6 +700,110 @@ class BiliApi {
       hasMore: _computeHasMore(loaded: results.length, totalCount: totalCount),
     );
   }
+
+  /// 搜索 B 站番剧/电影等 media 内容（`x/web-interface/wbi/search/type`，
+  /// search_type=media_*，v2.16.5+）。
+  ///
+  /// 与 [searchVideo] 同封装：WBI 签名 + buvid 指纹 Cookie + 完整浏览器头
+  /// （登录态存在时注入 SESSDATA）。media 搜索**不支持排序**（无 order 参数）。
+  ///
+  /// [searchType] 取值见 [MediaSearchTypes]（番剧/电影/电视剧/纪录片）。
+  ///
+  /// 返回单页结果 + 是否还有更多 + 总条数（[MediaSearchPageResult]）。
+  /// media 接口实测返回 `data.numResults`/`data.numPages`，hasMore 沿用
+  /// 「已加载累计 < numResults」。
+  ///
+  /// 错误处理（UI 据此提示）：
+  /// - code=-412 → 抛 [BiliApiException]「搜索接口被风控拦截，请稍后再搜」
+  /// - code=-1200 → 抛 [BiliApiException]「该类型搜索被 B 站降级过滤」
+  ///   （2026-09 匿名实测 media_tv/media_doc 返回此码，可能需登录态）
+  /// - code=-352 或其他业务码 → 抛 [BiliApiException]（带接口 message）
+  /// - 网络失败（[DioException]）→ 原样上抛（UI 提示网络失败）
+  /// - code=0 但结果为空 / result 不是 List → 返回空 [MediaSearchPageResult]
+  ///
+  /// ⚠️ 与 [searchVideo] 同一风控约束：调用方必须控制频率（防抖/手动搜索）。
+  Future<MediaSearchPageResult> searchMedia(
+    String keyword, {
+    required String searchType,
+    int page = 1,
+  }) async {
+    await _injectAuth();
+    final (imgKey, subKey) = await _ensureWbiKeys();
+    final params = WbiSigner.encodeWbi(
+      {
+        'search_type': searchType,
+        'keyword': keyword,
+        'page': '$page',
+        'page_size': '20',
+      },
+      imgKey: imgKey,
+      subKey: subKey,
+    );
+    debugPrint(
+      '[bili_api] searchMedia keyword=$keyword searchType=$searchType page=$page',
+    );
+    final resp = await _dio.get<Map<String, dynamic>>(
+      '/x/web-interface/wbi/search/type',
+      queryParameters: params,
+    );
+    final data = resp.data;
+    final code = data?['code'] as int?;
+    if (code == -412) {
+      throw const BiliApiException(
+        code: -412,
+        message: '搜索接口被风控拦截，请稍后再搜',
+        path: '/x/web-interface/wbi/search/type',
+      );
+    }
+    if (code == -1200) {
+      // 2026-09 匿名实测：media_tv/media_doc 返回此码（登录态可能放行）
+      throw BiliApiException(
+        code: -1200,
+        message: '「${_typeLabel(searchType)}」搜索被 B 站降级过滤，'
+            '请登录后重试（或搜索视频/番剧/电影）',
+        path: '/x/web-interface/wbi/search/type',
+      );
+    }
+    if (code != 0) {
+      throw BiliApiException(
+        code: code ?? -1,
+        message: data?['message'] as String? ?? '搜索失败',
+        path: '/x/web-interface/wbi/search/type',
+      );
+    }
+    final d = data?['data'] as Map<String, dynamic>?;
+    // 与 searchVideo 一致：numResults 命中数；null 时 UI 用「装满 20」兜底
+    final totalRaw = d?['numResults'];
+    final totalCount = (totalRaw is num) ? totalRaw.toInt() : null;
+    final raw = d?['result'];
+    if (raw is! List) {
+      return MediaSearchPageResult(
+        results: const [],
+        totalCount: totalCount,
+        hasMore: false,
+      );
+    }
+    final results = raw
+        .whereType<Map<String, dynamic>>()
+        .map(MediaSearchResult.fromJson)
+        // 缺 season_id / title 的条目不可整季导入，丢弃
+        .where((m) => m.seasonId > 0 && m.title.isNotEmpty)
+        .toList();
+    return MediaSearchPageResult(
+      results: results,
+      totalCount: totalCount,
+      hasMore: _computeHasMore(loaded: results.length, totalCount: totalCount),
+    );
+  }
+
+  /// search_type → 展示用中文名（-1200 提示等用）。未知类型原样返回。
+  static String _typeLabel(String searchType) => switch (searchType) {
+        MediaSearchTypes.bangumi => '番剧',
+        MediaSearchTypes.film => '电影',
+        MediaSearchTypes.tv => '电视剧',
+        MediaSearchTypes.doc => '纪录片',
+        _ => searchType,
+      };
 
   /// 「是否还有下一页」判断。
   ///

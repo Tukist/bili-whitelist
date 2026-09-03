@@ -13,6 +13,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:bili_whitelist_app/api/bilibili_api.dart';
 import 'package:bili_whitelist_app/api/github_api.dart';
+import 'package:bili_whitelist_app/config.dart';
 import 'package:bili_whitelist_app/models/whitelist_video.dart';
 import 'package:bili_whitelist_app/services/service_locator.dart';
 import 'package:bili_whitelist_app/services/whitelist_writer.dart';
@@ -148,6 +149,39 @@ class _MutableGistAdapter implements HttpClientAdapter {
         'id': 'gist1',
         'files': {'whitelist.json': {'content': read()}},
       }),
+      200,
+      headers: {
+        'content-type': ['application/json; charset=utf-8'],
+      },
+    );
+  }
+
+  @override
+  void close({bool force = false}) {}
+}
+
+/// 按路径路由的 BiliApi fake adapter（供 importPgcSeason 测试注入
+/// fetchPgcSeason 的 season 响应）。
+class _BiliRoutingAdapter implements HttpClientAdapter {
+  final Map<String, Map<String, dynamic> Function()> handlers;
+
+  _BiliRoutingAdapter(this.handlers);
+
+  @override
+  Future<ResponseBody> fetch(RequestOptions options,
+      Stream<Uint8List>? requestStream, Future<void>? cancelFuture) async {
+    final handler = handlers[options.path];
+    if (handler == null) {
+      return ResponseBody.fromString(
+        jsonEncode({'code': -1, 'message': 'no handler: ${options.path}'}),
+        404,
+        headers: {
+          'content-type': ['application/json'],
+        },
+      );
+    }
+    return ResponseBody.fromString(
+      jsonEncode(handler()),
       200,
       headers: {
         'content-type': ['application/json; charset=utf-8'],
@@ -432,6 +466,137 @@ void main() {
       expect(finalData!.videos, hasLength(2));
       expect(finalData.videos.map((v) => v.bvid).toSet(),
           {'BVpgc1', 'BVpgc2'});
+    });
+  });
+
+  group('importPgcSeason（整季导入入口：拉整季 + 逐集 addVideo）', () {
+    /// 状态化 Gist（GET 返回当前 / PATCH 更新），模拟真实顺序写入。
+    Dio statefulGistDio(String initialJson) {
+      var current = initialJson;
+      final dio = Dio(BaseOptions(baseUrl: 'https://api.github.com'));
+      dio.httpClientAdapter = _MutableGistAdapter(
+        read: () => current,
+        write: (String c) => current = c,
+      );
+      return dio;
+    }
+
+    /// BiliApi 路由：spi（buvid 指纹）+ pgc season 接口。
+    Dio biliDio(Map<String, dynamic> seasonResult) {
+      final dio = Dio(
+        BaseOptions(baseUrl: kBiliApi, headers: biliHeaders()),
+      );
+      dio.httpClientAdapter = _BiliRoutingAdapter({
+        '/x/frontend/finger/spi': () => {
+              'code': 0,
+              'data': {'b_3': 'buvid3t', 'b_4': 'buvid4t'},
+            },
+        '/pgc/view/web/season': () => {
+              'code': 0,
+              'message': '0',
+              'result': seasonResult,
+            },
+      });
+      return dio;
+    }
+
+    final seasonResult = {
+      'season_id': 1,
+      'title': '测试番',
+      'cover': '',
+      'episodes': [
+        {
+          'ep_id': 1,
+          'aid': 1,
+          'cid': 11,
+          'bvid': 'BVpgc1',
+          'title': '1',
+          'long_title': '第一集',
+          'cover': '',
+          'badge': '',
+          'duration': 60000,
+        },
+        {
+          'ep_id': 2,
+          'aid': 2,
+          'cid': 22,
+          'bvid': 'BVpgc2',
+          'title': '2',
+          'long_title': '第二集',
+          'cover': '',
+          'badge': '会员',
+          'duration': 70000,
+        },
+      ],
+    };
+
+    test('空白名单整季导入 → added=2 skipped=0，进度回调按集上报', () async {
+      final dio = statefulGistDio(_emptyGistV4);
+      final writer = WhitelistWriter(
+        github: _githubApi(dio.httpClientAdapter),
+        api: BiliApi(dio: biliDio(seasonResult)),
+      );
+      _store[GithubApi.kTokenKey] = 'ghp_fake';
+      _store[GithubApi.kGistIdKey] = 'gist1';
+
+      final progress = <String>[];
+      final summary = await writer.importPgcSeason(
+        seasonId: 1,
+        onProgress: progress.add,
+      );
+      expect(summary.season.title, '测试番');
+      expect(summary.added, 2);
+      expect(summary.skipped, 0);
+      expect(summary.interrupted, isFalse);
+      // 进度文案覆盖「准备导入」+ 逐集「导入中 i/N」
+      expect(progress.first, contains('准备导入「测试番」'));
+      expect(progress.length, 3);
+      expect(progress[1], contains('导入中 1/2'));
+      expect(progress[2], contains('导入中 2/2'));
+    });
+
+    test('白名单已有其中 1 集 → added=1 skipped=1', () async {
+      final dio = statefulGistDio(_v4GistWith(['BVpgc1']));
+      final writer = WhitelistWriter(
+        github: _githubApi(dio.httpClientAdapter),
+        api: BiliApi(dio: biliDio(seasonResult)),
+      );
+      _store[GithubApi.kTokenKey] = 'ghp_fake';
+      _store[GithubApi.kGistIdKey] = 'gist1';
+
+      final summary = await writer.importPgcSeason(seasonId: 1);
+      expect(summary.added, 1);
+      expect(summary.skipped, 1);
+      expect(summary.interrupted, isFalse);
+      final finalData = await writer.github.fetchFromGist();
+      expect(finalData!.videos.map((v) => v.bvid).toSet(),
+          {'BVpgc1', 'BVpgc2'});
+    });
+
+    test('拉整季失败（-404）→ BiliApiException 上抛，未写 Gist', () async {
+      final dio = statefulGistDio(_emptyGistV4);
+      final bad = Dio(BaseOptions(baseUrl: kBiliApi, headers: biliHeaders()));
+      bad.httpClientAdapter = _BiliRoutingAdapter({
+        '/x/frontend/finger/spi': () => {
+              'code': 0,
+              'data': {'b_3': 'b', 'b_4': 'b'},
+            },
+        '/pgc/view/web/season': () => {
+              'code': -404,
+              'message': '啥都木有',
+            },
+      });
+      final writer = WhitelistWriter(
+        github: _githubApi(dio.httpClientAdapter),
+        api: BiliApi(dio: bad),
+      );
+      _store[GithubApi.kTokenKey] = 'ghp_fake';
+      _store[GithubApi.kGistIdKey] = 'gist1';
+
+      await expectLater(
+        writer.importPgcSeason(seasonId: 999),
+        throwsA(isA<BiliApiException>()),
+      );
     });
   });
 

@@ -1,17 +1,22 @@
 /// 搜索页：三个 Tab ——
-/// - 「全部 B 站」：搜 B 站全网视频（[BiliApi.searchVideo]），结果可一键「加入」白名单
+/// - 「全部 B 站」：搜 B 站全网（[BiliApi.searchVideo] 视频 / [BiliApi.searchMedia]
+///   番剧·电影·电视剧，v2.16.5+），结果可一键「加入/整季导入」白名单
 /// - 「我的白名单」：对当前白名单数据本地过滤（标题 / UP 主包含关键词）
 /// - 「搜索 UP 主」（v2.13.0+）：搜 B 站全网用户（[BiliApi.searchUpowner]），
 ///   结果可一键「加入白名单 UP 主」
 ///
 /// 防风控：输入防抖 600ms 自动搜 + 手动搜索按钮；搜索失败分类提示
-/// （-412 风控 / -352 限流 / 网络失败），返回空数组时显示「无结果」。
+/// （-412 风控 / -352 限流 / -1200 降级 / 网络失败），返回空数组时显示「无结果」。
 ///
-/// 翻页与排序（v2.12.1）：
-/// - 排序 chip 行：综合 / 最多播放 / 最新发布 / 最多收藏；切换会取消防抖、
-///   重置分页状态并重新执行 page=1 搜索
-/// - 上拉加载更多：结果列表底部 ≤200px 触发，自动请求 page+1；按 bvid
-///   去重追加；`SearchPageResult.hasMore` 为 false 时显示「没有更多了」
+/// 翻页与排序（v2.12.1 / v2.16.5）：
+/// - 搜索范围 chip 行：视频 / 番剧 / 电影 / 电视剧；切换取消防抖、重置分页
+///   状态并重新执行 page=1 搜索（media 范围时隐藏排序行——media 接口不支持排序）
+/// - 排序 chip 行（仅视频范围）：综合 / 最多播放 / 最新发布 / 最多收藏
+/// - 上拉加载更多：结果列表底部 ≤200px 触发，自动请求 page+1；按 bvid /
+///   season_id 去重追加；`hasMore` 为 false 时显示「没有更多了」
+/// - media（番剧/电影/电视剧）结果右侧「导入」= 整季逐集导入
+///   （fetchPgcSeason → 逐集写白名单，与首页「粘贴链接导入」共用
+///   [runPgcSeasonImport]；已在白名单的集自动跳过）
 ///
 /// UP 主 Tab：复用同一套防抖逻辑（不分页排序 chip，因为 search_type=bili_user
 /// 接口只支持默认排序），结果列表用 [UpownerTile] 展示，点整行跳 [UpownerPage]。
@@ -24,6 +29,7 @@ import 'package:flutter/material.dart';
 
 import '../api/bilibili_api.dart';
 import '../api/github_api.dart';
+import '../models/media_search_result.dart';
 import '../models/search_result.dart';
 import '../models/upowner.dart';
 import '../models/whitelist_video.dart';
@@ -31,9 +37,32 @@ import '../services/service_locator.dart';
 import '../services/upowner_writer.dart';
 import '../services/whitelist_writer.dart';
 import '../widgets/cover_image.dart';
+import '../widgets/pgc_import_dialog.dart';
 import '../widgets/upowner_tile.dart';
 import 'player_page.dart';
 import 'upowner_page.dart';
+
+/// 「全部 B 站」Tab 的搜索范围（对应 wbi/search/type 的 search_type）。
+///
+/// 排序 chip 只对 [video] 有意义（media 接口不支持 order），media 范围时
+/// 结果走 [MediaSearchResult] 列表并可整季导入。
+enum _SearchScope {
+  video('video', '视频'),
+  bangumi(MediaSearchTypes.bangumi, '番剧'),
+  film(MediaSearchTypes.film, '电影'),
+  tv(MediaSearchTypes.tv, '电视剧');
+
+  final String searchType;
+  final String label;
+
+  const _SearchScope(this.searchType, this.label);
+
+  /// 是否为 media（番剧/电影/电视剧）范围：结果可整季导入。
+  bool get isMedia => this != video;
+
+  /// media 范围结果空态提示里的内容词（「没有找到相关番剧」等）。
+  String get emptyMessage => isMedia ? label : '视频';
+}
 
 /// B 站搜索排序选项（与 [BiliApi.searchVideo] order 参数对应）。
 ///
@@ -117,6 +146,25 @@ class _SearchPageState extends State<SearchPage>
   bool _hasMore = true;
   bool _loadingMore = false;
   String _currentOrder = 'totalrank';
+
+  /// 当前搜索范围（v2.16.5+）：默认视频。切范围 = 清结果 + 重搜 page=1。
+  _SearchScope _scope = _SearchScope.video;
+
+  /// media（番剧/电影/电视剧）搜索状态：与视频搜索互相独立（字段、翻页均
+  /// 分开维护，切范围不清对方已加载页，切回时直接展示缓存结果）。
+  List<MediaSearchResult>? _mediaResults;
+  bool _mediaSearching = false;
+  String? _mediaError;
+  int _mediaPage = 1;
+  bool _mediaHasMore = true;
+  bool _mediaLoadingMore = false;
+
+  /// 本会话内已整季导入成功的 season_id（媒体结果「已导入」按钮状态依据；
+  /// 跨会话由「白名单里含该季首集 ep_id」启发判断，见 [_isSeasonImported]）。
+  final Set<int> _importedSeasonIds = {};
+
+  /// 正在整季导入的 season_id（进度对话框期间按钮禁用，防连点重复弹框）。
+  final Set<int> _importingSeasonIds = {};
 
   /// UP 主搜索状态（v2.13.0+）：与视频搜索共享防抖触发，但独立的结果/翻页
   /// 状态，不与视频搜索混。
@@ -209,6 +257,12 @@ class _SearchPageState extends State<SearchPage>
         _page = 1;
         _hasMore = true;
         _loadingMore = false;
+        _mediaResults = null;
+        _mediaError = null;
+        _mediaSearching = false;
+        _mediaPage = 1;
+        _mediaHasMore = true;
+        _mediaLoadingMore = false;
         _upownerResults = null;
         _upownerError = null;
         _upownerSearching = false;
@@ -221,7 +275,13 @@ class _SearchPageState extends State<SearchPage>
     // 「我的白名单」Tab 只做本地过滤，不消耗搜索接口额度
     final idx = _tabCtrl.index;
     if (idx != 0 && idx != 2) return;
-    if (idx == 0) {
+    if (idx == 0 && _scope.isMedia) {
+      setState(() {
+        _mediaPage = 1;
+        _mediaHasMore = true;
+        _mediaLoadingMore = false;
+      });
+    } else if (idx == 0) {
       setState(() {
         _page = 1;
         _hasMore = true;
@@ -237,7 +297,7 @@ class _SearchPageState extends State<SearchPage>
     _debounce = Timer(const Duration(milliseconds: 600), _doSearch);
   }
 
-  /// 手动搜索（按钮 / 键盘搜索键）：根据当前 Tab 分发到视频或 UP 主搜索。
+  /// 手动搜索（按钮 / 键盘搜索键）：根据当前 Tab + 搜索范围分发。
   Future<void> _doSearch() async {
     final keyword = _keywordCtrl.text.trim();
     _debounce?.cancel();
@@ -249,6 +309,12 @@ class _SearchPageState extends State<SearchPage>
         _page = 1;
         _hasMore = true;
         _loadingMore = false;
+        _mediaResults = null;
+        _mediaError = null;
+        _mediaSearching = false;
+        _mediaPage = 1;
+        _mediaHasMore = true;
+        _mediaLoadingMore = false;
         _upownerResults = null;
         _upownerError = null;
         _upownerSearching = false;
@@ -260,9 +326,38 @@ class _SearchPageState extends State<SearchPage>
     }
     if (_tabCtrl.index == 2) {
       await _doUpownerSearch();
+    } else if (_scope.isMedia) {
+      await _doMediaSearch();
     } else {
       await _doVideoSearch();
     }
+  }
+
+  /// 切换搜索范围 chip：取消防抖、清当前范围结果，从 page=1 重查。
+  void _switchScope(_SearchScope scope) {
+    if (scope == _scope) return;
+    _debounce?.cancel();
+    setState(() {
+      _scope = scope;
+      // 清目标范围的结果与错误（切范围展示新结果更直观；若保留旧结果会
+      // 让用户误以为没切成功）
+      if (scope.isMedia) {
+        _mediaResults = null;
+        _mediaError = null;
+        _mediaSearching = false;
+        _mediaPage = 1;
+        _mediaHasMore = true;
+        _mediaLoadingMore = false;
+      } else {
+        _results = null;
+        _searchError = null;
+        _searching = false;
+        _page = 1;
+        _hasMore = true;
+        _loadingMore = false;
+      }
+    });
+    if (_keywordCtrl.text.trim().isNotEmpty) _doSearch();
   }
 
   /// 视频搜索（Tab=0）。
@@ -296,6 +391,44 @@ class _SearchPageState extends State<SearchPage>
         _results = null;
         _searching = false;
         _searchError = '网络请求失败，请检查网络后重试';
+      });
+    }
+  }
+
+  /// media（番剧/电影/电视剧）搜索（Tab=0 + 范围非视频）。
+  Future<void> _doMediaSearch() async {
+    final keyword = _keywordCtrl.text.trim();
+    setState(() {
+      _mediaSearching = true;
+      _mediaError = null;
+      _mediaPage = 1;
+      _mediaHasMore = true;
+      _mediaLoadingMore = false;
+    });
+    try {
+      final page = await _api.searchMedia(
+        keyword,
+        searchType: _scope.searchType,
+      );
+      if (!mounted) return;
+      setState(() {
+        _mediaResults = page.results;
+        _mediaHasMore = page.hasMore;
+        _mediaSearching = false;
+      });
+    } on BiliApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _mediaResults = null;
+        _mediaSearching = false;
+        _mediaError = '搜索失败：${e.message}';
+      });
+    } on DioException {
+      if (!mounted) return;
+      setState(() {
+        _mediaResults = null;
+        _mediaSearching = false;
+        _mediaError = '网络请求失败，请检查网络后重试';
       });
     }
   }
@@ -350,12 +483,53 @@ class _SearchPageState extends State<SearchPage>
     _doSearch();
   }
 
-  /// 上拉加载下一页：根据当前 Tab 分发到视频或 UP 主翻页。
+  /// 上拉加载下一页：根据当前 Tab + 搜索范围分发。
   Future<void> _loadMore() async {
     if (_tabCtrl.index == 2) {
       await _loadMoreUpowner();
+    } else if (_scope.isMedia) {
+      await _loadMoreMedia();
     } else {
       await _loadMoreVideo();
+    }
+  }
+
+  /// media 翻页：守卫/去重/失败语义与视频翻页一致（按 season_id 去重追加）。
+  Future<void> _loadMoreMedia() async {
+    if (_mediaSearching || _mediaLoadingMore || !_mediaHasMore) return;
+    final base = _mediaResults;
+    if (base == null) return;
+    final keyword = _keywordCtrl.text.trim();
+    if (keyword.isEmpty) return;
+    setState(() => _mediaLoadingMore = true);
+    final nextPage = _mediaPage + 1;
+    try {
+      final page = await _api.searchMedia(
+        keyword,
+        searchType: _scope.searchType,
+        page: nextPage,
+      );
+      if (!mounted) return;
+      final existing = base.map((m) => m.seasonId).toSet();
+      final appended = <MediaSearchResult>[
+        ...base,
+        for (final m in page.results)
+          if (!existing.contains(m.seasonId)) m,
+      ];
+      setState(() {
+        _mediaResults = appended;
+        _mediaPage = nextPage;
+        _mediaHasMore = page.hasMore;
+        _mediaLoadingMore = false;
+      });
+    } on BiliApiException catch (e) {
+      if (!mounted) return;
+      setState(() => _mediaLoadingMore = false);
+      _showSnack('加载失败：${e.message}，点击重试');
+    } on DioException {
+      if (!mounted) return;
+      setState(() => _mediaLoadingMore = false);
+      _showSnack('网络请求失败，请检查网络后重试');
     }
   }
 
@@ -466,6 +640,43 @@ class _SearchPageState extends State<SearchPage>
     }
   }
 
+  /// media（番剧/电影/电视剧）结果整季导入（v2.16.5+）。
+  ///
+  /// 与首页「粘贴 ep/ss 链接导入」共用 [runPgcSeasonImport]：进度对话框逐集
+  /// 提示、addVideo 按 bvid 查重自动跳过已存在集。结束后刷新白名单快照并
+  /// 把 season_id 记入本会话已导入集合（按钮变「已导入」）。
+  Future<void> _importMedia(MediaSearchResult m) async {
+    if (_importingSeasonIds.contains(m.seasonId)) return;
+    setState(() => _importingSeasonIds.add(m.seasonId));
+    try {
+      await runPgcSeasonImport(
+        context: context,
+        writer: _writer,
+        configHint: '请先在首页右上角「管理」入口配置 GitHub token 与 Gist ID',
+        seasonId: m.seasonId,
+        onDone: (_) async {
+          await _loadWhitelist();
+          if (mounted) setState(() => _importedSeasonIds.add(m.seasonId));
+        },
+      );
+    } finally {
+      if (mounted) setState(() => _importingSeasonIds.remove(m.seasonId));
+    }
+  }
+
+  /// 该 season 是否已整季导入（media 结果「已导入」按钮状态判断）。
+  ///
+  /// 会话内：本会话导入成功的 season_id 直接命中；跨会话：白名单里存在
+  /// `ep_id == 本季首集 ep_id` 的视频视为已导入（media 搜索的 `eps[0].id`
+  /// 就是该季首集 ep_id，整季导入时会写入白名单视频的同值 epId）。
+  /// eps 缺失（部分电影搜索结果为 null）时退化为仅会话内判断。
+  bool _isSeasonImported(MediaSearchResult m) {
+    if (_importedSeasonIds.contains(m.seasonId)) return true;
+    final firstEp = m.firstEpId;
+    if (firstEp == null) return false;
+    return _whitelist?.videos.any((v) => v.epId == firstEp) ?? false;
+  }
+
   /// UP 主加入白名单（搜索页 UP 主 Tab 用）。
   Future<void> _joinUpowner(Upowner up) async {
     if (_joiningUpowners.contains(up.mid)) return;
@@ -530,7 +741,9 @@ class _SearchPageState extends State<SearchPage>
                 decoration: InputDecoration(
                   hintText: _tabCtrl.index == 2
                       ? '搜索 B 站 UP 主（昵称 / 认证名）'
-                      : '搜索 B 站视频或白名单',
+                      : (_tabCtrl.index == 0 && _scope.isMedia
+                          ? '搜索 B 站${_scope.label}（可整季导入）'
+                          : '搜索 B 站视频或白名单'),
                   border: InputBorder.none,
                   isDense: true,
                 ),
@@ -564,10 +777,40 @@ class _SearchPageState extends State<SearchPage>
   Widget _buildGlobalTab() {
     return Column(
       children: [
-        _buildOrderBar(),
+        _buildScopeBar(),
+        if (_scope == _SearchScope.video) _buildOrderBar(),
         const Divider(height: 1),
-        Expanded(child: _buildGlobalResults()),
+        Expanded(
+          child: _scope.isMedia
+              ? _buildMediaResults()
+              : _buildGlobalResults(),
+        ),
       ],
+    );
+  }
+
+  /// 搜索范围 chip 横行（视频/番剧/电影/电视剧，v2.16.5+）。
+  ///
+  /// media 范围下不显示排序行（media 搜索接口不支持 order），排序 chip 只
+  /// 在视频范围出现。切换即清结果重搜第 1 页。
+  Widget _buildScopeBar() {
+    return SingleChildScrollView(
+      scrollDirection: Axis.horizontal,
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+      child: Row(
+        children: [
+          for (final s in _SearchScope.values) ...[
+            ChoiceChip(
+              label: Text(s.label),
+              selected: _scope == s,
+              onSelected: (sel) {
+                if (sel) _switchScope(s);
+              },
+            ),
+            const SizedBox(width: 6),
+          ],
+        ],
+      ),
     );
   }
 
@@ -716,6 +959,113 @@ class _SearchPageState extends State<SearchPage>
                       child: CircularProgressIndicator(strokeWidth: 2),
                     )
                   : const Text('加入'),
+            ),
+    );
+  }
+
+  // ---- media 结果（番剧/电影/电视剧，v2.16.5+） ----
+
+  /// media 搜索结果区：状态机与视频结果区对齐（搜索中/错误重试/空提示/列表），
+  /// 底部「加载中/没有更多了」复用 [_buildBottomStatus]。
+  Widget _buildMediaResults() {
+    if (_mediaSearching) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (_mediaError != null) {
+      return _MessageView(
+        icon: Icons.error_outline,
+        message: _mediaError!,
+        actionLabel: '重试',
+        onAction: _doSearch,
+      );
+    }
+    final results = _mediaResults;
+    if (results == null) {
+      return _MessageView(
+        icon: Icons.movie_filter_outlined,
+        message: '输入关键词，搜索 B 站${_scope.label}\n'
+            '结果可一键整季导入白名单（加入前逐集查重）',
+      );
+    }
+    if (results.isEmpty) {
+      return _MessageView(
+        icon: Icons.search_off,
+        message: '没有找到相关${_scope.emptyMessage}，换个关键词试试',
+      );
+    }
+    final theme = Theme.of(context);
+    final showLoadingMore = _mediaLoadingMore;
+    final showNoMore = !_mediaHasMore && !showLoadingMore;
+    final extraSlots = (showLoadingMore || showNoMore) ? 1 : 0;
+    return ListView.separated(
+      controller: _scrollCtrl,
+      itemCount: results.length + extraSlots,
+      separatorBuilder: (_, __) => const Divider(height: 1, indent: 112),
+      itemBuilder: (context, i) {
+        if (i >= results.length) {
+          return _buildBottomStatus(showLoadingMore, showNoMore);
+        }
+        return _buildMediaTile(theme, results[i]);
+      },
+    );
+  }
+
+  Widget _buildMediaTile(ThemeData theme, MediaSearchResult m) {
+    final imported = _isSeasonImported(m);
+    final importing = _importingSeasonIds.contains(m.seasonId);
+    final typeLabel = m.typeLabel.isNotEmpty ? m.typeLabel : _scope.label;
+    // 副标题行：角标（独家/大会员）+ 集数/上映信息 + 风格标签
+    final metaParts = <String>[
+      if (m.badge.isNotEmpty) m.badge,
+      if (m.indexShow.isNotEmpty) m.indexShow,
+      if (m.styles.isNotEmpty) m.styles,
+    ];
+    return ListTile(
+      leading: ClipRRect(
+        borderRadius: BorderRadius.circular(4),
+        child: CoverImage(cover: m.cover, width: 96, height: 60),
+      ),
+      title: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            margin: const EdgeInsets.only(top: 2, right: 6),
+            padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+            decoration: BoxDecoration(
+              color: theme.colorScheme.primaryContainer,
+              borderRadius: BorderRadius.circular(4),
+            ),
+            child: Text(
+              typeLabel,
+              style: TextStyle(
+                fontSize: 10,
+                color: theme.colorScheme.onPrimaryContainer,
+              ),
+            ),
+          ),
+          Expanded(
+            child: Text(
+              m.title,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+            ),
+          ),
+        ],
+      ),
+      subtitle: Text(
+        metaParts.join(' · '),
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: theme.textTheme.bodySmall?.copyWith(
+          color: theme.colorScheme.outline,
+        ),
+      ),
+      trailing: imported
+          ? const FilledButton.tonal(onPressed: null, child: Text('已导入'))
+          : FilledButton(
+              onPressed: importing ? null : () => _importMedia(m),
+              child: const Text('导入'),
             ),
     );
   }

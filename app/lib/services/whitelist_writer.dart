@@ -28,6 +28,32 @@ class AddResult {
   });
 }
 
+/// 整季（番剧/电影）导入结果汇总（v2.16.5+，首页与搜索页共用）。
+class PgcImportSummary {
+  /// 拉到的整季信息（标题/封面/季内集数等，结果反馈用）。
+  final PgcSeason season;
+
+  /// 本季新增集数。
+  final int added;
+
+  /// 已在白名单被跳过的集数。
+  final int skipped;
+
+  /// 是否中途中断（保存失败/网络失败，未跑完全季）。
+  final bool interrupted;
+
+  /// 中断原因（[interrupted] 为 true 时有值：网络请求失败 / 保存失败原因）。
+  final String interruptReason;
+
+  const PgcImportSummary({
+    required this.season,
+    required this.added,
+    required this.skipped,
+    required this.interrupted,
+    this.interruptReason = '',
+  });
+}
+
 /// 白名单写入服务。
 ///
 /// 异常契约：
@@ -37,7 +63,12 @@ class AddResult {
 class WhitelistWriter {
   final GithubApi github;
 
-  WhitelistWriter({GithubApi? github}) : github = github ?? GithubApi();
+  /// B 站 API（番剧整季拉取用；测试可注入 mock）。
+  final BiliApi api;
+
+  WhitelistWriter({GithubApi? github, BiliApi? api})
+    : github = github ?? GithubApi(),
+      api = api ?? BiliApi();
 
   /// 配置门禁：token + gist_id 是否都已配置（写操作前调用）。
   Future<bool> hasConfig() => github.hasConfig();
@@ -176,6 +207,80 @@ class WhitelistWriter {
       video: video,
       data: next,
       message: '已加入：$displayTitle',
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // 番剧/电影整季导入（v2.16.5+）：首页「导入链接」与搜索页「media 结果导入」
+  // 共用。拉整季 + 逐集 [addVideo]，纯逻辑无 UI（进度经回调上报）
+  // ---------------------------------------------------------------------------
+
+  /// 番剧/电影整季导入：拉整季信息 → 逐集 [addVideo] 写白名单
+  /// （addVideo 内部按 bvid 查重，已在白名单的集自动跳过）。
+  ///
+  /// [epId]/[seasonId] 二选一（语义同 [BiliApi.fetchPgcSeason]）。
+  /// [onProgress] 可选：每集写盘前后回调进度文案（UI 进度框用）。
+  ///
+  /// 异常契约（调用方 UI 据此分类提示）：
+  /// - 拉整季阶段：B 站失败抛 [BiliApiException]、网络失败抛 [DioException]
+  ///   （此时未写任何 Gist）
+  /// - 逐集写盘阶段失败不抛：中断并汇总到 [PgcImportSummary.interrupted] /
+  ///   [PgcImportSummary.interruptReason]（已写集数见 [PgcImportSummary.added]）
+  Future<PgcImportSummary> importPgcSeason({
+    int? epId,
+    int? seasonId,
+    void Function(String status)? onProgress,
+  }) async {
+    // 1) 拉整季（ep/ss 引用都返回全季 episodes 列表）
+    final season = await api.fetchPgcSeason(epId: epId, seasonId: seasonId);
+    final eps = season.episodes;
+    if (eps.isEmpty) {
+      return PgcImportSummary(
+        season: season,
+        added: 0,
+        skipped: 0,
+        interrupted: false,
+      );
+    }
+    onProgress?.call('准备导入「${season.title}」，共 ${eps.length} 集…');
+
+    // 2) 逐集构造 WhitelistVideo 并写入（每集独立拉 Gist 查重 + 追加）
+    var added = 0, skipped = 0;
+    var interrupted = false;
+    var interruptReason = '';
+    for (var i = 0; i < eps.length; i++) {
+      final ep = eps[i];
+      if (ep.bvid.isEmpty) continue; // 防御：无 bvid 的脏条目跳过
+      final video = videoFromPgcEpisode(season, ep);
+      onProgress?.call('导入中 ${i + 1}/${eps.length}：${video.title}');
+      try {
+        final result = await addVideo(video);
+        if (result.added) {
+          added++;
+        } else if (result.message.contains('已在白名单')) {
+          skipped++;
+        } else {
+          // 保存失败等非重复原因 → 中断（其余集不写）
+          interrupted = true;
+          interruptReason = result.message;
+          break;
+        }
+      } on DioException {
+        interrupted = true;
+        interruptReason = '网络请求失败';
+        break;
+      } on GithubApiException catch (e) {
+        interrupted = true;
+        interruptReason = e.message;
+        break;
+      }
+    }
+    return PgcImportSummary(
+      season: season,
+      added: added,
+      skipped: skipped,
+      interrupted: interrupted,
+      interruptReason: interruptReason,
     );
   }
 

@@ -8,6 +8,22 @@
 
 ---
 
+## v2.16.5 (2026-09-03)
+
+**新增**
+
+- **搜索支持番剧 / 电影并可导入**：「全部 B 站」搜索页新增搜索范围切换（视频 / 番剧 / 电影 / 电视剧）：
+  - 番剧 / 电影走 media 搜索接口（`x/web-interface/wbi/search/type`，`search_type=media_bangumi / media_ft`，匿名 + WBI 签名即可，2026-09 curl 实测确认字段：`season_id`（整季导入钥匙，无顶层 `ep_id`）/ `title`（含高亮标签需清洗）/ `cover`（偶有 `http://` 前缀需补 https）/ `badges[]` 角标（独家、大会员）/ `styles` 风格串 / `index_show`（「全14话」或上映日期）/ `eps[0].id` 首集 ep_id）
+  - 结果列表展示封面 + 类型角标 + 标题 + 角标/集数/风格副标题；右侧「导入」**整季逐集加入白名单**（与首页粘贴链接导入共用 `WhitelistWriter.importPgcSeason` + `runPgcSeasonImport`，进度逐集提示、bvid 查重自动跳过已存在集），导入后按钮变「已导入」（会话级记忆 + 白名单首集 ep_id 匹配双重判断）
+  - media 结果同样支持上拉翻页（`data.numResults` 判断，与视频搜索同一套 `hasMore` 逻辑）；排序 chip 仅视频范围显示（media 接口不支持 order）
+  - 电视剧（`media_tv`）/ 纪录片（`media_doc`）入口同样可切：**匿名请求实测被 B 站降级过滤（code=-1200「被降级过滤的请求」）**，错误分类提示「可能需登录」，番剧/电影不受影响
+
+**重构**
+
+- 番剧/电影整季导入逻辑从首页私有方法抽为共用：`WhitelistWriter.importPgcSeason`（纯逻辑：拉整季 + 逐集 addVideo，进度回调，异常汇总）+ `widgets/pgc_import_dialog.dart` 的 `runPgcSeasonImport`（UI 编排：配置门禁 + 进度对话框 + 结果反馈），首页粘贴链接导入与搜索页 media 结果导入共用同一实现与文案
+
+---
+
 ## v2.16.4 (2026-09-03)
 
 **新增**
