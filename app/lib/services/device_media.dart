@@ -50,6 +50,39 @@ class DeviceMedia {
     }
   }
 
+  /// 原生亮度原始值 → 有效百分比（0..100，纯函数可单测）。
+  ///
+  /// 兜底规则：**任何拿不到有效值的情况都回退 [fallbackPercent]**（默认 50%）——
+  /// - null（通道失败 / 原生异常）
+  /// - 非有限值（NaN / Infinity）
+  /// - 越界（原生正常返回 0..1；收到 -1 = 窗口未设置（BRIGHTNESS_OVERRIDE_NONE）
+  ///   之类的异常值也在此列——v2.16.12 前若原生把 -1 原样透传，基准会换算成
+  ///   -100% 再被 clamp 到 0，表现为「动一点就跳 0」）
+  ///
+  /// 有效值按 0..1 → 0..100 换算后同样钳制到 [0, 100]，保证返回值**永远可用**。
+  static double normalizeBrightnessPercent(
+    Object? raw, {
+    double fallbackPercent = 50,
+  }) {
+    final v = raw is num ? raw.toDouble() : double.nan;
+    if (!v.isFinite || v < 0 || v > 1) return fallbackPercent;
+    final pct = v * 100;
+    return pct < 0 ? 0 : (pct > 100 ? 100 : pct);
+  }
+
+  /// 当前应用内亮度（**0..100 百分比，保证有效**）：原生 0..1 → 百分比，
+  /// 任何失败（通道异常 / 异常值如 -1）都按 [normalizeBrightnessPercent]
+  /// 兜底到 [fallbackPercent]（默认 50%），不抛异常、永不返回无效值。
+  ///
+  /// 播放页手势把返回值直接当调节基准——读取必须可靠，否则基准错了
+  /// 换算出来的目标也会错（跳 0/100 的根因之一）。
+  static Future<double> getBrightnessPercent({
+    double fallbackPercent = 50,
+  }) async {
+    final raw = await getBrightness();
+    return normalizeBrightnessPercent(raw, fallbackPercent: fallbackPercent);
+  }
+
   /// 设置应用内亮度（0..1，原生钳制 0.05..1.0）。失败静默。
   static Future<void> setBrightness(double value) async {
     try {

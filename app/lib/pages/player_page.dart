@@ -101,6 +101,11 @@ String pgcFallbackMessage(PgcFallbackAction action) {
 //
 // 滑动量换算统一走 [slideFraction]：滑满一屏 = ±100%（比例），
 // 方向约定：向右 / 向上为「前进 / 增大」。
+//
+// 亮度/音量纵向调节的灵敏度（v2.16.12+）：完整上下滑一屏 ≈ 基准 ±30%
+// （灵敏度 [kAdjustSensitivity] = 0.3，见 [adjustPercent]），小幅滑动
+// 平滑小幅变化——不再像 v2.16.7~11 那样「滑满一屏 = ±100%、基准被逐帧
+// 累加改写」，表现为手指动一点点就跳 0 / 100。
 // -------------------------------------------------------------------------
 
 /// 手势提示浮层的类型（也即竖屏半屏判定可产生的目标）。
@@ -127,6 +132,12 @@ enum PanSlideMode {
 /// 主导方向判定的位移阈值（px）：dx/dy 都未超此值视为未开始滑动
 /// （点按抖动 / 微移不触发任何手势），超过才按主导分量归类。
 const double kPanModeThreshold = 12;
+
+/// 亮度 / 音量纵向调节的灵敏度（v2.16.12+）：`调节量 = 基准 + 滑动比例 ×
+/// 灵敏度 × 100`——完整上下滑一屏（比例 ±1）≈ 基准 ±30%，小幅滑动平滑
+/// 小幅变化。旧版按 ±100% 映射 + 基准被逐帧改写，导致手指动一点点就
+/// 跳 0 / 100；0.3 让满行程只跨 30%，细调不再越界。
+const double kAdjustSensitivity = 0.3;
 
 /// 竖屏半屏判定：滑动起点 x ≤ 屏宽一半 → 亮度，否则 → 音量。
 PlayerSlideKind verticalSlideKind(double x, double width) =>
@@ -184,21 +195,38 @@ int seekTargetMs({
   return target;
 }
 
-/// 音量目标档位：基准档 + 滑动比例 × 最大档（钳制 0..max）。
+/// 音量目标档位：基准档 + 滑动比例 × 灵敏度 × 最大档（钳制 0..max）。
+/// 灵敏度默认 [kAdjustSensitivity]（0.3）——完整上下滑一屏 = ±30% 最大档，
+/// 与百分比口径的 [adjustPercent] 一致（0.3 × max 档）。
 /// 最大档 <= 0（无音量设备 / 防御）→ 0。
 int volumeTargetLevel({
   required int baseLevel,
   required double fraction,
   required int maxLevel,
+  double sensitivity = kAdjustSensitivity,
 }) {
   if (maxLevel <= 0) return 0;
-  final t = baseLevel + (fraction * maxLevel).round();
+  final delta = fraction * sensitivity * maxLevel;
+  // 档位差向远离 0 取整（±x.5 边界向上取），并加 ε 修正消除 0.3 × max 的
+  // 二进制误差在 x.5 边界随机向下取整的问题（满屏 ±30% 常落在 ±4.5 档，
+  // 裸 round 会让结果在 4/5 之间摇摆）。
+  final d = delta >= 0
+      ? (delta + 0.5 + 1e-9).floor()
+      : (delta - 0.5 - 1e-9).ceil();
+  final t = baseLevel + d;
   return t < 0 ? 0 : (t > maxLevel ? maxLevel : t);
 }
 
-/// 纵向调节当前百分比（0..100）：基准百分比 + 滑动比例 × 100（钳制）。
-double adjustPercent({required double basePercent, required double fraction}) {
-  final v = basePercent + fraction * 100;
+/// 纵向调节当前百分比（0..100，v2.16.12+）：基准百分比 + 滑动比例 ×
+/// 灵敏度 × 100（钳制）。灵敏度默认 [kAdjustSensitivity]（0.3）——
+/// 完整上下滑一屏（fraction=±1）≈ 基准 ±30%，小幅滑动平滑小幅变化
+/// （如滑 1/10 屏 → ±3%），不再「滑满一屏 = ±100%」一碰就到头。
+double adjustPercent({
+  required double basePercent,
+  required double fraction,
+  double sensitivity = kAdjustSensitivity,
+}) {
+  final v = basePercent + fraction * sensitivity * 100;
   return v < 0 ? 0 : (v > 100 ? 100 : v);
 }
 
@@ -300,7 +328,12 @@ class _PlayerPageState extends State<PlayerPage> {
   // 纵向调节（亮度/音量）：起点半屏定类型，滑动量按屏高换算比例。
   PlayerSlideKind? _adjustKind; // 纵向调节类型（null = 未进行）
   bool _adjustReady = false; // 基准值已从原生取到（取到前忽略滑动）
-  double _adjustBase = 0; // 基准：亮度=百分比 / 音量=当前档
+  // v2.16.12+：基准在锁定后**固定不再改写**（旧版逐帧把基准改成目标值 +
+  // ±100% 映射 → 换算双重叠加，手指动一点点就近 0/100）。目标始终按
+  // 「固定基准 + 累计比例 × 灵敏度 0.3」计算，只追平一次、可回退。
+  double _adjustBase = 0; // 手势锁定时读到的原始基准：音量=当前档/亮度=百分比
+  double _adjustApplied = 0; // 最近一次已生效目标（音量=档位/亮度=百分比，
+                              // 只用于写通道与浮层的阈值过滤，不是换算基准）
   double _adjustSpan = 1; // 纵向拖满一屏对应的屏高（px）
   double _adjustDy = 0; // 累计纵向位移（px，向下为正）
   int _volumeMax = 0; // 音量最大档（本次手势开始时取）
@@ -1340,8 +1373,13 @@ class _PlayerPageState extends State<PlayerPage> {
 
   // ---------- vertical（垂直主导）→ 亮度 / 音量（横竖屏都可用） ----------
 
-  /// 锁定为垂直：按起点 [_panStartX] 半屏判定类型，再异步取原生基准值
-  /// （取到前 _adjustReady=false，期间忽略滑动；通道失败则本次手势作废）。
+  /// 锁定为垂直：按起点 [_panStartX] 半屏判定类型，再**异步读取当前基准**
+  /// （音量当前档 + 最大档 / 亮度当前百分比）。读取成功前 [_adjustReady]
+  /// =false，期间忽略滑动——基准未就绪不做任何换算，避免基准缺失/错误
+  /// 导致跳变（「动一点就 0/100」的根因之一）。
+  /// 读取失败：亮度由 [DeviceMedia.getBrightnessPercent] 兜底 50%；
+  /// 音量（getVolume 为 null 或 max<=0）无有效档位信息 → 放弃本次手势
+  /// （不硬设 0，避免把音量清零）。
   void _beginVerticalAdjust() {
     final width = MediaQuery.sizeOf(context).width;
     final kind = verticalSlideKind(_panStartX, width);
@@ -1350,29 +1388,45 @@ class _PlayerPageState extends State<PlayerPage> {
     _adjustKind = kind;
     _adjustReady = false;
     _adjustDy = 0;
+    _adjustApplied = 0;
     _adjustSpan = MediaQuery.sizeOf(context).height;
     if (kind == PlayerSlideKind.volume) {
       _volumeMax = 0;
       DeviceMedia.getVolume().then((v) {
-        if (!mounted || _adjustKind != kind || v == null) return;
+        if (!mounted || _adjustKind != kind) return;
+        if (v == null || v.max <= 0) {
+          // 通道失败 / 无音量设备：本次手势作废（不硬设 0）
+          debugPrint('[player_page] 音量基准读取失败（v=$v）→ 放弃本次手势');
+          _adjustKind = null;
+          _scheduleHudHide(const Duration(milliseconds: 700));
+          return;
+        }
         _volumeMax = v.max;
         _adjustBase = v.current.toDouble();
+        _adjustApplied = v.current.toDouble();
         _adjustReady = true;
         _showValueHud(kind, _percentOfLevel(v.current, v.max));
+        debugPrint('[player_page] 音量基准 current=${v.current} max=${v.max} '
+            '（${_percentOfLevel(v.current, v.max).toStringAsFixed(0)}%）');
       });
     } else {
-      DeviceMedia.getBrightness().then((b) {
-        if (!mounted || _adjustKind != kind || b == null) return;
-        // 0..1 → 百分比；下限 5%（与原生 / brightnessPercent 一致）
-        _adjustBase = (b * 100).clamp(5.0, 100.0).toDouble();
+      DeviceMedia.getBrightnessPercent().then((pct) {
+        if (!mounted || _adjustKind != kind) return;
+        // 亮度下限 5%（与原生 MIN_BRIGHTNESS / brightnessPercent 一致）
+        final base = pct < 5 ? 5.0 : pct;
+        _adjustBase = base;
+        _adjustApplied = base;
         _adjustReady = true;
-        _showValueHud(kind, _adjustBase);
+        _showValueHud(kind, base);
+        debugPrint('[player_page] 亮度基准 ${base.toStringAsFixed(1)}%');
       });
     }
   }
 
-  /// 纵向滑动更新：上滑（dy 为负）→ 增大。换算为比例后按类型调音量 /
-  /// 亮度，变化达阈值才写原生（避免每帧刷通道）并刷新浮层。
+  /// 纵向滑动更新：上滑（dy 为负）→ 增大。目标始终按「锁定时的固定基准 +
+  /// 累计滑动比例 × 灵敏度 0.3」换算（v2.16.12+，基准不再被逐帧改写——
+  /// 旧版把目标写回基准再叠加，双重累积导致手指动一点点就跳 0/100），
+  /// 目标变化达阈值才写原生（避免每帧刷通道）并刷新浮层。
   void _onVerticalDragUpdate(DragUpdateDetails d) {
     final kind = _adjustKind;
     if (kind == null || !_adjustReady) return;
@@ -1384,16 +1438,22 @@ class _PlayerPageState extends State<PlayerPage> {
         fraction: fraction,
         maxLevel: _volumeMax,
       );
-      if (level != _adjustBase.round()) {
+      if (level != _adjustApplied.round()) {
+        debugPrint('[player_page] 音量调节 '
+            '${_adjustApplied.round()}/$_volumeMax → $level/$_volumeMax'
+            '（${_percentOfLevel(level, _volumeMax).toStringAsFixed(0)}%）');
         DeviceMedia.setVolume(level);
-        _adjustBase = level.toDouble();
+        _adjustApplied = level.toDouble();
         _showValueHud(kind, _percentOfLevel(level, _volumeMax));
       }
     } else {
-      final pct = brightnessPercent(basePercent: _adjustBase, fraction: fraction);
-      if ((pct - _adjustBase).abs() >= 1) {
+      final pct =
+          brightnessPercent(basePercent: _adjustBase, fraction: fraction);
+      if ((pct - _adjustApplied).abs() >= 1) {
+        debugPrint('[player_page] 亮度调节 '
+            '${_adjustApplied.toStringAsFixed(1)}% → ${pct.toStringAsFixed(1)}%');
         DeviceMedia.setBrightness(pct / 100);
-        _adjustBase = pct;
+        _adjustApplied = pct;
         _showValueHud(kind, pct);
       }
     }

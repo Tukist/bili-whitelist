@@ -5,8 +5,9 @@
 // - nextPanMode：方向锁定（已有模式不受后续位移影响，本次手势不切换）
 // - slideFraction：位移 → 比例（拖满一屏 = ±100%，防除零 / 越界钳制）
 // - seekTargetMs：横屏 seek 目标位置（基准 + 比例 × 时长，钳制 0..时长）
-// - volumeTargetLevel：音量目标档（基准 + 比例 × 最大档，钳制 0..max）
-// - adjustPercent / brightnessPercent：纵向调节百分比（0..100 / 亮度下限 5%）
+// - volumeTargetLevel：音量目标档（基准 + 比例 × 灵敏度 × 最大档，钳制 0..max）
+// - adjustPercent / brightnessPercent：纵向调节百分比（灵敏度 0.3：滑满一屏
+//   ±30%、小幅平滑；亮度下限 5%）
 //
 // 逻辑见 lib/pages/player_page.dart 顶部的纯函数（与会员集 pgc 回退同风格，
 // 便于脱离 Widget/原生通道直接测判定与换算）。
@@ -140,17 +141,29 @@ void main() {
     });
   });
 
-  group('volumeTargetLevel（音量目标档）', () {
+  group('volumeTargetLevel（音量目标档，灵敏度 0.3）', () {
     test('max <= 0 → 0（防御）', () {
       expect(volumeTargetLevel(baseLevel: 5, fraction: 1, maxLevel: 0), 0);
     });
 
-    test('向上滑 = 增大，按比例换算档位', () {
-      // 最大档 15：拖半屏 → +7 档（7.5 取整 8），base 5 → 13
-      expect(volumeTargetLevel(baseLevel: 5, fraction: 0.5, maxLevel: 15), 13);
-      // 拖 1/3 屏 → +5 档
+    test('向上滑 = 增大：滑满一屏 = +30% 最大档（不再 ±100%）', () {
+      // 最大档 15：满屏 +0.3×15=4.5 档 → 5+4.5=9.5 round 10（10/15≈67%）
+      expect(volumeTargetLevel(baseLevel: 5, fraction: 1, maxLevel: 15), 10);
+      // 拖半屏 → +2.25 档 → 7（7/15≈47%）
+      expect(volumeTargetLevel(baseLevel: 5, fraction: 0.5, maxLevel: 15), 7);
+      // 拖 1/3 屏 → +1.5 档 → 7
       expect(volumeTargetLevel(baseLevel: 5, fraction: 1 / 3, maxLevel: 15),
-          10);
+          7);
+      // 1/4 屏 → +1.125 档 → 6（≈ +7.5% 最大档）
+      expect(volumeTargetLevel(baseLevel: 5, fraction: 0.25, maxLevel: 15),
+          6);
+    });
+
+    test('小幅滑动平滑：1/10 屏 → ±0.45 档 → 不变（档位离散的合理静默）', () {
+      expect(volumeTargetLevel(baseLevel: 5, fraction: 0.1, maxLevel: 15), 5);
+      expect(volumeTargetLevel(baseLevel: 5, fraction: -0.1, maxLevel: 15), 5);
+      // 稍大些（2/10 屏）→ +0.9 档 → 才 +1 档
+      expect(volumeTargetLevel(baseLevel: 5, fraction: 0.2, maxLevel: 15), 6);
     });
 
     test('钳制 0..max（不会滑到负数 / 超过最大档）', () {
@@ -158,24 +171,67 @@ void main() {
       expect(volumeTargetLevel(baseLevel: 14, fraction: 1, maxLevel: 15), 15);
       expect(volumeTargetLevel(baseLevel: 15, fraction: 1, maxLevel: 15), 15);
       expect(volumeTargetLevel(baseLevel: 0, fraction: -1, maxLevel: 15), 0);
+      // 远离边界也能被满屏滑动打满（档位差 ±4.5 → 向远离 0 取整 ±5）
+      expect(volumeTargetLevel(baseLevel: 8, fraction: -1, maxLevel: 15),
+          3); // 8 - 5 = 3
+      expect(volumeTargetLevel(baseLevel: 10, fraction: 1, maxLevel: 15),
+          15); // 10 + 5 = 15
     });
   });
 
-  group('adjustPercent / brightnessPercent（纵向调节百分比）', () {
-    test('基准 + 比例 × 100，钳制 0..100', () {
-      expect(adjustPercent(basePercent: 50, fraction: 0.5), 100);
-      expect(adjustPercent(basePercent: 50, fraction: -0.5), 0);
-      expect(adjustPercent(basePercent: 80, fraction: 0.5), 100);
-      expect(adjustPercent(basePercent: 20, fraction: -0.5), 0);
-      expect(adjustPercent(basePercent: 30, fraction: 0.1), 40);
+  group('adjustPercent / brightnessPercent（纵向调节百分比，灵敏度 0.3）', () {
+    test('基准 + 比例 × 灵敏度：滑满一屏 = ±30%（不再 ±100%）', () {
+      expect(adjustPercent(basePercent: 50, fraction: 1), 80);
+      expect(adjustPercent(basePercent: 50, fraction: -1), 20);
+      expect(adjustPercent(basePercent: 50, fraction: 0.5), 65);
+      expect(adjustPercent(basePercent: 50, fraction: -0.5), 35);
+      // 旧版语义（±100%）回归确认：50 满屏滑现在只到 80/20，不会跳 0/100
+      expect(adjustPercent(basePercent: 80, fraction: 1), 100);
+      expect(adjustPercent(basePercent: 20, fraction: -1), 0);
+    });
+
+    test('小幅滑动平滑小幅变化（1/10 屏 ≈ ±3%，不跳变）', () {
+      expect(adjustPercent(basePercent: 50, fraction: 0.1), closeTo(53, 1e-9));
+      expect(adjustPercent(basePercent: 50, fraction: -0.1),
+          closeTo(47, 1e-9));
+      // 手指“动一点点”（1/20 屏）→ 仅 ±1.5%
+      expect(adjustPercent(basePercent: 50, fraction: 0.05),
+          closeTo(51.5, 1e-9));
+      expect(adjustPercent(basePercent: 40, fraction: 0.1), 43);
+      expect(adjustPercent(basePercent: 40, fraction: -0.1), 37);
+    });
+
+    test('自定义灵敏度生效（按 fraction × sensitivity × 100 换算）', () {
+      expect(adjustPercent(basePercent: 50, fraction: 1, sensitivity: 1), 100);
+      expect(adjustPercent(basePercent: 50, fraction: 1, sensitivity: 0.5),
+          100); // ±50%
+      expect(adjustPercent(basePercent: 50, fraction: -1, sensitivity: 0.5),
+          0);
+      expect(adjustPercent(basePercent: 50, fraction: -0.5, sensitivity: 0.5),
+          25); // 25%
+    });
+
+    test('钳制 0..100（靠边滑动越界时钳到边界）', () {
+      expect(adjustPercent(basePercent: 90, fraction: 1), 100); // 90+30 → 100
+      expect(adjustPercent(basePercent: 10, fraction: -1), 0); // 10-30 → 0
+      expect(adjustPercent(basePercent: 0, fraction: 1), 30); // 从 0 只涨 30
+      expect(adjustPercent(basePercent: 100, fraction: -1), 70); // 从 100 只降 30
+      expect(adjustPercent(basePercent: 0, fraction: -1), 0);
+      expect(adjustPercent(basePercent: 100, fraction: 1), 100);
+    });
+
+    test('负方向（下滑 = 减小）线性', () {
+      expect(adjustPercent(basePercent: 60, fraction: -0.3), 51);
+      expect(adjustPercent(basePercent: 60, fraction: -1), 30);
     });
 
     test('亮度下限 5%（全黑时浮层同窗口不可见，防误导）', () {
-      expect(brightnessPercent(basePercent: 50, fraction: -1), 5);
-      expect(brightnessPercent(basePercent: 5, fraction: 1), 100);
-      expect(brightnessPercent(basePercent: 10, fraction: 0.2), 30);
-      // 高于 5 的部分行为与 adjustPercent 一致
-      expect(brightnessPercent(basePercent: 50, fraction: -0.3), 20);
+      expect(brightnessPercent(basePercent: 10, fraction: -1), 5); // 10-30 → 下限
+      expect(brightnessPercent(basePercent: 5, fraction: -1), 5);
+      expect(brightnessPercent(basePercent: 50, fraction: -1), 20); // 高于下限正常减
+      expect(brightnessPercent(basePercent: 5, fraction: 1), 35);
+      expect(brightnessPercent(basePercent: 90, fraction: 1), 100);
+      expect(brightnessPercent(basePercent: 40, fraction: 0.1), 43);
     });
   });
 }
