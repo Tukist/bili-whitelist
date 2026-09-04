@@ -93,9 +93,11 @@ String pgcFallbackMessage(PgcFallbackAction action) {
 //
 // 手势总览（参照 B 站手机端播放器；冲突处理见 build 中手势层注释）：
 // - 双击：播放 / 暂停（与单击显隐共存，单击延迟 ~300ms 等双击判定）
-// - 全屏横屏：横向滑动 seek——位移 / 屏宽 = 时长比例，松手 seekTo
-// - 竖屏：纵向滑动调亮度 / 音量——左半屏亮度、右半屏音量（原生通道
-//   bili_whitelist/media，见 services/device_media.dart）
+// - 滑动统一走 Pan + 主导方向判定（v2.16.9+）：斜向滑动按**位移主方向**
+//   归类——水平主导 → 全屏横屏 seek（位移/屏宽 = 时长比例，松手 seekTo）；
+//   垂直主导 → 起点左半屏亮度 / 右半屏音量（原生通道 bili_whitelist/media，
+//   见 services/device_media.dart）。竖屏只保留亮度/音量（水平主导忽略，
+//   无 seek 防误触）。
 //
 // 滑动量换算统一走 [slideFraction]：滑满一屏 = ±100%（比例），
 // 方向约定：向右 / 向上为「前进 / 增大」。
@@ -113,9 +115,51 @@ enum PlayerSlideKind {
   volume,
 }
 
+/// 滑动手势的主导方向（判定锁定后本次手势不再切换，防中途抖动）。
+enum PanSlideMode {
+  /// 水平主导 → seek（仅全屏横屏激活；竖屏忽略）。
+  horizontal,
+
+  /// 垂直主导 → 起点左半屏亮度 / 右半屏音量。
+  vertical,
+}
+
+/// 主导方向判定的位移阈值（px）：dx/dy 都未超此值视为未开始滑动
+/// （点按抖动 / 微移不触发任何手势），超过才按主导分量归类。
+const double kPanModeThreshold = 12;
+
 /// 竖屏半屏判定：滑动起点 x ≤ 屏宽一半 → 亮度，否则 → 音量。
 PlayerSlideKind verticalSlideKind(double x, double width) =>
     x <= width / 2 ? PlayerSlideKind.brightness : PlayerSlideKind.volume;
+
+/// 主导方向判定（纯函数，v2.16.9+）：斜向位移按**主导分量**归类——
+/// - dx/dy 都未超 [threshold] → null（未定，继续累计）
+/// - |dx| >= |dy| → [PanSlideMode.horizontal]（45° 平分归水平，与 |dx|
+///   不落后于 |dy| 的语义一致）
+/// - |dy| > |dx| → [PanSlideMode.vertical]
+/// 方向符号（正负）只表示左右 / 上下，不影响归类。
+PanSlideMode? decideMode(
+  double dx,
+  double dy, [
+  double threshold = kPanModeThreshold,
+]) {
+  final ax = dx.abs();
+  final ay = dy.abs();
+  if (ax <= threshold && ay <= threshold) return null;
+  return ax >= ay ? PanSlideMode.horizontal : PanSlideMode.vertical;
+}
+
+/// 手势方向锁定（纯函数）：已有模式时**不受后续位移影响**（原样返回，
+/// 本次手势不切换）；未锁定才交给 [decideMode] 判定。
+PanSlideMode? nextPanMode({
+  required PanSlideMode? current,
+  required double dx,
+  required double dy,
+  double threshold = kPanModeThreshold,
+}) {
+  if (current != null) return current;
+  return decideMode(dx, dy, threshold);
+}
 
 /// 位移 → 滑动比例：delta / span，钳制 -1..1（拖满一屏 = ±100%）。
 /// span <= 0（测试 / 极端布局）按 0 处理，避免除零。
@@ -175,8 +219,10 @@ double brightnessPercent({
 ///   倍速选择（九档 0.5~3x）、听视频（纯音频）开关、全屏切换；
 ///   点击画面切换控制层显隐，长按画面 2x、松手恢复长按前倍速；进入自动播放；
 ///   B 站式快捷手势（v2.16.7+）：双击播放/暂停（单击显隐延迟 ~300ms 防误触）、
-///   全屏横屏横向滑动 seek（时间浮层 + 松手 seekTo）、竖屏左/右半屏上下滑调
-///   亮度/音量（原生通道 bili_whitelist/media，仅当前 Activity 内生效）
+///   滑动按**主导方向**归类（v2.16.9+）：水平主导 → 全屏横屏 seek（时间浮层 +
+///   松手 seekTo）；垂直主导 → 按起点左/右半屏调亮度/音量（原生通道
+///   bili_whitelist/media，仅当前 Activity 内生效）。竖屏只保留亮度/音量
+///   （水平主导忽略，无 seek 防误触）
 /// - URL 过期（onUrlExpired）：重取 playurl → 记位置 → setDataSource(新流, 位置) 续播，
 ///   续播后按当前倍速/听视频状态恢复；重试 1 次仍失败显示「视频流过期，请重试」+ 重试按钮
 /// - 错误分类：403 防盗链异常 / -412 风控（指数退避 1s→2s→4s 重试）/ 62002 稿件失效 /
@@ -239,12 +285,19 @@ class _PlayerPageState extends State<PlayerPage> {
   // -------------------------------------------------------------------
   // 双击播放/暂停：GestureDetector onDoubleTap；单击显隐因与双击共存自动
   // 延迟 ~300ms（等双击窗口判定，双击赢得则单击取消，不误触显隐）。
-  // 横屏 seek 拖动中暂停 tick 位置刷新（松手 seek 后恢复）。
-  bool _seekDragging = false; // 横屏 seek 拖动中
+  // 滑动统一走单一 Pan（v2.16.9+）：位移累计超 [kPanModeThreshold] 按主导
+  // 方向锁定（[decideMode]）——horizontal → 全屏横屏 seek、竖屏忽略；
+  // vertical → 起点半屏亮度/音量（横竖屏都可用）。锁定后本次手势不再切换
+  // （防中途抖动）；seek 拖动中暂停 tick 位置刷新（松手 seek 后恢复）。
+  double _panStartX = 0; // 手势起点 x（垂直模式按半屏判亮度/音量）
+  PanSlideMode? _panMode; // 已锁定的主导方向（null = 未定，继续累计判定）
+  double _panDx = 0; // 手势累计横向位移（px，仅锁定判定用）
+  double _panDy = 0; // 手势累计纵向位移（px，仅锁定判定用）
+  bool _seekDragging = false; // 横屏 seek 拖动中（锁定 horizontal 后）
   int _seekDragBaseMs = 0; // seek 起点基准位置（拖动开始时）
   double _seekDragDx = 0; // 累计横向位移（px，向右为正）
   double _seekDragSpan = 1; // 拖满一屏对应的屏宽（px）
-  // 竖屏纵向调节（亮度/音量）：起点半屏定类型，滑动量按屏高换算比例。
+  // 纵向调节（亮度/音量）：起点半屏定类型，滑动量按屏高换算比例。
   PlayerSlideKind? _adjustKind; // 纵向调节类型（null = 未进行）
   bool _adjustReady = false; // 基准值已从原生取到（取到前忽略滑动）
   double _adjustBase = 0; // 基准：亮度=百分比 / 音量=当前档
@@ -1136,13 +1189,16 @@ class _PlayerPageState extends State<PlayerPage> {
   }
 
   // -------------------------------------------------------------------------
-  // B 站式快捷手势（v2.16.7+）：双击 / 横屏 seek / 竖屏亮度·音量
+  // B 站式快捷手势（v2.16.7+）：双击 / 滑动主导方向判定（v2.16.9+）
   //
   // 判定与冲突处理汇总（详见 build 手势层注释）：
   // - 双击 = 播放/暂停；单击 = 显隐（延迟 ~300ms 等双击窗口判定）
-  // - 横屏（_fullscreen）横向滑动 = seek：位移比例 = 时长比例，松手 seekTo
-  // - 竖屏（!_fullscreen）纵向滑动 = 亮度（左半屏）/ 音量（右半屏），
-  //   原生通道调节（device_media.dart），调节即生效、松手不恢复
+  // - 滑动统一走单一 Pan：位移累计超 [kPanModeThreshold] 后按主导方向锁定
+  //   （[decideMode]），锁定后本次手势不再切换——
+  //   水平主导：全屏横屏 = seek（位移比例 = 时长比例，松手 seekTo）；
+  //             竖屏忽略（v2.16.9 之前即无横屏滑动，防误触）
+  //   垂直主导：亮度（起点左半屏）/ 音量（右半屏），横竖屏都可用；
+  //             原生通道调节（device_media.dart），调节即生效、松手不恢复
   // - 控制层按钮 / 进度条在 Stack 上层，其区域内的点击与拖动天然优先
   // -------------------------------------------------------------------------
 
@@ -1153,9 +1209,97 @@ class _PlayerPageState extends State<PlayerPage> {
     await _togglePlay();
   }
 
-  // ---------- 全屏横屏横向滑动 seek ----------
+  // ---------- 滑动统一 Pan：起点记录 → 主导方向锁定 → 分发 ----------
 
-  void _onSeekDragStart(DragStartDetails _) {
+  /// 手势开始：记录起点（x0 供垂直模式半屏判亮度/音量），状态复位为未定，
+  /// 清掉上一手势残留 hud（延迟隐藏计时同步取消）。
+  void _onPanStart(DragStartDetails d) {
+    if (_player == null) return;
+    _panMode = null;
+    _panStartX = d.localPosition.dx;
+    _panDx = 0;
+    _panDy = 0;
+    _hudTimer?.cancel();
+    if (_hudKind != null) setState(() => _hudKind = null);
+    debugPrint('[player_page] 手势开始 x0=${_panStartX.toStringAsFixed(0)}px '
+        'fullscreen=$_fullscreen');
+  }
+
+  /// 手势滑动：先累计位移并尝试锁定主导方向（锁定后不再切换），
+  /// 再按锁定模式分发到 seek / 亮度·音量逻辑。
+  void _onPanUpdate(DragUpdateDetails d) {
+    if (_panMode == null) {
+      _panDx += d.delta.dx;
+      _panDy += d.delta.dy;
+      final m = nextPanMode(current: null, dx: _panDx, dy: _panDy);
+      if (m != null) _lockPanMode(m);
+    }
+    switch (_panMode) {
+      case PanSlideMode.horizontal:
+        // 水平主导：仅全屏横屏有 seek（竖屏忽略 = 无 seek，防误触）
+        if (_fullscreen) _onSeekDragUpdate(d);
+        break;
+      case PanSlideMode.vertical:
+        _onVerticalDragUpdate(d);
+        break;
+      case null:
+        break;
+    }
+  }
+
+  /// 锁定主导方向：初始化对应模式的拖动状态（水平 → seek 基准；垂直 →
+  /// 半屏定亮度/音量并取原生基准）。
+  void _lockPanMode(PanSlideMode m) {
+    _panMode = m;
+    switch (m) {
+      case PanSlideMode.horizontal:
+        if (_fullscreen) _beginSeekDrag();
+        break;
+      case PanSlideMode.vertical:
+        _beginVerticalAdjust();
+        break;
+    }
+    debugPrint('[player_page] 手势锁定 mode=${m.name}');
+  }
+
+  /// 手势结束：按锁定模式收尾（水平 → seekTo + 保存进度；垂直 → 复位类型），
+  /// 随后复位本次手势状态。位移未达阈值（mode 仍为 null）= 点按 / 微移，
+  /// 不产生任何动作（tap / 双击 / 长按已由 GestureDetector 另行处理）。
+  void _onPanEnd(DragEndDetails d) async {
+    final m = _panMode;
+    _panMode = null;
+    switch (m) {
+      case PanSlideMode.horizontal:
+        if (_fullscreen) await _onSeekDragEnd(d);
+        break;
+      case PanSlideMode.vertical:
+        _onVerticalDragEnd(d);
+        break;
+      case null:
+        break;
+    }
+  }
+
+  /// 手势被系统打断（来电 / 通知栏下拉等）：复位拖动状态，
+  /// 避免 _seekDragging 一直卡住 tick 位置刷新。
+  void _onPanCancel() {
+    _panMode = null;
+    if (_seekDragging) {
+      _seekDragging = false;
+      _scheduleHudHide(const Duration(milliseconds: 600));
+    }
+    if (_adjustKind != null) {
+      _adjustKind = null;
+      _adjustReady = false;
+      _scheduleHudHide(const Duration(milliseconds: 700));
+    }
+  }
+
+  // ---------- horizontal（水平主导）→ 全屏横屏 seek ----------
+
+  /// 锁定为水平且在全屏横屏：初始化 seek（基准 = 当前播放位置，位移从
+  /// 锁定起累计）。竖屏不建 seek（水平主导忽略）。
+  void _beginSeekDrag() {
     if (_player == null || _durationMs <= 0) return;
     _seekDragging = true;
     _seekDragBaseMs = _positionMs;
@@ -1177,7 +1321,7 @@ class _PlayerPageState extends State<PlayerPage> {
     _showSeekHud(target);
   }
 
-  void _onSeekDragEnd(DragEndDetails _) async {
+  Future<void> _onSeekDragEnd(DragEndDetails _) async {
     if (!_seekDragging) return;
     _seekDragging = false;
     final fraction = slideFraction(_seekDragDx, _seekDragSpan);
@@ -1194,16 +1338,15 @@ class _PlayerPageState extends State<PlayerPage> {
     _scheduleHudHide(const Duration(milliseconds: 600));
   }
 
-  // ---------- 竖屏纵向滑动调亮度 / 音量 ----------
+  // ---------- vertical（垂直主导）→ 亮度 / 音量（横竖屏都可用） ----------
 
-  /// 纵向手势开始：按起点 x 半屏判定类型，再异步取原生基准值
+  /// 锁定为垂直：按起点 [_panStartX] 半屏判定类型，再异步取原生基准值
   /// （取到前 _adjustReady=false，期间忽略滑动；通道失败则本次手势作废）。
-  void _onVerticalDragStart(DragStartDetails d) {
-    if (_player == null) return;
+  void _beginVerticalAdjust() {
     final width = MediaQuery.sizeOf(context).width;
-    final kind = verticalSlideKind(d.localPosition.dx, width);
-    debugPrint('[player_page] 纵向手势开始 kind=${kind.name} '
-        'x=${d.localPosition.dx.toStringAsFixed(0)}px');
+    final kind = verticalSlideKind(_panStartX, width);
+    debugPrint('[player_page] 垂直手势开始 kind=${kind.name} '
+        'x=${_panStartX.toStringAsFixed(0)}px');
     _adjustKind = kind;
     _adjustReady = false;
     _adjustDy = 0;
@@ -2736,9 +2879,13 @@ class _PlayerPageState extends State<PlayerPage> {
           //      Tap 需等双击窗口（~300ms）判定——双击赢得 → 单击自动取消
           //      （双击不误触显隐）；单击赢得 → 显隐延迟 ~300ms 触发
           //    - 长按 2x：按住不动 500ms 赢得，期间不响应滑动（松开再滑）
-          //    - 横屏 seek 与竖屏亮度/音量**按方向分屏注册**：仅 _fullscreen 注册
-          //      HorizontalDrag、仅竖屏注册 VerticalDrag（GestureDetector 对 null
-          //      回调不建识别器）→ 不存在方向的手势不会抢判定
+          //    - 滑动（v2.16.9+）：**单一 Pan 注册**（横竖屏统一）——pan 需位移
+          //      超 touchSlop 才赢得竞技场（tap 无位移不受影响）；赢后由
+          //      [decideMode] 按主导方向锁定：水平主导 → 仅全屏横屏 seek，
+          //      垂直主导 → 起点半屏亮度/音量（横竖屏都可用，斜向按主方向归类；
+          //      锁定后本次手势不再切换）。v2.16.7 旧实现「横屏只注册横向、
+          //      竖屏只注册纵向」→ 横屏全屏稍斜的上下滑被误判为横向 seek、
+          //      纯上下滑完全无响应——本次修复让两者共存
           //    - 控制层按钮 / 进度条在本层**之后**渲染（Stack 上层），其区域内
           //      点击与拖动天然拦截（按钮优先）；弹幕层 IgnorePointer 不参与命中
           //    听视频模式下让位给占位层（其自己处理点按恢复画面 + 长按 2x），
@@ -2751,18 +2898,12 @@ class _PlayerPageState extends State<PlayerPage> {
                 onDoubleTap: _player == null ? null : _onDoubleTap,
                 onLongPressStart: _player == null ? null : _onLongPressStart,
                 onLongPressEnd: _player == null ? null : _onLongPressEnd,
-                // 横屏 seek（仅全屏注册；拖满一屏 ≈ 滑过 100% 时长）
-                onHorizontalDragStart:
-                    _fullscreen ? _onSeekDragStart : null,
-                onHorizontalDragUpdate:
-                    _fullscreen ? _onSeekDragUpdate : null,
-                onHorizontalDragEnd: _fullscreen ? _onSeekDragEnd : null,
-                // 竖屏亮度/音量（仅非全屏注册）
-                onVerticalDragStart:
-                    !_fullscreen ? _onVerticalDragStart : null,
-                onVerticalDragUpdate:
-                    !_fullscreen ? _onVerticalDragUpdate : null,
-                onVerticalDragEnd: !_fullscreen ? _onVerticalDragEnd : null,
+                // 滑动统一 Pan（v2.16.9+）：方向判定在手势内完成——全屏横屏
+                // 水平主导 seek、垂直主导亮度/音量共存；竖屏水平主导忽略
+                onPanStart: _player == null ? null : _onPanStart,
+                onPanUpdate: _player == null ? null : _onPanUpdate,
+                onPanEnd: _player == null ? null : _onPanEnd,
+                onPanCancel: _player == null ? null : _onPanCancel,
               ),
             ),
           // 5. 控制层（置于点击层之上）

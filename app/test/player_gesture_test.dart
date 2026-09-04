@@ -1,5 +1,8 @@
 // 播放页 B 站式快捷手势纯逻辑单测（v2.16.7+，无原生/网络依赖）：
 // - verticalSlideKind：竖屏纵向滑动起点半屏判定 → 亮度 / 音量
+// - decideMode：滑动主导方向判定（v2.16.9+ 横屏 seek 与亮度/音量共存——
+//   斜向按位移主方向归类，|dx|>=|dy|→horizontal、|dy|>|dx|→vertical）
+// - nextPanMode：方向锁定（已有模式不受后续位移影响，本次手势不切换）
 // - slideFraction：位移 → 比例（拖满一屏 = ±100%，防除零 / 越界钳制）
 // - seekTargetMs：横屏 seek 目标位置（基准 + 比例 × 时长，钳制 0..时长）
 // - volumeTargetLevel：音量目标档（基准 + 比例 × 最大档，钳制 0..max）
@@ -22,6 +25,67 @@ void main() {
     test('起点 x 在右半屏 → 音量', () {
       expect(verticalSlideKind(206, 411), PlayerSlideKind.volume);
       expect(verticalSlideKind(411, 411), PlayerSlideKind.volume);
+    });
+  });
+
+  group('decideMode（主导方向判定，v2.16.9+）', () {
+    test('dx/dy 都未超阈值 → null（未定，继续累计）', () {
+      expect(decideMode(10, 100, 100), isNull); // 阈值内全量判定
+      expect(decideMode(11, 3), isNull);
+      expect(decideMode(12, 12), isNull); // 恰在阈值上仍不算
+      expect(decideMode(0, 0), isNull);
+      expect(decideMode(5, -8), isNull);
+    });
+
+    test('垂直主导（|dy| > |dx| 且超阈值）→ vertical', () {
+      expect(decideMode(10, 100), PanSlideMode.vertical); // 稍斜的上下滑
+      expect(decideMode(100, 1000), PanSlideMode.vertical);
+      expect(decideMode(3, 15), PanSlideMode.vertical);
+    });
+
+    test('水平主导（|dx| >= |dy| 且超阈值）→ horizontal', () {
+      expect(decideMode(100, 10), PanSlideMode.horizontal); // 稍斜的左右滑
+      expect(decideMode(1000, 100), PanSlideMode.horizontal);
+      expect(decideMode(15, 3), PanSlideMode.horizontal);
+    });
+
+    test('45° 平分（|dx| == |dy|）→ horizontal（|dx| 不落后即归水平）', () {
+      expect(decideMode(100, 100), PanSlideMode.horizontal);
+      expect(decideMode(-50, -50), PanSlideMode.horizontal);
+      expect(decideMode(13, 13), PanSlideMode.horizontal);
+    });
+
+    test('负数方向不影响归类（符号只表左右/上下）', () {
+      expect(decideMode(-10, -100), PanSlideMode.vertical); // 向左下滑
+      expect(decideMode(-100, -10), PanSlideMode.horizontal); // 向左上滑
+      expect(decideMode(100, -200), PanSlideMode.vertical); // 右下滑
+      expect(decideMode(-300, 40), PanSlideMode.horizontal); // 左上/右斜
+    });
+  });
+
+  group('nextPanMode（方向锁定，本次手势不切换）', () {
+    test('未锁定（current=null）时交给 decideMode 判定', () {
+      expect(nextPanMode(current: null, dx: 10, dy: 100),
+          PanSlideMode.vertical);
+      expect(nextPanMode(current: null, dx: 100, dy: 10),
+          PanSlideMode.horizontal);
+      expect(nextPanMode(current: null, dx: 5, dy: 5), isNull);
+    });
+
+    test('已锁定 → 不受后续位移影响（斜向反超也不切换）', () {
+      // 先锁定 horizontal，后续大幅垂直位移仍保持 horizontal
+      expect(
+          nextPanMode(
+              current: PanSlideMode.horizontal, dx: 5, dy: 500),
+          PanSlideMode.horizontal);
+      // 先锁定 vertical，后续大幅水平位移仍保持 vertical
+      expect(
+          nextPanMode(current: PanSlideMode.vertical, dx: 500, dy: 5),
+          PanSlideMode.vertical);
+      // 微小抖动同样不回退为未定
+      expect(
+          nextPanMode(current: PanSlideMode.vertical, dx: 1, dy: 1),
+          PanSlideMode.vertical);
     });
   });
 
