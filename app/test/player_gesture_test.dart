@@ -8,6 +8,9 @@
 // - volumeTargetLevel：音量目标档（基准 + 比例 × 灵敏度 × 最大档，钳制 0..max）
 // - adjustPercent / brightnessPercent：纵向调节百分比（灵敏度 0.3：滑满一屏
 //   ±30%、小幅平滑；亮度下限 5%）
+// - isExcludedGestureStart：手势起点豁免带判定（v2.16.14+，起点 y0 落在屏幕
+//   底部 max(屏高×factor, minPx) 带内或顶部 topPx 带内 → 本次 Pan 忽略，
+//   让给系统导航手势；边界含等号；height<=0 防御不豁免）
 //
 // 逻辑见 lib/pages/player_page.dart 顶部的纯函数（与会员集 pgc 回退同风格，
 // 便于脱离 Widget/原生通道直接测判定与换算）。
@@ -232,6 +235,66 @@ void main() {
       expect(brightnessPercent(basePercent: 5, fraction: 1), 35);
       expect(brightnessPercent(basePercent: 90, fraction: 1), 100);
       expect(brightnessPercent(basePercent: 40, fraction: 0.1), 43);
+    });
+  });
+
+  group('isExcludedGestureStart（起点豁免带，v2.16.14+）', () {
+    // 默认参数：bottomFactor=0.08、bottomMinPx=48、topPx=24。
+    // h=1000：底部带 = max(1000×0.08, 48) = 80px → 带上缘 920。
+    test('底部带内（含带上缘边界）→ true', () {
+      expect(isExcludedGestureStart(y0: 999, height: 1000), isTrue); // 贴屏幕底
+      expect(isExcludedGestureStart(y0: 950, height: 1000), isTrue);
+      expect(isExcludedGestureStart(y0: 920, height: 1000), isTrue); // 上缘含等号
+    });
+
+    test('底部带上缘外（带上方一点/中部）→ false', () {
+      expect(isExcludedGestureStart(y0: 919.9, height: 1000), isFalse);
+      expect(isExcludedGestureStart(y0: 800, height: 1000), isFalse); // 中部
+      expect(isExcludedGestureStart(y0: 500, height: 1000), isFalse);
+    });
+
+    test('顶部带内（含边界 24px）→ true', () {
+      expect(isExcludedGestureStart(y0: 0, height: 1000), isTrue); // 贴屏幕顶
+      expect(isExcludedGestureStart(y0: 10, height: 1000), isTrue);
+      expect(isExcludedGestureStart(y0: 24, height: 1000), isTrue); // 边界含等号
+    });
+
+    test('顶带下缘外且不在底部带（中部净区）→ false', () {
+      expect(isExcludedGestureStart(y0: 25, height: 1000), isFalse);
+      expect(isExcludedGestureStart(y0: 100, height: 1000), isFalse);
+    });
+
+    test('矮屏（横屏屏高 ~400）由固定 minPx 兜底加宽豁免带', () {
+      // h=400：8% = 32px < 48px → 底部带取 48px，带上缘 = 400-48 = 352
+      expect(isExcludedGestureStart(y0: 399, height: 400), isTrue);
+      expect(isExcludedGestureStart(y0: 360, height: 400), isTrue);
+      expect(isExcludedGestureStart(y0: 352, height: 400), isTrue); // 边界
+      expect(isExcludedGestureStart(y0: 351, height: 400), isFalse); // 带外
+      expect(isExcludedGestureStart(y0: 100, height: 400), isFalse);
+    });
+
+    test('显式 bottomMinPx=0 → 纯比例带（无固定兜底，可单独验证 factor）', () {
+      // h=400、factor=0.08、minPx=0：底部带 = 32px，带上缘 = 368
+      expect(isExcludedGestureStart(y0: 380, height: 400, bottomMinPx: 0),
+          isTrue);
+      expect(isExcludedGestureStart(y0: 368, height: 400, bottomMinPx: 0),
+          isTrue); // 边界
+      expect(isExcludedGestureStart(y0: 360, height: 400, bottomMinPx: 0),
+          isFalse); // 无兜底时 360 已在 8% 带外
+      // 加大 factor（如 0.12）→ 带加宽，同一起点变为带内
+      expect(isExcludedGestureStart(
+              y0: 360, height: 400, bottomFactor: 0.12, bottomMinPx: 0),
+          isTrue); // 400×0.12=48px 带上缘 352
+    });
+
+    test('顶部带可关（topPx=0）：仅贴屏幕顶（y0=0）在顶带内', () {
+      expect(isExcludedGestureStart(y0: 0, height: 1000, topPx: 0), isTrue);
+      expect(isExcludedGestureStart(y0: 1, height: 1000, topPx: 0), isFalse);
+    });
+
+    test('高度异常（<= 0，防御）→ false（不豁免，退化旧行为）', () {
+      expect(isExcludedGestureStart(y0: 0, height: 0), isFalse);
+      expect(isExcludedGestureStart(y0: 999, height: -1), isFalse);
     });
   });
 }
