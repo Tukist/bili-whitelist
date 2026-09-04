@@ -28,6 +28,11 @@
 ///   行全忙 → 丢弃。高密度下优先不叠字（宁可丢几条）。
 /// - **屏蔽（v2.16.6）**：发射前按 [settings] 过滤（屏蔽词 substring /
 ///   屏蔽类型）；设置变更（新实例）→ 清活跃并按当前播放位置重载，即时生效。
+/// - **显示区域（v2.16.13）**：[settings.displayAreaPercent]（10%~100%）把
+///   弹幕带等比压缩到屏幕上方该比例高度内（顶锚/底锚同乘比例，轨道数按
+///   缩放后带高换算）——弹幕不再飘到画面中下部；100% 与旧版布局逐像素
+///   一致。区域/屏蔽/透明度任一设置变化都走「新实例 → 清屏重载」，区域
+///   调小即时清屏按新区域重排。
 /// - **透明度（v2.16.6）**：[settings.opacity]（20%~100%）乘到绘制 alpha；
 ///   顶部/底部弹幕带 0.15s 淡入 + 0.4s 淡出（透明度为 1 时零额外开销）。
 /// - **绘制**：CustomPaint + 缓存 TextPainter（发射时 layout 一次，每帧只
@@ -100,6 +105,23 @@ const double _bottomAreaRatio = 0.82;
 /// 顶部/底部弹幕各自保留的行数（纵向堆叠层数）。
 const int _topLaneCount = 3;
 const int _bottomLaneCount = 2;
+
+/// 弹幕带总行数上限（含顶/底固定行；防超大屏算出离谱多的滚动轨道）。
+const int _maxTotalLanes = 60;
+
+/// 由「弹幕可用带高」换算滚动轨道数（纯逻辑，可单测）：
+/// 带高 = 屏高 × [danmaku_overlay 可用带比例 0.70] × displayAreaPercent/100。
+/// 总可切行 = floor(带高 / 行高)，扣除顶/底固定行后的余量即滚动轨道数；
+/// 总行保底 = 顶+底+1（区域过小也至少保留 1 条滚动轨），封顶 [_maxTotalLanes]。
+/// 例：屏高 1080、行高 27、区域 30% → 带高 ≈ 226.8px → 8 行 - 3 顶 - 2 底
+/// = **3 条滚动轨**（区域 100% 时 28-5=23 条，与 v2.16.12 及更早完全一致）。
+int danmakuScrollLaneCount(double areaHeightPx, double laneH,
+    {int topLanes = _topLaneCount, int bottomLanes = _bottomLaneCount}) {
+  final total = (areaHeightPx / laneH)
+      .floor()
+      .clamp(topLanes + bottomLanes + 1, _maxTotalLanes);
+  return total - topLanes - bottomLanes;
+}
 
 /// 单帧发射预算：密集弹幕（时间点重合/轮询补齐）分散到后续帧逐个进入，
 /// 避免单帧集中 layout 文本掉帧（帧率稳定的关键）。
@@ -174,8 +196,8 @@ class DanmakuOverlay extends StatefulWidget {
   /// 最新播放位置（毫秒，父层 500ms 轮询刷新）。
   final int positionMs;
 
-  /// 弹幕显示设置（屏蔽词/屏蔽类型/透明度）。设置值变化 → 父层传**新实例**
-  /// （copyWith），本层感知后清活跃按当前位置重载（即时生效）。
+  /// 弹幕显示设置（屏蔽词/屏蔽类型/透明度/显示区域）。设置值变化 → 父层传
+  /// **新实例**（copyWith），本层感知后清活跃按当前位置重载（即时生效）。
   final DanmakuSettings settings;
 
   const DanmakuOverlay({
@@ -256,11 +278,19 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
       _lastPosMs = widget.positionMs;
       return;
     }
-    // 设置变化（父层改动屏蔽词/屏蔽类型/透明度 → copyWith 新实例）：
+    // 设置变化（父层改动屏蔽词/屏蔽类型/透明度/显示区域 → copyWith 新实例）：
     // 清活跃 + 按当前播放位置重载，让屏蔽即时生效（在屏残留立即移除，
-    // 且不重放已播弹幕——游标维持当前位置不动）。
+    // 且不重放已播弹幕——游标维持当前位置不动）。**显示区域变化还要重算
+    // 布局**（轨道数/锚点随百分比变）——否则区域调小不生效，直到下次旋转/
+    // 切集才重排。
     if (!identical(oldWidget.settings, widget.settings)) {
       debugPrint('[danmaku] 设置变更 -> ${widget.settings}，清屏重载');
+      if (oldWidget.settings.displayAreaPercent !=
+          widget.settings.displayAreaPercent) {
+        _needRelayout = true;
+        debugPrint('[danmaku] 显示区域 ${oldWidget.settings.displayAreaPercent}%'
+            ' -> ${widget.settings.displayAreaPercent}%，标记重算布局');
+      }
       _reset(rewindToCurrent: true);
       _lastPosMs = widget.positionMs;
     } else {
@@ -303,14 +333,20 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
     final w = size.width;
     final h = size.height;
     _laneH = danmakuDisplayFontSize(25) * 1.6; // 行高：普通字号行高+余量
-    // 弹幕可用带占屏高 70%（顶部 12% 控制带之下起）；总行 = 顶 + 滚 + 底
-    final total = ((h * _usableAreaRatio) / _laneH)
-        .floor()
-        .clamp(_topLaneCount + _bottomLaneCount + 1, 60);
-    final scrollLanes = total - _topLaneCount - _bottomLaneCount;
-    _topY0 = h * _topAreaRatio;
+    // 显示区域（v2.16.13）：弹幕带按 displayAreaPercent 等比压缩到屏幕
+    // 上方 —— 顶锚/底锚随比例缩放（100% = 旧版 0.12h~0.82h 带，逐像素
+    // 一致），轨道数按缩放后的带高换算（见 danmakuScrollLaneCount）。
+    final ratio = widget.settings.displayAreaPercent / 100.0;
+    final areaH = h * _usableAreaRatio * ratio; // 顶锚~底锚间的带高（px）
+    final scrollLanes = danmakuScrollLaneCount(areaH, _laneH);
+    _topY0 = h * _topAreaRatio * ratio;
+    // 底锚：比例缩放值 与「区域下界 − 底部 2 行高」取小——极小区域下底行
+    // 上提，保证底部弹幕不越出区域下界（100% 时取缩放值，与旧版一致）。
+    _bottomY0 = math.min(
+      h * _bottomAreaRatio * ratio,
+      h * ratio - _bottomLaneCount * _laneH,
+    );
     _scrollY0 = _topY0 + _topLaneCount * _laneH;
-    _bottomY0 = h * _bottomAreaRatio;
     _lanes = DanmakuLanes(
       screenWidth: w,
       entryGap: 10,
@@ -319,9 +355,16 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
       bottomLanes: _bottomLaneCount,
       staySec: kDanmakuStaySec,
     );
+    // 布局日志：区域 + 轨道数 + 最大发射 y（供模拟器实测断言
+    // 「区域 N% → 轨道 y 上限 ≈ 屏高×N/100」）。
+    final maxY = _bottomY0 + (_bottomLaneCount - 1) * _laneH;
     debugPrint('[danmaku] 布局: 屏 ${w.round()}x${h.round()} 行高 '
-        '${_laneH.round()} 滚动轨道 $scrollLanes 顶 $_topLaneCount '
-        '底 $_bottomLaneCount');
+        '${_laneH.round()} 区域 ${widget.settings.displayAreaPercent}%'
+        '（高度 ${areaH.round()}px/总带 ${(h * ratio).round()}px）'
+        ' 滚动轨道 $scrollLanes 顶 $_topLaneCount 底 $_bottomLaneCount'
+        ' | 轨道 y 范围 ${_topY0.round()}~${maxY.round()}'
+        '（区域下界 ${(h * ratio).round()}px，限制比 '
+        '${(maxY / h * 100).toStringAsFixed(1)}%）');
   }
 
   /// 取指定滚动轨道（下标 i）的顶部 y。

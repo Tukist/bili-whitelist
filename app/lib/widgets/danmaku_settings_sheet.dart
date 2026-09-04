@@ -1,5 +1,6 @@
-/// 弹幕设置面板（BottomSheet 内容，v2.16.6+）：
-/// 屏蔽类型（滚动/顶部/底部）+ 屏蔽关键词管理 + 全局透明度滑杆。
+/// 弹幕设置面板（BottomSheet 内容，v2.16.6+ → v2.16.13+ 显示区域）：
+/// 屏蔽类型（滚动/顶部/底部）+ 显示区域（10%~100% 步进 10）+ 屏蔽关键词
+/// 管理 + 全局透明度滑杆。
 ///
 /// 自包含 StatefulWidget：内部持有编辑态，任何改动即时 [onChanged] 回传
 /// 父层（播放页 setState 让渲染层生效 + 持久化）。父层通过 `showModalBottomSheet`
@@ -169,6 +170,35 @@ class _DanmakuSettingsSheetState extends State<DanmakuSettingsSheet> {
               textInputAction: TextInputAction.done,
               onSubmitted: _addWord,
             ),
+            const Divider(height: 20),
+            // ---- 显示区域（v2.16.13）----
+            Row(
+              children: [
+                const Text('显示区域', style: _kSectionTitleStyle),
+                const Spacer(),
+                Text('${_s.displayAreaPercent}%',
+                    style: const TextStyle(
+                        color: Colors.white70,
+                        fontSize: 13,
+                        fontWeight: FontWeight.w600)),
+              ],
+            ),
+            Slider(
+              value: _s.displayAreaPercent.toDouble(),
+              min: kDanmakuDisplayAreaMin.toDouble(),
+              max: kDanmakuDisplayAreaMax.toDouble(),
+              divisions: (kDanmakuDisplayAreaMax - kDanmakuDisplayAreaMin) ~/
+                  kDanmakuDisplayAreaStep,
+              activeColor: Colors.pinkAccent,
+              inactiveColor: Colors.white24,
+              label: '${_s.displayAreaPercent}%',
+              onChanged: (v) =>
+                  _set(_s.copyWith(displayAreaPercent: v.round())),
+            ),
+            const SizedBox(height: 2),
+            const Text('弹幕只在屏幕上方 N% 高度内滚动，防飘到画面中下部妨碍观感'
+                '（100% = 默认全屏带），设置自动保存',
+                style: TextStyle(color: Colors.white24, fontSize: 11)),
             const Divider(height: 20),
             // ---- 透明度 ----
             Row(

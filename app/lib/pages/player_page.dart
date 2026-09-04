@@ -412,19 +412,23 @@ class _PlayerPageState extends State<PlayerPage> {
   // （无 pages 数据 → 单 P，不展示选集 UI）
   int _currentPageIndex = 0;
 
-  // 弹幕（播放页弹幕层，v2.16.3+ → v2.16.6+ 屏蔽/透明度）
+  // 弹幕（播放页弹幕层，v2.16.3+ → v2.16.6+ 屏蔽/透明度 → v2.16.13+
+  // 显示区域/设置记忆）
   // ---------------------------------------------------------------------
   // 开关默认关；开启时按当前集 cid 拉取弹幕 XML（fetchDanmaku，失败静默
   // 返回空不阻塞播放）→ 交给 DanmakuOverlay 随时间发射渲染。
   // 渲染层只在「开关开 && 有数据」时构建，关闭无任何开销。
-  // 弹幕设置（屏蔽词/屏蔽类型/透明度）：进页异步加载本地持久化值；改动
-  // 经 _showDanmakuSettings 回写 state（overlay 收到新 settings 实例即时
-  // 重载生效）并保存。
+  // 弹幕设置（屏蔽词/屏蔽类型/透明度/显示区域/开关状态）：进页异步加载本地
+  // 持久化值（开关记忆上次开 → 本次自动开并自动拉弹幕）；改动经
+  // _showDanmakuSettings / _toggleDanmaku 回写 state（overlay 收到新
+  // settings 实例即时重载生效）并保存。
 
-  /// 弹幕总开关（默认关；开启才拉取并显示）。
+  /// 弹幕总开关（默认关；开启才拉取并显示）。v2.16.13 起由持久化设置
+  /// 的 enabled 字段初始化/保存（见 _loadDanmakuSettings/_toggleDanmaku）。
   bool _danmakuEnabled = false;
 
-  /// 弹幕显示设置（屏蔽词/类型/透明度；overlay 渲染与发射过滤用）。
+  /// 弹幕显示设置（屏蔽词/类型/透明度/显示区域/开关；overlay 渲染与发射
+  /// 过滤用）。
   DanmakuSettings _danmakuSettings = const DanmakuSettings();
 
   /// 当前集（cid）的全量弹幕（按 timeSec 升序）；切集/关闭时清空。
@@ -1602,27 +1606,39 @@ class _PlayerPageState extends State<PlayerPage> {
   // -------------------------------------------------------------------------
 
   /// 弹幕开关：开 → 拉取当前 cid 弹幕并显示；关 → 清空显示数据（缓存保留）。
+  /// v2.16.13 起开关状态并入设置持久化——重启 App 后保持上次开关状态。
   void _toggleDanmaku() {
     final on = !_danmakuEnabled;
     debugPrint('[player_page] 弹幕开关 -> ${on ? '开' : '关'} cid=$_currentCid');
     setState(() {
       _danmakuEnabled = on;
+      _danmakuSettings = _danmakuSettings.copyWith(enabled: on);
       if (!on) {
         _danmaku = const []; // 关闭：清空渲染数据（cache 保留，重开秒显示）
       }
     });
+    // 立即持久化开关（fire-and-forget：失败静默，下次进页读不到用默认）
+    DanmakuSettingsStore.instance.save(_danmakuSettings);
     if (on) _loadDanmaku();
   }
 
-  /// 异步加载弹幕设置（屏蔽词/类型/透明度）。带超时保护：测试环境无
-  /// shared_preferences 原生通道时 getInstance 永不返回，不能阻塞播放
-  /// 初始化（与 PlaybackProgress.load 同模式）；超时/异常保持默认设置。
+  /// 异步加载弹幕设置（屏蔽词/类型/透明度/显示区域/**开关记忆**）。带超时
+  /// 保护：测试环境无 shared_preferences 原生通道时 getInstance 永不返回，
+  /// 不能阻塞播放初始化（与 PlaybackProgress.load 同模式）；超时/异常保持
+  /// 默认设置。
   Future<void> _loadDanmakuSettings() async {
     try {
       final s = await DanmakuSettingsStore.instance
           .get()
           .timeout(const Duration(milliseconds: 500));
-      if (mounted) setState(() => _danmakuSettings = s);
+      if (!mounted) return;
+      setState(() {
+        _danmakuSettings = s;
+        // 开关记忆（v2.16.13）：上次开着 → 本次进播放页自动开（不用再点）
+        _danmakuEnabled = s.enabled;
+      });
+      // 记忆为开 → 自动拉当前集弹幕（切集走 _switchPage 同样按开启状态拉取）
+      if (s.enabled) _loadDanmaku();
     } catch (_) {
       // 超时/存储异常：保持默认设置（不影响播放）
     }

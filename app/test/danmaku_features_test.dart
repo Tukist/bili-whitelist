@@ -1,11 +1,14 @@
-// 弹幕增强（v2.16.6+）单元测试：
+// 弹幕增强（v2.16.6+ → v2.16.13+ 显示区域）单元测试：
 // - DanmakuLanes：滚动真碰撞轨道分配（空轨/同速/快慢追尾/打满丢弃/出屏
 //   腾空）、顶部/底部行堆叠与全忙丢弃、advance 推进
 // - DanmakuSettings：屏蔽词 substring 匹配（大小写不敏感）、类型屏蔽判定、
-//   透明度 clamp、JSON 序列化/容错
+//   透明度 clamp、JSON 序列化/容错、开关 enabled/显示区域 displayAreaPercent
+//   字段（roundtrip / 缺失回默认 / 脏值归一化到 10~100 步进 10）
 // - DanmakuSettingsStore：shared_preferences mock 存取 roundtrip、
 //   无记录/损坏 JSON → 默认设置
-// - DanmakuOverlay：widget smoke（Ticker + 发射 + 透明度设置不抛异常）
+// - DanmakuOverlay：widget smoke（Ticker + 发射 + 透明度设置不抛异常）、
+//   显示区域轨道换算纯逻辑 danmakuScrollLaneCount（100% 与旧版一致 /
+//   30% 显著减少 / 极小区域保底）
 // 不访问真实网络。
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -189,11 +192,31 @@ void main() {
       expect(s.copyWith().opacity, 1.0);
     });
 
+    test('默认值：开关关、显示区域 100（旧版全屏带）', () {
+      const s = DanmakuSettings();
+      expect(s.enabled, isFalse);
+      expect(s.displayAreaPercent, kDanmakuDisplayAreaMax);
+    });
+
+    test('displayArea 归一化：越界/非步进收敛到 10~100 的 10 倍数', () {
+      expect(DanmakuSettings.normalizeDisplayArea(100), 100);
+      expect(DanmakuSettings.normalizeDisplayArea(30), 30);
+      expect(DanmakuSettings.normalizeDisplayArea(200), 100);
+      expect(DanmakuSettings.normalizeDisplayArea(5), kDanmakuDisplayAreaMin);
+      expect(DanmakuSettings.normalizeDisplayArea(33), 30); // 就近 10 倍数
+      // copyWith 同样收敛（UI 滑杆步进之外不产生非法值）
+      expect(
+          const DanmakuSettings().copyWith(displayAreaPercent: 33).displayAreaPercent,
+          30);
+    });
+
     test('JSON roundtrip 保留全部字段', () {
       const s = DanmakuSettings(
         blockWords: ['词1', '词2'],
         blockScroll: true,
         blockBottom: true,
+        enabled: true,
+        displayAreaPercent: 30,
         opacity: 0.5,
       );
       final back = DanmakuSettings.fromJson(s.toJson());
@@ -201,23 +224,34 @@ void main() {
       expect(back.blockScroll, isTrue);
       expect(back.blockTop, isFalse);
       expect(back.blockBottom, isTrue);
+      expect(back.enabled, isTrue);
+      expect(back.displayAreaPercent, 30);
       expect(back.opacity, closeTo(0.5, 1e-9));
+      // JSON 字面量核对（enabled/displayAreaPercent 字段确实写入）
+      expect(s.toJson()['enabled'], isTrue);
+      expect(s.toJson()['displayAreaPercent'], 30);
     });
 
     test('fromJson 容错：缺字段/类型非法/脏词 → 回退默认/清洗', () {
-      // 完全空 map → 全默认
+      // 完全空 map → 全默认（含旧版本无 enabled/displayAreaPercent 字段）
       final def = DanmakuSettings.fromJson(const {});
       expect(def.blockWords, isEmpty);
       expect(def.opacity, 1.0);
-      // 脏类型 → 默认（bool 不是 bool、opacity 超界 clamp）
+      expect(def.enabled, isFalse);
+      expect(def.displayAreaPercent, kDanmakuDisplayAreaMax);
+      // 脏类型 → 默认（bool 不是 bool、opacity 超界 clamp、区域非法收敛）
       final dirty = DanmakuSettings.fromJson(const {
         'blockWords': [' 有空格 ', '', 'ok'],
         'blockScroll': 'not-bool',
         'opacity': 9.0,
+        'enabled': 'yes',
+        'displayAreaPercent': 7,
       });
       expect(dirty.blockWords, ['有空格', 'ok']); // 清洗生效
       expect(dirty.blockScroll, isFalse);
       expect(dirty.opacity, kDanmakuOpacityMax);
+      expect(dirty.enabled, isFalse); // 脏 bool → 默认关
+      expect(dirty.displayAreaPercent, kDanmakuDisplayAreaMin); // 7 → 10
     });
   });
 
@@ -228,6 +262,8 @@ void main() {
       expect(s.blockWords, isEmpty);
       expect(s.opacity, 1.0);
       expect(s.blockScroll, isFalse);
+      expect(s.enabled, isFalse);
+      expect(s.displayAreaPercent, kDanmakuDisplayAreaMax);
     });
 
     test('save → get roundtrip', () async {
@@ -235,6 +271,8 @@ void main() {
       const saved = DanmakuSettings(
         blockWords: ['awsl', '哈哈哈哈'],
         blockTop: true,
+        enabled: true,
+        displayAreaPercent: 30,
         opacity: 0.45,
       );
       await DanmakuSettingsStore.instance.save(saved);
@@ -242,6 +280,8 @@ void main() {
       expect(back.blockWords, ['awsl', '哈哈哈哈']);
       expect(back.blockTop, isTrue);
       expect(back.blockScroll, isFalse);
+      expect(back.enabled, isTrue);
+      expect(back.displayAreaPercent, 30);
       expect(back.opacity, closeTo(0.45, 1e-9));
     });
 
@@ -323,6 +363,34 @@ void main() {
       await tester.pumpWidget(build(const DanmakuSettings(opacity: 0.3)));
       await tester.pump(const Duration(milliseconds: 200));
       await tester.pumpWidget(const SizedBox());
+    });
+  });
+
+  group('DanmakuOverlay 显示区域轨道换算（v2.16.13）', () {
+    const laneH = 27.0; // 常规行高：字号 25 × 1.6
+
+    test('100%：与 v2.16.12 旧布局一致（0.7h 带 → 28 行 → 滚动 23）', () {
+      // 屏高 1080：可用带高 = 1080 × 0.7 = 756
+      expect(danmakuScrollLaneCount(756, laneH), 23);
+      expect(danmakuScrollLaneCount(756, laneH) + 3 + 2, 28);
+    });
+
+    test('区域 30%：带高按 0.3 缩减 → 轨道数显著减少（23 → 3）', () {
+      // 屏高 1080、区域 30%：带高 = 1080 × 0.7 × 0.3 = 226.8 → 8 行 - 顶3 底2
+      expect(danmakuScrollLaneCount(226.8, laneH), 3);
+      // 区域 50%：378 → 14 行 → 9 条滚动轨
+      expect(danmakuScrollLaneCount(378, laneH), 9);
+    });
+
+    test('区域小到带高不足固定行：保底 1 条滚动轨（不崩溃）', () {
+      // 区域 10%：带高 75.6 → floor 2 行，不足 顶3+底2 → 保底 6 总行
+      expect(danmakuScrollLaneCount(75.6, laneH), 1);
+    });
+
+    test('超大屏（带高极大）封顶 60 总行 → 滚动 55', () {
+      expect(danmakuScrollLaneCount(4000, laneH), 55);
+      // 正常小屏行高略变也不影响换算（如 640 高：0.7×640=448 → 16 行 → 11）
+      expect(danmakuScrollLaneCount(448, laneH), 11);
     });
   });
 
