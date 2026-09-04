@@ -1,15 +1,26 @@
 /// 播放页弹幕渲染层：随时间发射弹幕并在视频画面上滚动/停留。
 ///
-/// 设计要点（编码员权衡，v2.16.3 → v2.16.6 演进）：
+/// 设计要点（编码员权衡，v2.16.3 → v2.16.6 演进，v2.16.11 修复滚动连续性）：
 /// - **驱动**：内部 Ticker 每帧推进（60fps 平滑滚动）。父层每 500ms 轮询
 ///   getPosition 后把最新 [positionMs] 传进来（复用字幕进度节奏，弹幕发射
 ///   粒度 500ms 足够）。只有弹幕层存在（开启且有数据）才运行，关闭时
 ///   整个 widget 不构建 → 无任何开销。
+/// - **滚动连续性（v2.16.11 修复，根因）**：CustomPainter 挂在每帧通知的
+///   repaint listenable 上（外层 RepaintBoundary 隔离，只重绘本层不 rebuild）
+///   ——**推进的每一帧都落屏**。旧版只在"发射帧" setState 触发重绘：两批
+///   弹幕之间（可达父层 500ms 轮询间隔）弹幕位置在变但画面不刷新，等到下
+///   一次 setState 才一次性"跳"一段 → 视觉卡顿/跳跃/时快时慢。另外：
+///   - **时间基准**：帧间隙 > [kDanmakuGapResetSec]（切后台/引擎停摆恢复）
+///     视为长时间无帧 → 重置基准、本帧不推进（位置不跳，原地继续）；
+///     播放暂停（playing=false）每帧仍在更新基准 → 恢复瞬间 dt 不跳变。
+///   - **发射节奏**：按真实时间累计"发射信用"（速率 [kDanmakuSpawnRatePerSec]，
+///     封顶 [kDanmakuSpawnCreditMax]），seek/卡顿积压的密集窗口不再一次性
+///     扎堆补发，按信用摊到后续帧逐个进入。
 /// - **平滑（v2.16.6）**：位置推进严格按帧间时间差 dt（浮点秒）驱动，
-///   dt 钳制在 [maxDtSec] 内——掉帧/卡顿时弹幕不跳变（大步长会显得"生硬"），
-///   只按真实流逝时间缓慢追平。发射循环每帧有预算上限，密集弹幕分散到
-///   后续帧逐个进入（避免单帧集中布局 TextPainter 掉帧）。滚动弹幕尾缘
-///   被屏幕左缘裁剪消失、右缘屏外入场，天然无闪烁。
+///   dt 钳制在 [maxDtSec] 内——普通掉帧（<=100ms）弹幕不跳变（大步长会显得
+///   "生硬"），只按真实流逝时间平滑追平。发射循环每帧有预算上限，密集弹幕
+///   分散到后续帧逐个进入（避免单帧集中布局 TextPainter 掉帧）。滚动弹幕
+///   尾缘被屏幕左缘裁剪消失、右缘屏外入场，天然无闪烁。
 /// - **真碰撞分层（v2.16.6）**：不再 round-robin，改用 [DanmakuLanes]
 ///   轨道分配器——滚动弹幕每条轨道只记录"最后一条"的尾缘/速率，新弹幕
 ///   按追尾时间判定（O(1)），同轨追不上才进入；轨道全忙 → 丢弃（计丢弃
@@ -51,6 +62,35 @@ const double kDanmakuFadeOutSec = 0.4;
 
 /// 单帧 dt 钳制上限（秒）：掉帧超过该值不跳位置，按上限推进平滑恢复。
 const double kMaxDanmakuDtSec = 0.05;
+
+/// 帧间隙超过该值视为「长时间无帧」（切后台/引擎停摆/大卡顿恢复）——重置
+/// 时间基准、本帧不推进（弹幕原地继续），防止恢复瞬间按钳制上限大步"跳进"。
+const double kDanmakuGapResetSec = 0.1;
+
+/// 弹幕发射信用速率（条/秒）：发射按**真实流逝时间**累计信用，弹幕到达率
+/// 超过该速率时（seek 密集窗口/卡顿积压）超出部分摊平到后续帧逐帧进入，
+/// 避免掉帧恢复后一次性扎堆补发（视觉"涌出一堆"）。正常密度（几秒一条）
+/// 信用始终充足，不受影响。
+const double kDanmakuSpawnRatePerSec = 40;
+
+/// 发射信用瞬时上限（条）：突发时单帧最多连发的余额（再多也按速率摊平）。
+const double kDanmakuSpawnCreditMax = 4;
+
+/// 把帧间真实 dt（秒）平滑为弹幕推进用的 dt（纯逻辑，可单测）：
+/// - 超过 [kDanmakuGapResetSec]（切后台/暂停恢复等长时间无帧）→ 返回 0，
+///   调用方重置时间基准、本帧不推进——弹幕位置不跳，直接从原地继续；
+/// - 普通掉帧 → 钳制到 [kMaxDanmakuDtSec]，不产生肉眼可见的大步长；
+/// - 正常帧（<= 上限）→ 原样返回（按真实流逝推进，无累积漂移）。
+double danmakuSmoothDt(double dt) {
+  if (dt > kDanmakuGapResetSec) return 0;
+  return math.min(dt, kMaxDanmakuDtSec);
+}
+
+/// 发射信用在真实流逝 [dt]（秒，建议传已平滑值）后的余额：
+/// `credit + dt × 速率`，封顶 [kDanmakuSpawnCreditMax]。
+/// 大间隙帧 dt=0 → 信用不涨 → 恢复帧不会因积压而一口气补发多条。
+double danmakuCreditAfter(double credit, double dt) => math.min(
+    credit + dt * kDanmakuSpawnRatePerSec, kDanmakuSpawnCreditMax);
 
 /// 弹幕区占屏高比例（顶部 12% 起、底部控制带前止，见 _ensureLayout）。
 const double _topAreaRatio = 0.12;
@@ -155,6 +195,16 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
   late final Ticker _ticker;
   Duration _lastElapsed = Duration.zero;
 
+  /// 每帧重绘信号：CustomPainter 挂在它上面（见 [build]），tick 推进位置后
+  /// `value++` → 仅重绘本层（markNeedsPaint，不 rebuild widget 树）。
+  /// 弹幕滚动连续的关键：**位置推进的每一帧都必须落到屏幕**，而不是只在
+  /// 发射/父层 500ms 刷新时才 paint（旧实现导致弹幕"走 500ms 跳一次"）。
+  final ValueNotifier<int> _repaint = ValueNotifier<int>(0);
+
+  /// 发射时间信用（条，浮点）：每帧按真实 dt × 速率累计，>= 1 才允许发射
+  /// 一条并扣 1。初始给满——播放开始即可按正常节奏发射，不引入延迟。
+  double _spawnCredit = kDanmakuSpawnCreditMax;
+
   /// 已发射但还在屏幕上的弹幕。
   final List<_ActiveDanmaku> _active = [];
 
@@ -168,6 +218,11 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
   int _spawnCount = 0; // 实际发射条数
   int _blockedCount = 0; // 被屏蔽条数（词/类型）
   int _lastLogSec = 0;
+  // 帧节奏统计（2s 日志周期内累计，打印后清零）：
+  int _statFrames = 0; // 参与推进的帧数
+  double _statDtSum = 0; // 推进 dt 累计（秒）
+  double _statDtMax = 0; // 推进 dt 峰值（秒）
+  int _statRepaint = 0; // 本周期内重绘请求次数（= _repaint.value 增量）
 
   /// 轨道分配器（布局时按屏尺寸创建）。
   DanmakuLanes? _lanes;
@@ -278,11 +333,21 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
   /// 取指定底部行（下标 i，0 = 底区最上行）的顶部 y。
   double _bottomLaneY(int i) => _bottomY0 + i * _laneH;
 
+  /// 安全读取当前布局尺寸：Ticker 帧回调在每帧 drawFrame（layout）之前执行，
+  /// mount 后首帧回调时 render object 尚未 layout——此时 `context.size` 在
+  /// debug 下抛 assert（"has not been through layout"）并终止 Ticker 调度。
+  /// 这里显式用 [RenderBox.hasSize] 判定，layout 完成前返回 null（该帧跳过
+  /// 布局/发射，下一帧补上），不抛异常。
+  Size? get _currentSize {
+    final ro = context.findRenderObject();
+    if (ro is RenderBox && ro.hasSize) return ro.size;
+    return null;
+  }
+
   void _onTick(Duration elapsed) {
     if (!mounted) return;
-    // 尺寸变化检测（旋转/全屏切换）：tick 回调发生在 build/layout 之外，
-    // 可安全读 context.size；发现变化 → 置重算标记，本帧起用新布局轨道。
-    final curSize = context.size;
+    // 尺寸变化检测（旋转/全屏切换）：发现变化 → 置重算标记，本帧起用新布局轨道。
+    final curSize = _currentSize;
     if (curSize != null && _layoutSize != curSize) {
       _layoutSize = curSize;
       _needRelayout = true;
@@ -291,11 +356,14 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
     _lastElapsed = elapsed;
     if (!widget.playing) return; // 暂停：冻结弹幕（dt 不累计）
     if (widget.danmaku.isEmpty && _active.isEmpty) return;
-    // 掉帧保护：大步长会让人眼察觉位置跳变（"移动生硬"的主因之一），
-    // 钳制单帧位移；丢失的时间在后续帧按真实 dt 自然追平，无累积漂移。
-    dt = math.min(dt, kMaxDanmakuDtSec);
+    // 平滑推进量：
+    // - 长时间无帧（切后台/引擎停摆恢复，dt > 100ms）→ 本帧不推进（弹幕
+    //   原地继续，位置不跳），暂停/切后台恢复瞬间不会"大步跳进"；
+    // - 普通掉帧（<=100ms）→ 钳制到单帧位移上限平滑恢复，不做大步补偿。
+    dt = danmakuSmoothDt(dt);
 
     // 1) 推进已有活跃弹幕（浮点 dt 精确位移）
+    final hadActive = _active.isNotEmpty; // 推进前是否屏上有弹幕（出屏清空也要重绘）
     for (final a in _active) {
       if (a.danmaku.isScroll) {
         a.x += a.vx * dt; // vx 为负：向左
@@ -314,9 +382,13 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
     // 2) 轨道分配器同步推进（腾空已出屏轨道/已停留完的行）
     _lanes?.advance(dt);
 
-    // 3) 发射 timeSec <= 当前播放位置的弹幕（每帧预算内，余量下帧补）
+    // 3) 发射 timeSec <= 当前播放位置的弹幕（时间信用 + 单帧硬预算双限，
+    //    余量下帧按真实时间继续补）
+    //    先按本帧真实流逝累计发射信用；大间隙帧 dt=0 → 不涨 → 恢复帧不会
+    //    因积压（seek 密集窗口/卡顿掉队）而一次性扎堆补发。
+    _spawnCredit = danmakuCreditAfter(_spawnCredit, dt);
     var changed = false;
-    final size = context.size;
+    final size = _currentSize;
     if (size != null && size != Size.zero && _cursor < widget.danmaku.length) {
       _ensureLayout(size);
       final posSec = widget.positionMs / 1000.0;
@@ -325,12 +397,14 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
       while (_cursor < list.length && budget > 0) {
         final d = list[_cursor];
         if (d.timeSec > posSec) break; // 未到时间，停（后续帧继续）
+        if (_spawnCredit < 1) break; // 信用不足：停，余量按真实时间摊入后续帧
         _cursor++;
         if (widget.settings.shouldBlock(d)) {
           _blockedCount++; // 屏蔽命中：不显示（游标已越过，不重发）
           changed = true;
-          continue;
+          continue; // 屏蔽不进屏、无绘制成本，不消耗信用
         }
+        _spawnCredit -= 1;
         budget--;
         if (_spawn(d, size)) {
           _spawnCount++;
@@ -338,13 +412,37 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
         }
       }
     }
-    if (changed) setState(() {});
+    // 每帧重绘驱动：只要本帧开始时屏上有活跃弹幕（在移动/停留淡变）、当前
+    // 仍有活跃、或本帧有增删，就请求重绘一次——CustomPainter 挂在 [_repaint]
+    // 上，只 markNeedsPaint 本层（RepaintBoundary 隔离），不 rebuild widget
+    // 树。旧实现只在发射帧 setState：两批弹幕之间（可达父层 500ms positionMs
+    // 轮询间隔）弹幕位置在变但画面不刷新，恢复刷新时一次性"跳"一段——
+    // 卡顿/跳跃/时快时慢的主因。
+    if (hadActive || _active.isNotEmpty || changed) {
+      _repaint.value++; // ValueNotifier：触发 CustomPainter 重绘本层
+      _statRepaint++;
+    }
+    // 帧节奏统计：dt 为推进量（<=50ms 平滑后）；均值≈16ms + 重绘请求
+    // ≈60/s → 弹幕滚动连续 60fps（logcat 取证：绘制请求频率 = 推进频率）。
+    _statFrames++;
+    _statDtSum += dt;
+    if (dt > _statDtMax) _statDtMax = dt;
     // 弹幕活动日志（每 ~2s 一次，供模拟器 logcat 实测佐证渲染层在发射）
     final nowSec = elapsed.inSeconds;
     if (nowSec != _lastLogSec && (_spawnCount > 0 || _blockedCount > 0)) {
       _lastLogSec = nowSec;
       _logStats();
     }
+  }
+
+  /// 测试探针：当前第一条活跃滚动弹幕的 x（无滚动活跃时为 NaN）——供
+  /// widget 测试断言"逐帧推进 / 大间隙重置不跳变 / 暂停冻结"。
+  @visibleForTesting
+  double get debugActiveScrollX {
+    for (final a in _active) {
+      if (a.danmaku.isScroll) return a.x;
+    }
+    return double.nan;
   }
 
   /// 周期日志：发射/屏蔽/丢弃计数 + 活跃 vs 轨道数（实测断言依据：
@@ -354,13 +452,21 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
     final lanes = _lanes;
     final activeScroll = _active.where((a) => a.danmaku.isScroll).length;
     final activeStatic = _active.length - activeScroll;
+    final avgDtMs =
+        _statFrames == 0 ? 0.0 : (_statDtSum / _statFrames) * 1000;
     debugPrint('[danmaku] 发射 $_spawnCount 屏蔽 $_blockedCount '
         '丢(滚动)${lanes?.scrollDropped ?? 0} '
         '丢(顶/底)${(lanes?.topDropped ?? 0) + (lanes?.bottomDropped ?? 0)} · '
         '屏上 滚$activeScroll/静$activeStatic · '
         '滚动轨道 用${lanes?.busyScrollLanes ?? 0}/共${lanes?.scrollLanes ?? 0}'
         ' · pos=${widget.positionMs}ms '
-        'cursor=$_cursor/${widget.danmaku.length}');
+        'cursor=$_cursor/${widget.danmaku.length} · '
+        '帧$_statFrames 均${avgDtMs.round()}ms 峰${(_statDtMax * 1000).round()}ms '
+        '重绘$_statRepaint');
+    _statFrames = 0;
+    _statDtSum = 0;
+    _statDtMax = 0;
+    _statRepaint = 0;
   }
 
   /// 发射一条弹幕：经轨道分配器落轨/落行；无可用轨道（打满）→ 丢弃并
@@ -462,6 +568,7 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
   @override
   void dispose() {
     _ticker.dispose();
+    _repaint.dispose();
     for (final a in _active) {
       a.dispose();
     }
@@ -470,14 +577,22 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
 
   @override
   Widget build(BuildContext context) {
-    return CustomPaint(
-      size: Size.infinite,
-      painter: _DanmakuPainter(_active, widget.settings.opacity),
+    // RepaintBoundary：弹幕层独立成层——每帧 60fps 重绘只发生在本层
+    // （markNeedsPaint 到最近的 repaint boundary），不波及播放页整树
+    // （视频纹理/字幕/控制层不随弹幕重绘）。
+    return RepaintBoundary(
+      child: CustomPaint(
+        size: Size.infinite,
+        painter: _DanmakuPainter(_active, widget.settings.opacity, _repaint),
+      ),
     );
   }
 }
 
 /// 绘制活跃弹幕（每帧 paint 时把缓存的 TextPainter 画到对应坐标）。
+///
+/// 挂在 [_DanmakuOverlayState._repaint] 上：tick 推进后 notify → 每帧仅
+/// markNeedsPaint 本层（不 rebuild、不重排）。
 ///
 /// 透明度 [opacity] 与顶部/底部淡入淡出统一按"层 alpha"实现：需要淡变时
 /// 对该条文本 saveLayer 一次（含阴影一起变淡），alpha=1 时零额外开销。
@@ -487,7 +602,8 @@ class _DanmakuPainter extends CustomPainter {
   /// 全局透明度（0.2~1.0，用户滑杆设置）。
   final double opacity;
 
-  _DanmakuPainter(this.active, this.opacity);
+  _DanmakuPainter(this.active, this.opacity, Listenable repaint)
+      : super(repaint: repaint);
 
   @override
   void paint(Canvas canvas, Size size) {

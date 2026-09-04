@@ -8,6 +8,22 @@
 
 ---
 
+## v2.16.11 (2026-09-04)
+
+**修复**
+
+- **弹幕滚动不连续（卡顿/跳跃/时快时慢）**：
+  - **根因（实证）**：v2.16.6 弹幕位置推进与画面重绘解耦——Ticker 每帧在数据层面推进弹幕 x，但 **CustomPaint 只在"发射帧"（`changed → setState`）才真正重绘**。两批弹幕之间（可达父层 500ms 播放位置轮询间隔）弹幕位置在变、画面却不刷新，等下一次 setState 才一次性画出来 → 弹幕以 ~500ms 步长"瞬移"，表现为滚动不连续 / 跳跃 / 时快时慢（推进 60fps × 绘制 ~2-8fps）
+  - **修复（`lib/widgets/danmaku_overlay.dart`）**：
+    - **每帧落屏**：CustomPainter 挂到 `ValueNotifier` repaint 信号上，Ticker 每帧推进后 `value++` → 只 markNeedsPaint 本层（外层 `RepaintBoundary` 隔离，不 rebuild、不波及播放页整树）——推进的每一帧都真正画出来，滚动回到 60fps 连续
+    - **时间基准（暂停/恢复/切后台不跳）**：帧间隙 > 100ms（切后台/引擎停摆/大卡顿恢复）→ 重置时间基准、本帧不推进（弹幕原地继续，不做大步补偿）；播放暂停期间基准每帧照常更新 → 恢复瞬间 dt 不跳变
+    - **发射时间预算**：发射从"每帧条数上限"改为按**真实流逝时间累计信用**（40 条/s 封顶、单帧余额 4），seek/卡顿积压的密集弹幕不再一次性扎堆补发，按信用摊到后续帧逐个进入
+    - 纯函数 `danmakuSmoothDt` / `danmakuCreditAfter` 可单测；TextPainter 缓存维持（发射时 layout 一次、每帧只 paint，无每帧重排）
+  - **顺带健壮性修复（debug 构建下弹幕层 ticker 死亡）**：Ticker 帧回调发生在每帧 layout 之前，mount 后**首帧**回调时 render object 尚未 layout——原实现直接读 `context.size` 会触发 Flutter debug 断言（"has not been through layout"）并抛异常终止 Ticker 调度（此后弹幕完全不推进）。改为 `RenderBox.hasSize` 安全读取（`_currentSize`），layout 完成前该帧跳过布局/发射、下一帧补上，不抛异常。release 下原代码因断言关闭未暴露，但 debug（flutter run/调试）下弹幕层会静默失效
+  - **单测**：`test/danmaku_features_test.dart` 新增 4 用例（dt 平滑/信用纯逻辑、逐帧推进 + 大间隙重置不跳变、暂停冻结 + 恢复平滑）
+
+---
+
 ## v2.16.10 (2026-09-04)
 
 **修复**

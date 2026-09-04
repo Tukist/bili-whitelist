@@ -325,4 +325,112 @@ void main() {
       await tester.pumpWidget(const SizedBox());
     });
   });
+
+  group('DanmakuOverlay 滚动连续性推进逻辑（v2.16.11）', () {
+    test('danmakuSmoothDt：大间隙归零重置 / 普通掉帧钳制 / 正常帧原样', () {
+      // 长时间无帧（切后台/引擎停摆恢复，>100ms）→ 0：重置基准、本帧不推进
+      expect(danmakuSmoothDt(0.5), 0);
+      expect(danmakuSmoothDt(0.101), 0);
+      // 普通掉帧（<=100ms）→ 钳制到单帧位移上限（平滑恢复，不大步跳）
+      expect(danmakuSmoothDt(0.1), closeTo(kMaxDanmakuDtSec, 1e-9));
+      expect(danmakuSmoothDt(0.066), closeTo(kMaxDanmakuDtSec, 1e-9));
+      // 正常帧 → 原样返回（按真实流逝推进，无累积漂移）
+      expect(danmakuSmoothDt(0.016), closeTo(0.016, 1e-9));
+      expect(danmakuSmoothDt(0.0), 0);
+    });
+
+    test('danmakuCreditAfter：按真实时间累计并封顶；大间隙帧（dt=0）不涨', () {
+      // 满额状态下小帧流逝：不超 cap
+      expect(danmakuCreditAfter(kDanmakuSpawnCreditMax, 0.016),
+          kDanmakuSpawnCreditMax);
+      // 从 0 累计：速率 40 条/s × 0.25s = +10 条 → 封顶 4
+      expect(danmakuCreditAfter(0, 0.25), kDanmakuSpawnCreditMax);
+      // 大间隙恢复帧 dt=0：信用不涨（积压不会一次性补发）
+      expect(danmakuCreditAfter(0, 0.0), 0);
+      // 60fps 单帧流逝 +0.64 → 速率 40/s 可持续（平均每帧可发 ~0.6 条）
+      expect(danmakuCreditAfter(0, 0.016), closeTo(0.64, 1e-9));
+    });
+
+    testWidgets('播放中每帧持续推进；大间隙帧（切后台恢复）重置基准不跳变', (tester) async {
+      final list = [_dm('连续滚动', timeSec: 0)];
+      Widget build() => MaterialApp(
+            home: Center(
+              child: SizedBox(
+                width: 400,
+                height: 800,
+                child: DanmakuOverlay(
+                  danmaku: list,
+                  playing: true,
+                  positionMs: 0,
+                  settings: const DanmakuSettings(),
+                ),
+              ),
+            ),
+          );
+      await tester.pumpWidget(build());
+      await tester.pump(const Duration(milliseconds: 16)); // 布局完成 → 发射
+      await tester.pump(const Duration(milliseconds: 16)); // 移动 1 帧
+      final dynamic st = tester.state(find.byType(DanmakuOverlay));
+      double prev = st.debugActiveScrollX as double;
+      expect(prev, lessThan(410)); // 已从屏外入口（x=410）向左进入
+      // 逐小帧推进：**每一帧都在动**（修复前无发射的帧画面静止）
+      const stepMs = 16;
+      for (var i = 0; i < 5; i++) {
+        await tester.pump(const Duration(milliseconds: stepMs));
+        final x = st.debugActiveScrollX as double;
+        expect(x, lessThan(prev));
+        expect(prev - x, lessThan(5)); // 单帧位移小且均匀（平滑，非跳跃）
+        prev = x;
+      }
+      // 模拟切后台/引擎停摆恢复：单帧 0.5s 大间隙 → 重置基准，本帧不推进
+      await tester.pump(const Duration(milliseconds: 500));
+      final afterGap = st.debugActiveScrollX as double;
+      expect(afterGap, closeTo(prev, 1e-6)); // 位置不跳（原地继续）
+      // 恢复正常小帧 → 继续平滑推进（小步，而非大步"跳进"）
+      await tester.pump(const Duration(milliseconds: stepMs));
+      final resumed = st.debugActiveScrollX as double;
+      expect(resumed, lessThan(afterGap));
+      expect(afterGap - resumed, lessThan(5));
+      await tester.pumpWidget(const SizedBox());
+    });
+
+    testWidgets('暂停冻结不动；恢复后从原位置继续小步推进（基准不跳）', (tester) async {
+      final list = [_dm('暂停测试', timeSec: 0)];
+      Widget build(bool playing) => MaterialApp(
+            home: Center(
+              child: SizedBox(
+                width: 400,
+                height: 800,
+                child: DanmakuOverlay(
+                  danmaku: list,
+                  playing: playing,
+                  positionMs: 0,
+                  settings: const DanmakuSettings(),
+                ),
+              ),
+            ),
+          );
+      await tester.pumpWidget(build(true));
+      await tester.pump(const Duration(milliseconds: 16));
+      await tester.pump(const Duration(milliseconds: 16));
+      final dynamic st = tester.state(find.byType(DanmakuOverlay));
+      for (var i = 0; i < 3; i++) {
+        await tester.pump(const Duration(milliseconds: 16));
+      }
+      final before = st.debugActiveScrollX as double;
+      // 暂停：tick 继续跑但冻结（不推进、不重绘）
+      await tester.pumpWidget(build(false));
+      for (var i = 0; i < 3; i++) {
+        await tester.pump(const Duration(milliseconds: 16));
+      }
+      expect(st.debugActiveScrollX as double, closeTo(before, 1e-6));
+      // 恢复：暂停期间基准每帧更新 → 首帧即小步继续，无跳变
+      await tester.pumpWidget(build(true));
+      await tester.pump(const Duration(milliseconds: 16));
+      final after = st.debugActiveScrollX as double;
+      expect(after, lessThan(before));
+      expect(before - after, lessThan(5));
+      await tester.pumpWidget(const SizedBox());
+    });
+  });
 }
