@@ -5,6 +5,7 @@
 // 纯 Dart 测试，无原生插件依赖。
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:bili_whitelist_app/models/upowner.dart';
 import 'package:bili_whitelist_app/models/whitelist_video.dart';
 import 'package:bili_whitelist_app/services/whitelist_writer.dart';
 
@@ -230,6 +231,122 @@ void main() {
       final next =
           WhitelistWriter.reorderVideosInCollection(data, '动画', []);
       expect(identical(next, data), true);
+    });
+  });
+
+  group('保存/管理变换保留 upowners（防「UP主被清空」回归）', () {
+    // 背景：油猴脚本旧版 parse 只认 collections/videos，PATCH 覆盖写回把
+    // v4 顶层 upowners 整个清掉（历史「合集消失」同款）。本组保证 App 端
+    // 任何写 Gist 的变换都不丢 upowners 字段。
+    Upowner up(int mid) => Upowner(
+          mid: mid,
+          name: 'UP$mid',
+          face: '',
+          addedAt: DateTime.utc(2026, 1, 1),
+        );
+
+    WhitelistData withUps({
+      required List<WhitelistVideo> videos,
+      List<CollectionInfo> collections = const [],
+      List<Upowner> upowners = const [],
+    }) =>
+        WhitelistData(
+          version: 4,
+          updatedAt: '2026-09-01T00:00:00Z',
+          videos: videos,
+          collections: collections,
+          upowners: upowners,
+        );
+
+    test('fromJson → toJson 往返保留 upowners（含 lastSeen*）', () {
+      final data = WhitelistData.fromJson({
+        'version': 4,
+        'updated_at': '2026-09-01T00:00:00Z',
+        'collections': [],
+        'videos': [_video('BV1').toJson()],
+        'upowners': [
+          {
+            ...up(100).toJson(),
+            'last_seen_bvid': 'BV1seen',
+            'last_seen_at': '2026-09-01T00:00:00Z',
+          },
+        ],
+      });
+      final json = data.toJson();
+      expect(json.containsKey('upowners'), isTrue);
+      expect((json['upowners'] as List), hasLength(1));
+      final back = WhitelistData.fromJson(json);
+      expect(back.upowners.single.mid, 100);
+      expect(back.upowners.single.lastSeenBvid, 'BV1seen');
+    });
+
+    test('addVideo 路径：copyWith 追加 videos 不丢 upowners', () {
+      final data = withUps(videos: [_video('BV1')], upowners: [up(100)]);
+      final next = data.copyWith(videos: [...data.videos, _video('BV2')]);
+      expect(next.upowners.single.mid, 100);
+    });
+
+    test('moveVideosToCollection / removeVideos 不丢 upowners', () {
+      final data = withUps(
+        videos: [_video('BV1'), _video('BV2', collection: '动画')],
+        upowners: [up(100), up(200)],
+      );
+      final moved = WhitelistWriter.moveVideosToCollection(
+          data, {'BV1'}, '动画');
+      expect(moved.upowners, hasLength(2));
+      final removed = WhitelistWriter.removeVideos(moved, {'BV2'});
+      expect(removed.videos, hasLength(1));
+      expect(removed.upowners, hasLength(2));
+    });
+
+    test('reorderVideosInCollection / reorderCollections 不丢 upowners', () {
+      final data = withUps(
+        videos: [_video('BV1', collection: '动画'), _video('BV2', collection: '动画')],
+        collections: const [CollectionInfo(name: '动画', createdAt: '')],
+        upowners: [up(100)],
+      );
+      final reordered = WhitelistWriter.reorderVideosInCollection(
+          data, '动画', ['BV2', 'BV1']);
+      expect(reordered.upowners, hasLength(1));
+      final reorderedColl = reorderCollections(reordered, ['动画']);
+      expect(reorderedColl.upowners, hasLength(1));
+    });
+
+    test('renameCollection / deleteCollection 不丢 upowners', () {
+      final data = withUps(
+        videos: [_video('BV1', collection: '动画')],
+        collections: const [CollectionInfo(name: '动画', createdAt: '')],
+        upowners: [up(100)],
+      );
+      final renamed = renameCollection(data, '动画', '番剧');
+      expect(renamed.upowners, hasLength(1));
+      final deleted = deleteCollection(renamed, '番剧');
+      expect(deleted.videos.single.isUncategorized, isTrue);
+      expect(deleted.upowners, hasLength(1));
+    });
+
+    test('addUpowner / removeUpowner 只改 upowners，视频合集不动', () {
+      final data = withUps(
+        videos: [_video('BV1', collection: '动画')],
+        collections: const [CollectionInfo(name: '动画', createdAt: '')],
+        upowners: [up(100)],
+      );
+      final added = addUpowner(data, up(300));
+      expect(added.upowners, hasLength(2));
+      expect(added.videos, hasLength(1));
+      final removed = removeUpowner(added, 100);
+      expect(removed.upowners, hasLength(1));
+      expect(removed.upowners.single.mid, 300);
+    });
+
+    test('normalizedForSave 后保存序列化仍含 upowners（写 Gist 最终形态）', () {
+      final data = withUps(videos: [_video('BV1')], upowners: [up(100)]);
+      final saved = data.normalizedForSave();
+      final json = saved.toJson();
+      expect(json['version'], 4);
+      expect((json['upowners'] as List), hasLength(1));
+      // updated_at 已刷新（写盘成功会带新时间）
+      expect(DateTime.tryParse(json['updated_at'] as String), isNotNull);
     });
   });
 }

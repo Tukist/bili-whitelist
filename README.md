@@ -142,6 +142,7 @@
 ```
 
 - **写路径**：PC 油猴脚本（或 App 的管理操作）→ PATCH Gist → 数据持久化
+  （油猴 v2.3.1+ 已保留顶层 `upowners`，与 App 写路径一致）
 - **读路径**：App 刷新 → GET Gist（实时 API）→ 白名单列表 → 播放页实时调 `playurl` 接口取流
 - **播放数据流**：App 拿到 playurl 的 DASH 双流 URL → 原生 ExoPlayer `MergingMediaSource` 合成播放
 
@@ -270,7 +271,7 @@ bili-whitelist/
 ├── README.md                  # 本文档
 ├── .gitignore                 # 敏感/隐私文件一律不入库
 ├── whitelist.py               # PC 端白名单管理 CLI（add/remove/list/serve/push/collection）
-├── bili-whitelist.user.js     # 油猴脚本（v2.3.0，B 站视频页一键加白名单，直连 Gist）
+├── bili-whitelist.user.js     # 油猴脚本（v2.3.1，B 站视频页一键加白名单，直连 Gist）
 ├── start-whitelist.bat        # 一键启动本地 serve（可选）
 ├── sync_config.example.json   # GitHub 配置示例（token/gist_id 占位，真实配置在 sync_config.json，已 gitignore）
 ├── whitelist.example.json     # 白名单数据示例（v3 结构，纯假数据；真实 whitelist.json 已 gitignore）
@@ -461,6 +462,7 @@ GH_REPO_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx bash build_release.sh
 
 - 任何端写回 Gist 时统一规范化：`version=4`、刷新 `updated_at`、`upowners` 必出
 - 字段含义见 `app/lib/models/upowner.dart` 与 `app/lib/services/inbox_service.dart`
+- ⚠ **v2.16.10 修复**：油猴脚本 v2.3.0 的 parse/build 不认 `upowners`，电脑上加视频的 PATCH 覆盖写回曾把该字段清空（表现为"隔段时间重进 App UP 主没了"，与历史"合集消失"同款）——**请把油猴脚本更新到 v2.3.1**（`parseWhitelist` 透传 + `buildWhitelistJson` 兜底保留 `upowners`）；已被清空的 UP 主需重新添加一次，此后任意端写入不再丢
 
 ### 风控与限制
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         白名单助手 (Bili-Whitelist) 直连版
 // @namespace    https://github.com/Tukist/bili-whitelist
-// @version      2.3.0
+// @version      2.3.1
 // @description  B站视频页一键加入白名单（支持多P合集/自定义合集）：直连 GitHub Gist API 读写白名单，零本地服务依赖
 // @match        https://www.bilibili.com/video/*
 // @grant        GM_xmlhttpRequest
@@ -23,6 +23,9 @@
  *   v2.3.0 起支持自定义合集（collection）：新增视频带 collection:""（未分类），
  *   合并写入时保留 Gist 顶层 collections 数组原样不破坏；version 保留读到的值
  *   （v2 保持 2、v3 保持 3，仅从空列表初始化时写 3）。
+ *   v2.3.1 起支持 App v4 白名单 UP 主：parse/build 同步保留顶层 upowners 数组
+ *   （此前只认识 collections/videos，PATCH 覆盖写回会把 App 加的 upowners 清空——
+ *   与历史「合集消失」同款 bug，见 whitelist_video.dart v4 说明）。
  *
  * 【使用】
  *   1. 浏览器安装 Tampermonkey（油猴），新建脚本粘贴保存
@@ -283,9 +286,10 @@
     }
 
     // 解析 whitelist JSON；非法或空则返回空列表结构（空列表初始化 → version 3）
-    // v3：保留顶层 collections 数组原样（合并时不破坏）；v1/v2 无该字段视为 []
+    // v3/v4：保留顶层 collections 与 upowners 数组原样（合并时不破坏）；
+    // v1/v2 无该字段视为 []（v4 字段缺失由 buildWhitelistJson 补空数组兜底）
     function parseWhitelist(text) {
-        if (!text) return { version: 3, updated_at: '', collections: [], videos: [] };
+        if (!text) return { version: 3, updated_at: '', collections: [], videos: [], upowners: [] };
         try {
             const d = JSON.parse(text);
             return {
@@ -293,9 +297,10 @@
                 updated_at: d.updated_at || '',
                 collections: Array.isArray(d.collections) ? d.collections : [],
                 videos: Array.isArray(d.videos) ? d.videos : [],
+                upowners: Array.isArray(d.upowners) ? d.upowners : [],
             };
         } catch (e) {
-            return { version: 3, updated_at: '', collections: [], videos: [] };
+            return { version: 3, updated_at: '', collections: [], videos: [], upowners: [] };
         }
     }
 
@@ -311,9 +316,10 @@
     function buildWhitelistJson(wl) {
         // 用 +00:00 后缀，与现有数据格式保持一致（toISOString 是 Z 后缀）
         wl.updated_at = new Date().toISOString().replace('Z', '+00:00');
-        // v3：顶层 collections 缺失时补空数组（整对象序列化，保证不丢字段）；
-        // v1/v2 已有数据保持其 collections 原样（不存在则 []）
+        // v4：顶层 collections / upowners 缺失时补空数组（整对象序列化，
+        // 保证不丢字段）；v1/v2/v3 已有数据保持其原样（不存在则 []）
         if (!Array.isArray(wl.collections)) wl.collections = [];
+        if (!Array.isArray(wl.upowners)) wl.upowners = [];
         // version 保留读到的值：v2 保持 2、v3 保持 3；空列表初始化已在
         // parseWhitelist 写成 3；仅旧 v1 数据（无 pages）合并时升级到 v2
         if (typeof wl.version !== 'number' || wl.version < 1) wl.version = 3;

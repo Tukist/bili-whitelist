@@ -8,6 +8,18 @@
 
 ---
 
+## v2.16.10 (2026-09-04)
+
+**修复**
+
+- **白名单 UP 主隔段时间重进 App 后被自动清空（油猴脚本丢 v4 upowners 字段）**：
+  - **问题**：v2.13.0 App 新增顶层 `upowners`（UP 主白名单，数据模型升 v4），但**油猴脚本 v2.3.0 的 `parseWhitelist` / `buildWhitelistJson` 仍只认识 `version/updated_at/collections/videos`**——在电脑上用油猴加视频时 GET→PATCH 覆盖写回，把 Gist 里的 `upowners` 整个字段丢掉（与历史「合集消失」同款 bug：当时油猴旧版只认识 videos、不保留 collections）。之后手机重进 App 触发同步，拉到的是已被清空的 Gist，表现为「UP 主被自动清空」
+  - **修复（油猴 v2.3.1）**：`parseWhitelist` 透传保留顶层 `upowners` 数组（读入即保留、内容不丢）；`buildWhitelistJson` 对缺失的 `upowners` 补空数组兜底（序列化不再丢键）；空结构初始化同步带 `upowners: []`
+  - **App 端核对结论**：`WhitelistData` 模型 `fromJson/toJson/copyWith/normalizedForSave` 与全部写 Gist 路径（`GithubApi.saveToGist` 载荷、`WhitelistWriter.addVideo/importPgcSeason/合集移动/删除/重排`、`UpownerWriter.add/removeByMid/updateLastSeenBatch`、信箱、`SyncService.saveToCache`）均保留 `upowners`，无丢失路径——本版本补回归单测：**所有管理变换（改名/删除合集、合集重排、视频移合集/移除/拖拽重排、UP 主增删）与模型往返、保存序列化均保留 `upowners`**（`test/whitelist_order_test.dart` 新增 7 用例）
+  - **数据现状**：Gist 上 `upowners` 已被上述 bug 清空且无可恢复备份（本地各备份 / git 历史均不含），**已丢失的 UP 主需在 App 搜索页重新添加一次**；修复后油猴/App 任意写入不再丢
+
+---
+
 ## v2.16.9 (2026-09-04)
 
 **修复**
