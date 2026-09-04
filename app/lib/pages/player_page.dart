@@ -21,6 +21,7 @@ import '../services/history_store.dart';
 import '../services/realtime_transcriber.dart';
 import '../widgets/danmaku_overlay.dart';
 import '../widgets/danmaku_settings_sheet.dart';
+import 'comment_page.dart';
 import 'login_page.dart';
 
 /// 可选的播放倍速档位（默认 1.0，均落在原生支持区间 0.25~4.0 内）。
@@ -1672,6 +1673,15 @@ class _PlayerPageState extends State<PlayerPage> {
   void _toggleListenMode() {
     debugPrint('[player_page] toggle listenMode -> ${!_listenMode}');
     setState(() => _listenMode = !_listenMode);
+  }
+
+  /// 打开评论区（只读查看；aid 在评论页内异步解析，失败页内提示重试）。
+  Future<void> _openComments() async {
+    debugPrint('[player_page] 打开评论区 bvid=${widget.video.bvid} '
+        'epId=${widget.video.epId}');
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(builder: (_) => CommentPage(video: widget.video)),
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -3471,6 +3481,29 @@ class _PlayerPageState extends State<PlayerPage> {
                                     : Colors.white,
                                 fontSize: 14,
                               ),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                  // 评论按钮：打开评论区（只读查看，aid 页内解析）
+                  Expanded(
+                    child: InkWell(
+                      onTap: _player == null ? null : _openComments,
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          const Icon(Icons.comment_outlined,
+                              color: Colors.white, size: 18),
+                          const SizedBox(width: 4),
+                          Flexible(
+                            child: Text(
+                              '评论',
+                              softWrap: false,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(
+                                  color: Colors.white, fontSize: 14),
                             ),
                           ),
                         ],

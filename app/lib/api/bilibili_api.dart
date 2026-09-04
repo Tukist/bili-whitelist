@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import '../config.dart';
+import '../models/comment.dart';
 import '../models/danmaku.dart';
 import '../models/media_search_result.dart';
 import '../models/search_result.dart';
@@ -1510,4 +1511,207 @@ class BiliApi {
       sign: d['sign'] as String? ?? '',
     );
   }
+
+  // -------------------------------------------------------------------------
+  // 评论区（v2.16.15+ 起）：x/v2/reply/main（主评论）+ x/v2/reply/reply（楼中楼）
+  // -------------------------------------------------------------------------
+
+  /// 拉取视频/番剧的主评论一页（`x/v2/reply/main`）。
+  ///
+  /// 2026-09 匿名实测结论：
+  /// - **匿名可用**（带完整头 + [_injectAuth] 的 buvid 指纹/登录态更稳），
+  ///   **无需 WBI 签名**
+  /// - [aid] 必须传视频 aid（番剧集 ep 的 aid 与 view 接口一致；普通视频
+  ///   [resolveAidForVideo] / [fetchVideoAid] 拿）
+  /// - [mode] 排序：3=按热度（默认，B 站网页端「最热」）
+  /// - [next] 翻页游标：**从 0 起，回传上一响应 [ReplyMainPage.cursorNext]
+  ///   原样**（不要手写 +1）
+  /// - 响应 `data.replies[]`（根评论 root=0/parent=0，每条内嵌 `replies[]`
+  ///   楼中楼预览至多 3 条）、`data.top_replies`（置顶）、
+  ///   `data.cursor{next,is_end,all_count}`
+  /// - 防御：`data.replies[]` 中 `oid != aid` 的脏条目直接丢弃
+  ///
+  /// 错误分类（UI 据此提示）：
+  /// - code=12002 → [BiliApiException]「评论区已关闭」
+  /// - code=-412 → [BiliApiException]「被风控拦截，请稍后再试」
+  /// - code=-352 → [BiliApiException]「被限流，请稍后再试」
+  /// - 其他业务码 → [BiliApiException]（带接口 message）
+  /// - code=0 但无 data / replies 缺失 → 空页（isEnd=true，按「暂无/到底」处理）
+  /// - 网络失败（[DioException]）→ 原样上抛
+  Future<ReplyMainPage> fetchVideoComments({
+    required int aid,
+    int mode = 3,
+    int next = 0,
+  }) async {
+    await _injectAuth();
+    final params = {'type': '1', 'oid': '$aid', 'mode': '$mode', 'next': '$next'};
+    debugPrint('[bili_api] fetchVideoComments aid=$aid mode=$mode next=$next');
+    final resp = await _dio.get<Map<String, dynamic>>(
+      '/x/v2/reply/main',
+      queryParameters: params,
+    );
+    final data = resp.data;
+    _throwReplyError(data, '/x/v2/reply/main');
+    final d = data?['data'] as Map<String, dynamic>?;
+    if (d == null) {
+      // 无 data：当空页处理（暂无评论 / 到底）
+      return const ReplyMainPage(
+        replies: [],
+        topReplies: [],
+        cursorNext: 0,
+        isEnd: true,
+        totalCount: 0,
+      );
+    }
+    final cursor = d['cursor'] as Map<String, dynamic>? ?? const {};
+    final isEndFlag = cursor['is_end'] == true;
+    final cursorNext = (cursor['next'] is num)
+        ? (cursor['next'] as num).toInt()
+        : 0;
+    final totalCount = (cursor['all_count'] is num)
+        ? (cursor['all_count'] as num).toInt()
+        : 0;
+    final replies = _parseReplyList(d['replies'], aid);
+    final topReplies = _parseReplyList(d['top_replies'], aid);
+    final isEnd = isEndFlag || (replies.isEmpty && topReplies.isEmpty);
+    debugPrint(
+      '[bili_api] fetchVideoComments aid=$aid ok: replies=${replies.length} '
+      'top=${topReplies.length} next=$cursorNext isEnd=$isEnd total=$totalCount',
+    );
+    return ReplyMainPage(
+      replies: replies,
+      topReplies: topReplies,
+      cursorNext: cursorNext,
+      isEnd: isEnd,
+      totalCount: totalCount,
+    );
+  }
+
+  /// 拉取某根评论下的完整楼中楼一页（`x/v2/reply/reply`）。
+  ///
+  /// 分页：每次 [pn] 递增 1（页大小 [ps]，默认 20）；
+  /// [ReplyChildrenPage.hasMore] = `pn × ps < page.count`——调用方据此继续
+  /// 翻页，不要再请求空页。
+  ///
+  /// 错误分类同 [fetchVideoComments]。
+  Future<ReplyChildrenPage> fetchReplyChildren({
+    required int aid,
+    required int root,
+    int pn = 1,
+    int ps = 20,
+  }) async {
+    await _injectAuth();
+    final params = {
+      'type': '1',
+      'oid': '$aid',
+      'root': '$root',
+      'pn': '$pn',
+      'ps': '$ps',
+    };
+    debugPrint('[bili_api] fetchReplyChildren aid=$aid root=$root pn=$pn');
+    final resp = await _dio.get<Map<String, dynamic>>(
+      '/x/v2/reply/reply',
+      queryParameters: params,
+    );
+    final data = resp.data;
+    _throwReplyError(data, '/x/v2/reply/reply');
+    final d = data?['data'] as Map<String, dynamic>?;
+    if (d == null) {
+      return const ReplyChildrenPage(replies: [], hasMore: false);
+    }
+    final page = d['page'] as Map<String, dynamic>? ?? const {};
+    final count = (page['count'] is num) ? (page['count'] as num).toInt() : 0;
+    final pageNum = (page['num'] is num) ? (page['num'] as num).toInt() : pn;
+    final size = (page['size'] is num) ? (page['size'] as num).toInt() : ps;
+    final replies = _parseReplyList(d['replies'], aid);
+    final hasMore = replies.isNotEmpty && pageNum * size < count;
+    debugPrint(
+      '[bili_api] fetchReplyChildren root=$root ok: replies=${replies.length} '
+      'page=$pageNum/$size count=$count hasMore=$hasMore',
+    );
+    return ReplyChildrenPage(replies: replies, hasMore: hasMore);
+  }
+
+  /// 播放页进入评论区前异步解析 aid（普通视频/番剧集通用）。
+  ///
+  /// [meta]（view 接口 data）已带 aid → 直接用，不重复请求；否则调
+  /// [fetchVideoMeta] 拿 `data.aid`（番剧 ep 的 bvid 与普通视频一样返回
+  /// 真实 aid，与 `PgcEpisode.aid` 一致）。任何失败返回 null（调用方提示
+  /// 「无法获取视频信息」并允许重试）。
+  Future<int?> fetchVideoAid(
+    WhitelistVideo v, {
+    Map<String, dynamic>? meta,
+  }) async {
+    final hit = resolveAidForVideo(v, meta: meta);
+    if (hit != null) return hit;
+    try {
+      final m = await fetchVideoMeta(v.bvid);
+      return resolveAidForVideo(v, meta: m);
+    } catch (e) {
+      debugPrint('[bili_api] fetchVideoAid 失败 bvid=${v.bvid}: $e');
+      return null;
+    }
+  }
+
+  /// 解析 reply 接口返回的 `replies[]`/`top_replies[]` 原始列表为模型列表。
+  ///
+  /// 防御：`oid` 存在且 != [aid] 的脏条目丢弃；rpid <= 0 的丢弃。
+  List<CommentReply> _parseReplyList(Object? raw, int aid) {
+    if (raw is! List) return const [];
+    final out = <CommentReply>[];
+    for (final item in raw.whereType<Map<String, dynamic>>()) {
+      final oidRaw = item['oid'];
+      if (oidRaw is num && oidRaw.toInt() != aid) continue; // oid 不一致丢弃
+      final reply = CommentReply.fromJson(item);
+      if (reply.rpid <= 0) continue;
+      out.add(reply);
+    }
+    return out;
+  }
+
+  /// reply 系列接口的业务错误 → 抛 [BiliApiException]（12002/-412/-352 等）。
+  /// code=0 或响应体不是 JSON map 时静默返回（由调用方按空处理）。
+  void _throwReplyError(Map<String, dynamic>? data, String path) {
+    final code = data?['code'] as int?;
+    if (code == null || code == 0) return;
+    switch (code) {
+      case 12002:
+        throw BiliApiException(
+          code: 12002,
+          message: '评论区已关闭',
+          path: path,
+        );
+      case -412:
+        throw BiliApiException(
+          code: -412,
+          message: '评论接口被风控拦截，请稍后再试',
+          path: path,
+        );
+      case -352:
+        throw BiliApiException(
+          code: -352,
+          message: '评论接口被限流，请稍后再试',
+          path: path,
+        );
+      default:
+        throw BiliApiException(
+          code: code,
+          message: data?['message'] as String? ?? '评论获取失败',
+          path: path,
+        );
+    }
+  }
+}
+
+/// 播放页进入评论区前的 aid 解析（纯函数，可单测）：
+///
+/// - [meta]（view 接口返回的 `data` map）已带有效 `aid` → 直接用
+/// - 否则返回 null（调用方需异步调 [BiliApi.fetchVideoAid]）
+///
+/// 普通视频与番剧集统一按 aid 取评论：番剧 ep 的 aid 与
+/// `PgcEpisode.aid` / view 接口返回一致（2026-09 实测）。
+int? resolveAidForVideo(WhitelistVideo v, {Map<String, dynamic>? meta}) {
+  final raw = meta?['aid'];
+  if (raw is num && raw.toInt() > 0) return raw.toInt();
+  return null;
 }

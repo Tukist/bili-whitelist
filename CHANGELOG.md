@@ -8,6 +8,21 @@
 
 ---
 
+## v2.16.15 (2026-09-05)
+
+**新增**
+
+- **播放页评论区查看（只读，视频 / 番剧通用）**：
+  - **入口**（`app/lib/pages/player_page.dart`）：播放页底部功能行新增「评论」按钮（弹幕与下载之间）→ 打开评论区
+  - **接口**（`app/lib/api/bilibili_api.dart` + 新模型 `app/lib/models/comment.dart`）：主评论 `x/v2/reply/main`（**匿名可用**，带完整头 + buvid 指纹 / 登录态 Cookie，**无需 WBI**）——`fetchVideoComments({aid, mode=3, next})` 翻页**回传上一响应 `cursor.next` 原样**（不手写 +1），`data.replies[]` 解析（每条内嵌至多 3 条楼中楼预览）+ `top_replies` 置顶 + `cursor{next,is_end,all_count}`；楼中楼 `x/v2/reply/reply`——`fetchReplyChildren({aid, root, pn, ps})`，`hasMore = pn×ps < page.count`（空页不再多拉）。**oid 防御**：`replies[]` 中 `oid != aid` 的脏条目丢弃；错误分类：12002=评论区已关闭、-412 风控、-352 限流、网络 DioException（UI 各自提示 / 重试）
+  - **aid 解析**：普通视频与番剧集统一按 aid 取评论——`resolveAidForVideo`（纯函数，meta 带 aid 直接用）+ `BiliApi.fetchVideoAid`（无 meta 时调 view 接口取 `data.aid`，番剧 ep 的 aid 与 `PgcEpisode.aid` 一致；失败提示重试）
+  - **正文清洗**：`content.message` 的 `<br />` → 换行、HTML 实体 / 数字实体解码、残留标签剥除；图片 `content.pictures[]`（`img_src` http→https，`i*.hdslb.com` 无需 Referer，加载仍带浏览器头兜底；按原图宽高比占位；`play_gif_thumbnail` 标「动图」角标）
+  - **评论页**（新 `app/lib/pages/comment_page.dart`）：AppBar「评论 N」（N=评论总数）或「评论」；列表项 = 圆头像 + 用户名 + 等级角标（Lv 色块）+ 正文（可复制 SelectableText）+ 图片（多图按宽高比、失败灰底占位）+ 点赞 + 相对时间 + 「N 条回复」；**楼中楼预览**（收起态缩进小字显示内嵌预览）→ 点「N 条回复」展开拉完整楼中楼（pn 递增翻页、hasMore「加载更多回复」、可收起）；**上拉加载下一页主评论**（滚动近底部触发，cursor.next 回传；到底显示「没有更多了」）；置顶评论顶部展示 + 「置顶」角标；空态「暂无评论」/ 12002「评论区已关闭」/ 错误态带重试；只读不写操作，长内容不截断（整页可滚动）
+  - **单测**：`app/test/comment_model_test.dart`（消息清洗 / 图片 / 预览浅解析防嵌套 / resolveAidForVideo）+ `app/test/comment_api_test.dart`（请求参数 aid/mode/next 与 root/pn、解析、空态 null/[]、oid 不一致丢弃、cursor.next 透传、12002/-412/-352 / 网络、hasMore 换算、fetchVideoAid 三态）
+  - **设备实测**（模拟器，`app/integration_test/comment_flow_test.dart` 真网络集成测试 + uiautomator/logcat 文本取证）：播放页「评论」→ 评论区加载（「评论 89」+ 置顶 + 用户名/Lv/点赞/时间节点齐全）；点「2 条回复」→ 楼中楼 `fetchReplyChildren` 展开成功；多页视频上拉翻页（第 2 页请求带上游 cursor.next）；带图评论图片真实加载（无「图片加载失败」）；番剧集（epId）aid 解析正确打开评论；无评论 / 关闭视频显示空态或关闭提示
+
+---
+
 ## v2.16.14 (2026-09-05)
 
 **修复**
