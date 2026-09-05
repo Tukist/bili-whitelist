@@ -8,6 +8,64 @@
 
 ---
 
+## v2.16.21 (2026-09-05)
+
+**新增 / 改进（"进去即登录 + 1080P"链路做扎实——自动续期 + 失效自动重登 + 匿名明确提示）**
+
+- **自动续期分档提前（`app/lib/api/bilibili_api.dart` `planSessionStart` +
+  `app/lib/pages/playlist_page.dart` `_handleSessionOnStart`）**：续期触发阈值按
+  refresh_token 有无分档——
+  - **有 refresh_token → 距过期 < 15 天即静默续期**（SESSDATA 约 30 天有效，续期成功
+    即把新 SESSDATA/新 refresh_token 入库 → 会话始终活跃在新窗口内，**登录一次长期
+    不掉线**；约半月一次续期调用，频率远低于 B 站续期接口风控阈值——权衡后不做
+    「每次启动都续期」）
+  - 无 refresh_token（登录时未抓到刷新口令）→ 续期必失败，阈值保持 7 天（避免白跑
+    失败请求）；已过期一律先试续期、失败再引导重登
+- **续期结果分类处理（`refreshSession` 返回 `SessionRenewResult`）**：
+  - `networkError`（网络/超时）→ 保留现会话、**下次启动再试**，彻底不打扰
+  - `missingCredentials` / `tokenInvalid`（refresh_token 失效，-101 等）→ 会话**已过期**
+    → 清失效凭据 + 自动引导重新登录；**未过期** → 保留现会话（SESSDATA 仍有效、
+    1080P 继续——不打断可用会话强弹登录页；播放遇 -101 / 管理面板与播放页临近过期
+    横幅会在会话真正失效前引导）
+  - 响应解析兜底：新会话**同时兼容 Set-Cookie 与响应体 `data.sessdata`/`data.bili_jct`
+    两种下发**（不同时期接口实现都覆盖），拿不到新会话绝不覆盖旧凭据
+- **关闭登录页 = 明确匿名（不默认静默降级）**：
+  - **首页**（`playlist_page.dart`）：无有效 SESSDATA 时 AppBar 下方显示提示条
+    「未登录仅 720P，去登录解锁 1080P（登录一次，之后每次进入自动恢复）」，点按直达
+    登录页；登录成功/关闭后即时刷新（无需重启）
+  - **播放页**（`player_page.dart`）：匿名观看时顶部横幅「未登录仅 720P，去登录解锁
+    1080P（登录一次长期保持）」，点按去登录；**登录成功才重取流解锁 1080P，未登录
+    返回不打断当前播放**（`_goLogin` 按登录结果决策，失败态保留「去登录」按钮）
+  - 登录成功保存后首页/播放提示即消失；登录态下播放取流自动 `qn=80`（1080P）
+- **单测**（`app/test/auto_login_test.dart` 更新 + 新增 `app/test/session_renew_test.dart`
+  / `app/test/playurl_auth_test.dart`）：
+  - `planSessionStart` 双档阈值映射（有 token 15 天 / 无 token 7 天，含边界与已过期）
+  - `refreshSession` 分类：缺凭据（不发网络请求）/ Set-Cookie 续期成功入库 /
+    响应体兜底续期成功 / refresh_token 失效（-101）不动 storage / code=0 拿不到新会话
+    不覆盖旧凭据 / 网络异常不动 storage
+  - `fetchPlayUrl` **登录态注入断言**：有效 SESSDATA → 取流请求 Cookie 带 SESSDATA +
+    buvid 指纹 + `qn=80`（1080P 链路）；匿名 → 不带 SESSDATA 仍可播；残留过期
+    SESSDATA → 不注入 + 清除（v2.16.20 修复路径回归）
+  - Widget：关闭登录页后首页显示「未登录仅 720P」提示条、点按再次请求登录；有
+    refresh_token 提前续期窗口内续期网络失败 → 保留、不请求登录
+- **模拟器实测（logcat + uiautomator dump 文本取证，不读媒体）**：
+  - 无会话冷启动 → `[session] 启动检查：无 SESSDATA → 自动进入登录页` +
+    `[session] 打开登录页（自动引导）`，dump 见登录页（banner 全文 + 短信登录
+    手机号/验证码）；back 返回 → 首页 dump 含「未登录仅 720P…」提示条
+  - 匿名播放：点合集视频 → `[bili_api] fetchPlayUrl qn=80 fnval=16 ok: quality=64
+    (720P) dashV=4` + `[player] onPrepared 852x480` + 进度推进（无 BiliDashError）；
+    播放页 dump 含匿名横幅文案
+  - 注入合成有效会话（+30 天）冷启动 → `[session] 启动检查：会话有效（≥续期阈值），
+    静默恢复`，无登录页弹出
+  - 注入将过期会话（+10 天 + refresh_token）冷启动 → 进入提前续期窗口、真实发出
+    续期请求 → 接口失败记录（模拟器网络层 badResponse；业务码 -101 判定留给真机）→
+    `[session] 续期失败（networkError，未过期）→ 保留现会话`，不弹登录页、流程不崩
+- ⚠ 验证局限：**真实登录（短信收码）→ 服务端真给 1080P 的端到端无法在模拟器完成**
+  （无法收码、合成 SESSDATA 服务端不认）——App 可控链路（有效 SESSDATA 注入 +
+  qn=80 请求）由单测 + 逻辑保证，请真机登录后复核 quality=80 下发
+
+---
+
 ## v2.16.20 (2026-09-05)
 
 **修复**

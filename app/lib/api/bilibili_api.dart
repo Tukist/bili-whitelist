@@ -288,28 +288,58 @@ abstract final class MediaSearchTypes {
   static const doc = 'media_doc';
 }
 
-/// 启动时登录态处理动作（v2.16.18 自动登录）。
+/// 启动时登录态处理动作（v2.16.18 自动登录；v2.16.21 续期阈值按
+/// refresh_token 有无分档，见 [planSessionStart]）。
 enum SessionStartAction {
-  /// 会话有效（距过期 ≥ 7 天）：静默恢复，不弹任何界面、不打扰。
+  /// 会话有效（距过期 ≥ 当前档位的续期阈值）：静默恢复，不弹任何界面、不打扰。
   silent,
 
-  /// 会话将过期 / 已过期（距过期 < 7 天）：尝试静默续期（refresh_token）。
+  /// 会话将过期 / 已过期（距过期 < 当前档位的续期阈值）：尝试静默续期。
   refresh,
 
   /// 无 SESSDATA（首次使用 / 已登出 / 彻底过期）：自动进入登录页引导登录。
   autoLogin,
 }
 
+/// 续期触发阈值（[planSessionStart] 用，SESSDATA 约 30 天有效）：
+///
+/// - 有 refresh_token（自动续期链路完整）→ **15 天**就提前续期：会话长期
+///   保持在新窗口内，理论「登录一次长期不掉线」；续期接口约半月调用一次，
+///   频率远低于风控阈值（频繁调用反而不利，故不做「每次启动都续期」）。
+/// - 无 refresh_token（登录时未抓到刷新口令等）→ 续期必然失败，阈值缩回
+///   **7 天**（临近过期提示足够，避免每天启动都白跑一次失败请求）。
+const Duration kSessionRenewWithToken = Duration(days: 15);
+const Duration kSessionRenewFallback = Duration(days: 7);
+
+/// 续期结果分类（[BiliApi.refreshSession] 的返回值），供启动逻辑区分处理：
+///
+/// - [renewed]：续期成功，新 SESSDATA/新 refresh_token 已入库，用户无感；
+/// - [missingCredentials]：缺 csrf / refresh_token（登录时没抓到刷新口令），
+///   无法续期——会话仍有效则保留，彻底过期时由启动引导重登；
+/// - [tokenInvalid]：refresh_token 失效（接口返回 -101/-400 等业务码，或
+///   成功响应里拿不到新会话）——自动续期不可再指望：会话**已过期** →
+///   启动引导重登；**未过期** → 保留现会话（SESSDATA 仍有效、1080P 继续，
+///   播放遇 -101 或管理面板/播放页的临近过期提示再引导，不打扰可用会话）；
+/// - [networkError]：网络/超时/解析等瞬时失败 → 保留现会话，下次启动再试。
+enum SessionRenewResult { renewed, missingCredentials, tokenInvalid, networkError }
+
 /// 启动登录态决策（纯函数，便于单测）：
 ///
 /// - [remain] 为 null（无 SESSDATA / 解析失败）→ [SessionStartAction.autoLogin]
-/// - 距过期 ≥ 7 天 → [SessionStartAction.silent]（登录态有效，静默恢复）
-/// - 距过期 < 7 天（**含已过期**，[Duration.isNegative]）→
-///   [SessionStartAction.refresh]（用 refresh_token 静默续期；续期失败且
-///   续期前**已过期**时应转 [SessionStartAction.autoLogin]，由调用方判定）
-SessionStartAction planSessionStart(Duration? remain) {
+/// - [hasRefreshToken]：secure storage 是否存了 refresh_token（决定阈值档位，
+///   有 → 15 天提前续期，无 → 7 天，见 [kSessionRenewWithToken]）
+/// - 距过期 ≥ 阈值 → [SessionStartAction.silent]（登录态有效，静默恢复）
+/// - 距过期 < 阈值（**含已过期**，[Duration.isNegative]）→
+///   [SessionStartAction.refresh]（静默续期；续期失败且续期前**已过期**
+///   时应转 [SessionStartAction.autoLogin]，由调用方判定）
+SessionStartAction planSessionStart(
+  Duration? remain, {
+  bool hasRefreshToken = false,
+}) {
   if (remain == null) return SessionStartAction.autoLogin;
-  if (remain < const Duration(days: 7)) return SessionStartAction.refresh;
+  final threshold =
+      hasRefreshToken ? kSessionRenewWithToken : kSessionRenewFallback;
+  if (remain < threshold) return SessionStartAction.refresh;
   return SessionStartAction.silent;
 }
 
@@ -360,6 +390,13 @@ class BiliApi {
 
   /// 从 secure storage 读取 SESSDATA（未登录返回 null）。
   Future<String?> readSessdata() => _storage.read(key: _sessdataKey);
+
+  /// secure storage 里是否存了 refresh_token（续期阈值档位判断，见
+  /// [planSessionStart]——有刷新口令才能走"提前续期"档）。
+  Future<bool> hasRefreshToken() async {
+    final t = await _storage.read(key: _refreshTokenKey);
+    return t != null && t.isNotEmpty;
+  }
 
   /// 保存登录成功后的会话信息（WebView 登录 / refreshSession 续期共用）。
   Future<void> saveSession({
@@ -412,14 +449,21 @@ class BiliApi {
 
   /// 用 refresh_token 自动续期登录态（静默，不抛异常）。
   ///
-  /// 接口（bilibili-API-collect 核实，yutto 无 refresh 实现）：
+  /// 接口（bilibili-API-collect 核实）：
   ///   POST https://api.bilibili.com/x/passport-login/web/cookie/refresh
   ///   form: `csrf=<bili_jct>&refresh_token=<旧 refresh_token>`
-  /// 成功响应 Set-Cookie 新 SESSDATA/bili_jct，data.refresh_token 为新续期口令。
+  /// 成功响应：Set-Cookie 下发新 SESSDATA/bili_jct（少数时期接口实现把新
+  /// 会话直接放响应体 `data.sessdata`/`data.bili_jct`，两处都兜底解析）；
+  /// `data.refresh_token` 为新续期口令（换新即旧口令作废，必须保存新值）。
   ///
-  /// 返回 true 表示续期成功（已更新 storage）；缺任一凭据、
-  /// refresh_token 失效（-101/86095 等）或网络异常均返回 false。
-  Future<bool> refreshSession() async {
+  /// 返回 [SessionRenewResult] 分类（v2.16.21，供启动逻辑区分
+  /// 「token 失效 → 到期引导重登」与「网络失败 → 下次启动再试」）：
+  /// - [SessionRenewResult.renewed]：续期成功，已更新 storage；
+  /// - [SessionRenewResult.missingCredentials]：缺 csrf / refresh_token；
+  /// - [SessionRenewResult.tokenInvalid]：接口返回业务码（-101 口令失效等），
+  ///   或 code=0 但新旧会话都没拿到（异常响应，续期链路不可用）；
+  /// - [SessionRenewResult.networkError]：网络 / 超时 / 解析异常。
+  Future<SessionRenewResult> refreshSession() async {
     try {
       final biliJct = await _storage.read(key: _biliJctKey);
       final refreshToken = await _storage.read(key: _refreshTokenKey);
@@ -427,7 +471,7 @@ class BiliApi {
           biliJct.isEmpty ||
           refreshToken == null ||
           refreshToken.isEmpty) {
-        return false;
+        return SessionRenewResult.missingCredentials;
       }
       await _injectAuth();
       final resp = await _dio.post<Map<String, dynamic>>(
@@ -437,9 +481,13 @@ class BiliApi {
       );
       final data = resp.data;
       final code = data?['code'] as int?;
-      if (code != 0) return false;
+      if (code != 0) {
+        debugPrint('[bili_api] refreshSession 业务码失败 code=$code '
+            'msg=${data?['message']}');
+        return SessionRenewResult.tokenInvalid;
+      }
 
-      // 从 Set-Cookie 提取新 SESSDATA/bili_jct
+      // 新会话：Set-Cookie 优先，响应体 data 兜底（覆盖不同时期接口实现）
       String? sessdata;
       String? newBiliJct;
       for (final c in resp.headers['set-cookie'] ?? const <String>[]) {
@@ -450,22 +498,30 @@ class BiliApi {
           if (kv[0] == 'bili_jct' && newBiliJct == null) newBiliJct = kv[1];
         }
       }
-      // 新 refresh_token：响应 data 里直接带
-      String? newRefreshToken;
       final d = data?['data'] as Map<String, dynamic>?;
-      if (d != null) {
-        newRefreshToken = d['refresh_token'] as String?;
+      // 新 refresh_token：响应 data 里直接带（换新后旧口令作废）
+      final newRefreshToken = d?['refresh_token'] as String?;
+      sessdata ??= d?['sessdata'] as String?;
+      newBiliJct ??= d?['bili_jct'] as String?;
+      if (sessdata == null || sessdata.isEmpty) {
+        debugPrint('[bili_api] refreshSession code=0 但未拿到新 SESSDATA '
+            '（set-cookie 与 body 均缺）');
+        return SessionRenewResult.tokenInvalid;
       }
-      if (sessdata == null || sessdata.isEmpty) return false;
 
       await saveSession(
         sessdata: sessdata,
         biliJct: newBiliJct ?? biliJct,
         refreshToken: newRefreshToken ?? refreshToken,
       );
-      return true;
+      debugPrint('[bili_api] refreshSession 成功（新会话已保存，用户无感）');
+      return SessionRenewResult.renewed;
+    } on DioException catch (e) {
+      debugPrint('[bili_api] refreshSession 网络异常: ${e.type}');
+      return SessionRenewResult.networkError;
     } catch (_) {
-      return false;
+      // 解析/存储异常等一律按瞬时失败处理（不打扰，下次启动再试）
+      return SessionRenewResult.networkError;
     }
   }
 

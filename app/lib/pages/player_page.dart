@@ -2996,17 +2996,58 @@ class _PlayerPageState extends State<PlayerPage> {
     setState(() => _loginPrompt = false);
     await Navigator.of(context).push(
         MaterialPageRoute<void>(builder: (_) => const LoginPage()));
-    if (mounted) _retry();
+    if (!mounted) return;
+    // 登录成功（现在有有效会话）→ 重取流解锁 1080P；没登录（直接返回/
+    // 关闭登录页）→ 不打断当前画面：播放失败态保留「去登录」按钮，正常
+    // 播放态（匿名/临近过期横幅）横幅保持现状即可。
+    final loggedIn = await _hasValidSession();
+    if (!mounted) return;
+    if (loggedIn) {
+      await _checkLoginExpiry(); // 新会话长有效期 → 清掉匿名/临近过期横幅
+      if (!mounted) return;
+      _retry();
+    } else if (_error != null) {
+      setState(() => _loginPrompt = true); // 未登录返回：失败态仍可再去登录
+    }
+  }
+
+  /// secure storage 里是否有**未过期**的有效 SESSDATA（登录成功判定）。
+  Future<bool> _hasValidSession() async {
+    try {
+      final raw = await _api.readSessdata();
+      final expire =
+          raw == null || raw.isEmpty ? null : BiliApi.sessdataExpireAt(raw);
+      return expire != null && expire.isAfter(DateTime.now());
+    } catch (_) {
+      return false;
+    }
   }
 
   // -------------------------------------------------------------------------
   // 登录过期检测（C. 简单版：SESSDATA 内嵌过期时间戳）
   // -------------------------------------------------------------------------
 
+  /// 播放页顶部横幅文案（未登录 / 登录将过期共用同一横幅组件）。
+  ///
+  /// 未登录（无 SESSDATA，含关闭自动引导登录页 = 明确匿名）→ 给清晰提示 +
+  /// 去登录入口（v2.16.21，不默认静默降级）；已登录但临近过期 → 提示重登。
+  static const String _kAnonymousBannerText =
+      '未登录仅 720P，去登录解锁 1080P（登录一次长期保持）';
+
+  /// 检查登录态并维护顶部横幅：
+  /// - 无 SESSDATA（匿名）→ 显示 [._kAnonymousBannerText]（点按去登录）；
+  /// - 有 SESSDATA 且临近过期（< 7 天）→ 显示过期提醒；
+  /// - 有 SESSDATA 且有效期充足 → 清掉横幅（登录成功后 _goLogin 复用本方法）。
   Future<void> _checkLoginExpiry() async {
     try {
       final raw = await _api.readSessdata();
-      if (raw == null || raw.isEmpty) return;
+      if (raw == null || raw.isEmpty) {
+        if (!mounted) return;
+        if (_loginExpiryText != _kAnonymousBannerText) {
+          setState(() => _loginExpiryText = _kAnonymousBannerText);
+        }
+        return;
+      }
       final decoded = Uri.decodeComponent(raw);
       final parts = decoded.split(',');
       if (parts.length < 2) return; // 解析失败就不管
@@ -3014,15 +3055,17 @@ class _PlayerPageState extends State<PlayerPage> {
       if (ts == null) return;
       final expire = DateTime.fromMillisecondsSinceEpoch(ts * 1000);
       final remain = expire.difference(DateTime.now());
+      if (!mounted) return;
       if (remain < const Duration(days: 7)) {
-        if (!mounted) return;
         final text = remain.isNegative
             ? '登录已过期，请重新登录'
             : '登录将过期（${_fmtDateTime(expire)}），请重新登录';
         setState(() => _loginExpiryText = text);
+      } else if (_loginExpiryText != null) {
+        setState(() => _loginExpiryText = null); // 有效期充足 → 不再提示
       }
     } catch (_) {
-      // 解析失败静默忽略（TODO：M3c 补 refresh_token 自动续期全流程）
+      // 解析/存储异常静默忽略
     }
   }
 
@@ -3659,7 +3702,8 @@ class _PlayerPageState extends State<PlayerPage> {
   }
 }
 
-/// 登录即将过期横幅（点按跳登录页）。
+/// 登录即将过期 / 未登录匿名横幅（点按跳登录页；未登录文案见播放页
+/// [_PlayerPageState._kAnonymousBannerText]）。
 class _LoginExpiryBanner extends StatelessWidget {
   final String text;
   final VoidCallback onTap;

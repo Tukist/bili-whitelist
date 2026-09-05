@@ -1,6 +1,6 @@
-// v2.16.18 自动登录单测：
-// 1. planSessionStart 纯函数决策映射（无会话→autoLogin / <7天→refresh /
-//    ≥7天→silent；含 7 天边界与已过期）
+// v2.16.18/2.16.21 自动登录单测：
+// 1. planSessionStart 纯函数决策映射（无会话→autoLogin；续期阈值按
+//    refresh_token 有无分档——有→15 天提前续期、无→7 天：含边界与已过期）
 // 2. Widget：有会话（长期有效）冷启动 → 首页**无**登录按钮 tooltip、
 //    不请求登录（静默恢复）；管理面板显示「已连接 + 重新登录」次级入口
 // 3. Widget：无会话冷启动 → **自动请求登录**一次（带 kAutoLoginBanner 提示，
@@ -10,6 +10,8 @@
 //    清除失效会话（v2.16.20 修复：残留过期 SESSDATA 不应再被播放取流
 //    注入——服务端对真实过期 cookie 返回 -101 → 未登录播放没画面）；
 //    会话有效但 <7 天且缺 refresh 凭据 → 续期失败未过期 → 保留、不请求
+// 5. Widget（v2.16.21）：关闭登录页 = 匿名 → 首页出现「未登录仅 720P」
+//    提示条（去登录入口，不默认静默）；点提示条再次请求登录
 //
 // 真实登录页（WebView 平台注册）只在真机/模拟器验证（CHANGELOG v2.16.18）。
 import 'package:flutter/material.dart';
@@ -78,24 +80,44 @@ Future<void> _pumpHome(WidgetTester tester, _LoginSpy spy) async {
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
-  group('planSessionStart（启动登录态决策，纯函数）', () {
+  group('planSessionStart（启动登录态决策，纯函数；v2.16.21 阈值分档）', () {
     test('无 SESSDATA（null）→ autoLogin（自动进登录页）', () {
       expect(planSessionStart(null), SessionStartAction.autoLogin);
+      expect(planSessionStart(null, hasRefreshToken: true),
+          SessionStartAction.autoLogin);
     });
 
-    test('距过期 ≥ 7 天 → silent（静默恢复）', () {
+    test('有 refresh_token：距过期 ≥ 15 天 → silent（提前续期窗口外）', () {
+      expect(planSessionStart(const Duration(days: 30),
+          hasRefreshToken: true), SessionStartAction.silent);
+      expect(planSessionStart(const Duration(days: 15),
+          hasRefreshToken: true), SessionStartAction.silent); // 边界：恰好 15 天
+    });
+
+    test('有 refresh_token：距过期 < 15 天 → refresh（提前续期，登录一次长期保持）',
+        () {
+      expect(planSessionStart(const Duration(days: 14, hours: 23),
+          hasRefreshToken: true), SessionStartAction.refresh);
+      expect(planSessionStart(const Duration(days: 8),
+          hasRefreshToken: true), SessionStartAction.refresh);
+      expect(planSessionStart(const Duration(hours: 1),
+          hasRefreshToken: true), SessionStartAction.refresh);
+    });
+
+    test('无 refresh_token：距过期 ≥ 7 天 → silent（续期必失败，保持原档位）',
+        () {
       expect(planSessionStart(const Duration(days: 30)),
           SessionStartAction.silent);
+      expect(planSessionStart(const Duration(days: 14)),
+          SessionStartAction.silent); // 14 天但不提前（无口令续期会失败）
       expect(planSessionStart(const Duration(days: 7)),
           SessionStartAction.silent); // 边界：恰好 7 天不需续期
     });
 
-    test('距过期 < 7 天 → refresh（静默续期）', () {
+    test('无 refresh_token：距过期 < 7 天 → refresh', () {
       expect(planSessionStart(const Duration(days: 6, hours: 23)),
           SessionStartAction.refresh);
       expect(planSessionStart(const Duration(hours: 1)),
-          SessionStartAction.refresh);
-      expect(planSessionStart(const Duration(minutes: 1)),
           SessionStartAction.refresh);
     });
 
@@ -104,6 +126,8 @@ void main() {
       expect(planSessionStart(const Duration(seconds: -1)),
           SessionStartAction.refresh);
       expect(planSessionStart(const Duration(days: -3)),
+          SessionStartAction.refresh);
+      expect(planSessionStart(const Duration(days: -3), hasRefreshToken: true),
           SessionStartAction.refresh);
     });
   });
@@ -156,7 +180,7 @@ void main() {
     testWidgets('会话 <7 天且缺 refresh 凭据：续期失败未过期 → 保留、不请求登录',
         (tester) async {
       _store['bili_sessdata'] = _fakeSessdata(const Duration(days: 6));
-      // 缺 bili_jct / refresh_token → refreshSession 直接返回 false（无网络）
+      // 缺 bili_jct / refresh_token → refreshSession 直接返回 missingCredentials
       final spy = _LoginSpy();
       await _pumpHome(tester, spy);
       await tester.pump();
@@ -164,6 +188,44 @@ void main() {
 
       expect(spy.calls, 0); // 未过期 → 保留现会话，不打扰
       expect(find.byTooltip('登录（解锁 1080P）'), findsNothing);
+    });
+
+    testWidgets('有 refresh_token 的提前续期窗口（如 12 天）：续期网络失败'
+        ' → 保留、不请求登录（下次启动再试，不打扰）', (tester) async {
+      _store['bili_sessdata'] = _fakeSessdata(const Duration(days: 12));
+      _store['bili_jct'] = 'jct_ok';
+      _store['bili_refresh_token'] = 'refresh_token_ok';
+      // 有 refresh_token → 阈值 15 天 → 进入续期窗口；widget 测试环境无网络
+      // （flutter_test 屏蔽真实 HTTP）→ refreshSession 返回 networkError，
+      // 会话未过期 → 保留现会话，不弹登录页
+      final spy = _LoginSpy();
+      await _pumpHome(tester, spy);
+      await tester.pump();
+      await tester.pump();
+      // 推进假时钟让 dio 的 connectTimeout(10s) 定时器触发收尾，避免 pending timer
+      await tester.pump(const Duration(seconds: 11));
+
+      expect(spy.calls, 0);
+    });
+
+    testWidgets('无会话登录页关闭（=匿名）：首页出现「未登录仅 720P」提示条，'
+        '点按可再次请求登录', (tester) async {
+      final spy = _LoginSpy();
+      await _pumpHome(tester, spy);
+      await tester.pump();
+      await tester.pump();
+      await tester.pump();
+
+      // 自动引导一次已发生（登录页被关闭 = 保持匿名）
+      expect(spy.calls, 1);
+      // 首页明确提示条（不默认静默降级）+ 登录入口可见
+      expect(find.textContaining('未登录仅 720P'), findsOneWidget);
+      // 点提示条 → 再次请求打开登录页（带自动保存说明 banner）
+      await tester.tap(find.textContaining('未登录仅 720P'));
+      await tester.pump();
+      await tester.pump();
+      expect(spy.calls, 2);
+      expect(spy.lastBanner, kAutoLoginBanner);
     });
 
     testWidgets('会话已过期且无 refresh 凭据：续期失败 → 自动请求重新登录'
@@ -218,7 +280,8 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(find.text('B 站账号'), findsOneWidget);
-      expect(find.textContaining('未登录'), findsOneWidget);
+      // 与首页「未登录仅 720P」提示条区分开：匹配管理面板账号行专有文案
+      expect(find.textContaining('登录后可解锁 1080P'), findsOneWidget);
       expect(find.text('登录'), findsOneWidget);
     });
   });

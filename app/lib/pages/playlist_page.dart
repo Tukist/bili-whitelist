@@ -43,10 +43,13 @@ import 'upowner_page.dart';
 ///   番剧/电影 ep|ss 链接与 b23 番剧短码 → 整季逐集加入白名单，v2.16.2）
 /// - 右上角管理入口：GitHub token/gist_id 配置 + 新建合集 + 合集管理
 ///   + 缓存管理 + 翻译服务配置 + **B 站账号**（登录/重新登录，v2.16.18）
-/// - **启动自动登录**（v2.16.18，取代原右上角常驻登录按钮）：
-///   SESSDATA 有效 → 静默恢复（不弹界面）；距过期 < 7 天 → refresh_token
+/// - **启动自动登录（v2.16.18 起，取代原右上角常驻登录按钮）**：
+///   SESSDATA 有效 → 静默恢复（不弹界面）；距过期 < 续期阈值（有
+///   refresh_token 15 天 / 无则 7 天，v2.16.21 分档）→ refresh_token
 ///   静默续期；无 SESSDATA / 彻底过期 → 自动进入登录页引导登录一次；
-///   登录成功自动保存，之后每次进入静默恢复
+///   登录成功自动保存，之后每次进入静默恢复（登录一次长期保持）。
+///   登录页可关闭：关闭 = 匿名，首页/播放页给明确「未登录仅 720P，
+///   去登录解锁 1080P」提示入口（v2.16.21，不默认静默降级）
 /// - **主页 PageView 三页**（初始停在主页合集页，左右滑动切换）：
 ///   右滑 → 历史记录页（播放历史，点击续播；顶部历史图标可直达）；
 ///   左滑 → 白名单 UP 主管理页
@@ -113,6 +116,16 @@ class _PlaylistPageState extends State<PlaylistPage> {
     );
   }
 
+  /// 首页是否需要「未登录仅 720P」提示条（去登录入口，v2.16.21）：
+  /// 无有效 SESSDATA（真未登录/彻底过期且引导被关闭）时为 true。
+  /// 由 [_refreshLoginHint] 异步维护（登录页关闭/引导后重查），启动时先置
+  /// true 再按读取结果校正，避免误显示已登录态。
+  bool _showLoginHint = false;
+
+  /// 未登录提示条文案（关闭登录页=明确匿名，不默认静默降级）。
+  static const String _kLoginHintText =
+      '未登录仅 720P，去登录解锁 1080P（登录一次，之后每次进入自动恢复）';
+
   /// 自动登录是否已引导（本次进程只自动引导一次，避免循环/重复弹页）。
   bool _autoLoginGuided = false;
 
@@ -121,6 +134,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
     super.initState();
     _load();
     _handleSessionOnStart();
+    _refreshLoginHint();
     _loadVersion();
     // 启动 5s 后静默检查更新 + 信箱检查；两者都失败静默不打扰。
     _refreshInboxCount();
@@ -150,57 +164,102 @@ class _PlaylistPageState extends State<PlaylistPage> {
     }
   }
 
-  /// 启动自动登录（v2.16.18，App 启动 / 首页 initState 即触发，不依赖按钮）：
+  /// 启动自动登录（v2.16.18 起，App 启动 / 首页 initState 即触发，不依赖按钮；
+  /// v2.16.21 续期策略强化——「进去即登录」链路做扎实）：
   ///
-  /// - SESSDATA 有效（距过期 ≥ 7 天）→ 静默恢复，不弹任何界面；
-  /// - 距过期 < 7 天（含已过期）→ 用 refresh_token 静默续期，成功即静默；
-  ///   续期失败且**已过期** → 自动进入登录页引导重新登录；
-  ///   续期失败但未过期 → 保留现会话（不打扰，过期时由下次启动引导）；
+  /// - SESSDATA 有效且离过期还早（≥ 续期阈值）→ 静默恢复，不弹任何界面；
+  /// - 距过期 < 阈值 → 用 refresh_token **静默续期**（阈值分档：
+  ///   有 refresh_token → 15 天提前续期，无 → 7 天，见 [planSessionStart]）：
+  ///   - 续期成功 → 新会话已入库（用户无感），静默；
+  ///   - 续期失败：按 [SessionRenewResult] 分类处理——
+  ///     · 续期前**已过期**（会话彻底失效，无论何种失败原因）→ 先
+  ///       `clearSession()` 清失效凭据（防残留过期 SESSDATA 被播放取流注入
+  ///       → 服务端 -101 拒绝，v2.16.20），再自动引导重新登录一次；
+  ///     · **未过期** → 保留现会话不打扰（SESSDATA 仍有效、1080P 继续）：
+  ///       refresh_token 失效（[SessionRenewResult.tokenInvalid]）时自动续期
+  ///       已不可指望，但强弹登录页会打断仍可用的会话——由播放遇 -101、
+  ///       管理面板「登录将过期」与播放页临近过期横幅在会话真正失效前
+  ///       引导重登；网络失败（[SessionRenewResult.networkError]）则
+  ///       下次启动再试，彻底不打扰；
   /// - 无 SESSDATA（首次使用 / 已登出）→ 自动进入登录页引导登录一次
-  ///   （提示条说明「登录后自动保存、下次进入自动恢复」）；
+  ///   （提示条说明「登录后自动保存、下次进入自动恢复」）；登录页可关闭，
+  ///   关闭 = 匿名（首页顶部给明确「未登录仅 720P」提示条入口，不默认静默）；
   /// - 存储读取异常（原生插件缺失 / Keystore 故障）→ 静默跳过，不误导登录。
   ///
   /// 决策映射抽成 [planSessionStart]（纯函数，见 bilibili_api.dart，可单测）。
   Future<void> _handleSessionOnStart() async {
     final api = BiliApi();
     Duration? remain;
+    bool hasRefreshToken = false;
     try {
       remain = await api.remainingSession();
+      hasRefreshToken = await api.hasRefreshToken();
     } catch (e) {
       // 测试环境无 secure storage 原生插件等：静默，不引导登录
       debugPrint('[session] 读取登录态失败，静默跳过自动登录: $e');
       return;
     }
-    switch (planSessionStart(remain)) {
+    switch (planSessionStart(remain, hasRefreshToken: hasRefreshToken)) {
       case SessionStartAction.autoLogin:
         debugPrint('[session] 启动检查：无 SESSDATA → 自动进入登录页');
         await _guideAutoLogin();
       case SessionStartAction.refresh:
-        bool renewed = false;
+        SessionRenewResult outcome;
         try {
-          renewed = await api.refreshSession();
+          outcome = await api.refreshSession();
         } catch (_) {
-          renewed = false; // 网络/续期异常按失败处理
+          outcome = SessionRenewResult.networkError; // 异常按失败处理
         }
-        if (renewed) {
-          debugPrint('[session] SESSDATA 距过期<7天，静默续期成功');
-          return;
+        switch (outcome) {
+          case SessionRenewResult.renewed:
+            debugPrint('[session] 续期成功（新会话已保存），静默恢复');
+            return;
+          case SessionRenewResult.missingCredentials:
+          case SessionRenewResult.tokenInvalid:
+          case SessionRenewResult.networkError:
+            break;
         }
         // 续期失败：已过期 → 会话彻底失效，先清失效凭据（避免残留过期
         // SESSDATA 被播放取流等请求注入 → 服务端 -101 拒绝），再引导重登
         if (remain != null && remain.isNegative) {
-          debugPrint('[session] 会话已过期且续期失败 → 清除失效会话并引导重新登录');
+          debugPrint('[session] 会话已过期且续期失败'
+              '（outcome=$outcome）→ 清除失效会话并引导重新登录');
           try {
             await api.clearSession();
           } catch (_) {
             // 存储异常静默：引导登录不受影响
           }
           await _guideAutoLogin();
+        } else if (outcome == SessionRenewResult.tokenInvalid) {
+          // refresh_token 已废但 SESSDATA 本地仍有效：保留现会话（1080P
+          // 继续），不弹登录页打扰可用会话；播放 -101/临近过期提示会引导
+          debugPrint('[session] 续期失败：refresh_token 失效但会话未过期'
+              ' → 保留现会话（播放/临近过期时再引导重登）');
         } else {
-          debugPrint('[session] 距过期<7天但续期失败（未过期，保留现会话）');
+          debugPrint('[session] 续期失败（$outcome，未过期）'
+              ' → 保留现会话，下次启动再试');
         }
       case SessionStartAction.silent:
-        debugPrint('[session] 启动检查：会话有效（≥7天），静默恢复');
+        debugPrint('[session] 启动检查：会话有效（≥续期阈值），静默恢复');
+    }
+  }
+
+  /// 重查登录态并刷新首页「未登录仅 720P」提示条显隐（登录成功/清除后调用；
+  /// 读取异常按未登录不显示处理，避免误提示）。
+  Future<void> _refreshLoginHint() async {
+    final api = BiliApi();
+    bool loggedIn = false;
+    try {
+      final raw = await api.readSessdata();
+      final expire =
+          raw == null || raw.isEmpty ? null : BiliApi.sessdataExpireAt(raw);
+      loggedIn = expire != null && expire.isAfter(DateTime.now());
+    } catch (_) {
+      // 存储异常（测试环境等）：不显示提示条，避免误导
+      return;
+    }
+    if (mounted && _showLoginHint != !loggedIn) {
+      setState(() => _showLoginHint = !loggedIn);
     }
   }
 
@@ -763,6 +822,36 @@ class _PlaylistPageState extends State<PlaylistPage> {
   ) {
     return Column(
       children: [
+        // 未登录提示条（v2.16.21）：登录页被关闭/从未登录时给明确匿名提示 +
+        // 去登录入口，不默认静默降级；点击直达登录页（带自动保存说明 banner）
+        if (_showLoginHint)
+          Material(
+            color: theme.colorScheme.secondaryContainer,
+            child: InkWell(
+              onTap: () => _openLogin(context, banner: kAutoLoginBanner),
+              child: Padding(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+                child: Row(
+                  children: [
+                    Icon(Icons.info_outline,
+                        size: 16, color: theme.colorScheme.primary),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        _kLoginHintText,
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.colorScheme.onSecondaryContainer,
+                        ),
+                      ),
+                    ),
+                    Icon(Icons.chevron_right,
+                        size: 18, color: theme.colorScheme.primary),
+                  ],
+                ),
+              ),
+            ),
+          ),
         _CacheBar(
           fetchedAt: _fetchedAt,
           sourceName: _sourceName,
@@ -815,7 +904,11 @@ class _PlaylistPageState extends State<PlaylistPage> {
   ///
   /// [banner]：登录页顶部提示条文案——仅「自动引导登录」时传入
   /// （[kAutoLoginBanner]），说明登录态会自动保存、下次进入自动恢复；
-  /// 管理面板手动「登录/重新登录」不传（页面本身即自解释）。
+  /// 管理面板手动「登录/重新登录」与首页未登录提示条不传 banner 时可自解释。
+  ///
+  /// 登录页关闭（登录成功保存后自动 pop / 用户直接返回）都会回来，随后
+  /// 重查一次登录态刷新首页「未登录仅 720P」提示条——登录成功即消失、
+  /// 保持匿名则保留（无需重启）。
   ///
   /// 测试可注入 [widget.openLogin] 替身（不真推含 WebView 的登录页）。
   Future<void> _openLogin(BuildContext context, {String? banner}) async {
@@ -823,11 +916,12 @@ class _PlaylistPageState extends State<PlaylistPage> {
     final injected = widget.openLogin;
     if (injected != null) {
       await injected(context, banner: banner);
-      return;
+    } else {
+      await Navigator.of(context).push(
+        MaterialPageRoute<void>(builder: (_) => LoginPage(banner: banner)),
+      );
     }
-    await Navigator.of(context).push(
-      MaterialPageRoute<void>(builder: (_) => LoginPage(banner: banner)),
-    );
+    await _refreshLoginHint();
   }
 }
 
