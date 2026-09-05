@@ -100,8 +100,9 @@ String pgcFallbackMessage(PgcFallbackAction action) {
 //   垂直主导 → 起点左半屏亮度 / 右半屏音量（原生通道 bili_whitelist/media，
 //   见 services/device_media.dart）。竖屏只保留亮度/音量（水平主导忽略，
 //   无 seek 防误触）。
-// - 手势起点豁免带（v2.16.14+）：起点 y0 落在屏幕底部（或顶部）豁免带内
-//   的 Pan 整体忽略（不 seek / 不调亮度音量）——横屏全屏从屏幕下方滑动
+// - 手势起点豁免带（v2.16.14+ 顶/底 → v2.16.17+ 四边）：起点落在屏幕
+//   底部/顶部/左/右任一条豁免带内的 Pan 整体忽略（不 seek / 不调亮度音量）
+//   ——横屏全屏从**物理屏幕底部**滑动（旋转后 = 逻辑左/右边缘，见类顶注释）
 //   唤醒系统导航不再误触发 seek，让给系统手势；参数与判定见
 //   [isExcludedGestureStart]。
 //
@@ -139,19 +140,27 @@ enum PanSlideMode {
 /// （点按抖动 / 微移不触发任何手势），超过才按主导分量归类。
 const double kPanModeThreshold = 12;
 
-// 手势起点豁免带（v2.16.14+）
+// 手势起点豁免带（v2.16.14+ 顶/底 → v2.16.17+ 扩展四边）
 // ---------------------------------------------------------------------------
 // 背景（用户实测反馈）：横屏全屏（immersiveSticky）时想从屏幕**底部**滑动
 // 唤醒 Android 三键导航 / 手势导航，App 手势层与系统手势区同时收到触摸——
-// 旧版单一 Pan 覆盖整屏，这次从屏幕下方发起的左右滑被当成 seek（进度被拖走、
-// hud 乱跳）。而系统导航条在几何屏幕底部，底部这一带本来就不该属于播放手势。
-// 方案：Pan 起点 y0 落在**底部豁免带**内 → 本次 Pan 整体忽略（不 seek、
-// 不调亮度/音量、不出 hud），把这段屏幕让给系统手势；顶部同样留窄带
-// （横屏刘海 / 状态栏下拉区，防从屏幕最上缘启动的滑动误触发 seek）。
-// 竖屏/横屏统一适用：竖屏底部带内让给系统（从底部启动的纵向亮度/音量调节
-// 本来就可能被系统「上滑唤导航」手势抢占/截断，豁免后中部启动的调节不受
-// 影响，更安全）。豁免只作用于 Pan 滑动本身——tap / 双击 / 长按不走 Pan
-// 竞技场（tap 无位移不触发 Pan），底部带内单击显隐等照常。
+// 旧版单一 Pan 覆盖整屏，从屏幕下方发起的滑动被当成 seek（进度被拖走、
+// hud 乱跳）。而系统导航条在几何屏幕底部，这一带本来就不该属于播放手势。
+// v2.16.14 方案：Pan 起点 y0 落在**底部/顶部豁免带**内 → 本次 Pan 整体忽略
+// （不 seek、不调亮度/音量、不出 hud），把这段屏幕让给系统手势。
+//
+// v2.16.17 修复（用户实测 v2.16.14 仍误触发 seek 的根因）：豁免只查 y0 上下，
+// 但**横屏全屏时系统导航区在物理屏幕底边，对应 Flutter 逻辑坐标的左/右边**
+// （旋转后物理底边 = 逻辑左边缘或右边缘，取决于 landscapeLeft/Right）——
+// 用户从物理底部上滑在逻辑上呈「起点贴逻辑左/右边缘的横向滑动」，y0 在屏
+// 中部、不落任何 y 豁免带 → 豁免失效、仍被当 seek。修复：豁免判定扩展为
+// **四边**（含逻辑左/右边缘），横屏左右边缘用「与底部同宽」的豁免带覆盖
+// 物理底边导航区（两侧都留：用户持机方向不同，物理底边可能映到左或右任
+// 一边）；且判定改用**触摸按下点**（onPanDown 的真实坐标；onPanStart 是
+// 竞技场胜出点，边缘滑动实测可内移 ~100px，按它判边带会漏判）。
+// 竖屏维持上下豁免为主 + 左右窄带可选防误触（见参数注释）。
+// 豁免只作用于 Pan 滑动本身——tap / 双击 / 长按不走 Pan 竞技场（tap 无位移
+// 不触发 Pan），豁免带内单击显隐等照常。
 // ---------------------------------------------------------------------------
 
 /// 底部豁免带 = 屏高 × [kBottomGestureExclusionFactor]，且**不低于**
@@ -168,21 +177,38 @@ const double kBottomGestureExclusionMinPx = 48;
 /// 顶部豁免带（px，固定窄带）：状态栏 / 刘海下拉区。
 const double kTopGestureExclusionPx = 24;
 
-/// 手势起点是否落在豁免带内（纯函数，v2.16.14+，可单测）：
-/// - y0 ≥ 底部带上缘：height - max(height × [bottomFactor], [bottomMinPx])
-///   → 底部带内（让给系统导航手势）
+/// 竖屏时左右边缘的豁免带宽度（px，固定小窄带）：默认生效的左右豁免
+/// （v2.16.17+）——防从屏幕左/右最边缘启动的滑动被误判为亮度/音量调节 /
+/// 与系统手势导航「边缘返回」区重叠时抢手势；竖屏宽度 411dp 时 16px 仅占
+/// 两侧各 ~4%，几乎不挤压半屏亮度/音量操作区。横屏时该默认值不适用
+/// （物理底边导航区需要更宽，见 [isExcludedGestureStart] 调用处按横/竖屏
+/// 分别传入）。
+const double kSideGestureExclusionPxPortrait = 16;
+
+/// 手势起点是否落在豁免带内（纯函数，v2.16.14+ 顶/底、v2.16.17+ 四边，
+/// 可单测）。逻辑坐标点 (x0, y0)、逻辑尺寸 (width, height)，任一边命中即
+/// 返回 true：
 /// - y0 ≤ [topPx] → 顶部带内（状态栏 / 刘海区）
-/// 高度异常（≤ 0，防御）→ false（不豁免，退化为旧行为）。
+/// - y0 ≥ height - max(height × [bottomFactor], [bottomMinPx]) → 底部带内
+/// - x0 ≤ [leftPx] → 左带内（横屏全屏时物理底边导航区 = 逻辑左边缘）
+/// - x0 ≥ width - [rightPx] → 右带内（物理底边也可能映到逻辑右边缘）
+/// 尺寸异常（≤ 0，防御）→ false（不豁免，退化为旧行为）。
 bool isExcludedGestureStart({
+  required double x0,
   required double y0,
+  required double width,
   required double height,
+  double topPx = kTopGestureExclusionPx,
   double bottomFactor = kBottomGestureExclusionFactor,
   double bottomMinPx = kBottomGestureExclusionMinPx,
-  double topPx = kTopGestureExclusionPx,
+  double leftPx = kSideGestureExclusionPxPortrait,
+  double rightPx = kSideGestureExclusionPxPortrait,
 }) {
-  if (height <= 0) return false;
+  if (width <= 0 || height <= 0) return false;
   final bottomPx = math.max(height * bottomFactor, bottomMinPx);
-  return y0 >= height - bottomPx || y0 <= topPx;
+  final inTopBottom = y0 <= topPx || y0 >= height - bottomPx;
+  final inSides = x0 <= leftPx || x0 >= width - rightPx;
+  return inTopBottom || inSides;
 }
 
 /// 亮度 / 音量纵向调节的灵敏度（v2.16.12+）：`调节量 = 基准 + 滑动比例 ×
@@ -302,9 +328,11 @@ double brightnessPercent({
 ///   滑动按**主导方向**归类（v2.16.9+）：水平主导 → 全屏横屏 seek（时间浮层 +
 ///   松手 seekTo）；垂直主导 → 按起点左/右半屏调亮度/音量（原生通道
 ///   bili_whitelist/media，仅当前 Activity 内生效）。竖屏只保留亮度/音量
-///   （水平主导忽略，无 seek 防误触）。v2.16.14+：Pan 起点落在屏幕底部/
-///   顶部豁免带（[isExcludedGestureStart]）→ 本次 Pan 整体忽略（不 seek /
-///   不调亮度音量）——横屏全屏从屏幕下方滑动唤醒系统导航不再误触发 seek
+///   （水平主导忽略，无 seek 防误触）。v2.16.14+/v2.16.17+：触摸按下点落在
+///   屏幕底部/顶部/左右豁免带（[isExcludedGestureStart]，四边，按下点判定见
+///   [_onPanDown]）→ 本次 Pan 整体忽略（不 seek / 不调亮度音量）——横屏全屏
+///   从**物理底部**滑动（旋转后 = 逻辑左/右边缘，左右带加宽）唤醒系统导航
+///   不再误触发 seek
 /// - URL 过期（onUrlExpired）：重取 playurl → 记位置 → setDataSource(新流, 位置) 续播，
 ///   续播后按当前倍速/听视频状态恢复；重试 1 次仍失败显示「视频流过期，请重试」+ 重试按钮
 /// - 错误分类：403 防盗链异常 / -412 风控（指数退避 1s→2s→4s 重试）/ 62002 稿件失效 /
@@ -372,7 +400,7 @@ class _PlayerPageState extends State<PlayerPage> {
   // vertical → 起点半屏亮度/音量（横竖屏都可用）。锁定后本次手势不再切换
   // （防中途抖动）；seek 拖动中暂停 tick 位置刷新（松手 seek 后恢复）。
   double _panStartX = 0; // 手势起点 x（垂直模式按半屏判亮度/音量）
-  bool _panExcluded = false; // 起点在豁免带（v2.16.14+）→ 本次 Pan 整体忽略
+  bool _panExcluded = false; // 起点在豁免带（v2.16.17+ 四边）→ 本次 Pan 整体忽略
   PanSlideMode? _panMode; // 已锁定的主导方向（null = 未定，继续累计判定）
   double _panDx = 0; // 手势累计横向位移（px，仅锁定判定用）
   double _panDy = 0; // 手势累计纵向位移（px，仅锁定判定用）
@@ -1301,33 +1329,77 @@ class _PlayerPageState extends State<PlayerPage> {
     await _togglePlay();
   }
 
-  // ---------- 滑动统一 Pan：起点记录 → 主导方向锁定 → 分发 ----------
+  // ---------- 滑动统一 Pan：按下判豁免 → 起点记录 → 主导方向锁定 → 分发 ----------
 
-  /// 手势开始：记录起点（x0 供垂直模式半屏判亮度/音量），状态复位为未定，
-  /// 清掉上一手势残留 hud（延迟隐藏计时同步取消）。
-  /// 豁免带判定（v2.16.14+）：起点 y0 落在底部/顶部豁免带 → [_panExcluded]
-  /// = true，本次 Pan 整体忽略（update/end/cancel 早退，不 seek/不调亮度
-  /// 音量/不出 hud）——横屏全屏从屏幕下方滑动唤醒系统导航不再误触发 seek。
-  /// tap / 双击 / 长按不走 Pan 竞技场（tap 无位移不触发 Pan），不受影响。
+  /// 侧边豁免带宽度（px，v2.16.17+）：横屏（width > height，**物理底边 =
+  /// 逻辑左/右边**，见类顶注释）→ 与底部同宽策略（短边 ×8% or 48px 取较大，
+  /// 覆盖 3-button/手势导航条物理高度换算 + 手指按下点容差）；竖屏 → 窄带
+  /// 防误触（物理底边 = 逻辑底边，已有底部豁免覆盖，左右窄带仅防边缘误启动
+  /// 亮度/音量）。
+  double _sideGestureExclusionPx(Size size) {
+    if (size.width > size.height) {
+      return math.max(
+          size.height * kBottomGestureExclusionFactor,
+          kBottomGestureExclusionMinPx);
+    }
+    return kSideGestureExclusionPxPortrait;
+  }
+
+  /// 按下即判豁免（v2.16.17+，用**触摸按下点**而非 panStart 的竞技场胜出点）：
+  /// onPanDown 在手指按下第一时间回调（尚未位移 / 未进 arena），localPosition
+  /// 即真实触摸起点；而 onPanStart 的坐标是手势**赢得竞技场那一刻**的位置
+  /// （已滑过 touch slop、且边缘滑动常被系统手势区延迟释放——实测横屏右缘
+  /// 起点内移可达 ~100px），按它判边缘豁免带会漏判。命中豁免带（四边，
+  /// [isExcludedGestureStart]）→ [_panExcluded] = true，本次 Pan 整体忽略
+  /// （update/end/cancel 早退，不 seek / 不调亮度音量 / 不出 hud）——横屏全屏
+  /// 从**物理屏幕底部**滑动（旋转后 = 逻辑左或右边缘，取决于 landscapeLeft/
+  /// Right）唤醒系统导航不再误触发 seek。tap / 双击 / 长按不走 Pan 竞技场
+  /// （tap 无位移不触发 Pan），按下点豁免不影响单击显隐等。
+  void _onPanDown(DragDownDetails d) {
+    if (_player == null) return;
+    final size = MediaQuery.sizeOf(context);
+    final w = size.width;
+    final h = size.height;
+    final sidePx = _sideGestureExclusionPx(size);
+    if (isExcludedGestureStart(
+          x0: d.localPosition.dx,
+          y0: d.localPosition.dy,
+          width: w,
+          height: h,
+          leftPx: sidePx,
+          rightPx: sidePx,
+        )) {
+      _panExcluded = true;
+      debugPrint('[player_page] 手势按下点在豁免带 x0='
+          '${d.localPosition.dx.toStringAsFixed(0)}px y0='
+          '${d.localPosition.dy.toStringAsFixed(0)}px'
+          '（屏 ${w.toInt()}x${h.toInt()}，side=${sidePx.toStringAsFixed(0)}px）'
+          '→ 本次 Pan 忽略（让给系统手势）');
+    } else {
+      _panExcluded = false;
+    }
+  }
+
+  /// 手势赢得竞技场（已过 touch slop）：记录起点（x0 供垂直模式半屏判亮度/
+  /// 音量），状态复位为未定，清掉上一手势残留 hud（延迟隐藏计时同步取消）。
+  /// 豁免判定不在这里做（按下点已判，见 [_onPanDown]）；命中时直接早退——
+  /// 不再 seek / 不调亮度音量 / 不出 hud。
   void _onPanStart(DragStartDetails d) {
     if (_player == null) return;
+    if (_panExcluded) {
+      debugPrint('[player_page] 按下点已豁免 → panStart 早退（本次 Pan 忽略）');
+      return;
+    }
     _panMode = null;
-    _panExcluded = false;
     _panStartX = d.localPosition.dx;
     _panDx = 0;
     _panDy = 0;
     _hudTimer?.cancel();
     if (_hudKind != null) setState(() => _hudKind = null);
-    final height = MediaQuery.sizeOf(context).height;
-    if (isExcludedGestureStart(y0: d.localPosition.dy, height: height)) {
-      _panExcluded = true;
-      debugPrint('[player_page] 手势起点在豁免带 y0='
-          '${d.localPosition.dy.toStringAsFixed(0)}px'
-          '（屏高 ${height.toStringAsFixed(0)}px）→ 本次 Pan 忽略（让给系统手势）');
-      return;
-    }
+    final size = MediaQuery.sizeOf(context);
     debugPrint('[player_page] 手势开始 x0=${_panStartX.toStringAsFixed(0)}px '
-        'fullscreen=$_fullscreen');
+        'y0=${d.localPosition.dy.toStringAsFixed(0)}px '
+        'fullscreen=$_fullscreen（屏 ${size.width.toInt()}x${size.height.toInt()}）');
   }
 
   /// 手势滑动：先累计位移并尝试锁定主导方向（锁定后不再切换），
@@ -3045,11 +3117,15 @@ class _PlayerPageState extends State<PlayerPage> {
           //      锁定后本次手势不再切换）。v2.16.7 旧实现「横屏只注册横向、
           //      竖屏只注册纵向」→ 横屏全屏稍斜的上下滑被误判为横向 seek、
           //      纯上下滑完全无响应——本次修复让两者共存
-          //    - 豁免带（v2.16.14+）：Pan **起点 y0** 落在底部/顶部豁免带
-          //      （[isExcludedGestureStart]，见类顶常量）→ 本次 Pan 整体忽略，
-          //      不 seek / 不调亮度音量 / 不出 hud——横屏全屏从屏幕下方滑动
-          //      唤醒系统导航不再误触发 seek（起点带内该次触摸让给系统手势）；
-          //      tap / 双击 / 长按无位移不触发 Pan、不受豁免影响
+          //    - 豁免带（v2.16.14+ 顶/底 → v2.16.17+ 四边 + 按下点判定）：
+          //      **触摸按下点**（onPanDown 的真实坐标；onPanStart 是竞技场胜出
+          //      点，边缘滑动会因 slop/系统延迟内移，实测可达 ~100px，不可靠）
+          //      落在底部/顶部/左/右豁免带（[isExcludedGestureStart]，见类顶
+          //      常量）→ 本次 Pan 整体忽略，不 seek / 不调亮度音量 / 不出
+          //      hud——横屏全屏从**物理屏幕底部**滑动（旋转后 = 逻辑左/右
+          //      边缘，左右带加宽覆盖物理底边导航区）唤醒系统导航不再误触发
+          //      seek（按下点带内该次触摸让给系统手势）；tap / 双击 / 长按无
+          //      位移不触发 Pan、不受豁免影响
           //    - 控制层按钮 / 进度条在本层**之后**渲染（Stack 上层），其区域内
           //      点击与拖动天然拦截（按钮优先）；弹幕层 IgnorePointer 不参与命中
           //    听视频模式下让位给占位层（其自己处理点按恢复画面 + 长按 2x），
@@ -3064,6 +3140,7 @@ class _PlayerPageState extends State<PlayerPage> {
                 onLongPressEnd: _player == null ? null : _onLongPressEnd,
                 // 滑动统一 Pan（v2.16.9+）：方向判定在手势内完成——全屏横屏
                 // 水平主导 seek、垂直主导亮度/音量共存；竖屏水平主导忽略
+                onPanDown: _player == null ? null : _onPanDown,
                 onPanStart: _player == null ? null : _onPanStart,
                 onPanUpdate: _player == null ? null : _onPanUpdate,
                 onPanEnd: _player == null ? null : _onPanEnd,
