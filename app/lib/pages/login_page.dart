@@ -20,6 +20,11 @@ const String kLoginMobileUA = 'Mozilla/5.0 (Linux; Android 13; Pixel 7 '
     'Build/TQ3A.230805.001; wv) AppleWebKit/537.36 (KHTML, like Gecko) '
     'Version/4.0 Chrome/126.0.0.0 Mobile Safari/537.36';
 
+/// 自动引导登录时的提示条文案（LoginPage 顶部，仅自动登录路径传入）：
+/// 说明登录态会自动保存、之后每次进入自动恢复，避免用户误以为每次都要登录。
+const String kAutoLoginBanner = '登录 B 站账号可解锁 1080P 高清（手机号+验证码）。'
+    '登录后自动保存：下次进入 App 自动恢复，无需再次登录；不登录也能看（最高 720P）。';
+
 /// 内嵌 B 站官方登录页（WebView 登录，M4 替代原扫码登录）。
 ///
 /// 加载 https://passport.bilibili.com/login，用户在页面内用**短信验证码**
@@ -35,7 +40,10 @@ const String kLoginMobileUA = 'Mozilla/5.0 (Linux; Android 13; Pixel 7 '
 ///
 /// refresh_token 没抓到也不阻塞登录：自动续期会退化为"到期重新登录"。
 class LoginPage extends StatefulWidget {
-  const LoginPage({super.key});
+  /// 顶部提示条（自动登录引导时传入 [kAutoLoginBanner]；手动打开不传）。
+  final String? banner;
+
+  const LoginPage({super.key, this.banner});
 
   @override
   State<LoginPage> createState() => _LoginPageState();
@@ -253,6 +261,8 @@ class _LoginPageState extends State<LoginPage> {
   @override
   Widget build(BuildContext context) {
     final controller = _controller;
+    final theme = Theme.of(context);
+    final banner = widget.banner;
     return Scaffold(
       appBar: AppBar(
         title: const Text('登录'),
@@ -266,9 +276,29 @@ class _LoginPageState extends State<LoginPage> {
           ),
         ),
       ),
-      body: controller == null
-          ? const Center(child: CircularProgressIndicator())
-          : WebViewWidget(controller: controller),
+      body: Column(
+        children: [
+          // 自动登录引导提示条（手动打开登录页时无 banner 不显示）
+          if (banner != null && banner.isNotEmpty)
+            MaterialBanner(
+              content: Text(banner, style: theme.textTheme.bodySmall),
+              leading: Icon(
+                Icons.info_outline,
+                size: 20,
+                color: theme.colorScheme.primary,
+              ),
+              actions: const [SizedBox.shrink()],
+              backgroundColor: theme.colorScheme.secondaryContainer,
+              padding: const EdgeInsets.fromLTRB(16, 8, 16, 8),
+              dividerColor: Colors.transparent,
+            ),
+          Expanded(
+            child: controller == null
+                ? const Center(child: CircularProgressIndicator())
+                : WebViewWidget(controller: controller),
+          ),
+        ],
+      ),
     );
   }
 }

@@ -288,6 +288,31 @@ abstract final class MediaSearchTypes {
   static const doc = 'media_doc';
 }
 
+/// 启动时登录态处理动作（v2.16.18 自动登录）。
+enum SessionStartAction {
+  /// 会话有效（距过期 ≥ 7 天）：静默恢复，不弹任何界面、不打扰。
+  silent,
+
+  /// 会话将过期 / 已过期（距过期 < 7 天）：尝试静默续期（refresh_token）。
+  refresh,
+
+  /// 无 SESSDATA（首次使用 / 已登出 / 彻底过期）：自动进入登录页引导登录。
+  autoLogin,
+}
+
+/// 启动登录态决策（纯函数，便于单测）：
+///
+/// - [remain] 为 null（无 SESSDATA / 解析失败）→ [SessionStartAction.autoLogin]
+/// - 距过期 ≥ 7 天 → [SessionStartAction.silent]（登录态有效，静默恢复）
+/// - 距过期 < 7 天（**含已过期**，[Duration.isNegative]）→
+///   [SessionStartAction.refresh]（用 refresh_token 静默续期；续期失败且
+///   续期前**已过期**时应转 [SessionStartAction.autoLogin]，由调用方判定）
+SessionStartAction planSessionStart(Duration? remain) {
+  if (remain == null) return SessionStartAction.autoLogin;
+  if (remain < const Duration(days: 7)) return SessionStartAction.refresh;
+  return SessionStartAction.silent;
+}
+
 /// B 站 API 客户端（dio 封装）。
 ///
 /// - 全局默认头 = 完整浏览器头（防 -412 风控），登录后追加 Cookie: SESSDATA

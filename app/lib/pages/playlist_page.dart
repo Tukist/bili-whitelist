@@ -42,10 +42,11 @@ import 'upowner_page.dart';
 /// - 右上角导入入口：粘贴分享链接/文本（视频 BV/b23.tv 短链/完整链接；
 ///   番剧/电影 ep|ss 链接与 b23 番剧短码 → 整季逐集加入白名单，v2.16.2）
 /// - 右上角管理入口：GitHub token/gist_id 配置 + 新建合集 + 合集管理
-///   + 缓存管理 + 翻译服务配置
-/// - 右上角登录入口可进 WebView 登录页（解锁 1080P，M4 起内嵌官方登录页）
-/// - 启动时静默检查登录态：SESSDATA 距过期 < 7 天自动续期；
-///   续期失败且已过期时提示重新登录
+///   + 缓存管理 + 翻译服务配置 + **B 站账号**（登录/重新登录，v2.16.18）
+/// - **启动自动登录**（v2.16.18，取代原右上角常驻登录按钮）：
+///   SESSDATA 有效 → 静默恢复（不弹界面）；距过期 < 7 天 → refresh_token
+///   静默续期；无 SESSDATA / 彻底过期 → 自动进入登录页引导登录一次；
+///   登录成功自动保存，之后每次进入静默恢复
 /// - **主页 PageView 三页**（初始停在主页合集页，左右滑动切换）：
 ///   右滑 → 历史记录页（播放历史，点击续播；顶部历史图标可直达）；
 ///   左滑 → 白名单 UP 主管理页
@@ -54,7 +55,14 @@ class PlaylistPage extends StatefulWidget {
   /// 拖动排序/导入等写操作统一走 [GithubApi.saveToGist]。
   final GithubApi? github;
 
-  const PlaylistPage({super.key, this.github});
+  /// 测试注入：登录页导航替身（默认推真实 [LoginPage]）。
+  /// 无会话/会话过期自动引导与管理面板「登录/重新登录」统一走这里，
+  /// 测试可注入替身记录"请求了登录"而不真推 LoginPage（WebView 构造
+  /// 在测试环境会 assert 平台未注册）。
+  final Future<void> Function(BuildContext context, {String? banner})?
+      openLogin;
+
+  const PlaylistPage({super.key, this.github, this.openLogin});
 
   @override
   State<PlaylistPage> createState() => _PlaylistPageState();
@@ -105,11 +113,14 @@ class _PlaylistPageState extends State<PlaylistPage> {
     );
   }
 
+  /// 自动登录是否已引导（本次进程只自动引导一次，避免循环/重复弹页）。
+  bool _autoLoginGuided = false;
+
   @override
   void initState() {
     super.initState();
     _load();
-    _maybeRefreshSession();
+    _handleSessionOnStart();
     _loadVersion();
     // 启动 5s 后静默检查更新 + 信箱检查；两者都失败静默不打扰。
     _refreshInboxCount();
@@ -139,30 +150,64 @@ class _PlaylistPageState extends State<PlaylistPage> {
     }
   }
 
-  /// 启动续期（静默）：距 SESSDATA 过期 < 7 天 → 用 refresh_token 自动续期；
-  /// 已过期且续期失败 → 提示重新登录。未登录/解析失败静默跳过。
-  Future<void> _maybeRefreshSession() async {
+  /// 启动自动登录（v2.16.18，App 启动 / 首页 initState 即触发，不依赖按钮）：
+  ///
+  /// - SESSDATA 有效（距过期 ≥ 7 天）→ 静默恢复，不弹任何界面；
+  /// - 距过期 < 7 天（含已过期）→ 用 refresh_token 静默续期，成功即静默；
+  ///   续期失败且**已过期** → 自动进入登录页引导重新登录；
+  ///   续期失败但未过期 → 保留现会话（不打扰，过期时由下次启动引导）；
+  /// - 无 SESSDATA（首次使用 / 已登出）→ 自动进入登录页引导登录一次
+  ///   （提示条说明「登录后自动保存、下次进入自动恢复」）；
+  /// - 存储读取异常（原生插件缺失 / Keystore 故障）→ 静默跳过，不误导登录。
+  ///
+  /// 决策映射抽成 [planSessionStart]（纯函数，见 bilibili_api.dart，可单测）。
+  Future<void> _handleSessionOnStart() async {
+    final api = BiliApi();
+    Duration? remain;
     try {
-      final api = BiliApi();
-      final remain = await api.remainingSession();
-      if (remain == null) return;
-      if (remain >= const Duration(days: 7)) return;
-      final ok = await api.refreshSession();
-      if (ok) return; // 续期成功：静默，不打扰用户
-      if (remain.isNegative && mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: const Text('登录已过期，请重新登录'),
-            action: SnackBarAction(
-              label: '去登录',
-              onPressed: () => _openLogin(context),
-            ),
-          ),
-        );
-      }
-    } catch (_) {
-      // 测试环境无 secure storage 原生插件等，静默
+      remain = await api.remainingSession();
+    } catch (e) {
+      // 测试环境无 secure storage 原生插件等：静默，不引导登录
+      debugPrint('[session] 读取登录态失败，静默跳过自动登录: $e');
+      return;
     }
+    switch (planSessionStart(remain)) {
+      case SessionStartAction.autoLogin:
+        debugPrint('[session] 启动检查：无 SESSDATA → 自动进入登录页');
+        await _guideAutoLogin();
+      case SessionStartAction.refresh:
+        bool renewed = false;
+        try {
+          renewed = await api.refreshSession();
+        } catch (_) {
+          renewed = false; // 网络/续期异常按失败处理
+        }
+        if (renewed) {
+          debugPrint('[session] SESSDATA 距过期<7天，静默续期成功');
+          return;
+        }
+        // 续期失败：已过期 → 会话彻底失效，自动引导重登；未过期 → 保留
+        if (remain != null && remain.isNegative) {
+          debugPrint('[session] 会话已过期且续期失败 → 自动引导重新登录');
+          await _guideAutoLogin();
+        } else {
+          debugPrint('[session] 距过期<7天但续期失败（未过期，保留现会话）');
+        }
+      case SessionStartAction.silent:
+        debugPrint('[session] 启动检查：会话有效（≥7天），静默恢复');
+    }
+  }
+
+  /// 自动引导进入登录页（本次进程只触发一次；等首帧结束再导航）。
+  Future<void> _guideAutoLogin() async {
+    if (_autoLoginGuided) return;
+    _autoLoginGuided = true;
+    if (!mounted) return;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      debugPrint('[session] 打开登录页（自动引导）');
+      _openLogin(context, banner: kAutoLoginBanner);
+    });
   }
 
   /// 获取（或懒构造）UpdateService。
@@ -451,7 +496,8 @@ class _PlaylistPageState extends State<PlaylistPage> {
     if (mounted) _load();
   }
 
-  /// 打开管理面板（GitHub 配置 + 新建合集 + 合集管理 + 缓存管理 + 翻译服务 + 检查更新）。
+  /// 打开管理面板（GitHub 配置 + B 站账号 + 新建合集 + 合集管理 + 缓存管理
+  /// + 翻译服务 + 检查更新）。
   void _openManage() {
     showModalBottomSheet<void>(
       context: context,
@@ -462,6 +508,10 @@ class _PlaylistPageState extends State<PlaylistPage> {
         onCollectionCreated: _createCollection,
         onManageCollections: _openCollectionManage,
         onCheckUpdate: _manualCheckUpdate,
+        // 次级「登录 / 重新登录」入口：面板内按钮先 pop 自身，再推登录页
+        onLogin: () {
+          if (mounted) _openLogin(context);
+        },
       ),
     );
   }
@@ -673,14 +723,9 @@ class _PlaylistPageState extends State<PlaylistPage> {
             onPressed: _openImport,
           ),
           IconButton(
-            tooltip: '管理（GitHub 配置 / 合集）',
+            tooltip: '管理（GitHub 配置 / 合集 / B 站账号）',
             icon: const Icon(Icons.settings_outlined),
             onPressed: _openManage,
-          ),
-          IconButton(
-            tooltip: '登录（解锁 1080P）',
-            icon: const Icon(Icons.login),
-            onPressed: () => _openLogin(context),
           ),
         ],
       ),
@@ -760,10 +805,23 @@ class _PlaylistPageState extends State<PlaylistPage> {
     );
   }
 
-  void _openLogin(BuildContext context) {
-    Navigator.of(
-      context,
-    ).push(MaterialPageRoute<void>(builder: (_) => const LoginPage()));
+  /// 打开登录页（WebView 短信登录）。
+  ///
+  /// [banner]：登录页顶部提示条文案——仅「自动引导登录」时传入
+  /// （[kAutoLoginBanner]），说明登录态会自动保存、下次进入自动恢复；
+  /// 管理面板手动「登录/重新登录」不传（页面本身即自解释）。
+  ///
+  /// 测试可注入 [widget.openLogin] 替身（不真推含 WebView 的登录页）。
+  Future<void> _openLogin(BuildContext context, {String? banner}) async {
+    if (!mounted) return;
+    final injected = widget.openLogin;
+    if (injected != null) {
+      await injected(context, banner: banner);
+      return;
+    }
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(builder: (_) => LoginPage(banner: banner)),
+    );
   }
 }
 
@@ -1417,17 +1475,22 @@ class _ManageSheet extends StatefulWidget {
   final Future<void> Function(String name) onCollectionCreated;
   final VoidCallback onManageCollections; // 打开合集管理面板（重命名/删除）
   final VoidCallback onCheckUpdate; // M1.2 检查更新入口
+  final VoidCallback onLogin; // B 站账号：面板关闭后推登录页（登录/重新登录）
 
   const _ManageSheet({
     required this.github,
     required this.onCollectionCreated,
     required this.onManageCollections,
     required this.onCheckUpdate,
+    required this.onLogin,
   });
 
   @override
   State<_ManageSheet> createState() => _ManageSheetState();
 }
+
+/// B 站账号登录态（管理面板顶部状态展示）。
+enum _AccountState { loading, loggedIn, expired, none }
 
 class _ManageSheetState extends State<_ManageSheet> {
   final _tokenCtrl = TextEditingController();
@@ -1438,10 +1501,17 @@ class _ManageSheetState extends State<_ManageSheet> {
   bool _creating = false;
   bool _obscureToken = true;
 
+  /// B 站账号状态（读取 secure storage 的 SESSDATA 剩余有效期判断）。
+  _AccountState _account = _AccountState.loading;
+
+  /// SESSDATA 剩余有效期（-1 秒 = 刚过期；仅展示用，不涉及具体凭据内容）。
+  Duration? _accountRemain;
+
   @override
   void initState() {
     super.initState();
     _loadConfig();
+    _loadAccount();
   }
 
   @override
@@ -1451,6 +1521,49 @@ class _ManageSheetState extends State<_ManageSheet> {
     _nameCtrl.dispose();
     super.dispose();
   }
+
+  /// 读取 B 站账号登录态（只判断有无/有效期，不读取任何凭据值）。
+  Future<void> _loadAccount() async {
+    _AccountState next;
+    Duration? remain;
+    try {
+      remain = await BiliApi().remainingSession();
+      if (remain == null) {
+        next = _AccountState.none;
+      } else if (remain.isNegative) {
+        next = _AccountState.expired;
+      } else {
+        next = _AccountState.loggedIn;
+      }
+    } catch (_) {
+      next = _AccountState.none; // 存储异常按未登录展示（可手动进登录页）
+    }
+    if (!mounted) return;
+    setState(() {
+      _account = next;
+      _accountRemain = remain;
+    });
+  }
+
+  /// 账号区块标题行说明文案（不涉及具体凭据）。
+  String get _accountTitle {
+    switch (_account) {
+      case _AccountState.loading:
+        return '正在检查 B 站账号…';
+      case _AccountState.loggedIn:
+        final remain = _accountRemain;
+        final near = remain != null && remain < const Duration(days: 7);
+        return '已登录：B 站账号已连接（1080P 已解锁${near ? '，将自动续期' : ''}）';
+      case _AccountState.expired:
+        return '登录已过期：重新登录后恢复 1080P';
+      case _AccountState.none:
+        return '未登录：登录后可解锁 1080P（登录一次，之后每次进入自动恢复）';
+    }
+  }
+
+  /// 账号区块按钮文案（登录 / 重新登录共用同一 WebView 登录页）。
+  String get _accountActionLabel =>
+      _account == _AccountState.loggedIn ? '重新登录' : '登录';
 
   Future<void> _loadConfig() async {
     try {
@@ -1524,6 +1637,36 @@ class _ManageSheetState extends State<_ManageSheet> {
                 color: theme.colorScheme.onSurfaceVariant,
               ),
             ),
+            const SizedBox(height: 16),
+            // ---- B 站账号（自动登录的次级入口：登录 / 重新登录）----
+            Text('B 站账号', style: theme.textTheme.titleMedium),
+            const SizedBox(height: 4),
+            Text(
+              _accountTitle,
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+            const SizedBox(height: 8),
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                // 关闭面板再推登录页（与「检查更新」同模式，干净上下文）
+                onPressed: () {
+                  Navigator.of(context).pop();
+                  widget.onLogin();
+                },
+                icon: Icon(
+                  _account == _AccountState.loggedIn
+                      ? Icons.person_outline
+                      : Icons.login,
+                  size: 18,
+                ),
+                label: Text(_accountActionLabel),
+              ),
+            ),
+            const SizedBox(height: 16),
+            const Divider(height: 1),
             const SizedBox(height: 16),
             // ---- GitHub 配置 ----
             Text('GitHub 配置', style: theme.textTheme.titleMedium),

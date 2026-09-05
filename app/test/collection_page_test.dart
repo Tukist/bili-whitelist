@@ -145,6 +145,13 @@ Future<({_FakeAdapter adapter, GithubApi github})> _pumpHomeWithGithub(
   _mockSecureStorage(); // 注册内存 secure storage 通道（hasConfig 需要）
   _store[GithubApi.kTokenKey] = 'ghp_fake';
   _store[GithubApi.kGistIdKey] = 'gist1';
+  // v2.16.18 启动自动登录：注入"会话有效（≥ 7 天）"的合成 SESSDATA，
+  // 让主页静默启动（这些用例测的是拖动排序，与登录流程无关；无会话会
+  // 自动进登录页，而 LoginPage 的 WebView 在测试环境无法构建）
+  final expireSec =
+      DateTime.now().add(const Duration(days: 30)).millisecondsSinceEpoch ~/
+          1000;
+  _store['bili_sessdata'] = '12345,$expireSec,${'a' * 32}';
   final adapter = _FakeAdapter();
   final dio = Dio(BaseOptions(baseUrl: 'https://api.github.com'));
   dio.httpClientAdapter = adapter;

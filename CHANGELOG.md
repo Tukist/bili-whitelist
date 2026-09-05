@@ -8,6 +8,21 @@
 
 ---
 
+## v2.16.18 (2026-09-05)
+
+**新增 / 改进**
+
+- **自动登录（启动自动处理登录态 + 移除首页登录按钮）**——解决用户反馈「每次进 App 都要点首页"登录（解锁 1080P）"按钮」：
+  - **根因**（诊断）：① 首页 AppBar 登录按钮是**无条件常驻渲染**（tooltip/图标固定为"登录（解锁 1080P）"，无任何登录态分支）——已登录用户每次进入仍看到"要登录"，反复误点/困惑；② **无 SESSDATA（首次/彻底过期）时没有任何自动登录路径**——旧 `_maybeRefreshSession` 只覆盖"已有 SESSDATA 且将过期→续期"，无会话直接静默跳过，用户只能手动点按钮；续期逻辑本身已挂 initState 且不依赖按钮（此项非问题）
+  - **启动自动登录**（`app/lib/pages/playlist_page.dart` `_handleSessionOnStart`，首页 initState 触发，不依赖任何按钮）：读 secure storage——**SESSDATA 有效（距过期 ≥ 7 天）→ 静默恢复**，不弹任何界面；**距过期 < 7 天（含已过期）→ refresh_token 静默续期**（成功即静默；续期失败且**已过期**→ 自动引导重新登录；未过期 → 保留现会话不打扰）；**无 SESSDATA（首次使用/登出）→ 自动进入登录页引导一次**（防循环：本次进程只引导一次）。存储读取异常（插件缺失/Keystore 故障）静默跳过，不误导登录
+  - **决策映射抽为纯函数**（`app/lib/api/bilibili_api.dart` `planSessionStart` + `SessionStartAction` 枚举）：`null → autoLogin / <7天 → refresh / ≥7天 → silent`，可单测
+  - **移除首页 AppBar 登录按钮**（原 tooltip"登录（解锁 1080P）"IconButton 删除）；**次级"账号/重新登录"入口**移到**管理面板**（右上角齿轮 → 新增「B 站账号」区块：状态读实时——已连接/会话过期/未登录文案 + 「登录 / 重新登录」按钮，关闭面板后推登录页）
+  - **自动引导登录页带提示条**（`app/lib/pages/login_page.dart` 新增可选 `banner`，自动路径传 `kAutoLoginBanner`：说明"登录后自动保存：下次进入自动恢复，无需再次登录；不登录也能看（最高 720P）"）；手动入口（管理面板）不显示提示条
+  - 测试注入接缝：`PlaylistPage.openLogin`（测试替身记录"请求登录"而不推含 WebView 的真实 LoginPage——后者构造在测试环境 assert 平台未注册）
+  - **单测**（新 `app/test/auto_login_test.dart`，11 用例）：`planSessionStart` 映射（null→autoLogin / ≥7天与恰好 7 天→silent / <7天与已过期→refresh）；widget（mock secure storage 通道 + 注入登录导航替身）——无会话冷启动**自动请求登录一次且带 banner**、多次 pump 不重复触发、有会话（≥7 天）**静默零请求**、<7 天缺 refresh 凭据续期失败未过期**保留不请求**、已过期缺凭据→**自动请求重登**、管理面板已连接「重新登录」/ 未连接「登录」入口与状态文案、首页无"登录（解锁 1080P）"tooltip。旧 `collection_page_test.dart` 拖动用例注入合成有效会话（测拖动与登录无关，无会话会触发自动登录页而 WebView 测试环境不可构建）
+  - **模拟器实测（logcat + uiautomator 文本取证，不读媒体）**：无会话冷启动 → `[session] 启动检查：无 SESSDATA → 自动进入登录页` + `[session] 打开登录页（自动引导）`，uiautomator dump 见登录页（content-desc「登录」+ Back + banner 全文 + WebView 加载）；back 回首页无循环；注入合成会话（+30 天，仅结构合法的假凭据，非真实账号）冷启动 → `[session] 启动检查：会话有效（≥7天），静默恢复`、**无**登录页弹出，首页 dump 正常合集卡片；打开管理面板 → dump 含「B 站账号 / 已登录：B 站账号已连接（1080P 已解锁）/ 重新登录」
+  - ⚠ **播放取流 1080P 档位说明**：App 取流注入 SESSDATA 逻辑未改动（既有实现 + 既有单测覆盖），合成会话服务端不认、无法在自动化中复现真实 1080P 档位；真实账号 1080P 请在真机登录后复核
+
 ## v2.16.17 (2026-09-05)
 
 **修复**
