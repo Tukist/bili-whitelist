@@ -4,6 +4,12 @@
     <uses-permission android:name="android.permission.INTERNET"/>
     <!-- 应用内版本更新（M1.3）：下载 APK 后通过系统安装器触发安装流程。min_sdk=26 → FileProvider 强制走。 -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES"/>
+    <!-- 评论图片保存相册（v2.16.19+）：API 29+ 走 MediaStore 免权限；仅 API 26~28
+         （Android 8/9）需要写公开目录 → WRITE_EXTERNAL_STORAGE 且 maxSdkVersion=28
+         限定（Android 10+ 永远不出现此权限）。 -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28"/>
     <application
         android:label="ビリビリ"
         android:name="${applicationName}"

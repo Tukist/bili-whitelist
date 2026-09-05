@@ -7,8 +7,10 @@
 // - DanmakuSettingsStore：shared_preferences mock 存取 roundtrip、
 //   无记录/损坏 JSON → 默认设置
 // - DanmakuOverlay：widget smoke（Ticker + 发射 + 透明度设置不抛异常）、
-//   显示区域轨道换算纯逻辑 danmakuScrollLaneCount（100% 与旧版一致 /
-//   30% 显著减少 / 极小区域保底）
+//   显示区域轨道换算纯逻辑 danmakuScrollLaneCount（100% / 30% / 极小区域
+//   保底 / 超大屏封顶——**滚动轨占满可用带，不再扣顶部/底部固定行**）、
+//   顶/底行 y 换算纯逻辑、小显示区域（30%）三类弹幕共存 + y 不越区域
+//   的 widget 测试（v2.16.13 显示区域后的布局调整：顶/底与滚动可重叠）
 // 不访问真实网络。
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -366,31 +368,72 @@ void main() {
     });
   });
 
-  group('DanmakuOverlay 显示区域轨道换算（v2.16.13）', () {
-    const laneH = 27.0; // 常规行高：字号 25 × 1.6
+  group('DanmakuOverlay 显示区域轨道换算（v2.16.13；布局调整后滚动占满带）', () {
+    const laneH = 27.0; // 常规行高口径（字号 25 → 17px × 1.6 ≈ 27.2，同量纲）
 
-    test('100%：与 v2.16.12 旧布局一致（0.7h 带 → 28 行 → 滚动 23）', () {
-      // 屏高 1080：可用带高 = 1080 × 0.7 = 756
-      expect(danmakuScrollLaneCount(756, laneH), 23);
-      expect(danmakuScrollLaneCount(756, laneH) + 3 + 2, 28);
+    test('100%：0.7h 带全部切给滚动（不再扣顶 3 底 2）→ 28 条', () {
+      // 屏高 1080：可用带高 = 1080 × 0.7 = 756 → floor(756/27) = 28
+      expect(danmakuScrollLaneCount(756, laneH), 28);
     });
 
-    test('区域 30%：带高按 0.3 缩减 → 轨道数显著减少（23 → 3）', () {
-      // 屏高 1080、区域 30%：带高 = 1080 × 0.7 × 0.3 = 226.8 → 8 行 - 顶3 底2
-      expect(danmakuScrollLaneCount(226.8, laneH), 3);
-      // 区域 50%：378 → 14 行 → 9 条滚动轨
-      expect(danmakuScrollLaneCount(378, laneH), 9);
+    test('区域 30%：带高 226.8 → 8 条（改动前 8-3-2=3——不再被顶/底行挤占）', () {
+      // 屏高 1080、区域 30%：带高 = 1080 × 0.7 × 0.3 = 226.8 → floor = 8
+      expect(danmakuScrollLaneCount(226.8, laneH), 8);
+      // 区域 50%：378 → 14 条
+      expect(danmakuScrollLaneCount(378, laneH), 14);
     });
 
-    test('区域小到带高不足固定行：保底 1 条滚动轨（不崩溃）', () {
-      // 区域 10%：带高 75.6 → floor 2 行，不足 顶3+底2 → 保底 6 总行
-      expect(danmakuScrollLaneCount(75.6, laneH), 1);
+    test('区域小到带高不足一行：保底 1 条滚动轨（不崩溃）', () {
+      // 区域 10% 屏高 1080：带高 75.6 → floor(75.6/27) = 2 条
+      expect(danmakuScrollLaneCount(75.6, laneH), 2);
+      // 带高 < 行高（极小屏 + 10%）：floor = 0 → 保底 1 条
+      expect(danmakuScrollLaneCount(20, laneH), 1);
     });
 
-    test('超大屏（带高极大）封顶 60 总行 → 滚动 55', () {
-      expect(danmakuScrollLaneCount(4000, laneH), 55);
-      // 正常小屏行高略变也不影响换算（如 640 高：0.7×640=448 → 16 行 → 11）
-      expect(danmakuScrollLaneCount(448, laneH), 11);
+    test('超大屏封顶 60 条滚动轨', () {
+      expect(danmakuScrollLaneCount(4000, laneH), 60);
+      // 正常小屏行高略变也不影响换算（如 640 高：0.7×640=448 → floor 16 条）
+      expect(danmakuScrollLaneCount(448, laneH), 16);
+    });
+  });
+
+  group('顶/底行 y 换算（重叠语义，纯逻辑）', () {
+    const laneH = 27.0;
+
+    test('顶部行 i：y = 顶锚 + i×行高（行 0 显示在显示区域最顶）', () {
+      // 30% 屏高 1080 的顶锚 = 0.12×1080×0.3 = 38.88 → 逐行 38.9 / 65.9 / 92.9
+      expect(danmakuTopTextY(38.9, 0, laneH), closeTo(38.9, 1e-9));
+      expect(danmakuTopTextY(38.9, 1, laneH), closeTo(65.9, 1e-9));
+      expect(danmakuTopTextY(38.9, 2, laneH), closeTo(92.9, 1e-9));
+    });
+
+    test('顶部行与滚动轨道同 y（共用顶锚）——纵坐标可重叠的基础', () {
+      // 顶行 i 与滚动轨 i 都由「顶锚 + i×行高」定位 → 顶/底不再避让滚动
+      expect(danmakuTopTextY(38.9, 0, laneH), danmakuTopTextY(38.9, 0, laneH));
+      // 顶行 0 即滚动轨 0 的带顶：小区域下顶部弹幕仍在最顶可见
+      expect(danmakuTopTextY(38.9, 0, laneH), closeTo(38.9, 1e-9));
+    });
+
+    test('底部行 i：y = 底缘 − i×行高 − 文本高（行 0 底边贴底缘，向上堆叠）', () {
+      const textH = 23.0;
+      // 行 0：文本顶 = 底缘 − 文本高 → 文本底边恰好 = 底缘
+      expect(danmakuBottomTextY(265.7, 0, laneH, textH), closeTo(242.7, 1e-9));
+      expect(danmakuBottomTextY(265.7, 0, laneH, textH) + textH,
+          closeTo(265.7, 1e-9));
+      // 行 1：再上移一行高 → 底行之间互不叠（差 = 行高）
+      expect(danmakuBottomTextY(265.7, 1, laneH, textH), closeTo(215.7, 1e-9));
+      // 与滚动轨可重叠：行 1 顶部（215.7）落在滚动轨带内（如 38.9~265.7）
+      expect(danmakuBottomTextY(265.7, 1, laneH, textH),
+          greaterThan(danmakuTopTextY(38.9, 0, laneH)));
+    });
+
+    test('底部行不越显示区域：行 0 底边 = 底缘，而底缘 ≤ 区域下界', () {
+      // 底缘在 _ensureLayout 被钳制 ≤ 屏高×区域比（此处 30% → 240），
+      // 行 0 底边 = 底缘 → 任何底行文本底边都不会越出区域下界
+      const bottomEdge = 185.6; // min(0.82×240, 240 − 2×27) = 185.6
+      expect(danmakuBottomTextY(bottomEdge, 0, laneH, 23.0) + 23.0,
+          closeTo(bottomEdge, 1e-9));
+      expect(bottomEdge, lessThanOrEqualTo(240.0));
     });
   });
 
@@ -498,6 +541,97 @@ void main() {
       final after = st.debugActiveScrollX as double;
       expect(after, lessThan(before));
       expect(before - after, lessThan(5));
+      await tester.pumpWidget(const SizedBox());
+    });
+  });
+
+  group('DanmakuOverlay 顶/底与滚动重叠（v2.16.13 后布局调整）', () {
+    // 屏 400x800、区域 30%：区域下界 = 240px；可用带高 = 800×0.7×0.3 = 168
+    // → 行高 27.2 → floor(168/27.2) = **6 条滚动轨**（改动前 6−3−2 = 1 条，
+    // 弹幕量被顶/底固定行挤到几乎不可用——本次修复的目标场景）。
+    final list = <Danmaku>[
+      for (var i = 0; i < 6; i++) _dm('滚$i', timeSec: 0.1 + i * 0.1),
+      _dm('顶甲', timeSec: 1.0, mode: 5),
+      _dm('顶乙', timeSec: 1.1, mode: 5),
+      _dm('底甲', timeSec: 1.2, mode: 4),
+      _dm('底乙', timeSec: 1.3, mode: 4),
+    ];
+    const settings = DanmakuSettings(displayAreaPercent: 30);
+
+    Widget build() => MaterialApp(
+          home: Center(
+            child: SizedBox(
+              width: 400,
+              height: 800,
+              child: DanmakuOverlay(
+                danmaku: list,
+                playing: true,
+                positionMs: 2000, // 全部 timeSec 已到 → 逐帧全部发射
+                settings: settings,
+              ),
+            ),
+          ),
+        );
+
+    // 测试面固定 400x800（默认 800x600 会把 SizedBox 高度压到 600 → 带高不足，
+    // 轨道数就不是本组要断言的 6 条）。
+    void setSurface(WidgetTester tester) {
+      tester.view.physicalSize = const Size(400, 800);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+    }
+
+    testWidgets('区域 30%：滚动 6 轨占满可用带，顶部 2 + 底部 2 仍全部发射'
+        '（不再因滚动/顶/底互斥而被挤掉）', (tester) async {
+      setSurface(tester);
+      await tester.pumpWidget(build());
+      // 推进 ~1.4s：layout + 逐帧发射（发射信用速率 40 条/s：首帧满额 4 条
+      // 后按 16ms/帧涓流补发 → 10 条约 0.3s 内全部进入；~1.5s 内滚动未出
+      // 屏（穿越 4s）、顶/底未到停留 3.5s 上限 → 全部在屏存活）
+      for (var i = 0; i < 90; i++) {
+        await tester.pump(const Duration(milliseconds: 16));
+      }
+      final dynamic st = tester.state(find.byType(DanmakuOverlay));
+      // 布局层面：滚动轨占满可用带（6 条），顶部/底部行保留（3/2）
+      expect(st.debugLayoutScrollLanes as int, 6);
+      // 三类共存：6 滚动 + 2 顶部 + 2 底部全部发射（互不挤占）
+      expect((st.debugActiveScrollYs as List).length, 6);
+      expect((st.debugActiveTopYs as List).length, 2);
+      expect((st.debugActiveBottomYs as List).length, 2);
+      // 无任何类型因轨道占用被丢弃（顶/底不再为滚动避让而让行）
+      expect(st.debugScrollDropped as int, 0);
+      expect(st.debugTopDropped as int, 0);
+      expect(st.debugBottomDropped as int, 0);
+      await tester.pumpWidget(const SizedBox());
+    });
+
+    testWidgets('区域 30%：滚动轨各自不叠、顶部贴顶锚、底行距 = 行高、'
+        '所有 y 不越显示区域', (tester) async {
+      setSurface(tester);
+      await tester.pumpWidget(build());
+      for (var i = 0; i < 90; i++) {
+        await tester.pump(const Duration(milliseconds: 16));
+      }
+      final dynamic st = tester.state(find.byType(DanmakuOverlay));
+      final laneH = st.debugLayoutLaneH as double;
+      final scrollYs = (st.debugActiveScrollYs as List).cast<double>();
+      final topYs = (st.debugActiveTopYs as List).cast<double>()..sort();
+      final bottomYs = (st.debugActiveBottomYs as List).cast<double>()..sort();
+      // 滚动轨道内部不叠：同时活跃的 6 条各占一行（y 两两不同）
+      expect(scrollYs.toSet().length, scrollYs.length);
+      // 顶部弹幕：行 0 贴顶锚（显示区域最顶），行 1 距行 0 = 行高（内部堆叠）
+      expect(topYs.first, closeTo(st.debugLayoutTopAnchorY as double, 1e-6));
+      expect(topYs[1] - topYs[0], closeTo(laneH, 1e-6));
+      // 底部弹幕：行 0/1 由底缘向上堆叠，行距 = 行高（底行之间互不叠）
+      expect(bottomYs[1] - bottomYs[0], closeTo(laneH, 1e-6));
+      // y 不越显示区域（30% → 0 ~ 240px）——顶/底不再向下/上越界
+      final regionBottom = 800.0 * 0.3;
+      expect(st.debugLayoutBottomEdgeY as double,
+          lessThanOrEqualTo(regionBottom));
+      for (final y in [...scrollYs, ...topYs, ...bottomYs]) {
+        expect(y, greaterThanOrEqualTo(0));
+        expect(y, lessThanOrEqualTo(regionBottom));
+      }
       await tester.pumpWidget(const SizedBox());
     });
   });

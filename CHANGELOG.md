@@ -8,6 +8,30 @@
 
 ---
 
+## v2.16.19 (2026-09-05)
+
+**新增 / 改进**
+
+- **评论区图片全屏查看 + 保存到相册**（`app/lib/pages/image_viewer_page.dart` 新增 + `app/lib/pages/comment_page.dart` 缩略图接入）：
+  - 点评论图片（根评论 / 楼中楼子回复都有）→ 黑底全屏查看页：**PageView 多图左右滑动 + 顶部页码（`x/N`）/ 关闭**、每图 **InteractiveViewer 双指缩放 1~4x + 双击 1x↔2.5x**（以屏幕中心为锚点）；**1x 时禁平移**（横向滑动交给 PageView 翻页）、放大后优先平移看图——缩放与翻页手势不打架；图片加载失败灰底占位不白屏
+  - **保存到相册**：底部「保存到相册」按钮 → Dart 带 UA/Referer 下载当前图字节（`lib/services/gallery_saver.dart`，dio，gif 存原始字节相册里可动）→ 原生 `GalleryController.kt`（MethodChannel `bili_whitelist/gallery`，与 MediaController/ApkInstaller 同风格手动注册）：
+    - **通道选择：原生小通道（免第三方依赖）**——评估两条路（image_gallery_saver/gal pub 包 vs 原生 MediaStore），原生 ~30 行内搞定且不留弃维护包 → 选原生
+    - **API 29+（主流，本项目 Android 10+ 目标）**：`MediaStore.Images` 插 `Pictures/BiliWhiteList`（RELATIVE_PATH + IS_PENDING 两步写，失败清理半成品条目）→ **零存储权限**
+    - **API 26~28**（minSdk=26 需覆盖）：老式 `getExternalStoragePublicDirectory(Pictures)/BiliWhiteList` + MediaScanner 广播；需要 `WRITE_EXTERNAL_STORAGE`（Manifest 已加 `maxSdkVersion=28` 限定，Android 10+ 永不出现该权限）——未授权时原生 `requestPermissions` 自动弹系统授权框，结果经 `MainActivity.onRequestPermissionsResult` 转发给 GalleryController **补完挂起的保存**（Dart 一次调用即可，授权框期间 await 挂起）；拒绝 → SnackBar「未授予存储权限…」
+  - 保存成功/失败中文 SnackBar（下载失败 / 权限拒绝 / 相册写入失败分文案）
+- **评论正文链接识别与站内跳转**（`app/lib/utils/comment_links.dart` 新增纯函数 + `comment_page.dart` 渲染/分发接入）：
+  - **拆分**：正文按链接拆「纯文本段/链接段」交替（`splitCommentLinks`）——覆盖完整视频链接（`www./m.`、带 `?p=` 查询）、**裸 BV**（`BV`+10 位，正文独立出现）、b23 短链（带协议头/裸 `b23.tv/xx`）、UP 空间（`space.bilibili.com/<uid>` 与 `/space/<uid>`，含无协议头）、番剧（`bangumi/play/ep|ss`，容忍大写）、通用 http(s)；**URL 在中文/全角标点处截断 + 尾随标点裁剪**（`链接。` / `链接，谢谢` 不吞标点）、换行正文不丢字、多个链接顺序拆分
+  - **渲染**：有链接 → RichText 链接段**主色 + 下划线**可点（`TapGestureRecognizer`），纯文本段原样；**无链接评论保持 SelectableText**（选择/复制能力不变）；有链接的评论长按整段复制兜底（RichText 不可选）
+  - **点击分发**：`video`（完整链接/裸 BV）→ `fetchVideoMeta` → `WhitelistWriter.videoFromMeta` → `PlayerPage` **站内预览播放（只播放不加入白名单）**；`b23` → `resolveShortLink`（复用 `utils/import_parser.dart`）重定向解析落点后按落点再分发（视频→预览 / 番剧→提示 / UP→主页 / 其他→浏览器；落点仍为短链防死循环直接浏览器）；`up` → `UpownerPage(mid)`；`other` → **url_launcher**（`^6.3.0`，新依赖）系统浏览器 `LaunchMode.externalApplication`（校验 scheme 只放 http/https，失败 SnackBar）
+  - **番剧链接取舍（bangumi）**：App 无通用番剧/电影播放入口（番剧需导入白名单走选集 + 会员集 pgc 回退），评论内点击**不硬塞播放**，SnackBar 提示「番剧/电影链接：请在搜索页切换『番剧/电影』搜索后导入观看」——先做视频/UP/通用三类站内动作
+- **弹幕顶/底与滚动分区重叠调整（上一任务遗留改动随本版一并发布）**（`app/lib/widgets/danmaku_overlay.dart` + `app/test/danmaku_features_test.dart`，顺带更新 `app/lib/models/danmaku_lanes.dart` 注释）：
+  - **问题**：v2.16.13 显示区域把弹幕带等比压缩后，轨道数换算仍扣除顶部 3 行 / 底部 2 行固定行——区域 30% 时 8 行只剩 **3 条滚动轨**，小显示区域弹幕量被顶/底固定行**过度挤压**（滚动轨堵、弹幕密时丢弃多）
+  - **调整**：顶锚以下**不再为顶/底弹幕分区避让**——**滚动轨道占满整条可用带**（`danmakuScrollLaneCount` 改为 `floor(带高/行高)` 钳 `1..60`，不再减顶/底固定行：100% 屏 756px → 28 条（旧 23）、30% 226.8px → 8 条（旧 3））；顶部弹幕从带顶向下堆叠（行 i y = 顶锚 + i×行高，新纯函数 `danmakuTopTextY`）、底部弹幕从带底向上堆叠（行 i y = 底缘 − i×行高 − 文本高，`danmakuBottomTextY`），与滚动轨道**纵坐标可重叠**；各自**内部**仍互不叠（滚动按轨道追尾碰撞、顶/底行分别堆叠、行满丢弃），所有弹幕 y 不越显示区域（底缘额外钳制在区域下界内，极小区域自动上提）
+  - **单测**（`danmaku_features_test.dart` 弹幕组重构）：轨道换算 100%→28 / 30%→8 / 带高不足行高保底 1 / 超大屏封顶 60；顶/底行 y 换算（行 0 贴带顶 / 贴底缘、与滚动轨道同 y = 可重叠基础）；区域 30% 三类弹幕共存 widget 测试（y 不越区域）；`danmaku_lanes.dart` 仅注释对齐（底部行 0 = 贴底缘最底行，取行先取最底行向上堆叠）
+- **发布元信息**：`pubspec.yaml` version 2.16.18+48 → **2.16.19+49**；依赖新增 `url_launcher ^6.3.0`
+
+---
+
 ## v2.16.18 (2026-09-05)
 
 **新增 / 改进**

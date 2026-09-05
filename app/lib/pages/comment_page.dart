@@ -4,7 +4,14 @@
 /// - 主评论分页（`x/v2/reply/main`，mode=3 按热度；上拉加载更多，回传
 ///   cursor.next 原样翻页；到底显示「没有更多了」）
 /// - 置顶评论（top_replies）置顶展示 + 「置顶」角标
-/// - 图片评论：按原图宽高比占位显示（加载失败灰底占位），动图带角标
+/// - 图片评论：按原图宽高比占位显示（加载失败灰底占位），动图带角标；
+///   **点击 → 全屏查看（v2.16.19+）**：黑底多图左右滑 + 缩放 + 「保存到
+///   系统相册」（原生 MediaStore 通道，见 image_viewer_page / gallery_saver）
+/// - **正文链接识别（v2.16.19+）**：正文里的链接渲染为可点击文本（主色
+///   下划线）——B 站视频（含裸 BV / b23 短链）→ 站内预览播放（不入
+///   白名单）；UP 空间 → UP 主页；番剧/电影 → 提示搜索页导入（App 无
+///   通用番剧播放入口）；其他 http(s) → 系统浏览器。拆分见
+///   utils/comment_links.dart
 /// - 楼中楼：根评论内嵌至多 3 条预览（缩进小字）；「N 条回复」展开 →
 ///   拉完整楼中楼（`x/v2/reply/reply`，pn 递增分页，hasMore 继续加载）
 /// - 空态/错误态：暂无评论 / 评论区已关闭（12002）/ 网络与风控（可重试）
@@ -14,12 +21,21 @@
 library;
 
 import 'package:dio/dio.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../api/bilibili_api.dart';
 import '../config.dart';
 import '../models/comment.dart';
 import '../models/whitelist_video.dart';
+import '../services/whitelist_writer.dart';
+import '../utils/comment_links.dart';
+import '../utils/import_parser.dart';
+import 'image_viewer_page.dart';
+import 'player_page.dart';
+import 'upowner_page.dart';
 
 /// 图片/头像请求兜底头：B 站图床（i*.hdslb.com）一般无需 Referer，
 /// 带上浏览器头更稳（防个别域名/防盗链策略拦截）。
@@ -254,6 +270,167 @@ class _CommentPageState extends State<CommentPage> {
   }
 
   // -------------------------------------------------------------------------
+  // 正文链接跳转分发（v2.16.19+）
+  // -------------------------------------------------------------------------
+
+  /// 视频预览解析进行中（防连点：一次只放行一个网络动作）。
+  bool _linkBusy = false;
+
+  /// 评论链接点击入口：捕获 Navigator/ScaffoldMessenger（await 后仍可用）
+  /// 后按分类分发。
+  Future<void> _onCommentLinkTap(CommentLink link) async {
+    debugPrint('[comment_page] 链接点击 kind=${link.kind.name} '
+        'raw=${link.raw} bvid=${link.bvid} upMid=${link.upMid}');
+    final nav = Navigator.of(context);
+    final messenger = ScaffoldMessenger.of(context);
+    await _openByKind(link, nav: nav, messenger: messenger);
+  }
+
+  /// 按链接分类执行跳转（b23 短链解析落点后复用同一分发）。
+  Future<void> _openByKind(
+    CommentLink link, {
+    required NavigatorState nav,
+    required ScaffoldMessengerState messenger,
+  }) async {
+    switch (link.kind) {
+      case CommentLinkKind.video:
+        final bvid = link.bvid;
+        if (bvid != null) {
+          await _previewVideo(bvid, nav: nav, messenger: messenger);
+        }
+      case CommentLinkKind.b23:
+        await _resolveB23(link, nav: nav, messenger: messenger);
+      case CommentLinkKind.up:
+        final mid = link.upMid;
+        if (mid != null) {
+          debugPrint('[comment_page] 打开 UP 主页 mid=$mid （来源 ${link.raw}）');
+          nav.push(MaterialPageRoute<void>(
+            builder: (_) => UpownerPage(mid: mid),
+          ));
+        }
+      case CommentLinkKind.bangumi:
+        // 取舍：App 无通用番剧/电影播放入口（番剧需导入白名单走选集/会员
+        // 集回退），评论内点击给引导提示，不硬塞播放页。
+        debugPrint('[comment_page] 番剧链接提示 bangumiRef=${link.bangumiRef}');
+        _tipSnack(messenger, '番剧/电影链接：请在搜索页切换「番剧/电影」搜索后导入观看');
+      case CommentLinkKind.other:
+        await _openExternal(link.raw, messenger: messenger);
+    }
+  }
+
+  /// 视频预览播放：fetchVideoMeta 补全元数据 → PlayerPage（**只播放，
+  /// 不加入白名单**）。
+  Future<void> _previewVideo(
+    String bvid, {
+    required NavigatorState nav,
+    required ScaffoldMessengerState messenger,
+  }) async {
+    if (_linkBusy) return;
+    _linkBusy = true;
+    try {
+      final meta = await _api.fetchVideoMeta(bvid);
+      final video = WhitelistWriter.videoFromMeta(meta, fallbackBvid: bvid);
+      nav.push(MaterialPageRoute<void>(
+        builder: (_) => PlayerPage(video: video),
+      ));
+      debugPrint('[comment_page] 链接预览播放 bvid=$bvid title=${video.title}');
+    } on BiliApiException catch (e) {
+      _tipSnack(messenger, '打开视频失败：${e.message}');
+    } on DioException {
+      _tipSnack(messenger, '网络请求失败，请检查网络后重试');
+    } on Exception catch (e) {
+      // 兜底：意外异常（元数据解析等）不静默吞掉，提示可重试
+      debugPrint('[comment_page] 视频预览意外异常 bvid=$bvid e=$e');
+      _tipSnack(messenger, '打开视频失败：${e.toString()}');
+    } finally {
+      _linkBusy = false;
+    }
+  }
+
+  /// b23.tv 短链：请求重定向 → 按落点分类再分发（视频→预览 / 番剧→提示 /
+  /// UP→主页 / 其他→浏览器）。
+  Future<void> _resolveB23(
+    CommentLink link, {
+    required NavigatorState nav,
+    required ScaffoldMessengerState messenger,
+  }) async {
+    if (_linkBusy) return;
+    _linkBusy = true;
+    try {
+      // raw 可能是无协议头的裸引用（b23.tv/xxx），补上供 dio 重定向请求
+      var url = link.raw;
+      if (!url.startsWith('http')) url = 'https://$url';
+      final resolved = await resolveShortLink(url);
+      _linkBusy = false; // 解析完成即释放（放行落点为视频的预览播放）
+      final target = classifyUrl(resolved);
+      if (target == null) {
+        // 重定向落点非可识别站内形态 → 浏览器兜底
+        await _openExternal(resolved, messenger: messenger);
+        return;
+      }
+      if (target.kind == CommentLinkKind.b23) {
+        // 极罕见：落点仍是另一条短链（防死循环）→ 浏览器打开
+        await _openExternal(resolved, messenger: messenger);
+        return;
+      }
+      debugPrint('[comment_page] 短链解析 ${link.raw} → $resolved');
+      await _openByKind(target, nav: nav, messenger: messenger);
+    } on ImportParseException catch (e) {
+      _tipSnack(messenger, '短链解析失败：${e.message}');
+    } on DioException {
+      _tipSnack(messenger, '短链解析失败：网络请求失败，请稍后重试');
+    } finally {
+      _linkBusy = false;
+    }
+  }
+
+  /// 其他 http(s) 链接：系统浏览器打开（url_launcher，外部应用模式）。
+  Future<void> _openExternal(
+    String url, {
+    required ScaffoldMessengerState messenger,
+  }) async {
+    final uri = Uri.tryParse(url);
+    if (uri == null || (uri.scheme != 'http' && uri.scheme != 'https')) {
+      _tipSnack(messenger, '无法打开该链接');
+      return;
+    }
+    try {
+      final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
+      if (ok) {
+        debugPrint('[comment_page] 外链系统浏览器打开 url=$url');
+      } else {
+        _tipSnack(messenger, '打开链接失败（未找到可用浏览器）');
+      }
+    } catch (_) {
+      _tipSnack(messenger, '打开链接失败');
+    }
+  }
+
+  /// 轻提示（评论区页内 SnackBar，避免在长按复制等处重复写样板）。
+  void _tipSnack(ScaffoldMessengerState messenger, String message) {
+    messenger
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(
+        content: Text(message),
+        behavior: SnackBarBehavior.floating,
+        duration: const Duration(seconds: 2),
+      ));
+  }
+
+  /// 打开图片全屏查看页（点击缩略图）。
+  void _openImageGallery(BuildContext ctx, List<CommentPicture> pictures,
+      int index) {
+    debugPrint(
+        '[comment_page] 打开全屏图片查看 idx=$index/${pictures.length}');
+    Navigator.of(ctx).push(MaterialPageRoute<void>(
+      builder: (_) => ImageViewerPage(
+        urls: [for (final p in pictures) p.imgSrc],
+        initialIndex: index,
+      ),
+    ));
+  }
+
+  // -------------------------------------------------------------------------
   // 楼中楼展开 / 收起 / 翻页
   // -------------------------------------------------------------------------
 
@@ -397,6 +574,8 @@ class _CommentPageState extends State<CommentPage> {
             childState: _children[reply.rpid],
             onToggle: () => _toggleReplies(reply),
             onLoadMore: () => _loadMoreChildren(reply),
+            onLinkTap: _onCommentLinkTap,
+            onImageTap: _openImageGallery,
           );
         },
       ),
@@ -517,6 +696,12 @@ class _CommentRootTile extends StatelessWidget {
   final VoidCallback onToggle;
   final VoidCallback onLoadMore;
 
+  /// 正文链接点击（分发给页面 State 做站内跳转/浏览器打开）。
+  final ValueChanged<CommentLink> onLinkTap;
+
+  /// 图片缩略图点击（打开全屏查看页）。
+  final void Function(BuildContext, List<CommentPicture>, int) onImageTap;
+
   const _CommentRootTile({
     required this.reply,
     required this.pinned,
@@ -526,6 +711,8 @@ class _CommentRootTile extends StatelessWidget {
     required this.childState,
     required this.onToggle,
     required this.onLoadMore,
+    required this.onLinkTap,
+    required this.onImageTap,
   });
 
   @override
@@ -543,15 +730,19 @@ class _CommentRootTile extends StatelessWidget {
           if (r.message.isNotEmpty)
             Padding(
               padding: const EdgeInsets.only(top: 6),
-              child: SelectableText(
-                r.message,
+              child: _LinkifiedBody(
+                text: r.message,
                 style: const TextStyle(fontSize: 15, height: 1.45),
+                onLinkTap: onLinkTap,
               ),
             ),
           if (r.pictures.isNotEmpty)
             Padding(
               padding: const EdgeInsets.only(top: 8),
-              child: _CommentPictures(pictures: r.pictures),
+              child: _CommentPictures(
+                pictures: r.pictures,
+                onImageTap: onImageTap,
+              ),
             ),
           if (showPreviews)
             Padding(
@@ -626,28 +817,37 @@ class _CommentRootTile extends StatelessWidget {
           ),
           const Spacer(),
           if (reply.count > 0)
-            InkWell(
-              onTap: onToggle,
-              borderRadius: BorderRadius.circular(4),
-              child: Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
-                child: Row(
-                  children: [
-                    Text(
-                      expanded ? '收起' : '${_fmtLike(reply.count)} 条回复',
-                      style: TextStyle(
-                        fontSize: 12.5,
-                        color: expanded ? Colors.grey.shade600 : primary,
-                      ),
+            // 无障碍标签（v2.16.19+ 顺手增强）：回复折叠/展开按钮可被
+            // 读屏/自动化识别（label = 回复数 / 收起）
+            MergeSemantics(
+              child: Semantics(
+                button: true,
+                label: expanded ? '收起楼中楼回复' : '${_fmtLike(reply.count)} 条回复，点击展开',
+                child: InkWell(
+                  onTap: onToggle,
+                  borderRadius: BorderRadius.circular(4),
+                  child: Padding(
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+                    child: Row(
+                      children: [
+                        Text(
+                          expanded ? '收起' : '${_fmtLike(reply.count)} 条回复',
+                          style: TextStyle(
+                            fontSize: 12.5,
+                            color: expanded ? Colors.grey.shade600 : primary,
+                          ),
+                        ),
+                        Icon(
+                          expanded
+                              ? Icons.keyboard_arrow_up
+                              : Icons.keyboard_arrow_down,
+                          size: 16,
+                          color: expanded ? Colors.grey.shade600 : primary,
+                        ),
+                      ],
                     ),
-                    Icon(
-                      expanded
-                          ? Icons.keyboard_arrow_up
-                          : Icons.keyboard_arrow_down,
-                      size: 16,
-                      color: expanded ? Colors.grey.shade600 : primary,
-                    ),
-                  ],
+                  ),
                 ),
               ),
             ),
@@ -699,7 +899,12 @@ class _CommentRootTile extends StatelessWidget {
               ),
             ),
           if (state != null)
-            for (final child in state.replies) _SubReplyRow(reply: child),
+            for (final child in state.replies)
+              _SubReplyRow(
+                reply: child,
+                onLinkTap: onLinkTap,
+                onImageTap: onImageTap,
+              ),
           if (state != null && state.hasMore)
             Center(
               child: childrenLoading
@@ -783,8 +988,14 @@ class _PreviewBlock extends StatelessWidget {
 /// 展开后的单条子回复行（紧凑小字号）。
 class _SubReplyRow extends StatelessWidget {
   final CommentReply reply;
+  final ValueChanged<CommentLink> onLinkTap;
+  final void Function(BuildContext, List<CommentPicture>, int) onImageTap;
 
-  const _SubReplyRow({required this.reply});
+  const _SubReplyRow({
+    required this.reply,
+    required this.onLinkTap,
+    required this.onImageTap,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -828,15 +1039,19 @@ class _SubReplyRow extends StatelessWidget {
                 if (reply.message.isNotEmpty)
                   Padding(
                     padding: const EdgeInsets.only(top: 2),
-                    child: SelectableText(
-                      reply.message,
+                    child: _LinkifiedBody(
+                      text: reply.message,
                       style: const TextStyle(fontSize: 13.5, height: 1.4),
+                      onLinkTap: onLinkTap,
                     ),
                   ),
                 if (reply.pictures.isNotEmpty)
                   Padding(
                     padding: const EdgeInsets.only(top: 4),
-                    child: _CommentPictures(pictures: reply.pictures),
+                    child: _CommentPictures(
+                      pictures: reply.pictures,
+                      onImageTap: onImageTap,
+                    ),
                   ),
               ],
             ),
@@ -878,22 +1093,93 @@ class _Avatar extends StatelessWidget {
   }
 }
 
-/// 图片评论（按原图宽高比显示；加载失败灰底占位；动图角标）。
+/// 正文渲染（v2.16.19+）：按链接拆分。
+///
+/// - 无链接 → SelectableText（与旧版一致，保留选择/复制能力）；
+/// - 有链接 → RichText：链接段主色 + 下划线、点击回调 [onLinkTap]
+///   （分发站内跳转/浏览器打开），纯文本段原样；RichText 本身不可选，
+///   长按整段复制兜底（SnackBar 提示）。
+class _LinkifiedBody extends StatelessWidget {
+  final String text;
+  final TextStyle style;
+  final ValueChanged<CommentLink> onLinkTap;
+
+  const _LinkifiedBody({
+    required this.text,
+    required this.style,
+    required this.onLinkTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final segments = splitCommentLinks(text);
+    if (segments.length == 1 && !segments.first.isLink) {
+      // 纯文本：保持旧版 SelectableText 交互（选择/复制）
+      return SelectableText(text, style: style);
+    }
+    final primary = Theme.of(context).colorScheme.primary;
+    return GestureDetector(
+      // RichText 不可长按选择，复制能力兜底：长按整段复制到剪贴板
+      onLongPress: () async {
+        await Clipboard.setData(ClipboardData(text: text));
+        if (!context.mounted) return;
+        ScaffoldMessenger.of(context)
+          ..hideCurrentSnackBar()
+          ..showSnackBar(const SnackBar(
+            content: Text('已复制评论内容'),
+            duration: Duration(seconds: 1),
+            behavior: SnackBarBehavior.floating,
+          ));
+      },
+      child: RichText(
+        text: TextSpan(
+          style: style,
+          children: [
+            for (final seg in segments)
+              if (seg.isLink)
+                TextSpan(
+                  text: seg.text,
+                  style: TextStyle(
+                    color: primary,
+                    decoration: TextDecoration.underline,
+                    decorationColor: primary,
+                  ),
+                  recognizer: TapGestureRecognizer()
+                    ..onTap = () => onLinkTap(seg.link!),
+                )
+              else
+                TextSpan(text: seg.text),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// 图片评论（按原图宽高比显示；加载失败灰底占位；动图角标；
+/// 点击 → 全屏查看 + 保存，v2.16.19+）。
 class _CommentPictures extends StatelessWidget {
   final List<CommentPicture> pictures;
+  final void Function(BuildContext, List<CommentPicture>, int) onImageTap;
 
-  const _CommentPictures({required this.pictures});
+  const _CommentPictures({
+    required this.pictures,
+    required this.onImageTap,
+  });
 
   @override
   Widget build(BuildContext context) {
     return Wrap(
       spacing: 6,
       runSpacing: 6,
-      children: [for (final p in pictures) _picture(p, context)],
+      children: [
+        for (var i = 0; i < pictures.length; i++)
+          _picture(pictures[i], i, context),
+      ],
     );
   }
 
-  Widget _picture(CommentPicture p, BuildContext context) {
+  Widget _picture(CommentPicture p, int index, BuildContext context) {
     final s = _picSize(p);
     final placeholder = Container(
       width: s.w,
@@ -929,26 +1215,40 @@ class _CommentPictures extends StatelessWidget {
         ),
       ),
     );
-    if (!p.isGif) return img;
-    return Stack(
-      children: [
-        img,
-        Positioned(
-          right: 4,
-          bottom: 4,
-          child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
-            decoration: BoxDecoration(
-              color: Colors.black.withValues(alpha: 0.55),
-              borderRadius: BorderRadius.circular(4),
-            ),
-            child: const Text(
-              '动图',
-              style: TextStyle(color: Colors.white, fontSize: 10),
+    Widget content = img;
+    if (p.isGif) {
+      content = Stack(
+        children: [
+          img,
+          Positioned(
+            right: 4,
+            bottom: 4,
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
+              decoration: BoxDecoration(
+                color: Colors.black.withValues(alpha: 0.55),
+                borderRadius: BorderRadius.circular(4),
+              ),
+              child: const Text(
+                '动图',
+                style: TextStyle(color: Colors.white, fontSize: 10),
+              ),
             ),
           ),
+        ],
+      );
+    }
+    // 点击 → 全屏查看（黑底多图/缩放/保存）；无障碍标签 = 图片位置
+    return MergeSemantics(
+      child: Semantics(
+        button: true,
+        label: '评论图片 ${index + 1}/${pictures.length}，点击全屏查看与保存',
+        child: GestureDetector(
+          behavior: HitTestBehavior.opaque,
+          onTap: () => onImageTap(context, pictures, index),
+          child: content,
         ),
-      ],
+      ),
     );
   }
 

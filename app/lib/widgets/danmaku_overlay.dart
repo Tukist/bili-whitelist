@@ -29,10 +29,17 @@
 /// - **屏蔽（v2.16.6）**：发射前按 [settings] 过滤（屏蔽词 substring /
 ///   屏蔽类型）；设置变更（新实例）→ 清活跃并按当前播放位置重载，即时生效。
 /// - **显示区域（v2.16.13）**：[settings.displayAreaPercent]（10%~100%）把
-///   弹幕带等比压缩到屏幕上方该比例高度内（顶锚/底锚同乘比例，轨道数按
-///   缩放后带高换算）——弹幕不再飘到画面中下部；100% 与旧版布局逐像素
-///   一致。区域/屏蔽/透明度任一设置变化都走「新实例 → 清屏重载」，区域
-///   调小即时清屏按新区域重排。
+///   弹幕带等比压缩到屏幕上方该比例高度内（顶锚/底缘同乘比例，轨道数按
+///   缩放后带高换算）——弹幕不再飘到画面中下部；100% 与旧版锚点位置逐
+///   像素一致。区域/屏蔽/透明度任一设置变化都走「新实例 → 清屏重载」，
+///   区域调小即时清屏按新区域重排。
+/// - **顶/底与滚动纵坐标可重叠（v2.16.13 显示区域后的布局调整）**：顶锚
+///   以下不再分区避让——滚动轨道**占满整条可用带**（轨道数不再被顶部
+///   3 行 / 底部 2 行挤占：区域 30% 由 3 条回到 ~8 条，弹幕量不再被过度
+///   挤压）；顶部弹幕显示在带顶（行 i 的 y = 顶锚 + i×行高）、底部弹幕
+///   显示在带底（行 i 的 y = 底缘 − i×行高 − 文本高），与滚动轨道可
+///   纵坐标重叠。各自**内部**仍互不叠：滚动按轨道追尾碰撞、顶部行堆叠 /
+///   底部行堆叠（顶行满 / 底行满 → 丢弃），所有弹幕 y 不出显示区域。
 /// - **透明度（v2.16.6）**：[settings.opacity]（20%~100%）乘到绘制 alpha；
 ///   顶部/底部弹幕带 0.15s 淡入 + 0.4s 淡出（透明度为 1 时零额外开销）。
 /// - **绘制**：CustomPaint + 缓存 TextPainter（发射时 layout 一次，每帧只
@@ -97,31 +104,48 @@ double danmakuSmoothDt(double dt) {
 double danmakuCreditAfter(double credit, double dt) => math.min(
     credit + dt * kDanmakuSpawnRatePerSec, kDanmakuSpawnCreditMax);
 
-/// 弹幕区占屏高比例（顶部 12% 起、底部控制带前止，见 _ensureLayout）。
+/// 弹幕带（显示区域内）纵向几何锚点（见 _ensureLayout）：
+/// - 顶锚 = 屏高 × [_topAreaRatio] × 区域比：滚动轨道 0 与顶部弹幕行 0 的
+///   公共起始 y（不再为顶/底预留独立带，三类可纵坐标重叠）；
+/// - 可用带高 = 屏高 × [_usableAreaRatio] × 区域比：滚动轨道占满整条带；
+/// - 底缘 = min(屏高 × [_bottomAreaRatio] × 区域比, 屏高×区域比 − 底行数×
+///   行高)：底部弹幕堆叠的下缘（行 0 文本底边贴此；极小区域自动上提到
+///   区域下界内，底部弹幕不越出显示区域）。
 const double _topAreaRatio = 0.12;
 const double _usableAreaRatio = 0.7;
 const double _bottomAreaRatio = 0.82;
 
-/// 顶部/底部弹幕各自保留的行数（纵向堆叠层数）。
+/// 顶部/底部弹幕各自保留的行数（纵向堆叠层数；行内满 → 丢弃该条）。
 const int _topLaneCount = 3;
 const int _bottomLaneCount = 2;
 
-/// 弹幕带总行数上限（含顶/底固定行；防超大屏算出离谱多的滚动轨道）。
-const int _maxTotalLanes = 60;
+/// 滚动轨道数上限（防超大屏算出离谱多的轨道）。
+const int _maxScrollLanes = 60;
 
 /// 由「弹幕可用带高」换算滚动轨道数（纯逻辑，可单测）：
-/// 带高 = 屏高 × [danmaku_overlay 可用带比例 0.70] × displayAreaPercent/100。
-/// 总可切行 = floor(带高 / 行高)，扣除顶/底固定行后的余量即滚动轨道数；
-/// 总行保底 = 顶+底+1（区域过小也至少保留 1 条滚动轨），封顶 [_maxTotalLanes]。
-/// 例：屏高 1080、行高 27、区域 30% → 带高 ≈ 226.8px → 8 行 - 3 顶 - 2 底
-/// = **3 条滚动轨**（区域 100% 时 28-5=23 条，与 v2.16.12 及更早完全一致）。
-int danmakuScrollLaneCount(double areaHeightPx, double laneH,
-    {int topLanes = _topLaneCount, int bottomLanes = _bottomLaneCount}) {
-  final total = (areaHeightPx / laneH)
-      .floor()
-      .clamp(topLanes + bottomLanes + 1, _maxTotalLanes);
-  return total - topLanes - bottomLanes;
+/// 带高 = 屏高 × [_usableAreaRatio] × displayAreaPercent/100。
+/// 总可切行 = floor(带高 / 行高)——**不再扣除顶部/底部固定行**：滚动轨道
+/// 占满整条带，与顶部/底部弹幕纵坐标可重叠（各自内部仍不叠，见文件头
+/// 「顶/底与滚动纵坐标可重叠」）。保底 1 条（区域过小也至少 1 条滚动轨），
+/// 封顶 [_maxScrollLanes]。
+/// 例：屏高 1080、行高 27、区域 30% → 带高 ≈ 226.8px → **8 条滚动轨**
+/// （改动前 8−3−2 = 3 条——小区域弹幕量被顶/底固定行过度挤压，本次修复）；
+/// 区域 100% 时 756/27 → 28 条（改动前 23 条）。
+int danmakuScrollLaneCount(double areaHeightPx, double laneH) {
+  return (areaHeightPx / laneH).floor().clamp(1, _maxScrollLanes);
 }
+
+/// 顶部弹幕行 [row]（0 = 最顶行）文本顶部 y（纯逻辑，可单测）：
+/// 顶锚 + row×行高——行 0 显示在显示区域最顶，逐行向下堆叠。
+double danmakuTopTextY(double topAnchorY, int row, double laneH) =>
+    topAnchorY + row * laneH;
+
+/// 底部弹幕行 [row]（0 = 最底行）文本顶部 y（纯逻辑，可单测）：
+/// 底缘 − row×行高 − 文本高——行 0 文本底边恰好贴底缘，行号越大越往上
+/// 堆叠；与顶部/滚动弹幕可重叠，但底行之间互不叠。
+double danmakuBottomTextY(
+        double bottomEdgeY, int row, double laneH, double textHeight) =>
+    bottomEdgeY - row * laneH - textHeight;
 
 /// 单帧发射预算：密集弹幕（时间点重合/轮询补齐）分散到后续帧逐个进入，
 /// 避免单帧集中 layout 文本掉帧（帧率稳定的关键）。
@@ -255,9 +279,8 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
   // 布局参数（首次 layout 时按屏尺寸计算一次，旋转/全屏切换会带尺寸
   // 变化 → 用 _needRelayout 检测是否需要重算）。
   double _laneH = 27; // 单轨道行高（px）
-  double _topY0 = 0; // 顶部弹幕区起始 y（滚动轨道区上界）
-  double _scrollY0 = 0; // 滚动轨道区起始 y
-  double _bottomY0 = 0; // 底部弹幕区起始 y
+  double _topAnchorY = 0; // 顶锚：顶部弹幕行 0 与滚动轨道 0 的公共起始 y
+  double _bottomEdgeY = 0; // 底缘：底部弹幕堆叠的下缘（行 0 文本底边贴此）
   Size? _layoutSize; // 最近一次布局的尺寸（build 时发现变化 → 置重算标记）
 
   @override
@@ -333,20 +356,23 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
     final w = size.width;
     final h = size.height;
     _laneH = danmakuDisplayFontSize(25) * 1.6; // 行高：普通字号行高+余量
-    // 显示区域（v2.16.13）：弹幕带按 displayAreaPercent 等比压缩到屏幕
-    // 上方 —— 顶锚/底锚随比例缩放（100% = 旧版 0.12h~0.82h 带，逐像素
-    // 一致），轨道数按缩放后的带高换算（见 danmakuScrollLaneCount）。
+    // 显示区域 + 三类重叠布局（本次调整，语义见文件头）：
+    // - 顶锚/底缘随 displayAreaPercent 等比缩放（100% = 旧版 0.12h~0.82h
+    //   带锚点位置，逐像素一致）；
+    // - 滚动轨道**占满整条带**（不再扣除顶部 3 / 底部 2 行），与顶/底弹幕
+    //   纵坐标可重叠——区域调小不再把滚动轨挤到只剩 1~2 条；
+    // - 顶部弹幕从顶锚向下堆叠（行 i y = 顶锚 + i×行高），底部弹幕从底缘
+    //   向上堆叠（行 i y = 底缘 − i×行高 − 文本高），各自内部仍不叠。
     final ratio = widget.settings.displayAreaPercent / 100.0;
-    final areaH = h * _usableAreaRatio * ratio; // 顶锚~底锚间的带高（px）
+    final areaH = h * _usableAreaRatio * ratio; // 可用带高（px，滚动轨占满）
     final scrollLanes = danmakuScrollLaneCount(areaH, _laneH);
-    _topY0 = h * _topAreaRatio * ratio;
-    // 底锚：比例缩放值 与「区域下界 − 底部 2 行高」取小——极小区域下底行
-    // 上提，保证底部弹幕不越出区域下界（100% 时取缩放值，与旧版一致）。
-    _bottomY0 = math.min(
+    _topAnchorY = h * _topAreaRatio * ratio;
+    // 底缘：比例缩放锚 与「区域下界 − 底部 2 行高」取小——极小区域下底缘
+    // 上提，保证底部弹幕堆叠不越出区域下界（100% 时取缩放锚，与旧版一致）。
+    _bottomEdgeY = math.min(
       h * _bottomAreaRatio * ratio,
       h * ratio - _bottomLaneCount * _laneH,
     );
-    _scrollY0 = _topY0 + _topLaneCount * _laneH;
     _lanes = DanmakuLanes(
       screenWidth: w,
       entryGap: 10,
@@ -355,26 +381,29 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
       bottomLanes: _bottomLaneCount,
       staySec: kDanmakuStaySec,
     );
-    // 布局日志：区域 + 轨道数 + 最大发射 y（供模拟器实测断言
-    // 「区域 N% → 轨道 y 上限 ≈ 屏高×N/100」）。
-    final maxY = _bottomY0 + (_bottomLaneCount - 1) * _laneH;
+    // 布局日志：区域 + 轨道数 + 纵向范围（供模拟器实测断言「区域 N% →
+    // 所有弹幕 y 落在 0 ~ 屏高×N/100 内；滚动轨道占满可用带」）。
+    final scrollEndY = _topAnchorY + scrollLanes * _laneH;
     debugPrint('[danmaku] 布局: 屏 ${w.round()}x${h.round()} 行高 '
         '${_laneH.round()} 区域 ${widget.settings.displayAreaPercent}%'
-        '（高度 ${areaH.round()}px/总带 ${(h * ratio).round()}px）'
+        '（带高 ${areaH.round()}px/区域下界 ${(h * ratio).round()}px）'
         ' 滚动轨道 $scrollLanes 顶 $_topLaneCount 底 $_bottomLaneCount'
-        ' | 轨道 y 范围 ${_topY0.round()}~${maxY.round()}'
-        '（区域下界 ${(h * ratio).round()}px，限制比 '
-        '${(maxY / h * 100).toStringAsFixed(1)}%）');
+        ' | 顶锚 ${_topAnchorY.round()}px、滚动止 ${scrollEndY.round()}px、'
+        '底缘 ${_bottomEdgeY.round()}px（限制比 '
+        '${(_bottomEdgeY / h * 100).toStringAsFixed(1)}%）');
   }
 
-  /// 取指定滚动轨道（下标 i）的顶部 y。
-  double _scrollLaneY(int i) => _scrollY0 + i * _laneH;
+  /// 滚动轨道 [i] 的顶部 y：与顶部弹幕行共用顶锚——滚动与顶部弹幕
+  /// 纵坐标可重叠（第 1-2 轨与顶部行 0-1 同带）。
+  double _scrollLaneY(int i) => danmakuTopTextY(_topAnchorY, i, _laneH);
 
-  /// 取指定顶部行（下标 i，0 = 最顶行）的顶部 y。
-  double _topLaneY(int i) => _topY0 + i * _laneH;
+  /// 顶部弹幕行 [i]（0 = 最顶行）文本顶部 y（顶锚起逐行向下堆叠）。
+  double _topLaneY(int i) => danmakuTopTextY(_topAnchorY, i, _laneH);
 
-  /// 取指定底部行（下标 i，0 = 底区最上行）的顶部 y。
-  double _bottomLaneY(int i) => _bottomY0 + i * _laneH;
+  /// 底部弹幕行 [i]（0 = 最底行）文本顶部 y：按实际排版文本高
+  /// [textHeight] 贴底缘向上堆叠（行 0 文本底边恰好落在 [_bottomEdgeY]）。
+  double _bottomLaneY(int i, double textHeight) =>
+      danmakuBottomTextY(_bottomEdgeY, i, _laneH, textHeight);
 
   /// 安全读取当前布局尺寸：Ticker 帧回调在每帧 drawFrame（layout）之前执行，
   /// mount 后首帧回调时 render object 尚未 layout——此时 `context.size` 在
@@ -488,6 +517,44 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
     return double.nan;
   }
 
+  /// 测试探针：布局结果——滚动轨道数 / 行高 / 顶锚 / 底缘（供小显示区域
+  /// 「滚动轨占满带、顶/底不再避让」语义测试断言）。
+  @visibleForTesting
+  int get debugLayoutScrollLanes => _lanes?.scrollLanes ?? 0;
+
+  /// 测试探针：丢弃/发射计数（供小显示区域重叠语义测试断言「三类互不挤占」）。
+  @visibleForTesting
+  int get debugScrollDropped => _lanes?.scrollDropped ?? 0;
+
+  @visibleForTesting
+  int get debugTopDropped => _lanes?.topDropped ?? 0;
+
+  @visibleForTesting
+  int get debugBottomDropped => _lanes?.bottomDropped ?? 0;
+
+  @visibleForTesting
+  double get debugLayoutLaneH => _laneH;
+
+  @visibleForTesting
+  double get debugLayoutTopAnchorY => _topAnchorY;
+
+  @visibleForTesting
+  double get debugLayoutBottomEdgeY => _bottomEdgeY;
+
+  /// 测试探针：当前活跃弹幕的顶部 y，按类型分组（供断言「小区域三类共存 /
+  /// 各自内部不叠 / y 不越显示区域」）。
+  @visibleForTesting
+  List<double> get debugActiveScrollYs =>
+      [for (final a in _active) if (a.danmaku.isScroll) a.y];
+
+  @visibleForTesting
+  List<double> get debugActiveTopYs =>
+      [for (final a in _active) if (a.danmaku.isTop) a.y];
+
+  @visibleForTesting
+  List<double> get debugActiveBottomYs =>
+      [for (final a in _active) if (a.danmaku.isBottom) a.y];
+
   /// 周期日志：发射/屏蔽/丢弃计数 + 活跃 vs 轨道数（实测断言依据：
   /// 滚动弹幕逐轨前后不追尾 → 同屏活跃滚动数 <= 轨道数即无叠字；
   /// 丢弃计数 > 0 说明高密度片段在靠丢弹幕保不叠）。
@@ -544,12 +611,13 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
       final lane = lanes.pickBottomLane();
       if (lane == null) return _drop(painter);
       lanes.markBottomLane(lane);
-      // 底部弹幕：居中，x 为文本左缘
+      // 底部弹幕：居中，x 为文本左缘；y 按实际文本高贴底缘向上堆叠
+      // （行 0 底边恰好贴底缘，与滚动/顶部可纵坐标重叠，底行之间不叠）。
       placed = _ActiveDanmaku(
         danmaku: d,
         painter: painter,
         x: (size.width - textW) / 2,
-        y: _bottomLaneY(lane),
+        y: _bottomLaneY(lane, painter.height),
         lifeLeft: kDanmakuStaySec,
       );
     } else if (d.isTop) {

@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 2.16.18+48
+version: 2.16.19+49
 
 environment:
   sdk: ^3.8.1
@@ -47,6 +47,7 @@ dependencies:
   ffmpeg_kit_flutter_new_min: ^2.1.0  # ffmpeg-kit：m4s → 16k wav 转码（sherpa 实时转写预处理）
   sherpa_onnx: ^1.13.0        # 流式实时 ASR（zipformer streaming，逐块喂音频实时出字）
   archive: ^3.6.1             # 解压 tar.bz2 模型包（8 语流式 zipformer）
+  url_launcher: ^6.3.0        # 评论正文其他链接 → 系统浏览器打开（v2.16.19+）
 
 dev_dependencies:
   flutter_test:
