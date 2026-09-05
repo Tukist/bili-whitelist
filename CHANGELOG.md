@@ -8,6 +8,22 @@
 
 ---
 
+## v2.16.20 (2026-09-05)
+
+**修复**
+
+- **修复"未登录状态下点视频播放没画面（登录后正常）"回归**（用户 vivo 真机反馈）：
+  - **现象**：v2.16.18 自动登录（启动自动处理登录态 + 移除首页登录按钮）后，未登录/会话过期的用户在首页点视频播放没画面；登录后（新会话）播放正常
+  - **根因**（诊断）：v2.16.18 的启动自动登录在**会话已过期且续期失败**时会引导进入登录页，但用户跳过登录页（不登录）后，**secure storage 里残留的过期 SESSDATA 并未被清除**——旧实现（含 v2.16.18 前手动登录时代）认为"有会话就注入"。残留过期 SESSDATA 会在播放取流时经 `_injectAuth` 注入请求，B 站对**真实过期 cookie** 的 playurl 返回 **-101（登录已失效）**（注：伪造/无效 cookie 会被服务端当匿名处理给 720P，与真实过期会话行为不同）→ 播放页报"登录已失效"、无画面；重新登录（新有效 SESSDATA）后正常。模拟器（storage 空=真纯匿名）无法复现——匿名播放本就正常（`fetchPlayUrl quality=64` 720P → onPrepared），与真机"残留过期会话"状态差异即在此
+  - **修复**（`app/lib/api/bilibili_api.dart` `_injectAuth` + `app/lib/pages/playlist_page.dart` `_handleSessionOnStart`）：
+    - `_injectAuth`：读到的 SESSDATA 若本地解析**已过期**（`sessdataExpireAt`）→ **不注入**该失效会话（回退纯匿名请求，匿名 720P 实测正常），并顺带 `clearSession()` 清除失效凭据——播放取流不再被残留过期会话拖垮，未登录也能正常匿名播放
+    - `_handleSessionOnStart`：会话已过期且续期失败 → 引导登录页前**先 `clearSession()` 清掉失效会话**（用户跳过登录页后处于真未登录态，后续播放走匿名正常，不再残留死 cookie）
+  - **单测**：`pgc_playurl_api_test.dart` 新增"残留已过期 SESSDATA → 不注入（回退匿名）+ 清除失效凭据"（与 `fetchPlayUrl` 共用同一 `_injectAuth`，覆盖取流共用路径）；`auto_login_test.dart` 过期续期失败用例补断言"失效会话被清除"
+  - **模拟器回归（logcat 文本取证，不读媒体）**：无 SESSDATA 冷启动 → `[session] 启动检查：无 SESSDATA → 自动进入登录页`（自动登录仍按预期触发一次）→ 返回首页正常 → 点视频 → `[bili_api] fetchPlayUrl ... ok: quality=64 dashV=4` + `[player] onPrepared` + 进度持续推进（无 BiliDashError）；评论/弹幕入口匿名抽查正常（fetchVideoComments ok / fetchDanmaku 206 条渲染无异常）
+  - ⚠ 验证局限：真实"签名有效但已过期"的 SESSDATA 需真机真实账号复现（无法离线构造、不回显真实凭据），修复使残留过期会话不再被注入（本地即可判定过期并清除），真机请升级后复核
+
+---
+
 ## v2.16.19 (2026-09-05)
 
 **新增 / 改进**

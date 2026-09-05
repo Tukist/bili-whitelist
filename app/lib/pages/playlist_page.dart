@@ -186,9 +186,15 @@ class _PlaylistPageState extends State<PlaylistPage> {
           debugPrint('[session] SESSDATA 距过期<7天，静默续期成功');
           return;
         }
-        // 续期失败：已过期 → 会话彻底失效，自动引导重登；未过期 → 保留
+        // 续期失败：已过期 → 会话彻底失效，先清失效凭据（避免残留过期
+        // SESSDATA 被播放取流等请求注入 → 服务端 -101 拒绝），再引导重登
         if (remain != null && remain.isNegative) {
-          debugPrint('[session] 会话已过期且续期失败 → 自动引导重新登录');
+          debugPrint('[session] 会话已过期且续期失败 → 清除失效会话并引导重新登录');
+          try {
+            await api.clearSession();
+          } catch (_) {
+            // 存储异常静默：引导登录不受影响
+          }
           await _guideAutoLogin();
         } else {
           debugPrint('[session] 距过期<7天但续期失败（未过期，保留现会话）');

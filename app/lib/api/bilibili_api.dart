@@ -472,6 +472,13 @@ class BiliApi {
   /// 有 SESSDATA 就注入 Cookie 头（无则不加，保持匿名调用）。
   ///
   /// Cookie 由「浏览器指纹（buvid3/buvid4）+ 可选 SESSDATA」拼接。
+  ///
+  /// ⚠️ **已过期的 SESSDATA 不注入（v2.16.20 修复）**：本地残留的过期会话
+  /// 若照常注入，B 站对「真实过期 cookie」的取流请求返回 -101（登录已失效，
+  /// 与伪造/无效 cookie 不同——后者服务端当匿名处理直接给 720P），导致
+  /// 未登录（实际残留过期会话）播放没画面；登录后（新有效会话）才正常。
+  /// 判定过期（[sessdataExpireAt]）→ 本次按**纯匿名**请求（匿名 720P 实测
+  /// 正常），并顺手清除失效凭据，避免后续请求持续携带死 cookie。
   Future<void> _injectAuth() async {
     await _ensureBuvid();
     final parts = <String>[
@@ -480,7 +487,18 @@ class BiliApi {
     ];
     final sessdata = await readSessdata();
     if (sessdata != null && sessdata.isNotEmpty) {
-      parts.add('SESSDATA=$sessdata');
+      final expire = sessdataExpireAt(sessdata);
+      if (expire != null && expire.isBefore(DateTime.now())) {
+        // 残留过期会话：回退匿名 + 清除失效凭据（失败静默，不影响请求）
+        debugPrint('[bili_api] SESSDATA 已过期，本次按匿名请求并清除失效会话');
+        try {
+          await clearSession();
+        } catch (_) {
+          // 存储异常忽略：本次请求已按匿名处理
+        }
+      } else {
+        parts.add('SESSDATA=$sessdata');
+      }
     }
     if (parts.isEmpty) {
       _dio.options.headers.remove('Cookie');

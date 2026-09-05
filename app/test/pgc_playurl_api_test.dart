@@ -196,6 +196,26 @@ void main() {
       expect(cookie, contains('buvid3=buvid3test'));
       expect(cookie, isNot(contains('SESSDATA=')));
     });
+
+    test('残留已过期 SESSDATA → 不注入（回退匿名）+ 清除失效凭据', () async {
+      // 过期会话（2020 年失效的合成值，结构可被 sessdataExpireAt 解析）
+      _store['bili_sessdata'] =
+          '12345,1609451400,aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+      final adapter = _RoutingAdapter({
+        '/x/frontend/finger/spi': _spiBody,
+        '/pgc/player/web/playurl': _dashBody,
+      });
+      await _api(adapter).fetchPgcPlayUrl(98603);
+
+      final req = adapter.requests
+          .lastWhere((p) => p.path == '/pgc/player/web/playurl');
+      final cookie = req.headers['Cookie'] ?? '';
+      // 回退匿名：仅 buvid 指纹，不带 SESSDATA
+      expect(cookie, contains('buvid3=buvid3test'));
+      expect(cookie, isNot(contains('SESSDATA=')));
+      // 失效会话已被清除（后续请求不会再携带死 cookie）
+      expect(_store.containsKey('bili_sessdata'), isFalse);
+    });
   });
 
   group('fetchPgcPlayUrl 解析（包装层 result）', () {

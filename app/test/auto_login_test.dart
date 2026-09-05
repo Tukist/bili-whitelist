@@ -6,7 +6,9 @@
 // 3. Widget：无会话冷启动 → **自动请求登录**一次（带 kAutoLoginBanner 提示，
 //    测试注入导航替身，不真推含 WebView 的 LoginPage）；管理面板显示
 //    「未登录 + 登录」入口
-// 4. Widget：会话已过期（无 refresh 凭据）→ 续期失败 → 自动请求重登；
+// 4. Widget：会话已过期（无 refresh 凭据）→ 续期失败 → 自动请求重登 +
+//    清除失效会话（v2.16.20 修复：残留过期 SESSDATA 不应再被播放取流
+//    注入——服务端对真实过期 cookie 返回 -101 → 未登录播放没画面）；
 //    会话有效但 <7 天且缺 refresh 凭据 → 续期失败未过期 → 保留、不请求
 //
 // 真实登录页（WebView 平台注册）只在真机/模拟器验证（CHANGELOG v2.16.18）。
@@ -164,9 +166,10 @@ void main() {
       expect(find.byTooltip('登录（解锁 1080P）'), findsNothing);
     });
 
-    testWidgets('会话已过期且无 refresh 凭据：续期失败 → 自动请求重新登录',
-        (tester) async {
+    testWidgets('会话已过期且无 refresh 凭据：续期失败 → 自动请求重新登录'
+        ' + 清除失效会话', (tester) async {
       _store['bili_sessdata'] = _fakeSessdata(const Duration(days: -1));
+      _store['bili_jct'] = 'jct_stale';
       final spy = _LoginSpy();
       await _pumpHome(tester, spy);
       await tester.pump();
@@ -174,6 +177,10 @@ void main() {
 
       expect(spy.calls, 1); // 彻底过期 → 引导重登
       expect(spy.lastBanner, kAutoLoginBanner);
+      // 失效会话已被清除：避免残留过期 SESSDATA 后续被播放取流注入
+      // （服务端对真实过期 cookie 返回 -101 → 未登录播放没画面）
+      expect(_store.containsKey('bili_sessdata'), isFalse);
+      expect(_store.containsKey('bili_jct'), isFalse);
     });
 
     testWidgets('管理面板：已登录显示「已连接 + 重新登录」次级入口',
