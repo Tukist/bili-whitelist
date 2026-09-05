@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         白名单助手 (Bili-Whitelist) 直连版
 // @namespace    https://github.com/Tukist/bili-whitelist
-// @version      2.3.1
+// @version      2.3.2
 // @description  B站视频页一键加入白名单（支持多P合集/自定义合集）：直连 GitHub Gist API 读写白名单，零本地服务依赖
 // @match        https://www.bilibili.com/video/*
 // @grant        GM_xmlhttpRequest
@@ -15,8 +15,9 @@
 /*
  * ==================== 功能 / 使用 / 配置 ====================
  * 【功能】
- *   在 B 站视频页点按钮，把当前视频信息（bvid/cid/title/cover/duration/up_name/pages）
- *   直接写入 GitHub Gist 里的 whitelist.json，手机白名单点播 App 拉取 Gist 即见。
+ *   在 B 站视频页点按钮，把当前视频信息（bvid/cid/title/cover/duration/up_name/
+ *   pubdate/pages）直接写入 GitHub Gist 里的 whitelist.json，手机白名单点播 App
+ *   拉取 Gist 即见。
  *   完全直连，不再需要本机 whitelist.py / serve 服务。
  *   v2.2.0 起支持多 P 合集：pages 字段存全部分 P（cid/part/duration），
  *   供 App 端选集；单 P 视频 pages 仅 1 项，与旧数据兼容。
@@ -26,6 +27,11 @@
  *   v2.3.1 起支持 App v4 白名单 UP 主：parse/build 同步保留顶层 upowners 数组
  *   （此前只认识 collections/videos，PATCH 覆盖写回会把 App 加的 upowners 清空——
  *   与历史「合集消失」同款 bug，见 whitelist_video.dart v4 说明）。
+ *   v2.3.2 起新条目带 pubdate（发布时间，Unix 秒）：页面 __INITIAL_STATE__
+ *   .videoData.pubdate / view API data.pubdate 两路取值；parseWhitelist 按
+ *   bvid 整条目透传 + buildWhitelistJson 整对象序列化 → 读到的旧条目原样保留
+ *   含 pubdate（新增字段随合并写回不丢，遵循历史「upowners/collections 丢失」
+ *   教训——视频条目不做字段级重建，只整体透传）。
  *
  * 【使用】
  *   1. 浏览器安装 Tampermonkey（油猴），新建脚本粘贴保存
@@ -160,6 +166,14 @@
         }];
     }
 
+    // 发布时间（Unix 秒）：正数才收，0/缺失/脏类型 → undefined。
+    // 返回 undefined 时 Object.assign 拷贝键为 undefined、JSON.stringify 自动
+    // 省略该键 → 未知发布时间的视频不写脏值（App 端 pubdate 缺省 null 不显示）。
+    function toPubdate(v) {
+        return (typeof v === 'number' && Number.isFinite(v) && v > 0)
+            ? Math.floor(v) : undefined;
+    }
+
     // ==================== 拿视频信息 ====================
     // 优先读页面全局状态 window.__INITIAL_STATE__.videoData（同源零请求）；
     // 读不到则回退 B站 view API（带页面 UA，GM_xmlhttpRequest 默认带）
@@ -175,6 +189,7 @@
                         cover: vd.pic || '',
                         duration: vd.duration || 0,
                         up_name: (vd.owner && vd.owner.name) || '',
+                        pubdate: toPubdate(vd.pubdate),
                         pages: normalizePages(vd.pages, vd.cid, vd.title, vd.duration),
                     });
                     return;
@@ -207,6 +222,7 @@
                                     cover: v.pic || '',
                                     duration: v.duration || 0,
                                     up_name: (v.owner && v.owner.name) || '',
+                                    pubdate: toPubdate(v.pubdate),
                                     pages: normalizePages(v.pages, v.cid, v.title, v.duration),
                                 });
                             }
@@ -287,7 +303,9 @@
 
     // 解析 whitelist JSON；非法或空则返回空列表结构（空列表初始化 → version 3）
     // v3/v4：保留顶层 collections 与 upowners 数组原样（合并时不破坏）；
-    // v1/v2 无该字段视为 []（v4 字段缺失由 buildWhitelistJson 补空数组兜底）
+    // v1/v2 无该字段视为 []（v4 字段缺失由 buildWhitelistJson 补空数组兜底）。
+    // 视频条目只整体透传不做字段级重建 → 条目内任意扩展字段（pubdate/epId 等）
+    // 原样保留，合并写回不丢（历史 upowners/collections 丢失教训的防御原则）。
     function parseWhitelist(text) {
         if (!text) return { version: 3, updated_at: '', collections: [], videos: [], upowners: [] };
         try {
@@ -363,7 +381,9 @@
             }
 
             // 3. 合并（查重 + 追加 + 按 added_at 倒序）
-            //    v3：新增视频带 collection:""（未分类）；collections 由 buildWhitelistJson 原样保留
+            //    v3：新增视频带 collection:""（未分类）；collections 由
+            //    buildWhitelistJson 原样保留；v2.3.2 起新增视频带 pubdate
+            //    （fetchVideoInfo 两路取值），旧条目经 parse 整体透传原样保留
             const video = Object.assign({}, info, {
                 added_at: new Date().toISOString().replace('Z', '+00:00'),
                 collection: '',

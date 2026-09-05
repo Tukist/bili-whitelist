@@ -258,13 +258,14 @@ void main() {
   });
 
   group('videoFromMeta', () {
-    test('从 B 站 view 元数据构造 WhitelistVideo（含 pages/未分类）', () {
+    test('从 B 站 view 元数据构造 WhitelistVideo（含 pages/未分类/pubdate）', () {
       final meta = {
         'bvid': 'BV1xx411c7mD',
         'cid': 62131,
         'title': '测试视频',
         'pic': 'https://i0.hdslb.com/a.jpg',
         'duration': 600,
+        'pubdate': 1682899200, // view data.pubdate，Unix 秒
         'owner': {'name': 'UP主'},
         'pages': [
           {'cid': 62131, 'part': 'P1', 'duration': 300},
@@ -278,16 +279,30 @@ void main() {
       expect(v.title, '测试视频');
       expect(v.cover, 'https://i0.hdslb.com/a.jpg');
       expect(v.upName, 'UP主');
+      expect(v.pubdate, 1682899200); // 原值写入，无换算
       expect(v.pageCount, 2);
       expect(v.pages![1].part, 'P2');
       expect(v.isUncategorized, isTrue);
     });
 
-    test('无 pages → 视为单 P', () {
+    test('无 pages → 视为单 P；meta 无 pubdate → pubdate null（不写脏值）', () {
       final meta = {'bvid': 'BV1', 'cid': 1, 'title': 't'};
       final v = WhitelistWriter.videoFromMeta(meta, fallbackBvid: 'BV1');
       expect(v.pageCount, 1);
       expect(v.pages, isNull);
+      expect(v.pubdate, isNull);
+      expect(v.toJson().containsKey('pubdate'), isFalse);
+    });
+
+    test('meta pubdate=0/脏类型 → pubdate null（列表不显示）', () {
+      final withZero = WhitelistWriter.videoFromMeta(
+          {'bvid': 'BV1', 'cid': 1, 'title': 't', 'pubdate': 0},
+          fallbackBvid: 'BV1');
+      expect(withZero.pubdate, isNull);
+      final withStr = WhitelistWriter.videoFromMeta(
+          {'bvid': 'BV1', 'cid': 1, 'title': 't', 'pubdate': '1682899200'},
+          fallbackBvid: 'BV1');
+      expect(withStr.pubdate, isNull);
     });
   });
 
@@ -307,6 +322,7 @@ void main() {
           'cover': 'http://i0.hdslb.com/b.jpg',
           'badge': '',
           'duration': 1377000,
+          'pub_time': 1484067600, // Unix 秒（单位与普通 view data.pubdate 一致）
         },
         {
           'ep_id': 318143,
@@ -318,6 +334,7 @@ void main() {
           'cover': '',
           'badge': '会员',
           'duration': 1500000,
+          'pub_time': 1484672400,
         },
       ],
     });
@@ -355,6 +372,38 @@ void main() {
       expect(v.pages!.single.cid, 481327329);
       expect(v.pages!.single.part, '第1话 史上最强女仆、托尔！');
       expect(v.addedAt, '2026-09-01T00:00:00.000Z');
+    });
+
+    test('videoFromPgcEpisode：pubdate 透传 pub_time（秒，不换算）', () {
+      final v = WhitelistWriter.videoFromPgcEpisode(season, season.episodes[0],
+          now: DateTime.utc(2026, 9, 1));
+      expect(v.pubdate, 1484067600); // PgcEpisode.pubTimeSec 原值
+      // toJson 往返保留（整季导入 → 列表显示发布时间链路不丢）
+      final back = WhitelistVideo.fromJson(v.toJson());
+      expect(back.pubdate, 1484067600);
+    });
+
+    test('videoFromPgcEpisode：无 pub_time（0）→ pubdate null', () {
+      final noTime = PgcSeason.fromResult({
+        'title': '无时间番',
+        'episodes': [
+          {
+            'ep_id': 1,
+            'aid': 1,
+            'cid': 11,
+            'bvid': 'BVnotime',
+            'title': '1',
+            'long_title': '',
+            'cover': '',
+            'badge': '',
+            'duration': 60000, // 无 pub_time 字段 → 0
+          },
+        ],
+      });
+      final v = WhitelistWriter.videoFromPgcEpisode(
+          noTime, noTime.episodes[0]);
+      expect(v.pubdate, isNull);
+      expect(v.toJson().containsKey('pubdate'), isFalse);
     });
 
     test('videoFromPgcEpisode：写入 epId（免费集与会员集），toJson 往返保留', () {

@@ -55,7 +55,7 @@
 
 ### App 端（Flutter Android）
 
-- 白名单列表展示（封面 / 标题 / UP 主 / 时长）
+- 白名单列表展示（封面 / 标题 / UP 主 / 时长；**v2.16.16+ 显示发布时间**：新导入视频副信息行 `时长 · UP主 · 2023-05-01`，旧数据无发布时间则不显示）
 - **合集管理**：Tab 分类、新建 / 重命名 / 删除 / 移动视频到合集
 - **多 P 选集**：播放页切换分 P
 - **DASH 1080P 播放**：video + audio 双流合并播放；流 URL 过期自动续播
@@ -284,7 +284,7 @@ bili-whitelist/
 ├── README.md                  # 本文档
 ├── .gitignore                 # 敏感/隐私文件一律不入库
 ├── whitelist.py               # PC 端白名单管理 CLI（add/remove/list/serve/push/collection）
-├── bili-whitelist.user.js     # 油猴脚本（v2.3.1，B 站视频页一键加白名单，直连 Gist）
+├── bili-whitelist.user.js     # 油猴脚本（v2.3.2，B 站视频页一键加白名单，直连 Gist）
 ├── start-whitelist.bat        # 一键启动本地 serve（可选）
 ├── sync_config.example.json   # GitHub 配置示例（token/gist_id 占位，真实配置在 sync_config.json，已 gitignore）
 ├── whitelist.example.json     # 白名单数据示例（v3 结构，纯假数据；真实 whitelist.json 已 gitignore）
@@ -415,6 +415,7 @@ GH_REPO_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx bash build_release.sh
       "duration": 600,                   // 秒
       "up_name": "UP主",
       "added_at": "ISO 8601 UTC",
+      "pubdate": 1682899200,              // v2.16.16 起：发布时间（Unix 秒；旧数据无此键 = 未知，列表项不显示）
       "collection": "动画",               // 所属合集名；空串 = 未分类
       "pages": [                          // v2 起：分 P 列表（多 P 视频）
         { "cid": 123456, "part": "P1 标题", "duration": 300 }
@@ -425,6 +426,7 @@ GH_REPO_TOKEN=ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx bash build_release.sh
 ```
 
 - 老版本数据（v1/v2）读取兼容：缺 `pages` 视为单 P，缺 `collection` 视为未分类
+- **v2.16.16 起导入路径写入 `pubdate`**（普通视频：view 接口 `data.pubdate`；番剧/电影：`pgc` 接口每集 `pub_time`，两者同为 Unix 秒）；油猴脚本 v2.3.2+ 新条目同样带 `pubdate`，且 parse/build 对已有条目整体透传（含 `pubdate`/`epId` 等扩展字段不丢，遵循历史 upowners 丢失教训）。App 列表项副信息行 `时长 · UP主 · 发布时间`，无 `pubdate` 的旧数据不显示该段（不破坏布局）
 - 任何端写回 Gist 时统一规范化：`version=3`、刷新 `updated_at`、`collections` 必出
 - 字段含义见 `app/lib/models/whitelist_video.dart` 与 `whitelist.py` 头部注释
 

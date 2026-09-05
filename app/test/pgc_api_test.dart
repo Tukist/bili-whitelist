@@ -117,6 +117,7 @@ Map<String, dynamic> _seasonBody({int code = 0, bool withResult = true}) => {
               'cover': 'http://i0.hdslb.com/bfs/archive/a.jpg',
               'badge': '',
               'duration': 1377000, // 毫秒 → 1377 秒
+              'pub_time': 1484067600, // Unix 秒（单位与普通 view data.pubdate 一致）
             },
             {
               'ep_id': 98604,
@@ -128,6 +129,7 @@ Map<String, dynamic> _seasonBody({int code = 0, bool withResult = true}) => {
               'cover': 'http://i0.hdslb.com/bfs/archive/b.jpg',
               'badge': '会员',
               'duration': 1397000,
+              'pub_time': 1484672400,
             },
             {
               // 无 bvid 的脏条目（预告/占位）应被丢弃
@@ -178,10 +180,13 @@ void main() {
       expect(free.cid, 481327329);
       expect(free.durationSec, 1377); // 1377000 毫秒 → 秒
       expect(free.isVipOrPay, isFalse);
+      // pub_time 已是 Unix 秒 → 不做毫秒换算（与 duration 不同单位）
+      expect(free.pubTimeSec, 1484067600);
       final vip = season.episodes[1];
       expect(vip.isVipOrPay, isTrue);
       expect(vip.badge, '会员');
       expect(vip.durationSec, 1397);
+      expect(vip.pubTimeSec, 1484672400);
       expect(season.vipCount, 1);
       expect(season.hasVipOrPay, isTrue);
     });

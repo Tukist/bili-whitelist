@@ -100,8 +100,14 @@ class WhitelistWriter {
       addedAt: DateTime.now().toUtc().toIso8601String(),
       pages: pages.isEmpty ? null : pages,
       collection: '',
+      // view 接口 data.pubdate = Unix 秒；0/缺失（脏数据）→ null（不写脏值）
+      pubdate: _positiveInt(meta['pubdate']),
     );
   }
+
+  /// 防御：Unix 秒时间戳，正数才返回，0/缺失/脏类型 → null。
+  static int? _positiveInt(dynamic raw) =>
+      raw is num && raw > 0 ? raw.toInt() : null;
 
   /// 按 bvid：取 B 站元数据 → 构造视频 → [addVideo]。
   ///
@@ -149,7 +155,9 @@ class WhitelistWriter {
   ///
   /// - 标题 = 剧名 + 第X话 + 副标题（见 [pgcEpisodeTitle]）
   /// - up_name = `番剧/官方`；collection 空（未分类）；pages = 该集单 P；
-  ///   epId = 该集 ep_id（播放会员集时据此回退 pgc 取流）
+  ///   epId = 该集 ep_id（播放会员集时据此回退 pgc 取流）；
+  ///   pubdate = 该集 pub_time（Unix 秒，API 原值不带单位换算——2026-09 实测
+  ///   pgc episodes[].pub_time 与普通 view data.pubdate 同为秒；0 → null）
   ///   added_at = [now]（可注入测试用，缺省当前 UTC）
   static WhitelistVideo videoFromPgcEpisode(
     PgcSeason season,
@@ -172,6 +180,8 @@ class WhitelistWriter {
       collection: '',
       // ep_id 脏数据（0）不写入，视为无 epId 的普通视频
       epId: ep.epId > 0 ? ep.epId : null,
+      // pub_time 0（接口未给）→ null（列表不显示发布时间）
+      pubdate: _positiveInt(ep.pubTimeSec),
     );
   }
 

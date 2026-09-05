@@ -3,6 +3,8 @@
 /// v4 起支持 UP 主：顶层 upowners 列表，UP 主视频不在 videos[] 冗余存）。
 /// v2.16.4 起番剧/电影导入的视频带可选 `epId`（视频级附加字段，向后兼容，
 /// 不升顶层 version——旧读者忽略该键，新读者缺省 null = 普通视频）。
+/// v2.16.16 起普通视频/番剧导入的视频带可选 `pubdate`（发布时间，Unix 秒，
+/// 同为视频级附加字段向后兼容：旧读者忽略，新读者缺省 null = 未知）。
 library;
 
 import 'upowner.dart';
@@ -47,6 +49,7 @@ class WhitelistVideo {
   final String collection; // v3 所属合集名；空串 = 未分类
   final int order; // 合集内排序号（拖拽排序用）；旧数据缺省 0 = 按 added_at 倒序
   final int? epId; // 番剧/电影集 ep_id（v2.16.4+ 番剧导入写入；普通视频/旧数据 = null）
+  final int? pubdate; // 发布时间（Unix 秒；v2.16.16+ 导入写入；旧数据/未知 = null）
 
   const WhitelistVideo({
     required this.bvid,
@@ -60,6 +63,7 @@ class WhitelistVideo {
     this.collection = '',
     this.order = 0,
     this.epId,
+    this.pubdate,
   });
 
   factory WhitelistVideo.fromJson(Map<String, dynamic> json) {
@@ -80,6 +84,8 @@ class WhitelistVideo {
       order: json['order'] is num ? (json['order'] as num).toInt() : 0,
       // 旧数据无 epId / 脏类型 → null（不崩；播放回退逻辑按 null 视为普通视频）
       epId: json['epId'] is num ? (json['epId'] as num).toInt() : null,
+      // 旧数据无 pubdate / 脏类型 → null（UI 不显示发布时间）
+      pubdate: json['pubdate'] is num ? (json['pubdate'] as num).toInt() : null,
     );
   }
 
@@ -95,6 +101,8 @@ class WhitelistVideo {
         'order': order,
         // epId 非空才输出（普通视频/旧数据不回写多余字段）
         if (epId != null) 'epId': epId,
+        // pubdate 非空才输出（旧数据/未知不回写多余字段）
+        if (pubdate != null) 'pubdate': pubdate,
         if (pages != null)
           'pages': pages!.map((p) => p.toJson()).toList(),
       };
@@ -104,8 +112,9 @@ class WhitelistVideo {
 
   /// 复制并修改合集归属（管理操作「移动到合集」用）。
   ///
-  /// epId 不被本方法修改：未传时沿用原值（合集移动/重排不丢番剧集标识）。
-  WhitelistVideo copyWith({String? collection, int? order, int? epId}) =>
+  /// epId/pubdate 不被本方法修改：未传时沿用原值（合集移动/重排不丢
+  /// 番剧集标识与发布时间）。
+  WhitelistVideo copyWith({String? collection, int? order, int? epId, int? pubdate}) =>
       WhitelistVideo(
         bvid: bvid,
         cid: cid,
@@ -118,6 +127,7 @@ class WhitelistVideo {
         collection: collection ?? this.collection,
         order: order ?? this.order,
         epId: epId ?? this.epId,
+        pubdate: pubdate ?? this.pubdate,
       );
 
   /// 分 P 数量：pages 缺失或为空 → 单 P（1）。
@@ -125,6 +135,18 @@ class WhitelistVideo {
 
   /// 是否为多 P 视频（列表/播放页据此决定是否展示选集 UI）。
   bool get isMultiPage => pageCount > 1;
+}
+
+/// 发布时间格式化：Unix 秒 → `yyyy-MM-dd`；null / ≤0（脏值）→ 空串。
+///
+/// 旧数据无 pubdate（或解析出 0）返回空串 → UI 不显示发布时间，
+/// 且不破坏原有布局（展示行只拼接非空段）。
+String formatPubdate(int? unixSec) {
+  if (unixSec == null || unixSec <= 0) return '';
+  final dt = DateTime.fromMillisecondsSinceEpoch(unixSec * 1000);
+  final m = dt.month.toString().padLeft(2, '0');
+  final d = dt.day.toString().padLeft(2, '0');
+  return '${dt.year}-$m-$d';
 }
 
 /// 合集信息（whitelist.json v3 的 collections 数组项）。

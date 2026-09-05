@@ -97,6 +97,61 @@ void main() {
     });
   });
 
+  group('WhitelistVideo.pubdate（v2.16.16 发布时间）', () {
+    test('fromJson 解析 pubdate + toJson 序列化（非空才输出）', () {
+      final v = WhitelistVideo.fromJson(
+          {..._v2Video('BVp'), 'pubdate': 1682899200});
+      expect(v.pubdate, 1682899200);
+      expect(v.toJson()['pubdate'], 1682899200);
+    });
+
+    test('旧数据无 pubdate → null，toJson 不回写多余字段（向后兼容）', () {
+      final v = WhitelistVideo.fromJson(_v2Video('BV1'));
+      expect(v.pubdate, isNull);
+      expect(v.toJson().containsKey('pubdate'), isFalse);
+    });
+
+    test('pubdate 脏类型（字符串）→ null 不崩', () {
+      final v =
+          WhitelistVideo.fromJson({..._v2Video('BVdirty'), 'pubdate': '123'});
+      expect(v.pubdate, isNull);
+    });
+
+    test('fromJson → toJson 往返保留 pubdate', () {
+      final original = WhitelistVideo.fromJson(
+          {..._v2Video('BVp'), 'pubdate': 1484067600, 'epId': 98603});
+      final back = WhitelistVideo.fromJson(original.toJson());
+      expect(back.pubdate, 1484067600);
+      expect(back.epId, 98603);
+      expect(back.bvid, 'BVp');
+    });
+
+    test('copyWith 改合集不丢 pubdate', () {
+      final v =
+          WhitelistVideo.fromJson({..._v2Video('BVp'), 'pubdate': 1484067600});
+      expect(v.copyWith(collection: '动画').pubdate, 1484067600);
+      expect(v.copyWith().pubdate, 1484067600);
+    });
+
+    test('formatPubdate：Unix 秒 → yyyy-MM-dd；null/0 → 空串', () {
+      // 期望值按与实现一致的「本地时间」语义推导（跨时区机器测试也稳定）
+      String expected(int sec) {
+        final dt = DateTime.fromMillisecondsSinceEpoch(sec * 1000);
+        final m = dt.month.toString().padLeft(2, '0');
+        final d = dt.day.toString().padLeft(2, '0');
+        return '${dt.year}-$m-$d';
+      }
+
+      expect(formatPubdate(1484067600), expected(1484067600));
+      expect(formatPubdate(1682899200), expected(1682899200));
+      // 与 B 站展示语义一致：1682899200 = 2023-05-01T00:00Z，
+      // 东八区（本机/国内用户）下显示 2023-05-01
+      expect(formatPubdate(null), '');
+      expect(formatPubdate(0), '');
+      expect(formatPubdate(-5), '');
+    });
+  });
+
   group('WhitelistVideo.epId（v2.16.4 番剧集标识）', () {
     test('fromJson 解析 epId + toJson 序列化（非空才输出）', () {
       final v = WhitelistVideo.fromJson({..._v2Video('BVpgc'), 'epId': 98603});

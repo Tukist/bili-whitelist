@@ -106,7 +106,8 @@ class PgcPlayUrlResult extends PlayUrlResult {
 /// 2026-08 实测字段：`ep_id` / `aid` / `cid` / `bvid`（每集都有真实 bvid）/
 /// `title`（集数文本，如 `1`、`14(OVA)`）/ `long_title`（副标题）/
 /// `cover` / `badge`（空 = 免费可播；`会员`/`付费` = 受限）/
-/// `duration`（**毫秒**，需换算为秒）。
+/// `duration`（**毫秒**，需换算为秒）/ `pub_time`（**Unix 秒**，该集首播
+/// 时间；逐集不同——2026-09 实测 Hand Shakers 每集相差一周，缺省 0 = 未知）。
 class PgcEpisode {
   final int epId;
   final int aid;
@@ -116,6 +117,7 @@ class PgcEpisode {
   final String longTitle; // 该集副标题
   final String cover;
   final int durationSec; // 已由毫秒换算为秒
+  final int pubTimeSec; // 发布时间（Unix 秒；0 = 接口未给/未知）
   final String badge; // '' = 免费可播；'会员'/'付费' 等非空 = 受限
 
   const PgcEpisode({
@@ -127,6 +129,7 @@ class PgcEpisode {
     required this.longTitle,
     required this.cover,
     required this.durationSec,
+    required this.pubTimeSec,
     required this.badge,
   });
 
@@ -144,6 +147,8 @@ class PgcEpisode {
       longTitle: json['long_title'] as String? ?? '',
       cover: SearchResult.normalizeCover(json['cover'] as String? ?? ''),
       durationSec: (ms / 1000).round(), // duration 单位是毫秒
+      // pub_time 已是 Unix 秒（实测逐集不同），无需换算；缺省 0 = 未知
+      pubTimeSec: (json['pub_time'] as num?)?.toInt() ?? 0,
       badge: json['badge'] as String? ?? '',
     );
   }

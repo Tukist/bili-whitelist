@@ -8,6 +8,21 @@
 
 ---
 
+## v2.16.16 (2026-09-05)
+
+**新增**
+
+- **视频列表项显示发布时间（`pubdate` 字段 + 各导入路径写入 + 列表展示）**：
+  - **数据模型**（`app/lib/models/whitelist_video.dart`）：`WhitelistVideo` 新增可选 `pubdate`（发布时间，Unix 秒；视频级附加字段，向后兼容不升顶层 version——旧读者忽略该键、新读者缺省 null = 未知）；fromJson `is num` 防御（脏类型 → null 不崩）、toJson 非空才输出（旧数据不回写多余字段）、copyWith 沿用；新增 `formatPubdate()`（Unix 秒 → `yyyy-MM-dd`；null / 0 → 空串，供列表项拼接）
+  - **普通视频导入**（`app/lib/services/whitelist_writer.dart` `videoFromMeta`）：写入 view 接口 `data.pubdate`（**秒**，实测单位与语义同搜索结果的 pubdate）；0 / 缺失 / 脏类型 → null（不写脏值）。`addByBvid`（首页粘贴链接导入 / 搜索页「加入」）自动带上
+  - **番剧 / 电影导入**（`PgcEpisode` + `videoFromPgcEpisode`）：`app/lib/api/bilibili_api.dart` 的 `PgcEpisode` 新增 `pubTimeSec`——**2026-09 实测 `pgc/view/web/season` 的 `episodes[].pub_time` 是 Unix 秒整数**（与普通 view `data.pubdate` 同单位、逐集各不相同：Hand Shakers 每集差一周；**不需要毫秒换算**，区别于同条目里的 `duration` 毫秒），0 = 接口未给；`videoFromPgcEpisode` 透传为 `pubdate`（>0 才写）→ `importPgcSeason` 整季导入的每集自动带发布时间
+  - **列表展示**（`app/lib/widgets/video_tile.dart`）：副信息行 `时长 · UP主` → 有 `pubdate` 时拼 ` · 2023-05-01`；**null / 0 不拼该段**（旧数据展示与旧版逐字符一致、不破坏布局）。合集页 / 未分类白名单列表等 `VideoTile` 使用方自动生效；历史页 / 搜索结果等数据源本无 `pubdate`，自然不显示（无异常）
+  - **油猴脚本 v2.3.2**（`bili-whitelist.user.js`）：`fetchVideoInfo` 两路（页面 `__INITIAL_STATE__.videoData.pubdate` 优先 / view API `data.pubdate` 回退）为**新条目**带 `pubdate`（`toPubdate` 只收正数，0 / 缺失不写脏值）；`parseWhitelist` 条目整体透传 + `buildWhitelistJson` 整对象序列化 → 读到的**旧条目含 `pubdate` 原样保留**、合并写回不丢（遵循历史「upowners / collections 丢失」教训：新增字段不做字段级重建）
+  - **单测**：`whitelist_video_v3_test.dart` 新增 pubdate 组（解析 / 序列化 / null 缺省 / 脏类型 / 往返 / copyWith / `formatPubdate`）；`whitelist_writer_test.dart`（videoFromMeta 带 pubdate / 缺失与 0 与脏类型 → null、videoFromPgcEpisode 透传 pub_time 秒 + 无 pub_time → null、toJson 往返）；`pgc_api_test.dart`（episodes[].pub_time 秒级解析断言）；新 `video_tile_test.dart` widget 测试（有 pubdate → `1:30 · UP主 · 2023-05-01`；null / 0 → 旧文案无日期段、不崩）
+  - **实测（模拟器）**：以含 `pubdate` / 旧数据 / 真实番剧（`fetchPgcSeason` 真接口）三组数据驱动真实列表渲染，dump / logcat 文本取证显示日期、旧数据不显示且无异常
+
+---
+
 ## v2.16.15 (2026-09-05)
 
 **新增**
