@@ -321,20 +321,26 @@ void main() {
         blockWords: ['屏蔽词'],
         opacity: 0.5,
       );
-      await tester.pumpWidget(MaterialApp(
-        home: Center(
-          child: SizedBox(
-            width: 400,
-            height: 800,
-            child: DanmakuOverlay(
-              danmaku: list,
-              playing: true,
-              positionMs: 2000, // 全部 timeSec 已到 → 全部发射/过滤
-              settings: settings,
+      Widget build(int posMs) => MaterialApp(
+            home: Center(
+              child: SizedBox(
+                width: 400,
+                height: 800,
+                child: DanmakuOverlay(
+                  danmaku: list,
+                  playing: true,
+                  positionMs: posMs,
+                  settings: settings,
+                ),
+              ),
             ),
-          ),
-        ),
-      ));
+          );
+      // v2.16.24 起挂载即按播放位置对齐游标：先以 0 挂载（从头开始），随后
+      // 父层把位置推到 2000ms（1.5s 小步 ≤3s 不触发清屏）→ 全部 timeSec
+      // 已到 → 全部发射/过滤（与改动前「静态 2000 挂载」的发射效果一致）
+      await tester.pumpWidget(build(0));
+      await tester.pump(const Duration(milliseconds: 16));
+      await tester.pumpWidget(build(2000));
       // 推进若干帧让 Ticker 跑：layout/发射/推进/绘制路径全部执行
       await tester.pump(const Duration(milliseconds: 16));
       await tester.pump(const Duration(milliseconds: 200));
@@ -558,7 +564,7 @@ void main() {
     ];
     const settings = DanmakuSettings(displayAreaPercent: 30);
 
-    Widget build() => MaterialApp(
+    Widget build(int posMs) => MaterialApp(
           home: Center(
             child: SizedBox(
               width: 400,
@@ -566,7 +572,7 @@ void main() {
               child: DanmakuOverlay(
                 danmaku: list,
                 playing: true,
-                positionMs: 2000, // 全部 timeSec 已到 → 逐帧全部发射
+                positionMs: posMs, // 全部 timeSec 已到 → 逐帧全部发射
                 settings: settings,
               ),
             ),
@@ -584,7 +590,10 @@ void main() {
     testWidgets('区域 30%：滚动 6 轨占满可用带，顶部 2 + 底部 2 仍全部发射'
         '（不再因滚动/顶/底互斥而被挤掉）', (tester) async {
       setSurface(tester);
-      await tester.pumpWidget(build());
+      // v2.16.24 游标对齐：从 0 挂载 → 小步推位置到 2000ms（不触发清屏跳变）
+      await tester.pumpWidget(build(0));
+      await tester.pump(const Duration(milliseconds: 16));
+      await tester.pumpWidget(build(2000));
       // 推进 ~1.4s：layout + 逐帧发射（发射信用速率 40 条/s：首帧满额 4 条
       // 后按 16ms/帧涓流补发 → 10 条约 0.3s 内全部进入；~1.5s 内滚动未出
       // 屏（穿越 4s）、顶/底未到停留 3.5s 上限 → 全部在屏存活）
@@ -608,7 +617,9 @@ void main() {
     testWidgets('区域 30%：滚动轨各自不叠、顶部贴顶锚、底行距 = 行高、'
         '所有 y 不越显示区域', (tester) async {
       setSurface(tester);
-      await tester.pumpWidget(build());
+      await tester.pumpWidget(build(0));
+      await tester.pump(const Duration(milliseconds: 16));
+      await tester.pumpWidget(build(2000));
       for (var i = 0; i < 90; i++) {
         await tester.pump(const Duration(milliseconds: 16));
       }
@@ -632,6 +643,81 @@ void main() {
         expect(y, greaterThanOrEqualTo(0));
         expect(y, lessThanOrEqualTo(regionBottom));
       }
+      await tester.pumpWidget(const SizedBox());
+    });
+  });
+
+  group('发射游标对齐 danmakuCursorAt（v2.16.24 重开不补发核心）', () {
+    final list = [
+      _dm('a', timeSec: 1),
+      _dm('b', timeSec: 2),
+      _dm('b2', timeSec: 2), // 同一时刻重复（B 站同秒弹幕常见）
+      _dm('c', timeSec: 5),
+      _dm('d', timeSec: 9),
+    ];
+
+    test('位置 0 → 从头（0 秒弹幕不被误跳过）；中段 → 首个未严格过去的弹幕', () {
+      expect(danmakuCursorAt(list, 0), 0);
+      expect(danmakuCursorAt(list, 1.5), 1); // a(1) 严格已过 → 从 b(2) 起
+      expect(danmakuCursorAt(list, 4.9), 3); // 首个 >= 4.9 的是 c(5)
+    });
+
+    test('恰等于当前时刻的保留（位置推进到该秒即发射）；越末尾 → 长度；空表 → 0', () {
+      expect(danmakuCursorAt(list, 2), 1); // b(2) 恰在当前时刻 → 保留
+      expect(danmakuCursorAt(list, 9), 4); // d(9) 恰在当前时刻 → 保留
+      expect(danmakuCursorAt(list, 9.01), 5); // 严格已过 → 之后无未发
+      expect(danmakuCursorAt(list, 99), 5); // 全部已过 → 到末尾
+      expect(danmakuCursorAt(const [], 0), 0); // 空表
+    });
+
+    test('seek 后退：按新位置重算游标（后退越过的时间窗可重新发射）', () {
+      // 前进到 9s（游标=末尾）后 seek 回到 4s → 游标指向 c(5)：5s 段重放
+      expect(danmakuCursorAt(list, 4), 3);
+      expect(danmakuCursorAt(list, 0.5), 0); // 回到开头附近 → 从头
+    });
+  });
+
+  group('DanmakuOverlay 开关重开/挂载中段（v2.16.24）', () {
+    testWidgets('中段（3 分钟处）挂载：不补发开头弹幕，位置越过才发后续', (tester) async {
+      // 开头 ~30s 密集弹幕 + 一条 3 分钟处的——模拟「播到 3 分钟关弹幕再开」
+      final list = <Danmaku>[
+        for (var i = 0; i < 30; i++) _dm('开头$i', timeSec: 0.5 + i),
+        _dm('三分钟', timeSec: 181),
+      ];
+      Widget build(int posMs) => MaterialApp(
+            home: Center(
+              child: SizedBox(
+                width: 400,
+                height: 800,
+                child: DanmakuOverlay(
+                  danmaku: list,
+                  playing: true,
+                  positionMs: posMs,
+                  settings: const DanmakuSettings(),
+                ),
+              ),
+            ),
+          );
+      // 中段挂载（开关重开 = 新建 State，positionMs 直接给当前 3 分钟处）
+      await tester.pumpWidget(build(180000));
+      for (var i = 0; i < 30; i++) {
+        await tester.pump(const Duration(milliseconds: 16));
+      }
+      final dynamic st = tester.state(find.byType(DanmakuOverlay));
+      // 关键断言：30 条开头弹幕一条都没补发（修复前游标从 0 起会全部涌出）
+      expect((st.debugActiveScrollYs as List), isEmpty);
+      // 播放继续越过 181s（父层 500ms 轮询推近位置，1.5s 小步不触发清屏）
+      await tester.pumpWidget(build(181500));
+      await tester.pump(const Duration(milliseconds: 16));
+      await tester.pump(const Duration(milliseconds: 300));
+      // 只发「三分钟」这一条：从当前位置正常继续，不重复涌出开头弹幕
+      expect((st.debugActiveScrollYs as List).length, 1);
+      expect(st.debugActiveScrollX, isNot(isNaN)); // 有一条在屏向左滚
+      // 位置不再前进：屏上仍只有这一条（发射已到游标末，无重复发射）
+      for (var i = 0; i < 10; i++) {
+        await tester.pump(const Duration(milliseconds: 100));
+      }
+      expect((st.debugActiveScrollYs as List).length, 1);
       await tester.pumpWidget(const SizedBox());
     });
   });

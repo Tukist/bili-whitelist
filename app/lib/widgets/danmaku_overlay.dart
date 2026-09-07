@@ -44,9 +44,14 @@
 ///   顶部/底部弹幕带 0.15s 淡入 + 0.4s 淡出（透明度为 1 时零额外开销）。
 /// - **绘制**：CustomPaint + 缓存 TextPainter（发射时 layout 一次，每帧只
 ///   paint），避免每帧重建排版；文本带黑色阴影保证白/亮弹幕可读。
-/// - 切集/seek/恢复进度：父层换新数据实例 → 从头发射；播放位置发生 >3s
-///   的跳变（seek/恢复记忆）→ 本层清空活跃并把发射游标跳到新位置，不再
-///   补发已跳过的弹幕（跳变检测在 didUpdateWidget，父层无需额外通知）。
+/// - **发射游标永远对齐当前播放位置（v2.16.24 修复开关重开补发）**：弹幕层
+///   挂载/重建（开关重开、拉取完成晚于播放推进、切集恢复进度）与 seek/恢复
+///   进度 >3s 跳变/设置变更，统一把发射游标对齐到「首个 timeSec ≥ 当前播放
+///   位置」的弹幕（[danmakuCursorAt]，纯函数可单测）——播放位置严格已过的
+///   弹幕不再发射（**不补发开头**），从当前位置之后继续；seek 后退按新
+///   位置重算（越过的时间窗重新发射，B 站同语义）。位置 0 等价于从头开始。
+///   跳变检测在 didUpdateWidget（>3s 清屏），重开属新建 State（initState 对齐），
+///   父层无需额外通知。
 library;
 
 import 'dart:math' as math;
@@ -103,6 +108,33 @@ double danmakuSmoothDt(double dt) {
 /// 大间隙帧 dt=0 → 信用不涨 → 恢复帧不会因积压而一口气补发多条。
 double danmakuCreditAfter(double credit, double dt) => math.min(
     credit + dt * kDanmakuSpawnRatePerSec, kDanmakuSpawnCreditMax);
+
+/// 发射游标对齐纯函数：在**按 [Danmaku.timeSec] 升序**的 [list] 中找首个
+/// `timeSec >= posSec`（当前播放秒）的下标——发射游标应指向它。播放位置
+/// **严格已过**的弹幕（timeSec < posSec）不再发射；恰在当前时刻的保留
+/// （与发射口 `timeSec <= posSec` 自洽：位置推进到该秒时正常发射，0 秒弹幕
+/// 在从头播放时不被误跳过）。作用场景：
+/// - 弹幕层（重）挂载（开关重开/切集恢复进度/拉取完成晚于播放推进）→ 游标
+///   按当前播放位置初始化，**不补发开头弹幕**（v2.16.24 修复主 bug）；
+/// - seek/恢复进度跳变清屏后复位 → 前进跳过已看段，后退则从新位置起重新
+///   发射（可重放后退越过的时间窗，与 B 站一致）；
+/// - 设置变更（屏蔽/透明度/区域）清屏重载 → 不重放已播弹幕。
+/// 位置 0（从头播放）→ 0（正常从开头发射）；posSec 已越到末尾 → 列表长度
+/// （无未发弹幕）；空表 → 0。复杂度 O(log n)（二分；升序由
+/// [parseDanmakuXml] 排序保证，缓存/各调用方均保持该序）。
+int danmakuCursorAt(List<Danmaku> list, double posSec) {
+  var lo = 0;
+  var hi = list.length;
+  while (lo < hi) {
+    final mid = (lo + hi) >> 1;
+    if (list[mid].timeSec < posSec) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
 
 /// 弹幕带（显示区域内）纵向几何锚点（见 _ensureLayout）：
 /// - 顶锚 = 屏高 × [_topAreaRatio] × 区域比：滚动轨道 0 与顶部弹幕行 0 的
@@ -288,24 +320,27 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
     super.initState();
     _lastPosMs = widget.positionMs;
     _ticker = createTicker(_onTick)..start();
-    _reset(rewindToCurrent: false);
+    // 游标初值对齐当前播放位置：弹幕层可能挂在播放中段（开关重开/切集恢复
+    // 进度/拉取完成晚于播放推进）——从当前时刻之后的弹幕开始发射，不补发
+    // 开头已播过的弹幕（v2.16.24 修复「关弹幕再开 → 大量补发开头」）。
+    _reset();
   }
 
   @override
   void didUpdateWidget(DanmakuOverlay oldWidget) {
     super.didUpdateWidget(oldWidget);
-    // 切集：新数据实例（identity 不同）→ 从头发射
+    // 切集/换数据：父层换新 List 实例 → 清屏并按当前播放位置重排游标
+    // （位置为 0 时等价于旧行为「从头发射」；中段恢复进度则跳过已播段）。
     if (!identical(oldWidget.danmaku, widget.danmaku)) {
-      _reset(rewindToCurrent: false);
+      _reset();
       _needRelayout = true;
       _lastPosMs = widget.positionMs;
       return;
     }
     // 设置变化（父层改动屏蔽词/屏蔽类型/透明度/显示区域 → copyWith 新实例）：
-    // 清活跃 + 按当前播放位置重载，让屏蔽即时生效（在屏残留立即移除，
-    // 且不重放已播弹幕——游标维持当前位置不动）。**显示区域变化还要重算
-    // 布局**（轨道数/锚点随百分比变）——否则区域调小不生效，直到下次旋转/
-    // 切集才重排。
+    // 清活跃 + 游标对齐当前播放位置重载，让屏蔽即时生效（在屏残留立即移除，
+    // 且不重放已播弹幕）。**显示区域变化还要重算布局**（轨道数/锚点随百分
+    // 比变）——否则区域调小不生效，直到下次旋转/切集才重排。
     if (!identical(oldWidget.settings, widget.settings)) {
       debugPrint('[danmaku] 设置变更 -> ${widget.settings}，清屏重载');
       if (oldWidget.settings.displayAreaPercent !=
@@ -314,38 +349,35 @@ class _DanmakuOverlayState extends State<DanmakuOverlay>
         debugPrint('[danmaku] 显示区域 ${oldWidget.settings.displayAreaPercent}%'
             ' -> ${widget.settings.displayAreaPercent}%，标记重算布局');
       }
-      _reset(rewindToCurrent: true);
+      _reset();
       _lastPosMs = widget.positionMs;
     } else {
-      // seek / 恢复进度等位置大跳变（>3s）：清活跃 + 游标跳到当前时间点，
-      // 不补发已跳过的弹幕；普通播放推进（两帧差 <=500ms）不受影响。
+      // seek / 恢复进度等位置大跳变（>3s）：清活跃 + 游标对齐到新位置，
+      // 不补发跳过的弹幕（前进跳过、后退重放该时间窗）；普通播放推进
+      // （两帧差 <=500ms）不受影响。
       final delta = (widget.positionMs - _lastPosMs).abs();
       if (delta > 3000) {
-        _reset(rewindToCurrent: true);
+        _reset();
       }
       _lastPosMs = widget.positionMs;
     }
   }
 
-  /// 清空活跃弹幕（并释放 TextPainter）；[rewindToCurrent] 为 true 时把
-  /// 发射游标推进到 `>= 当前播放位置` 的第一条（seek 前进跳过后不补发）。
-  void _reset({required bool rewindToCurrent}) {
+  /// 清空活跃弹幕（并释放 TextPainter），把发射游标对齐到「首个 timeSec >=
+  /// 当前播放位置」的弹幕（[danmakuCursorAt]）——严格已播过的不补发：
+  /// 开关重开/后挂载不重放开头、seek 前进跳过已看段、设置变更清屏不重放；
+  /// seek 后退则按新位置重算（后退越过的时间窗重新发射）。初始/每次复位
+  /// 统一走这里；播放位置 0 时等价于从头发射。弹幕层重挂载由 initState
+  /// 触发（不走 didUpdateWidget 的 seek 检测，位置对齐逻辑天然覆盖重开）。
+  void _reset() {
     for (final a in _active) {
       a.dispose();
     }
     _active.clear();
-    if (!rewindToCurrent) {
-      _cursor = 0;
-    } else {
-      final list = widget.danmaku;
-      final posSec = widget.positionMs / 1000.0;
-      var i = _cursor;
-      // 游标只前进（seek 前进场景）；seek 后退同样适用：清空后从首个
-      // timeSec > pos 的弹幕开始，防止补发已看过的
-      while (i < list.length && list[i].timeSec <= posSec) {
-        i++;
-      }
-      _cursor = i;
+    _cursor = danmakuCursorAt(widget.danmaku, widget.positionMs / 1000.0);
+    if (_cursor > 0) {
+      debugPrint('[danmaku] 游标对齐 pos=${widget.positionMs}ms → '
+          'cursor=$_cursor/${widget.danmaku.length}（跳过已播弹幕，不补发）');
     }
   }
 
