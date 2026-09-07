@@ -8,6 +8,19 @@
 
 ---
 
+## v2.17.2 (2026-09-07)
+
+**播放页 UP 主入口（阶段 C 收尾：竖屏信息行 UP 主区仿 B 站——头像 + 名字进 UP 主页）**
+
+播放页竖屏大重构三阶段收官（A 竖屏布局 → B 跳转导航 → C UP 主入口）。本版把 v2.17.0 信息行里 UP 主名文本占位升级为可点的 UP 主入口，**不扩大 WhitelistVideo 模型**（白名单数据 / 导入 / 油猴链路零改动），mid/头像运行时补齐：
+
+- **UP 主区（`app/lib/pages/player_page.dart` + 新组件 `app/lib/widgets/upowner_badge.dart`）**：普通视频信息行显示**圆形头像（32px，UA/Referer 防盗链头 + 失败/空 → 首字圆形占位）+ UP 主名**（可点、紧凑不喧宾夺主）。mid/face/真名由运行时 `fetchVideoMeta(bvid)` 取 view 接口 `data.owner{mid,name,face}` 补齐（纯函数 `parseViewOwner` 解析，防御脏数据；结果按 bvid **会话内缓存** `_upMetaCache`，多播放页/多 P 切集不重复请求；换源 `playVideo` 后复位重拉、按 bvid 对账防串台）；真名拉取成功后覆盖 up_name 展示
+- **点击分发**：有 mid → 进 `UpownerPage(mid, initial: Upowner(预填头像名))`——**push 前自动暂停本页并保存进度**（复用阶段 B 的让路机制），从 UP 主页返回时 `didPopNext` 恢复续播，且从 UP 主页再点开视频不会双音轨；mid 未取到/失败 → 名字照常显示、点击 SnackBar「无法获取 UP 主信息」，不进页
+- **番剧 / 电影（带 epId）取舍（弱化）**：pgc 内容挂靠官方/搬运号，无 UP 主页点播价值且易误导——**不拉 owner、信息行显示剧集标签**（导入的 up_name，空则「剧集」）、**不可点**；旧版导入的无 epId 番剧数据无法区分，走普通视频路径（行为按 view owner 实测，属已知边界，注释已说明）
+- **验证**：`flutter analyze` 0 issue；全量单测 **620 通过**（609 + 新增 11：`UpownerBadge` 渲染/占位/点击分发/纯展示 5 个 widget 测试 + `parseViewOwner` 解析 6 个单测）；模拟器实测（匿名 720P）：播普通视频 → 信息行 UP 主区拉取成功（logcat `UP 主信息 mid=… name=摄影师云飞`）、点击进 UP 主页 mid/名字一致（头部预填即时显示，acc/info 匿名被 -412 限流属环境条件）、返回续播恢复；番剧集（epId）→ 不拉取 owner、信息行剧集标签、点击无跳转（按设计）
+
+---
+
 ## v2.17.1 (2026-09-07)
 
 **评论视频链接跳转可返回（阶段 B：push 新播放页 + 暂停旧页 + 返回续播）**

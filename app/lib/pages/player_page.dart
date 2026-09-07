@@ -14,6 +14,7 @@ import '../config.dart';
 import '../models/danmaku.dart';
 import '../models/danmaku_settings.dart';
 import '../models/subtitle.dart';
+import '../models/upowner.dart';
 import '../models/whitelist_video.dart';
 import '../player/bili_dash_player.dart';
 import '../services/danmaku_settings_store.dart';
@@ -23,8 +24,10 @@ import '../services/realtime_transcriber.dart';
 import '../widgets/comment_list.dart';
 import '../widgets/danmaku_overlay.dart';
 import '../widgets/danmaku_settings_sheet.dart';
+import '../widgets/upowner_badge.dart';
 import 'comment_page.dart';
 import 'login_page.dart';
+import 'upowner_page.dart';
 
 /// 可选的播放倍速档位（默认 1.0，均落在原生支持区间 0.25~4.0 内）。
 const List<double> kPlaybackSpeeds = [
@@ -328,6 +331,40 @@ double brightnessPercent({
   return v < 5 ? 5 : v;
 }
 
+// -------------------------------------------------------------------------
+// 信息行 UP 主入口（阶段 C）：view 接口 owner 解析 + 会话内缓存
+//
+// 背景：WhitelistVideo 只有 up_name，没有 mid/face（避免改白名单数据/
+// 导入/油猴链路）。UP 主区运行时调 fetchVideoMeta(bvid) 取
+// data.owner{mid,name,face} 补齐：mid 用于进 [UpownerPage]、name 覆盖
+// up_name 展示、face 作头像。同会话缓存避免重复请求同一视频的 view。
+// -------------------------------------------------------------------------
+
+/// 从 view 接口返回的 `data` map 解析 UP 主信息（owner.mid/name/face）。
+///
+/// - owner 缺失/类型异常/mid 非正 → null（调用方回退 up_name 文本展示）
+/// - face 允许为空串（部分接口场景无头像 → 走首字圆形占位）
+({int mid, String name, String face})? parseViewOwner(
+  Map<String, dynamic> data,
+) {
+  final owner = data['owner'];
+  if (owner is! Map<String, dynamic>) return null;
+  // 脏数据（字符串等非数字）→ 按 0 处理返回 null（与模型 fromJson 防御风格一致）
+  final mid = owner['mid'] is num ? (owner['mid'] as num).toInt() : 0;
+  if (mid <= 0) return null;
+  return (
+    mid: mid,
+    name: (owner['name'] as String?)?.trim() ?? '',
+    face: owner['face'] as String? ?? '',
+  );
+}
+
+/// 会话内 UP 主元数据缓存（bvid → owner，阶段 C）。
+///
+/// 同一视频可能被多次进播放页（历史/评论链接叠页/多 P 切集），缓存让
+/// 「已成功拉取过 view owner」的页面直接复用，不再重复请求 view 接口。
+final Map<String, ({int mid, String name, String face})> _upMetaCache = {};
+
 /// 播放页：进入即取流（DASH 双流 fnval=16，老视频降级 mp4 单流），
 /// 原生 ExoPlayer MergingMediaSource 合并播放。
 ///
@@ -344,8 +381,9 @@ double brightnessPercent({
 ///   整体忽略（不 seek / 不调亮度音量）——横屏全屏从**物理底部**滑动（旋转后
 ///   = 逻辑左/右边缘，左右带加宽）唤醒系统导航不再误触发 seek
 /// - 竖屏布局（v2.17.0+ 重构）：非全屏 = 视频区顶部置顶（按宽高比的黑盒，
-///   超高视频封顶屏高 60%）+ 下方视频信息行（标题/时长/UP 主名占位，阶段 C
-///   加 UP 入口）+ **内嵌评论区**（[CommentListView]，与独立 [CommentPage]
+///   超高视频封顶屏高 60%）+ 下方视频信息行（标题/时长 + UP 主入口——
+///   阶段 C 加：圆形头像+名字可点进 UP 主页，番剧弱化为剧集标签）+
+///   **内嵌评论区**（[CommentListView]，与独立 [CommentPage]
 ///   共用同一实现，视频切换按 bvid+分P 重建刷新）。画面/弹幕/字幕/手势/
 ///   控制层全部绑定在视频区矩形内（不再整屏黑底、不覆盖下方评论区）；
 ///   控制层「评论」按钮：竖屏 = 滚动定位到评论区，横屏全屏 = 打开独立
@@ -424,6 +462,14 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
   // Scrollable.ensureVisible 锚定滚动到评论区。
   final ScrollController _commentScroll = ScrollController();
   final GlobalKey _commentCountHeaderKey = GlobalKey();
+
+  // 信息行 UP 主入口（阶段 C，仿 B 站）
+  // ---------------------------------------------------------------------
+  // WhitelistVideo 无 mid/face → 运行时 fetchVideoMeta(bvid) 拿 view 接口
+  // data.owner 补齐（_refreshUpownerMeta，结果按 bvid 缓存在 _upMetaCache）。
+  // _ownerMeta 为当前视频的 UP 主信息（null = 未拉取/失败/番剧无入口）。
+  // 换源（playVideo 换 _video）后必须复位重拉，防止残留上一个视频的 UP。
+  ({int mid, String name, String face})? _ownerMeta;
 
 
   // B 站式快捷手势（v2.16.7+）
@@ -635,6 +681,9 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     _realtimeModelDirHint();
     _loadDanmakuSettings();
     _checkLoginExpiry();
+    // UP 主入口元数据（阶段 C）：拉 view 接口 owner 补齐 mid/face（异步，
+    // 信息行先用 up_name 文本渲染，拉取成功后 setState 换头像+真名）
+    _refreshUpownerMeta();
     _init();
   }
 
@@ -3160,6 +3209,8 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     setState(() {
       _video = video;
       _currentPageIndex = 0;
+      // UP 主信息随换源复位（不残留上一个视频的头像/名字）
+      _ownerMeta = null;
       _playing = false;
       _completed = false;
       _positionMs = 0;
@@ -3186,6 +3237,8 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     });
     // 3) 复用首次加载流程重新取流（含新 tick 定时器）
     await _init();
+    // 换源后重拉新视频的 UP 主信息（阶段 C）
+    _refreshUpownerMeta();
     // 换源后弹幕开关仍开 → 自动拉新视频弹幕（与切集一致；异常静默）
     try {
       if (_danmakuEnabled && _error == null) await _loadDanmaku();
@@ -3429,8 +3482,9 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
             height: videoAreaHeight,
             child: ColoredBox(color: Colors.black, child: _buildVideoLayers()),
           ),
-          // 2/3. 竖屏内容区：视频信息行（标题/时长/UP 主名占位，阶段 C 加
-          //      UP 入口）+ 内嵌评论区（评论区底部避开系统手势导航条）。
+          // 2/3. 竖屏内容区：视频信息行（标题/时长 + UP 主入口：阶段 C 已从
+          //      UP 主名文本占位升级为头像+名字可点进 UP 主页）+ 内嵌评论区
+          //      （评论区底部避开系统手势导航条）。
           //      全屏不渲染（下方内容区不占位）。
           if (!_fullscreen) ...[
             Container(
@@ -3604,9 +3658,11 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     );
   }
 
-  /// 竖屏（非全屏）视频信息行：标题（含分 P）+ UP 主名占位 + 时长。
+  /// 竖屏（非全屏）视频信息行：标题（含分 P）+ UP 主入口 + 时长。
   ///
-  /// 阶段 C 再在 UP 主名上加头像与「UP 主页」入口；本阶段先以文本占位。
+  /// 阶段 C：UP 主区从 v2.17.0 的「person 图标 + up_name 文本占位」升级为
+  /// [UpownerBadge]（圆形头像 + 名字，可点进 [UpownerPage]）；番剧/电影
+  /// （带 epId）按阶段 C 取舍弱化（见 [_buildVideoInfoBar] 内注释）。
   Widget _buildVideoInfoBar(BuildContext context) {
     final theme = Theme.of(context);
     final subStyle = TextStyle(fontSize: 12.5, color: Colors.grey.shade600);
@@ -3618,6 +3674,13 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     final durMs = _durationMs > 0
         ? _durationMs
         : (_video.duration > 0 ? _video.duration * 1000 : 0);
+    // 番剧/电影（带 epId）→ 剧集标签：pgc 内容挂靠官方/搬运号，点进其
+    // 「主页」无白名单点播价值且易误导（观感像进了 UP 空间其实是官方号），
+    // 取舍为**弱化**——不拉 view owner、无头像、不可点（名字为导入数据
+    // 的 up_name，空则显示「剧集」）。旧版导入的无 epId 番剧数据无法区分，
+    // 走普通视频路径（行为以 view 接口实测 owner 为准，属已知边界）。
+    final bangumiName =
+        _video.upName.isEmpty ? '剧集' : _video.upName;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
@@ -3634,16 +3697,29 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
         const SizedBox(height: 4),
         Row(
           children: [
-            Icon(Icons.person_outline, size: 15, color: Colors.grey.shade500),
-            const SizedBox(width: 4),
-            Flexible(
-              child: Text(
-                _video.upName.isEmpty ? 'UP 主' : _video.upName,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: subStyle,
+            // UP 主区（阶段 C）：普通视频 → 头像+名字可点；番剧 → 剧集标签
+            if (_video.epId != null) ...[
+              Icon(Icons.play_circle_outline,
+                  size: 15, color: Colors.grey.shade500),
+              const SizedBox(width: 4),
+              Flexible(
+                child: Text(
+                  bangumiName,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: subStyle,
+                ),
               ),
-            ),
+            ] else
+              Flexible(
+                child: UpownerBadge(
+                  name: _ownerMeta != null && _ownerMeta!.name.isNotEmpty
+                      ? _ownerMeta!.name // view owner.name 真名（覆盖 up_name）
+                      : (_video.upName.isEmpty ? 'UP 主' : _video.upName),
+                  face: _ownerMeta?.face,
+                  onTap: _onUpownerTap,
+                ),
+              ),
             if (_video.isMultiPage) ...[
               const SizedBox(width: 8),
               Text('第 ${_currentPageIndex + 1} 集',
@@ -3654,6 +3730,69 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
           ],
         ),
       ],
+    );
+  }
+
+  /// 信息行 UP 主入口的元数据拉取（阶段 C）：fetchVideoMeta 拿 view 接口
+  /// data.owner{mid,name,face} 补齐头像与 UP 主页入口（结果按 bvid 缓存在
+  /// [_upMetaCache]，多播放页/切集不重复请求）。
+  ///
+  /// 番剧（epId != null）**不拉取**——阶段 C 取舍为弱化展示（见
+  /// [_buildVideoInfoBar] 注释），避免为官方号做无意义请求。
+  Future<void> _refreshUpownerMeta() async {
+    if (_video.epId != null) return; // 番剧：无 UP 入口，不请求
+    final bvid = _video.bvid;
+    final cached = _upMetaCache[bvid];
+    if (cached != null) {
+      _ownerMeta = cached;
+      return; // 会话内缓存命中（无需 setState：build 前同步赋值即可）
+    }
+    try {
+      final data = await _api.fetchVideoMeta(bvid);
+      final parsed = parseViewOwner(data);
+      if (parsed != null) _upMetaCache[bvid] = parsed;
+      // 拉取期间可能换源/退出：按 bvid 对账，防把旧视频的 UP 信息串到新视频
+      if (!mounted || _video.bvid != bvid) return;
+      setState(() => _ownerMeta = parsed);
+      debugPrint('[player_page] UP 主信息 bvid=$bvid '
+          'mid=${parsed?.mid} name=${parsed?.name}');
+    } catch (e) {
+      // 失败静默：信息行保持 up_name 文本展示；点击时提示无法获取
+      debugPrint('[player_page] 拉取 UP 主信息失败 bvid=$bvid error=$e');
+    }
+  }
+
+  /// 点击信息行 UP 主区（仿 B 站 → 进 UP 主主页 [UpownerPage]）。
+  ///
+  /// - 已有 mid（view owner 拉取成功）→ 先暂停本页播放再 push UP 主页，
+  ///   返回时 [didPopNext] 恢复续播（复用 v2.17.1 叠播放页的让路机制：
+  ///   从 UP 主页再点开视频时本页不产生重叠音轨）
+  /// - 无 mid（拉取失败/进行中）→ 名字照常显示，点击提示获取状态，不进页
+  void _onUpownerTap() {
+    final meta = _ownerMeta;
+    if (meta == null) {
+      _showSnack('无法获取 UP 主信息（网络异常或稿件已失效）');
+      return;
+    }
+    if (!mounted) return;
+    debugPrint('[player_page] 进 UP 主页 mid=${meta.mid} name=${meta.name} '
+        'bvid=${_video.bvid}');
+    _pauseBeforePushingNewPlayer();
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => UpownerPage(
+          mid: meta.mid,
+          // initial 预填头像/名字（头部卡片立即可见，fetchUpownerInfo 返回后
+          // 覆盖；addedAt 仅为满足 Upowner 必填字段——播放页非白名单写入方，
+          // UpownerPage 只用 name/face/fans，不读写加入时间）
+          initial: Upowner(
+            mid: meta.mid,
+            name: meta.name,
+            face: meta.face,
+            addedAt: DateTime.fromMillisecondsSinceEpoch(0, isUtc: true),
+          ),
+        ),
+      ),
     );
   }
 
