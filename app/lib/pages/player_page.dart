@@ -19,6 +19,7 @@ import '../services/danmaku_settings_store.dart';
 import '../services/device_media.dart';
 import '../services/history_store.dart';
 import '../services/realtime_transcriber.dart';
+import '../widgets/comment_list.dart';
 import '../widgets/danmaku_overlay.dart';
 import '../widgets/danmaku_settings_sheet.dart';
 import 'comment_page.dart';
@@ -329,10 +330,17 @@ double brightnessPercent({
 ///   松手 seekTo）；垂直主导 → 按起点左/右半屏调亮度/音量（原生通道
 ///   bili_whitelist/media，仅当前 Activity 内生效）。竖屏只保留亮度/音量
 ///   （水平主导忽略，无 seek 防误触）。v2.16.14+/v2.16.17+：触摸按下点落在
-///   屏幕底部/顶部/左右豁免带（[isExcludedGestureStart]，四边，按下点判定见
-///   [_onPanDown]）→ 本次 Pan 整体忽略（不 seek / 不调亮度音量）——横屏全屏
-///   从**物理底部**滑动（旋转后 = 逻辑左/右边缘，左右带加宽）唤醒系统导航
-///   不再误触发 seek
+///   手势区（竖屏 = 视频区黑盒，见下；全屏 = 整屏）底部/顶部/左右豁免带
+///   （[isExcludedGestureStart]，四边，按下点判定见 [_onPanDown]）→ 本次 Pan
+///   整体忽略（不 seek / 不调亮度音量）——横屏全屏从**物理底部**滑动（旋转后
+///   = 逻辑左/右边缘，左右带加宽）唤醒系统导航不再误触发 seek
+/// - 竖屏布局（v2.17.0+ 重构）：非全屏 = 视频区顶部置顶（按宽高比的黑盒，
+///   超高视频封顶屏高 60%）+ 下方视频信息行（标题/时长/UP 主名占位，阶段 C
+///   加 UP 入口）+ **内嵌评论区**（[CommentListView]，与独立 [CommentPage]
+///   共用同一实现，视频切换按 bvid+分P 重建刷新）。画面/弹幕/字幕/手势/
+///   控制层全部绑定在视频区矩形内（不再整屏黑底、不覆盖下方评论区）；
+///   控制层「评论」按钮：竖屏 = 滚动定位到评论区，横屏全屏 = 打开独立
+///   评论页（原行为）。全屏（横屏）保持整屏播放布局（无下方内容区）。
 /// - URL 过期（onUrlExpired）：重取 playurl → 记位置 → setDataSource(新流, 位置) 续播，
 ///   续播后按当前倍速/听视频状态恢复；重试 1 次仍失败显示「视频流过期，请重试」+ 重试按钮
 /// - 错误分类：403 防盗链异常 / -412 风控（指数退避 1s→2s→4s 重试）/ 62002 稿件失效 /
@@ -396,6 +404,17 @@ class _PlayerPageState extends State<PlayerPage> {
   bool _controlsVisible = true;
   bool _fullscreen = false;
   bool _dragging = false;
+
+  // 竖屏内嵌评论区（v2.17.0+ 布局重构）：
+  // ---------------------------------------------------------------------
+  // 竖屏（非全屏）时视频下方内嵌 [CommentListView]（与独立 [CommentPage]
+  // 共用同一组件）。_commentScroll 为列表的外部滚动控制器（竖屏点控制层
+  // 「评论」按钮时定位用；独立页/全屏时该列表不在树中，控制器仍持有多余
+  // 无妨）；_commentCountHeaderKey 挂在列表顶部「评论 N」区头上，供
+  // Scrollable.ensureVisible 锚定滚动到评论区。
+  final ScrollController _commentScroll = ScrollController();
+  final GlobalKey _commentCountHeaderKey = GlobalKey();
+
 
   // B 站式快捷手势（v2.16.7+）
   // -------------------------------------------------------------------
@@ -605,6 +624,7 @@ class _PlayerPageState extends State<PlayerPage> {
     _hudTimer?.cancel();
     _eventSub?.cancel();
     _eventSub = null;
+    _commentScroll.dispose();
     _player?.dispose();
     _restoreSystemUi();
     super.dispose();
@@ -1358,6 +1378,25 @@ class _PlayerPageState extends State<PlayerPage> {
     return kSideGestureExclusionPxPortrait;
   }
 
+  /// 竖屏（非全屏）视频区黑盒高度：按视频宽高比铺满可用宽（顶部置顶），
+  /// 超高视频（如 9:16）按比例会顶掉下方内容区 → 封顶屏高 60%，留出信息行
+  /// 与评论区（画面在盒内按 AspectRatio 居中 + 黑边补齐）。
+  double _portraitVideoHeight(Size screen) {
+    final aspect = _aspectRatio > 0 ? _aspectRatio : 16 / 9;
+    final ideal = screen.width / aspect;
+    final maxH = screen.height * 0.6;
+    return ideal > maxH ? maxH : ideal;
+  }
+
+  /// 手势层所在矩形的逻辑尺寸：全屏 = 屏幕；竖屏 = 视频区黑盒（宽 = 屏宽、
+  /// 高 = [_portraitVideoHeight]）。亮度/音量纵向换算、半屏分界与豁免带判定
+  /// 均以手势层自身为准——竖屏时手势只发生在视频区内（不再覆盖下方内容区）。
+  Size _gestureAreaSize() {
+    final s = MediaQuery.sizeOf(context);
+    if (_fullscreen) return s;
+    return Size(s.width, _portraitVideoHeight(s));
+  }
+
   /// 按下即判豁免（v2.16.17+，用**触摸按下点**而非 panStart 的竞技场胜出点）：
   /// onPanDown 在手指按下第一时间回调（尚未位移 / 未进 arena），localPosition
   /// 即真实触摸起点；而 onPanStart 的坐标是手势**赢得竞技场那一刻**的位置
@@ -1370,10 +1409,10 @@ class _PlayerPageState extends State<PlayerPage> {
   /// （tap 无位移不触发 Pan），按下点豁免不影响单击显隐等。
   void _onPanDown(DragDownDetails d) {
     if (_player == null) return;
-    final size = MediaQuery.sizeOf(context);
+    final size = _gestureAreaSize();
     final w = size.width;
     final h = size.height;
-    final sidePx = _sideGestureExclusionPx(size);
+    final sidePx = _sideGestureExclusionPx(MediaQuery.sizeOf(context));
     if (isExcludedGestureStart(
           x0: d.localPosition.dx,
           y0: d.localPosition.dy,
@@ -1409,10 +1448,10 @@ class _PlayerPageState extends State<PlayerPage> {
     _panDy = 0;
     _hudTimer?.cancel();
     if (_hudKind != null) setState(() => _hudKind = null);
-    final size = MediaQuery.sizeOf(context);
+    final size = _gestureAreaSize();
     debugPrint('[player_page] 手势开始 x0=${_panStartX.toStringAsFixed(0)}px '
         'y0=${d.localPosition.dy.toStringAsFixed(0)}px '
-        'fullscreen=$_fullscreen（屏 ${size.width.toInt()}x${size.height.toInt()}）');
+        'fullscreen=$_fullscreen（手势面 ${size.width.toInt()}x${size.height.toInt()}）');
   }
 
   /// 手势滑动：先累计位移并尝试锁定主导方向（锁定后不再切换），
@@ -1544,15 +1583,15 @@ class _PlayerPageState extends State<PlayerPage> {
   /// 音量（getVolume 为 null 或 max<=0）无有效档位信息 → 放弃本次手势
   /// （不硬设 0，避免把音量清零）。
   void _beginVerticalAdjust() {
-    final width = MediaQuery.sizeOf(context).width;
-    final kind = verticalSlideKind(_panStartX, width);
+    final area = _gestureAreaSize();
+    final kind = verticalSlideKind(_panStartX, area.width);
     debugPrint('[player_page] 垂直手势开始 kind=${kind.name} '
         'x=${_panStartX.toStringAsFixed(0)}px');
     _adjustKind = kind;
     _adjustReady = false;
     _adjustDy = 0;
     _adjustApplied = 0;
-    _adjustSpan = MediaQuery.sizeOf(context).height;
+    _adjustSpan = area.height;
     if (kind == PlayerSlideKind.volume) {
       _volumeMax = 0;
       DeviceMedia.getVolume().then((v) {
@@ -1760,23 +1799,49 @@ class _PlayerPageState extends State<PlayerPage> {
     setState(() => _listenMode = !_listenMode);
   }
 
-  /// 打开评论区（只读查看；aid 在评论页内异步解析，失败页内提示重试）。
+  /// 评论按钮行为（v2.17.0+ 竖屏布局重构）：
   ///
-  /// v2.16.23+ 评论正文视频链接：通过 [CommentPage.onOpenVideoPreview] 回调
-  /// 本页 [playVideo] 换源（停旧播新，不叠第二个播放页）→ 评论页 pop 回本
-  /// 页即见新视频播放。UP 主页 push / 外链 url_launcher 维持现状（旧视频
-  /// 继续播可接受——边浏览 UP 主页边听，不产生双音轨，取舍见 comment_page）。
-  Future<void> _openComments() async {
-    debugPrint('[player_page] 打开评论区 bvid=${_video.bvid} '
-        'epId=${_video.epId}');
-    await Navigator.of(context).push(
-      MaterialPageRoute<void>(
-        builder: (_) => CommentPage(
-          video: _video,
-          onOpenVideoPreview: (v) => unawaited(playVideo(v)),
+  /// - **横屏全屏（_fullscreen=true）**：维持原行为——push 独立
+  ///   [CommentPage]（全屏下无内嵌评论区；返回后仍全屏续播）。独立页内
+  ///   点视频链接经 [CommentPage.onOpenVideoPreview] 回调本页 [playVideo]
+  ///   换源（停旧播新，不叠第二个播放页）后 pop 回本页。
+  /// - **竖屏非全屏**：评论区已内嵌在视频下方内容区，点按即「滚动定位到
+  ///   评论区」——用 [Scrollable.ensureVisible] 平滑滚动使列表顶「评论 N」
+  ///   区头贴到内容区顶（锚点 [_commentCountHeaderKey]）；列表尚未加载出
+  ///   区头（首屏加载/暂无评论等）时兜底把列表滚回顶部（内容区即从评论区
+  ///   起，回到顶部等价于定位到评论区）。
+  void _onCommentsButtonTap() {
+    if (!mounted) return;
+    debugPrint('[player_page] 评论按钮 _fullscreen=$_fullscreen '
+        'bvid=${_video.bvid} epId=${_video.epId}');
+    if (_fullscreen) {
+      Navigator.of(context).push(
+        MaterialPageRoute<void>(
+          builder: (_) => CommentPage(
+            video: _video,
+            onOpenVideoPreview: (v) => unawaited(playVideo(v)),
+          ),
         ),
-      ),
-    );
+      );
+      return;
+    }
+    final headerCtx = _commentCountHeaderKey.currentContext;
+    if (headerCtx != null) {
+      Scrollable.ensureVisible(
+        headerCtx,
+        duration: const Duration(milliseconds: 260),
+        curve: Curves.easeOut,
+        alignment: 0.0,
+      );
+      return;
+    }
+    if (_commentScroll.hasClients) {
+      _commentScroll.animateTo(
+        0,
+        duration: const Duration(milliseconds: 260),
+        curve: Curves.easeOut,
+      );
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -3178,11 +3243,68 @@ class _PlayerPageState extends State<PlayerPage> {
 
   @override
   Widget build(BuildContext context) {
+    // v2.17.0+ 竖屏布局重构：
+    // - 竖屏（非全屏）= 常规观看页：视频区顶部置顶（按宽高比的黑盒）+
+    //   下方视频信息行 + 内嵌评论区（滚动）；
+    // - 全屏（横屏）= 视频占满整屏（原全屏布局，无下方内容区）。
+    // 两态共用 _buildVideoLayers：画面/听视频占位/弹幕/字幕/手势/控制层/
+    // 浮层全部绑定在视频区矩形内（竖屏不再覆盖下方评论区）；切换全屏只是
+    // 换视频区高度与是否渲染下方内容，布局随 _fullscreen 联动。
+    final screen = MediaQuery.sizeOf(context);
+    final videoAreaHeight =
+        _fullscreen ? screen.height : _portraitVideoHeight(screen);
     return Scaffold(
-      backgroundColor: Colors.black,
-      body: Stack(
-        fit: StackFit.expand,
+      backgroundColor: _fullscreen
+          ? Colors.black
+          : Theme.of(context).colorScheme.surface,
+      body: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
+          // 1. 视频区（黑底）：竖屏 = 顶部置顶、按宽高比的黑盒（超高视频
+          //    封顶屏高 60%，盒内画面按 AspectRatio 居中 + 黑边补齐）；
+          //    全屏 = 占满整屏。
+          SizedBox(
+            key: const ValueKey('player-video-area'),
+            height: videoAreaHeight,
+            child: ColoredBox(color: Colors.black, child: _buildVideoLayers()),
+          ),
+          // 2/3. 竖屏内容区：视频信息行（标题/时长/UP 主名占位，阶段 C 加
+          //      UP 入口）+ 内嵌评论区（评论区底部避开系统手势导航条）。
+          //      全屏不渲染（下方内容区不占位）。
+          if (!_fullscreen) ...[
+            Container(
+              key: const ValueKey('player-info-bar'),
+              decoration: BoxDecoration(
+                color: Theme.of(context).colorScheme.surface,
+                border: Border(
+                  bottom: BorderSide(
+                    color:
+                        Theme.of(context).dividerColor.withValues(alpha: 0.5),
+                  ),
+                ),
+              ),
+              padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+              child: _buildVideoInfoBar(context),
+            ),
+            Expanded(
+              key: const ValueKey('player-comments'),
+              child: SafeArea(top: false, child: _buildEmbeddedComments()),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  /// 视频区各图层（与所在矩形自适应：竖屏视频黑盒 / 全屏整屏）。
+  ///
+  /// Positioned.fill 的层（弹幕/手势/缓冲/听视频占位等）填满矩形；
+  /// 字幕与控制层按矩形底部定位（字幕悬浮在控制行上方）——所有播放相关
+  /// UI 与手势都只在视频区内，不覆盖下方评论区。
+  Widget _buildVideoLayers() {
+    return Stack(
+      fit: StackFit.expand,
+      children: [
           // 1. 播放画面（保持宽高比居中，黑色铺底；听视频模式下隐藏但播放不中断）
           if (_textureId != null)
             Offstage(
@@ -3216,11 +3338,10 @@ class _PlayerPageState extends State<PlayerPage> {
           // 2.5 字幕层：Texture 之上、控制层之下（听视频模式隐藏）。
           // 底部控制行约 80px（进度条行 36 + 按钮行 44），字幕悬浮在其上方。
           // 主字幕大号在上，副字幕小号在其下（见 _SubtitleOverlay）。
-          // 字幕相对屏幕底部定位，但固定 bottom 值在全屏横屏下会跑偏：
-          // 竖屏逻辑高 914，bottom:100 使字幕落在 86% 处（控制行上方，正常）；
-          // 全屏横屏逻辑高仅 411，同样 bottom:100 会把字幕顶到画面中部（复现 bounds
-          // [982,736][1690,807]，屏幕高 1080）。故全屏时按控制层显隐取值：
-          // 控制层显示→抬升到控制行上方（110）；控制层隐藏（沉浸观影）→贴画面底部（24）。
+          // v2.17.0+：字幕相对**视频区矩形**底部定位（不再相对整屏）——
+          // 全屏横屏按控制层显隐取值（显示 → 抬升到控制行上方 110；
+          // 隐藏沉浸观影 → 贴画面底部 24，历史取值防跑偏）；竖屏视频区
+          // 较短，控制层显示时贴其上方（92），隐藏时贴视频区底（16）。
           if (!_listenMode &&
               _subtitleEnabled &&
               (_mainSubtitleText.isNotEmpty ||
@@ -3228,7 +3349,9 @@ class _PlayerPageState extends State<PlayerPage> {
             Positioned(
               left: 24,
               right: 24,
-              bottom: _fullscreen ? (_controlsVisible ? 110.0 : 24.0) : 100.0,
+              bottom: _fullscreen
+                  ? (_controlsVisible ? 110.0 : 24.0)
+                  : (_controlsVisible ? 92.0 : 16.0),
               child: _SubtitleOverlay(
                 mainText: _mainSubtitleText,
                 secondaryText: _secondarySubtitleText,
@@ -3302,17 +3425,92 @@ class _PlayerPageState extends State<PlayerPage> {
           // 7. 错误视图
           if (_error != null) _buildErrorView(),
         ],
-      ),
     );
   }
 
   Widget _buildControls() {
+    // 竖屏视频区较短（如超宽视频黑盒 < 230px）时中央播放/快进快退簇与底部
+    // 控制行重叠 → 收起中央簇（双击播放/暂停仍可用，见手势层）。
+    final screen = MediaQuery.sizeOf(context);
+    final compactPortrait =
+        !_fullscreen && _portraitVideoHeight(screen) < 230;
     return Stack(
       children: [
         _buildTopBar(),
-        Center(child: _buildCenterControls()),
+        if (!compactPortrait) Center(child: _buildCenterControls()),
         Align(alignment: Alignment.bottomCenter, child: _buildBottomBar()),
       ],
+    );
+  }
+
+  /// 竖屏（非全屏）视频信息行：标题（含分 P）+ UP 主名占位 + 时长。
+  ///
+  /// 阶段 C 再在 UP 主名上加头像与「UP 主页」入口；本阶段先以文本占位。
+  Widget _buildVideoInfoBar(BuildContext context) {
+    final theme = Theme.of(context);
+    final subStyle = TextStyle(fontSize: 12.5, color: Colors.grey.shade600);
+    final titleText = _video.isMultiPage
+        ? (_currentPartTitle.isEmpty
+            ? _video.title
+            : '${_video.title} · $_currentPartTitle')
+        : _video.title;
+    final durMs = _durationMs > 0
+        ? _durationMs
+        : (_video.duration > 0 ? _video.duration * 1000 : 0);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          titleText,
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
+          style: theme.textTheme.titleMedium?.copyWith(
+            fontSize: 16,
+            fontWeight: FontWeight.w600,
+            height: 1.3,
+          ),
+        ),
+        const SizedBox(height: 4),
+        Row(
+          children: [
+            Icon(Icons.person_outline, size: 15, color: Colors.grey.shade500),
+            const SizedBox(width: 4),
+            Flexible(
+              child: Text(
+                _video.upName.isEmpty ? 'UP 主' : _video.upName,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: subStyle,
+              ),
+            ),
+            if (_video.isMultiPage) ...[
+              const SizedBox(width: 8),
+              Text('第 ${_currentPageIndex + 1} 集',
+                  style: subStyle),
+            ],
+            const Spacer(),
+            Text(_fmtMs(durMs), style: subStyle),
+          ],
+        ),
+      ],
+    );
+  }
+
+  /// 竖屏（非全屏）内嵌评论区：数据/列表/楼中楼/图片/链接全部复用
+  /// [CommentListView]（与独立 [CommentPage] 同一份实现，避免双份）。
+  ///
+  /// 按「bvid + 当前分 P」换 key：换集/换源时自动重建重拉——评论归属随
+  /// aid 变化（换源必变；同 aid 分 P 只是多一次请求，换取语义简单可靠），
+  /// 且滚动位置随新视频复位。评论内点视频链接 → 本页 [playVideo] 当前
+  /// 实例换源（防双音轨），评论区随 key 刷新到新视频。
+  Widget _buildEmbeddedComments() {
+    return CommentListView(
+      key: ValueKey('embedded-comments-${_video.bvid}-$_currentPageIndex'),
+      video: _video,
+      controller: _commentScroll,
+      countHeaderKey: _commentCountHeaderKey,
+      showCountHeader: true,
+      onOpenVideo: (v) => unawaited(playVideo(v)),
     );
   }
 
@@ -3366,6 +3564,8 @@ class _PlayerPageState extends State<PlayerPage> {
   }
 
   /// 听视频占位界面：封面 + 标题 + 提示。点按恢复画面；长按同样支持 2x。
+  /// v2.17.0+：占位层绑定在视频区矩形内（竖屏黑盒可能较矮），内容压缩
+  /// + 可滚动，防小盒溢出。
   Widget _buildListenPlaceholder() {
     return Positioned.fill(
       child: GestureDetector(
@@ -3375,52 +3575,59 @@ class _PlayerPageState extends State<PlayerPage> {
         onLongPressEnd: _player == null ? null : _onLongPressEnd,
         child: ColoredBox(
           color: Colors.black,
-          child: Center(
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                if (_video.cover.isNotEmpty)
-                  ClipRRect(
-                    borderRadius: BorderRadius.circular(8),
-                    child: Image.network(
-                      _video.cover,
-                      width: 200,
-                      height: 113,
-                      fit: BoxFit.cover,
-                      headers: {
-                        'User-Agent': kBrowserUA,
-                        'Referer': kBiliReferer,
-                      },
-                      errorBuilder: (_, __, ___) => Container(
-                        width: 200,
-                        height: 113,
-                        color: Colors.white10,
-                        child: const Icon(Icons.broken_image_outlined,
-                            color: Colors.white54, size: 32),
+          child: SingleChildScrollView(
+            child: Center(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                    horizontal: 16, vertical: 12),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    if (_video.cover.isNotEmpty)
+                      ClipRRect(
+                        borderRadius: BorderRadius.circular(8),
+                        child: Image.network(
+                          _video.cover,
+                          width: 150,
+                          height: 84,
+                          fit: BoxFit.cover,
+                          headers: {
+                            'User-Agent': kBrowserUA,
+                            'Referer': kBiliReferer,
+                          },
+                          errorBuilder: (_, __, ___) => Container(
+                            width: 150,
+                            height: 84,
+                            color: Colors.white10,
+                            child: const Icon(Icons.broken_image_outlined,
+                                color: Colors.white54, size: 32),
+                          ),
+                        ),
+                      )
+                    else
+                      const Icon(Icons.headphones,
+                          color: Colors.white70, size: 40),
+                    const SizedBox(height: 12),
+                    const Icon(Icons.headphones,
+                        color: Colors.white70, size: 24),
+                    const SizedBox(height: 6),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 16),
+                      child: Text(
+                        _video.title,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        textAlign: TextAlign.center,
+                        style: const TextStyle(
+                            color: Colors.white, fontSize: 14),
                       ),
                     ),
-                  )
-                else
-                  const Icon(Icons.headphones,
-                      color: Colors.white70, size: 56),
-                const SizedBox(height: 16),
-                const Icon(Icons.headphones, color: Colors.white70, size: 32),
-                const SizedBox(height: 8),
-                Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 32),
-                  child: Text(
-                    _video.title,
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    textAlign: TextAlign.center,
-                    style: const TextStyle(
-                        color: Colors.white, fontSize: 16),
-                  ),
+                    const SizedBox(height: 8),
+                    const Text('听视频中 · 点按恢复画面',
+                        style: TextStyle(color: Colors.white54, fontSize: 12)),
+                  ],
                 ),
-                const SizedBox(height: 10),
-                const Text('听视频中 · 点按恢复画面',
-                    style: TextStyle(color: Colors.white54, fontSize: 13)),
-              ],
+              ),
             ),
           ),
         ),
@@ -3492,16 +3699,19 @@ class _PlayerPageState extends State<PlayerPage> {
                 Navigator.of(context).pop();
               },
             ),
-            Expanded(
-              child: Text(
-                _video.isMultiPage
-                    ? '${_video.title} · $_currentPartTitle'
-                    : _video.title,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-                style: const TextStyle(color: Colors.white, fontSize: 15),
+            // v2.17.0+：标题只在全屏顶栏显示——竖屏（非全屏）标题在视频
+            // 下方信息行（_buildVideoInfoBar），避免同一标题在屏上出现两次。
+            if (_fullscreen)
+              Expanded(
+                child: Text(
+                  _video.isMultiPage
+                      ? '${_video.title} · $_currentPartTitle'
+                      : _video.title,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: Colors.white, fontSize: 15),
+                ),
               ),
-            ),
           ],
         ),
       ),
@@ -3521,9 +3731,13 @@ class _PlayerPageState extends State<PlayerPage> {
       // 固定高度：Slider 在「有界高度」约束下会撑满整个高度
       // （_RenderSlider 布局取 constraints.maxHeight），不固定会盖满全屏
       // 并吞掉中心播放/暂停与返回按钮的点击，且进度条漂到屏幕中部。
-      // 两行结构：进度条行 + 按钮行（倍速/听视频/全屏），横竖屏均可用。
+      // 两行结构：进度条行 + 按钮行（倍速/听视频/字幕/弹幕/评论/下载/全屏）。
+      // v2.17.0+：底部 SafeArea 只在全屏吃系统底 inset——竖屏时本行位于
+      // 视频区底部（屏幕中部），系统导航条在屏幕最下方，不需也**不能**
+      // 再垫底（否则按钮行上方悬空留黑）。
       child: SafeArea(
         top: false,
+        bottom: _fullscreen,
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
@@ -3706,10 +3920,11 @@ class _PlayerPageState extends State<PlayerPage> {
                       ),
                     ),
                   ),
-                  // 评论按钮：打开评论区（只读查看，aid 页内解析）
+                  // 评论按钮（v2.17.0+）：竖屏 = 滚动定位到下方内嵌评论区；
+                  // 横屏全屏 = 打开原独立评论页（见 _onCommentsButtonTap）
                   Expanded(
                     child: InkWell(
-                      onTap: _player == null ? null : _openComments,
+                      onTap: _player == null ? null : _onCommentsButtonTap,
                       child: Row(
                         mainAxisAlignment: MainAxisAlignment.center,
                         children: [
