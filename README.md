@@ -174,6 +174,11 @@ B 站部分接口（如 `playurl`）要求 WBI 签名：
 - App 用原生 Kotlin 插件：AndroidX Media3（ExoPlayer）`MergingMediaSource` 将两路合并成一路播放
 - **防盗链**：B 站要求请求带 `Referer: https://www.bilibili.com` + 浏览器 UA，**两者缺一不可**，否则 403
 - **流 URL 数分钟过期**：插件检测到流失效（`onUrlExpired` 事件）→ Dart 层重新请求 `playurl` → `seekTo` 当前位置续播，用户无感
+- **纹理 id 对齐（v2.16.22 修复 vivo 黑屏有声音）**：`Texture(textureId:)` 必须用 Flutter 引擎在
+  `TextureRegistry.createSurfaceTexture()` 分配的纹理 id（`SurfaceTextureEntry.id()`）——旧实现用
+  自增序号，引擎纹理表查不到对应纹理 → 视频帧只进 SurfaceTexture 不上屏（音频轨独立，照常出声）
+  → vivo 等真机"有声音没画面（黑屏）"。已改为引擎分配 id（与官方 `video_player_android` 同源），
+  真机画面恢复
 
 ### 4. 登录（WebView 短信 + 自动登录，v2.16.18+）
 

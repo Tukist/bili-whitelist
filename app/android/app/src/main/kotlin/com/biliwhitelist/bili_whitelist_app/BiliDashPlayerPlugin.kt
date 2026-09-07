@@ -11,10 +11,13 @@ import io.flutter.plugin.common.MethodChannel
 import io.flutter.plugin.common.MethodChannel.MethodCallHandler
 import io.flutter.plugin.common.MethodChannel.Result
 import io.flutter.view.TextureRegistry
+import android.util.Log
 
 /// 浏览器 UA：必须与 lib/config.dart 的 kBrowserUA 完全一致（防盗链双必需之一）。
 private const val kBrowserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+
+private const val TAG = "BiliDashPlayerPlugin"
 
 /**
  * B 站 DASH 双流播放原生插件（MethodChannel: `bili_dash_player`）。
@@ -39,7 +42,6 @@ class BiliDashPlayerPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
 
     private val players = HashMap<Long, DashExoPlayer>()
     private val eventSink = QueuingEventSink()
-    private var nextTextureId = 1L
 
     override fun onAttachedToEngine(binding: FlutterPluginBinding) {
         context = binding.applicationContext
@@ -131,10 +133,14 @@ class BiliDashPlayerPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
         players[id] ?: throw IllegalStateException("播放器不存在（textureId=$id）")
 
     private fun createPlayer(): Long {
-        val id = nextTextureId++
         val registry = textureRegistry
             ?: throw IllegalStateException("插件尚未绑定 TextureRegistry")
         val entry = registry.createSurfaceTexture()
+        // Dart 侧 Texture(textureId:) 必须用引擎分配的纹理 id（entry.id()），
+        // 而非自增序号——否则 Texture 找不到对应纹理 → 有声音无画面（黑屏）。
+        // 与 video_player_android 同源（surfaceTextureEntry.id()）。
+        val id = entry.id()
+        Log.i(TAG, "createPlayer: Dart textureId=$id (engine surfaceTexture)")
 
         players[id] = DashExoPlayer(
             context!!,

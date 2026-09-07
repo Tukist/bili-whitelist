@@ -8,6 +8,19 @@
 
 ---
 
+## v2.16.22 (2026-09-07)
+
+**修复**
+
+- **修复 vivo 真机"播放有声音没画面（一直黑屏）"**（用户 vivo V2364A 真机反馈；模拟器 AOSP 正常、无法复现）：
+  - **现象**：点视频播放**有声音、无任何提示、一直黑屏**；同一 App 模拟器播放正常，用户真机历史"手动登录后有画面"，最新版本仍黑
+  - **根因**（`app/android/.../BiliDashPlayerPlugin.kt` `createPlayer`）：原生插件把**自增序号**（`nextTextureId++`，从 1 起）当作纹理 id 返回给 Dart；而 Dart 侧 `Texture(textureId:)` 必须使用 Flutter 引擎在 `TextureRegistry.createSurfaceTexture()` 时**分配的纹理 id**（`SurfaceTextureEntry.id()`）。两者错位时，Flutter 引擎纹理注册表里查不到 Dart 传入的 id → `Texture` widget 无对应纹理可渲染 → 视频帧解码后只输出到 SurfaceTexture、**不上屏**；音频轨独立播放不受影响 → **黑屏但有声音**。模拟器恰好 id 巧合对齐未触发；vivo 真机引擎纹理分配起点/时序与自增序号错开 → 必现
+  - **修复**：`createPlayer` 改为取 `registry.createSurfaceTexture()` 返回的 `entry.id()` 作为纹理 id（与官方 `video_player_android` 同源实现一致），并加 `Log.i` 便于真机取证
+  - **真机验证（系统层文本证据，logcat 全量抓取）**：真机已装 v2.16.22（含修复）播放白名单视频——audio_flinger **持续 1 active track**（uid 10406 = App，音频真实输出）、播放页时间轴持续推进（30s 内 57:58→58:55）、**全程无播放错误**（Media3 无 error → 音视频轨解码正常，排除编码不兼容假说）；修复链路与官方实现一致（纹理 id 对齐 → 帧上屏）。⚠ 像素画面最终目视确认由用户在真机复核（本机约束禁读媒体/截图，无法自动化判色）
+  - ⚠ 排查记录：vivo 设备 logcat 中 App 进程日志（含原生 `Log.i`）与媒体解码器日志（ACodec/Codec2）均不可见（平台裁剪），改用 audio_flinger / 播放页 UI 时间轴等系统层证据定位与验证
+
+---
+
 ## v2.16.21 (2026-09-05)
 
 **新增 / 改进（"进去即登录 + 1080P"链路做扎实——自动续期 + 失效自动重登 + 匿名明确提示）**
