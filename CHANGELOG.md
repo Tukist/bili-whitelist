@@ -8,6 +8,21 @@
 
 ---
 
+## v2.17.1 (2026-09-07)
+
+**评论视频链接跳转可返回（阶段 B：push 新播放页 + 暂停旧页 + 返回续播）**
+
+承接 v2.17.0（阶段 A：竖屏视频置顶 + 内嵌评论）。本版把「评论区点视频链接」从 **v2.16.23+ 的当前播放页换源（playVideo）** 改为 **push 新播放页**——跳转后可返回，返回时回到上一个视频继续播放（无双音轨）：
+
+- **路由可见性**（`app/lib/main.dart` + `app/lib/pages/player_page.dart`）：`main.dart` 挂全局 `RouteObserver<ModalRoute<void>>`（`routeObserver`，导出）；`PlayerPage` 实现 `RouteAware`——`didChangeDependencies` 订阅 / `dispose` 退订，`didPopNext`（本页重新成为顶层）恢复续播；push 新 `PlayerPage` 的路由统一带 `RouteSettings(name: 'player')`（`kPlayerRouteName`），播放页内评论跳转 / comment_list 兜底 / 历史、收件箱、UP 主页、搜索、合集各入口全部统一
+  - **机制取舍**（实现说明）：本 Flutter 版本 `RouteAware.didPushNext()` **无参**（RouteObserver 只通知被盖住的页、不传上方新路由），无法按「路由名 == player」在 didPushNext 里过滤——若无差别暂停，打开全屏独立评论页（边看边评）会被误停。因此**暂停改在 push 新播放页的调用点显式执行**（`_pauseBeforePushingNewPlayer`：pause + 保存进度 + 置标记），**恢复续播走 didPushNext 的对称事件 didPopNext**；didPushNext 不覆盖（忽略）
+- **评论链接跳转语义**（player_page / comment_page / comment_list）：内嵌评论 onOpenVideo 与独立评论页 C 内链接统一 → **push 新播放页**。全屏独立评论页 C 打开时播放页**不暂停**（边看边评）；C 内点链接 → **C 先 pop 自己**（让旧播放页重新成为顶层，否则 P2 叠在 C 上旧页收不到任何通知）→ 播放页 push 前显式暂停旧页 → 叠 P2。C 均带回调；无回调兜底仍 push 新播放页（路由名 player，双音轨取舍见 comment_page 注释——当前 C 唯一入口是播放页、必传回调）。同 bvid 且在播第 0 集点本视频自身链接 → 不暂停不叠页
+- **playVideo 换源保留**：`playVideo` 方法语义不变（当前页停旧播新），保留给多 P 切集 / 内部换源场景，不再由评论触发；同 bvid 判定等行为不回退
+- **验证**：`flutter analyze` 0 issue；全量单测 **609 通过**（606 + 新增 3：P 叠 P2 暂停/P2 返回恢复、打开独立评论页不暂停（边看边评）、同 bvid 不叠页；既有 playVideo 换源 / CommentPage 回调 / 兜底测试适配新语义）；模拟器实测：播 A（取流成功/内嵌评论加载）、全屏打开独立评论页期间 A **持续播放不暂停**（保存进度持续推进、无暂停日志）、返回后仍续播（无 didPopNext 误触发）；「评论链接 → P2 → 返回续播」完整链路由 widget 测试覆盖（本机白名单视频评论均不含视频链接，无法在真机有机触发评论链接跳转——如实说明）
+- 阶段 C（竖屏信息行 UP 主头像/主页入口等）按计划留待后续版本，本版未做
+
+---
+
 ## v2.17.0 (2026-09-07)
 
 **新功能：播放页竖屏布局重构（视频置顶 + 内嵌评论区）**

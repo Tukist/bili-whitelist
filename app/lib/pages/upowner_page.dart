@@ -265,7 +265,10 @@ class _UpownerPageState extends State<UpownerPage> {
         if (!mounted) return;
         setState(() => _fetchingMeta = false);
         Navigator.of(context).push(
-          MaterialPageRoute<void>(builder: (_) => PlayerPage(video: fixed)),
+          MaterialPageRoute<void>(
+            settings: const RouteSettings(name: kPlayerRouteName),
+            builder: (_) => PlayerPage(video: fixed),
+          ),
         );
       } on BiliApiException catch (e) {
         if (!mounted) return;
@@ -279,7 +282,10 @@ class _UpownerPageState extends State<UpownerPage> {
     } else {
       Navigator.of(
         context,
-      ).push(MaterialPageRoute<void>(builder: (_) => PlayerPage(video: v)));
+      ).push(MaterialPageRoute<void>(
+        settings: const RouteSettings(name: kPlayerRouteName),
+        builder: (_) => PlayerPage(video: v),
+      ));
     }
   }
 

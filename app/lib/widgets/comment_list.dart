@@ -13,7 +13,9 @@
 ///   （原生 MediaStore 通道，见 image_viewer_page / gallery_saver）
 /// - **正文链接识别**：正文里的链接渲染为可点击文本（主色下划线）——
 ///   B 站视频（含裸 BV / b23 短链）→ 有 [onOpenVideo] 回调则交给宿主
-///   （播放页当前实例换源，防双音轨）；无回调 → 兜底 push 新 PlayerPage
+///   （回调语义由宿主决定：播放页内嵌与播放页打开的独立评论页统一传
+///   「push 新播放页」回调，v2.17.1+——旧页暂停防双音轨、返回续播，见
+///   player_page._openVideoInNewPlayer）；无回调 → 兜底 push 新 PlayerPage
 ///   预览；UP 空间 → UP 主页；番剧/电影 → 提示搜索页导入；其他 http(s) →
 ///   系统浏览器。拆分见 utils/comment_links.dart
 /// - 楼中楼：根评论内嵌至多 3 条预览（缩进小字）；「N 条回复」展开 →
@@ -70,11 +72,13 @@ class CommentListView extends StatefulWidget {
   /// 可选：外部已解析好的 aid（如播放页已有 view 数据），省一次请求。
   final int? initialAid;
 
-  /// 评论内视频链接的回调（防双音轨换源）。
+  /// 评论内视频链接的回调（语义由调用方定义，接口 v2.16.23+ 起不变）。
   ///
   /// 非 null（播放页内嵌 / 播放页打开的独立评论页传入）：点视频链接 →
-  /// 回调把链接视频交给播放页**当前实例换源**（停旧播新）。内嵌场景不 pop；
-  /// 独立页由 CommentPage 薄壳包装本回调（回调后 pop 本页回播放页）。
+  /// 回调交给宿主。v2.17.1+（阶段 B）播放页统一传「push 新播放页」语义：
+  /// 内嵌场景本页不 pop、直接回调（新播放页叠上时宿主经 RouteAware 自动
+  /// 暂停旧页）；独立评论页由 CommentPage 薄壳先 pop 自己再回调（让宿主
+  /// 重新成为顶层后叠页才能触发暂停）。
   /// 为 null（独立打开、无宿主）→ 兜底 push 新 PlayerPage 预览播放。
   final void Function(WhitelistVideo video)? onOpenVideo;
 
@@ -388,9 +392,11 @@ class _CommentListViewState extends State<CommentListView> {
   /// 视频预览播放：fetchVideoMeta 补全元数据 → **只播放，不加入白名单**。
   ///
   /// - 有 [widget.onOpenVideo]（本列表由播放页内嵌 / 播放页打开的独立页传
-  ///   入）→ 把视频交给宿主处理（播放页换源停旧播新；独立页由薄壳包装本
-  ///   回调并 pop 回播放页）；
-  /// - 无回调（本列表独立打开）→ 兜底 push 新 PlayerPage 预览（旧行为）。
+  ///   入）→ 把视频交给宿主处理（v2.17.1+：播放页 push 新播放页，旧页经
+  ///   RouteAware 暂停防双音轨、返回续播；独立页由薄壳先 pop 自己再回调）；
+  /// - 无回调（本列表独立打开）→ 兜底 push 新 PlayerPage 预览（旧行为，
+  ///   路由名 [kPlayerRouteName] 统一：若下方恰有播放页，其 didPushNext
+  ///   仍会正确暂停，防双音轨）。
   Future<void> _previewVideo(
     String bvid, {
     required NavigatorState nav,
@@ -403,14 +409,15 @@ class _CommentListViewState extends State<CommentListView> {
       final video = WhitelistWriter.videoFromMeta(meta, fallbackBvid: bvid);
       final onOpen = widget.onOpenVideo;
       if (onOpen != null) {
-        // 宿主换源（同步段先停旧播放器 → 无旧音轨残留）；独立页薄壳
-        // 会在此回调里 pop 自己，回播放页即见新视频播放
-        debugPrint('[comment_list] 视频链接回调换源 bvid=$bvid '
+        // 宿主处理（push 新播放页，语义见 widget.onOpenVideo 文档；独立页
+        // 薄壳在回调里已先 pop 自己）
+        debugPrint('[comment_list] 视频链接回调宿主 bvid=$bvid '
             'title=${video.title}');
         onOpen(video);
         return;
       }
       nav.push(MaterialPageRoute<void>(
+        settings: const RouteSettings(name: kPlayerRouteName),
         builder: (_) => PlayerPage(video: video),
       ));
       debugPrint('[comment_list] 链接预览播放 bvid=$bvid title=${video.title}');

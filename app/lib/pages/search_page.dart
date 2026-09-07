@@ -1111,7 +1111,10 @@ class _SearchPageState extends State<SearchPage>
           ),
           onTap: () {
             Navigator.of(context).push(
-              MaterialPageRoute<void>(builder: (_) => PlayerPage(video: v)),
+              MaterialPageRoute<void>(
+                settings: const RouteSettings(name: kPlayerRouteName),
+                builder: (_) => PlayerPage(video: v),
+              ),
             );
           },
         );

@@ -53,6 +53,7 @@ class HistoryPageState extends State<HistoryPage> {
     );
     Navigator.of(context)
         .push(MaterialPageRoute<void>(
+          settings: const RouteSettings(name: kPlayerRouteName),
           builder: (_) =>
               PlayerPage(video: video, initialPageIndex: e.pageIndex),
         ))

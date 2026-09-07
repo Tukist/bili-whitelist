@@ -1,14 +1,18 @@
-// 评论视频链接换源（v2.16.23+，防双音轨）widget 测试。
+// 评论视频链接跳转（v2.17.1+，阶段 B）widget 测试。
 //
-// 背景：播放页 P 播视频 A → push 评论区 C → C 里点视频链接，旧实现 push
-// 第二个 PlayerPage（P2）叠在栈顶 → P 播放器未释放 → P(A)+P2(B) 双音轨。
-// 修复：C 点链接 → 回调 P 当前实例换源（停旧播新）+ pop C；无回调兜底 push。
-//
+// 背景：播放页 P 播视频 A → 评论区（竖屏内嵌 / 全屏独立页 C）里点视频链接，
+// 旧实现（v2.16.23）回调 P 当前实例 playVideo 换源（防双音轨，但不可返回）。
+// 阶段 B：改为 **push 新 PlayerPage（P2 播 B）**——P 在 push 前显式暂停并保存
+// 进度（防双音轨）；P2 返回 → P 经 RouteAware didPopNext 恢复续播 A。
 // 覆盖：
-// - PlayerPage.playVideo 换源：旧播放器 dispose、只新建一个播放器、
-//   页面不叠加（标题切到新视频）；同 bvid 跳过不重载
-// - CommentPage 有回调：点评论视频链接 → 回调拿到新视频 + pop 评论页
-// - CommentPage 无回调：点评论视频链接 → 兜底 push 新 PlayerPage
+// - PlayerPage.playVideo 换源（v2.16.23+ 语义）保留：旧播放器 dispose、只新建
+//   一个播放器、页面不叠加（内部换源回归，多 P 等仍可用）
+// - didPushNext/didPopNext 路由可见性：P 叠 P2 → 暂停（channel 记 pause）；
+//   P2 返回 → 恢复（channel 记 play）；非 'player' 路由（评论页）叠上不暂停
+//   （边看边评回归）
+// - CommentPage 有回调（onNavigateToVideo，由播放页传）：点评论视频链接 →
+//   pop 评论页 + 回调把新视频交给宿主（宿主 push 新播放页）
+// - CommentPage 无回调：点评论视频链接 → 兜底 push 新 PlayerPage（name 'player'）
 //
 // 测试环境说明（复用 speed_sheet_test 骨架 + 按路径路由的 HTTP fake）：
 // - mock 原生播放器 MethodChannel（create 返回递增 textureId、记录调用）
@@ -24,6 +28,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'package:bili_whitelist_app/main.dart';
 import 'package:bili_whitelist_app/models/whitelist_video.dart';
 import 'package:bili_whitelist_app/pages/comment_page.dart';
 import 'package:bili_whitelist_app/pages/player_page.dart';
@@ -415,12 +420,12 @@ void _installEnv(WidgetTester tester, List<String> playerLog) {
 Future<void> _pushCommentPage(
   WidgetTester tester,
   GlobalKey<NavigatorState> navKey, {
-  void Function(WhitelistVideo video)? onOpenVideoPreview,
+  void Function(WhitelistVideo video)? onNavigateToVideo,
 }) async {
   navKey.currentState!.push(MaterialPageRoute<void>(
     builder: (_) => CommentPage(
       video: _videoA(),
-      onOpenVideoPreview: onOpenVideoPreview,
+      onNavigateToVideo: onNavigateToVideo,
     ),
   ));
   await tester.pumpAndSettle();
@@ -489,8 +494,9 @@ void main() {
     });
   });
 
-  group('CommentPage 评论视频链接（v2.16.23+）', () {
-    testWidgets('有回调：点链接 → 回调拿新视频 + pop 评论页回播放页', (tester) async {
+  group('CommentPage 评论视频链接（v2.17.1+ 跳转语义）', () {
+    testWidgets('有回调：点链接 → 回调拿新视频 + pop 评论页回宿主（宿主负责叠新播放页）',
+        (tester) async {
       final log = <String>[];
       _installEnv(tester, log);
       final navKey = GlobalKey<NavigatorState>();
@@ -499,7 +505,7 @@ void main() {
         navigatorKey: navKey,
         home: const Scaffold(body: Center(child: Text('宿主页'))),
       ));
-      await _pushCommentPage(tester, navKey, onOpenVideoPreview: (v) {
+      await _pushCommentPage(tester, navKey, onNavigateToVideo: (v) {
         opened = v;
       });
       expect(find.byType(CommentPage), findsOneWidget);
@@ -510,16 +516,16 @@ void main() {
       await _pumpNetwork(tester);
       await tester.pumpAndSettle(); // 等 pop 退场动画完成
 
-      // 回调换源：拿到目标视频
-      expect(opened, isNotNull, reason: '有回调时应回调播放页换源');
+      // v2.17.1+ 语义：先 pop 评论页，再把视频交给宿主（播放页 push 新播放页）
+      expect(opened, isNotNull, reason: '有回调时应回调宿主拿到目标视频');
       expect(opened!.bvid, kVideoB);
-      // 评论页已 pop（回播放页观看）
+      // 评论页已 pop（回到宿主——生产环境宿主是播放页，会继续 push P2）
       expect(find.byType(CommentPage), findsNothing,
-          reason: '回调换源后应 pop 评论页');
+          reason: '回调前应已 pop 评论页');
       expect(find.text('宿主页'), findsOneWidget);
     });
 
-    testWidgets('无回调（评论页独立打开）：兜底 push 新 PlayerPage 预览',
+    testWidgets('无回调（评论页独立打开）：兜底 push 新 PlayerPage（路由名 player）预览',
         (tester) async {
       final log = <String>[];
       _installEnv(tester, log);
@@ -540,6 +546,115 @@ void main() {
       expect(find.text('评论链接视频B'), findsWidgets);
       // 评论页在 opaque 路由下方，push 完成后不在可见树中（仍在栈上）
       expect(find.byType(CommentPage), findsNothing);
+      // 兜底 push 的路由统一命名 'player'（下方若有播放页，其 RouteAware
+      // 也能据此……本版本 didPushNext 无参不做事，命名保留一致性/文档语义）
+      final playerElement = tester.element(find.byType(PlayerPage));
+      final route = ModalRoute.of(playerElement);
+      expect(route?.settings.name, kPlayerRouteName,
+          reason: '兜底 push PlayerPage 应带路由名 kPlayerRouteName');
+    });
+  });
+
+  group('评论链接跳转/返回（v2.17.1+ 阶段 B：push 新播放页 + 暂停 + 返回续播）', () {
+    testWidgets('P 叠 P2 → 播放器暂停（无双音轨）；P2 返回 → P 恢复（play）',
+        (tester) async {
+      final log = <String>[];
+      _installEnv(tester, log);
+      final navKey = GlobalKey<NavigatorState>();
+      await tester.pumpWidget(MaterialApp(
+        navigatorKey: navKey,
+        navigatorObservers: [routeObserver],
+        home: PlayerPage(video: _videoA()),
+      ));
+      await tester.pumpAndSettle();
+      expect(find.byType(PlayerPage), findsOneWidget);
+      expect(find.text('视频A'), findsOneWidget);
+      expect(log.where((m) => m == 'pause'), isEmpty, reason: '初始不应暂停');
+
+      // 播放页评论链接入口（内嵌评论 onOpenVideo / 独立评论页回调共用）：
+      // push 新播放页 B（路由名 'player'），push 前本页显式暂停。
+      final state = tester.state(find.byType(PlayerPage)) as dynamic;
+      state.openVideoInNewPlayer(_videoB());
+      await tester.pumpAndSettle();
+
+      // 旧页暂停（防双音轨）且新页 B 叠上可见
+      expect(log.where((m) => m == 'pause'), hasLength(1),
+          reason: 'push 新播放页前应暂停当前播放器');
+      expect(find.text('视频A'), findsNothing, reason: 'A 页被新播放页盖住');
+      expect(find.text('评论链接视频B'), findsWidgets);
+
+      // 返回（pop P2）→ P 恢复续播
+      navKey.currentState!.pop();
+      await tester.pumpAndSettle();
+      expect(log.where((m) => m == 'play'), hasLength(1),
+          reason: '返回后应恢复播放（play）');
+      expect(find.text('视频A'), findsOneWidget, reason: '回到 A 播放页');
+    });
+
+    testWidgets('打开独立评论页 C（非 player 路由）→ 本页不暂停（边看边评）',
+        (tester) async {
+      final log = <String>[];
+      _installEnv(tester, log);
+      final navKey = GlobalKey<NavigatorState>();
+      await tester.pumpWidget(MaterialApp(
+        navigatorKey: navKey,
+        navigatorObservers: [routeObserver],
+        home: PlayerPage(video: _videoA()),
+      ));
+      await tester.pumpAndSettle();
+      // 模拟播放页横屏「评论」按钮：push 全屏独立评论页（播放页同款回调：
+      // C 内点视频链接 → C 先 pop 自己再交给宿主 push 新播放页）
+      final state = tester.state(find.byType(PlayerPage)) as dynamic;
+      navKey.currentState!.push(MaterialPageRoute<void>(
+        builder: (_) => CommentPage(
+          video: _videoA(),
+          onNavigateToVideo: (v) => state.openVideoInNewPlayer(v),
+        ),
+      ));
+      await tester.pumpAndSettle();
+      expect(find.byType(CommentPage), findsOneWidget);
+      expect(log.where((m) => m == 'pause'), isEmpty,
+          reason: '打开独立评论页不应暂停播放（边看边评）');
+
+      // C 里点视频链接 → C pop → 宿主 push P2（本页暂停）
+      await tester.tap(find.text(kVideoB, findRichText: true));
+      await _pumpNetwork(tester);
+      await tester.pumpAndSettle();
+      expect(find.byType(CommentPage), findsNothing, reason: 'C 已先关闭');
+      expect(log.where((m) => m == 'pause'), hasLength(1),
+          reason: '跳新播放页前应暂停本页播放');
+      expect(find.text('评论链接视频B'), findsWidgets, reason: 'P2(B) 已叠上');
+
+      // P2 返回 → C 已不在栈中，直接回到 P → A 恢复续播
+      navKey.currentState!.pop();
+      await tester.pumpAndSettle();
+      expect(log.where((m) => m == 'play'), hasLength(1),
+          reason: '返回后应恢复播放（play）');
+      expect(find.text('视频A'), findsOneWidget, reason: '回到 A 播放页');
+    });
+
+    testWidgets('点同 bvid（本视频自身）：不暂停不叠页', (tester) async {
+      final log = <String>[];
+      _installEnv(tester, log);
+      final navKey = GlobalKey<NavigatorState>();
+      await tester.pumpWidget(MaterialApp(
+        navigatorKey: navKey,
+        navigatorObservers: [routeObserver],
+        home: PlayerPage(video: _videoA()),
+      ));
+      await tester.pumpAndSettle();
+      final createsBefore = log.where((m) => m == 'create').length;
+
+      final state = tester.state(find.byType(PlayerPage)) as dynamic;
+      state.openVideoInNewPlayer(_videoA()); // 点正在播的同一视频
+      await tester.pumpAndSettle();
+
+      expect(log.where((m) => m == 'pause'), isEmpty,
+          reason: '同 bvid 不应暂停');
+      expect(log.where((m) => m == 'create'), hasLength(createsBefore),
+          reason: '同 bvid 不应叠新播放页');
+      expect(find.byType(PlayerPage), findsOneWidget);
+      expect(find.text('视频A'), findsOneWidget);
     });
   });
 }

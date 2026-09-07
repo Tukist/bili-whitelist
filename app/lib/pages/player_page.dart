@@ -4,6 +4,7 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
+import '../main.dart';
 import '../api/bilibili_api.dart';
 import '../api/sherpa_model.dart';
 import '../api/translate_api.dart';
@@ -32,6 +33,14 @@ const List<double> kPlaybackSpeeds = [
 
 /// 长按视频画面时强制使用的倍速。
 const double kLongPressSpeed = 2.0;
+
+/// push 新 [PlayerPage] 的路由名（v2.17.1+，评论视频链接跳转 / 各入口统一）。
+///
+/// 播放页以 [RouteAware]（全局 [routeObserver]）订阅路由：[didPopNext]（本页
+/// 重新成为顶层）时恢复续播。暂停不是靠 didPushNext 判定（该版本
+/// didPushNext() 无参、无法按路由名过滤，见 player_page 内机制取舍注释），
+/// 而是由 push 新播放页的调用点在 [RouteAware] 之外显式执行。
+const String kPlayerRouteName = 'player';
 
 // -------------------------------------------------------------------------
 // 会员集播放回退决策（纯函数，便于单测）
@@ -370,11 +379,12 @@ class PlayerPage extends StatefulWidget {
   State<PlayerPage> createState() => _PlayerPageState();
 }
 
-class _PlayerPageState extends State<PlayerPage> {
-  /// 当前播放的视频（initState 初始化为 _video；评论内视频链接换源
-  /// （[playVideo]）后更新为被点视频）。标题/取流/弹幕/下载/历史/评论
-  /// 等一律以 [_video] 为准——换源后仍引用 _video 会把旧视频记进
-  /// 历史/进度、下载与评论串到旧视频上。
+class _PlayerPageState extends State<PlayerPage> with RouteAware {
+  /// 当前播放的视频（initState 初始化为 _video；内部换源（[playVideo]）后
+  /// 更新为被换视频）。标题/取流/弹幕/下载/历史/评论等一律以 [_video] 为准
+  /// ——换源后仍引用 _video 会把旧视频记进历史/进度、下载与评论串到旧视频
+  /// 上。v2.17.1+ 评论链接改走「push 新播放页」（[openVideoInNewPlayer]），
+  /// 不再改动本页 [_video]（本页暂停在旧视频 A 上，返回后续播 A）。
   late WhitelistVideo _video;
 
   final BiliApi _api = BiliApi();
@@ -585,6 +595,25 @@ class _PlayerPageState extends State<PlayerPage> {
   /// 500ms tick 计数：每 20 次（=10s）定时保存一次进度（防杀进程丢失）。
   int _tickCount = 0;
 
+  // 路由可见性（v2.17.1+，评论链接跳新播放页 → 返回续播，防双音轨）
+  // ---------------------------------------------------------------------
+  // 评论链接跳新播放页由 [openVideoInNewPlayer] **在 push 前显式暂停**本页
+  // 播放（[_pauseBeforePushingNewPlayer]：pause + 保存进度 + 置
+  // [_pausedForNewPlayer] 标记）；[didPopNext]（本页重新成为顶层，用户从
+  // 新播放页返回）→ 若此前因让路而暂停则恢复续播。非 'player' 路由（评论
+  // 页/图片/登录等）不打断播放——全屏独立评论页 C 打开时本页照常出声
+  // （边看边评），仅在 C 里点视频链接跳新播放页时才停。
+  bool _pausedForNewPlayer = false;
+
+  @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    // 订阅全局路由观察者：感知本页重新成为顶层（didPopNext 恢复续播）。
+    // ModalRoute.of(context) 在本阶段必然非空（页面在路由栈中）。
+    final route = ModalRoute.of(context);
+    if (route != null) routeObserver.subscribe(this, route as ModalRoute<void>);
+  }
+
   @override
   void initState() {
     super.initState();
@@ -611,6 +640,8 @@ class _PlayerPageState extends State<PlayerPage> {
 
   @override
   void dispose() {
+    // 退订路由观察者（必须：didChangeDependencies 里 subscribe 过）
+    routeObserver.unsubscribe(this);
     _downloads.cached.removeListener(_onCacheStateChanged);
     _downloads.tasks.removeListener(_onCacheStateChanged);
     _realtime.stage.removeListener(_onRealtimeStageChanged);
@@ -628,6 +659,96 @@ class _PlayerPageState extends State<PlayerPage> {
     _player?.dispose();
     _restoreSystemUi();
     super.dispose();
+  }
+
+  // -------------------------------------------------------------------------
+  // 路由可见性：push 新播放页前显式暂停；返回 → RouteAware 恢复续播
+  // （v2.17.1+）
+  // -------------------------------------------------------------------------
+  //
+  // 背景：评论区点视频链接从「playVideo 当前页换源」（v2.16.23+ 防双音轨）
+  // 改为「push 新播放页」（阶段 B 目标：跳转可返回，返回续播上一个视频）。
+  // 叠页后旧页播放器仍在出声 → 双音轨，所以旧页必须在自己「不再是顶层」
+  // 时暂停，回到顶层再恢复。
+  //
+  // 机制取舍：RouteAware.didPushNext() 在本 Flutter 版本**无参**（RouteObserver
+  // 只通知被盖住的页，不告知上方新路由是谁，见 flutter widgets/routes.dart），
+  // 无法按「路由名 == player」过滤——若在 didPushNext 里无差别暂停，打开全屏
+  // 独立评论页 C（边看边评，需本页照常出声）也会被误停。因此暂停改在
+  // **push 新播放页的调用点显式执行**（[_pauseBeforePushingNewPlayer]，push
+  // 方必然知道自己叠的是播放页）；恢复仍走 [didPopNext]（无参即天然正确：
+  // 本页重新成为顶层时触发，且只有我们自己置过 [_pausedForNewPlayer] 才动）。
+  // didPushNext 不予覆盖（收到也一律忽略），避免误伤边看边评/图片查看等。
+
+  /// 本页重新成为顶层（上面路由被 pop）：若此前因「让路给新播放页」而暂停
+  /// → 恢复续播（从离开时保存的进度继续，播放器异常/已释放则重建续播）。
+  @override
+  void didPopNext() {
+    if (!_pausedForNewPlayer) return;
+    _pausedForNewPlayer = false;
+    debugPrint('[player_page] didPopNext → 恢复本页续播 '
+        '${_video.bvid}#$_currentPageIndex');
+    unawaited(_resumeAfterNewPlayer());
+  }
+
+  /// push 新 [PlayerPage] 前的让路：暂停当前播放并保存进度（防双音轨）。
+  ///
+  /// 置 [_pausedForNewPlayer] 标记（供 [didPopNext] 恢复）；播放器存在且
+  /// 非完成/非错误态才真正 pause + 存进度（完成/错误态无出声，无需停、
+  /// 返回后保持原态）。见 [RouteAware] 段注释的机制取舍说明。
+  void _pauseBeforePushingNewPlayer() {
+    final player = _player;
+    if (player == null || _completed || _error != null) {
+      // 无出声可能：仅记录调试信息，不置标记（返回后保持当前状态）
+      debugPrint('[player_page] push 前无需暂停'
+          '（player=${player != null} completed=$_completed error=$_error）');
+      return;
+    }
+    debugPrint('[player_page] push 新播放页前暂停当前播放并保存进度 '
+        '${_video.bvid}#$_currentPageIndex');
+    _pausedForNewPlayer = true;
+    unawaited(_pauseAndSave());
+  }
+
+  /// 暂停当前播放器并保存一次进度（push 新播放页让路用）。
+  Future<void> _pauseAndSave() async {
+    final player = _player;
+    if (player == null) return;
+    try {
+      await player.pause();
+    } catch (_) {
+      // 原生通道异常：忽略（进度仍保存，音频停不停以原生为准）
+    }
+    if (mounted) setState(() => _playing = false);
+    await _saveProgress();
+  }
+
+  /// 从「新播放页」返回后恢复续播：
+  /// - 播放器可用且无错误 → play()（若离开前用户手动暂停也统一恢复——
+  ///   取舍：语义简单「跳走再回来一律续播」，想停再点一次暂停即可）；
+  /// - 播放器已释放 / 错误态 → 重建取流（_pendingRestore=true 令新流
+  ///   onPrepared 时 seek 到刚保存的离开进度续播）。
+  Future<void> _resumeAfterNewPlayer() async {
+    final player = _player;
+    if (player == null || _error != null) {
+      debugPrint('[player_page] didPopNext 播放器不可用'
+          '（player=${player != null} error=$_error）→ 重建续播');
+      _pendingRestore = true;
+      await _init();
+      return;
+    }
+    if (_completed) {
+      // 已看完停在结尾：不自动重播（用户可点播放/「重播」从头再来）
+      debugPrint('[player_page] didPopNext 已看完，保持结束态');
+      return;
+    }
+    try {
+      await player.play();
+    } catch (_) {
+      // 原生通道异常：忽略（UI 态不置播放，用户可手动重试）
+      return;
+    }
+    if (mounted) setState(() => _playing = true);
   }
 
   /// 退出/换源前保存一次进度 + 写入历史（fire-and-forget，防杀进程/直接
@@ -1799,12 +1920,12 @@ class _PlayerPageState extends State<PlayerPage> {
     setState(() => _listenMode = !_listenMode);
   }
 
-  /// 评论按钮行为（v2.17.0+ 竖屏布局重构）：
+  /// 评论按钮行为（v2.17.0+ 竖屏布局重构 / v2.17.1+ 链接跳转语义）：
   ///
-  /// - **横屏全屏（_fullscreen=true）**：维持原行为——push 独立
-  ///   [CommentPage]（全屏下无内嵌评论区；返回后仍全屏续播）。独立页内
-  ///   点视频链接经 [CommentPage.onOpenVideoPreview] 回调本页 [playVideo]
-  ///   换源（停旧播新，不叠第二个播放页）后 pop 回本页。
+  /// - **横屏全屏（_fullscreen=true）**：push 独立 [CommentPage]（全屏下无
+  ///   内嵌评论区；本页在 C 下面照常出声 = 边看边评）。C 内点视频链接 →
+  ///   C 先 pop 自己回本页，再由本页 [openVideoInNewPlayer] push 新播放页
+  ///   （push 前显式暂停本页防双音轨）；返回本页 → [didPopNext] 恢复续播。
   /// - **竖屏非全屏**：评论区已内嵌在视频下方内容区，点按即「滚动定位到
   ///   评论区」——用 [Scrollable.ensureVisible] 平滑滚动使列表顶「评论 N」
   ///   区头贴到内容区顶（锚点 [_commentCountHeaderKey]）；列表尚未加载出
@@ -1819,7 +1940,10 @@ class _PlayerPageState extends State<PlayerPage> {
         MaterialPageRoute<void>(
           builder: (_) => CommentPage(
             video: _video,
-            onOpenVideoPreview: (v) => unawaited(playVideo(v)),
+            // 独立评论页 C 内点视频链接 → C pop 自己后本方法 push 新播放页
+            // （不开新页时 C 已关，保持现状即可）。路由不带 'player' 名 →
+            // C 未命名 'player' 且不触发暂停 → 本页边看边评照常播放。
+            onNavigateToVideo: openVideoInNewPlayer,
           ),
         ),
       );
@@ -1842,6 +1966,38 @@ class _PlayerPageState extends State<PlayerPage> {
         curve: Curves.easeOut,
       );
     }
+  }
+
+  /// 评论内视频链接（内嵌评论区 / 独立评论页 [CommentPage]）→ **push 新
+  /// 播放页**（v2.17.1+ 语义，替换 v2.16.23+ 的「playVideo 当前页换源」）。
+  ///
+  /// 行为：先 [_pauseBeforePushingNewPlayer] 暂停本页（旧视频 A）并保存
+  /// 进度（无双音轨），再在路由栈上叠一个路由名为 [kPlayerRouteName] 的新
+  /// [PlayerPage]：
+  /// - 新页放视频 B，进度/历史独立；
+  /// - 用户在新页返回 → 本页 [didPopNext] **恢复 A 续播**（从离开处）。
+  ///
+  /// playVideo 换源语义保留给多 P 切集等**内部**换源场景（不再由评论触发）。
+  ///
+  /// 同 bvid 且在播第 0 集（点的是本视频自身，如多 P 视频评论区里的第 1 集
+  /// 链接）→ 不暂停不叠页（与 playVideo 同 bvid 判定一致）；多 P 时点自家
+  /// 其他分 P 的评论链接仍会叠页（播放该分 P 从其记忆进度开始）。
+  void openVideoInNewPlayer(WhitelistVideo video) {
+    if (!mounted) return;
+    if (video.bvid == _video.bvid && _currentPageIndex == 0) {
+      debugPrint('[player_page] 评论链接同 bvid=${video.bvid}，跳过叠页');
+      return;
+    }
+    debugPrint('[player_page] 评论链接 push 新播放页(name=$kPlayerRouteName) '
+        '${_video.bvid}#$_currentPageIndex -> ${video.bvid} '
+        'title=${video.title}');
+    // 先暂停自己（防双音轨）+ 保存进度；再从自己头上叠新播放页。
+    // 顺序不能反：若先 push，新页出声时本页还在播 → 双音轨瞬间成立。
+    _pauseBeforePushingNewPlayer();
+    Navigator.of(context).push(MaterialPageRoute<void>(
+      settings: const RouteSettings(name: kPlayerRouteName),
+      builder: (_) => PlayerPage(video: video),
+    ));
   }
 
   // -------------------------------------------------------------------------
@@ -2958,20 +3114,25 @@ class _PlayerPageState extends State<PlayerPage> {
   }
 
   // -------------------------------------------------------------------------
-  // 评论视频链接换源（v2.16.23+，防双音轨）
+  // 播放页内部换源（playVideo，v2.16.23+ 防双音轨；v2.17.1+ 起评论链接不再
+  // 走本方法——改为 push 新播放页 [openVideoInNewPlayer]，本方法保留给多 P
+  // 切集/其他内部换源场景）
   // -------------------------------------------------------------------------
 
-  /// 换源播放：评论内点击视频链接时由评论页回调（见 CommentPage
-  /// onOpenVideoPreview）→ **在当前播放页实例停旧播新**。
+  /// 换源播放：**在当前播放页实例停旧播新**（内部换源语义，如后续多 P
+  /// 切集/特殊场景复用）。
   ///
-  /// 修复背景：旧实现是评论页 push 第二个 PlayerPage（叠加在本页之上），
-  /// 本页播放器未释放 → P(A)+P2(B) 同时出声 = 双音轨。现改为：
+  /// v2.16.23 修复背景：评论页旧实现是 push 第二个 PlayerPage（叠加在本页
+  /// 之上），本页播放器未释放 → P(A)+P2(B) 同时出声 = 双音轨。当时改由
+  /// 评论页回调本方法「停旧播新」。v2.17.1（阶段 B）起评论链接语义改为
+  /// 「push 新播放页 + push 前显式暂停旧页 + 返回经 RouteAware 续播」
+  /// （[openVideoInNewPlayer]），本方法不再由评论触发，仅作内部换源保留。
+  /// 流程：
   /// 1. dispose/停止当前播放器并清理关联状态（timer/订阅/字幕/弹幕/手势
   ///    hud/进度等，同 dispose 语义）；
   /// 2. 更新 [_video] 为被点视频（分 P 从 0 集起）；
   /// 3. 复用首次加载流程 [_init] 重新取流（含 bvid/epId 的取流分支、本地
   ///    缓存优先、记忆进度恢复）。
-  /// 不重建页面、不新增 Navigator 页；评论页由调用方 pop，本页保持在栈中。
   Future<void> playVideo(WhitelistVideo video) async {
     if (video.bvid == _video.bvid) {
       debugPrint('[player_page] playVideo 同 bvid=${video.bvid}，跳过换源');
@@ -3501,8 +3662,9 @@ class _PlayerPageState extends State<PlayerPage> {
   ///
   /// 按「bvid + 当前分 P」换 key：换集/换源时自动重建重拉——评论归属随
   /// aid 变化（换源必变；同 aid 分 P 只是多一次请求，换取语义简单可靠），
-  /// 且滚动位置随新视频复位。评论内点视频链接 → 本页 [playVideo] 当前
-  /// 实例换源（防双音轨），评论区随 key 刷新到新视频。
+  /// 且滚动位置随新视频复位。评论内点视频链接 → [openVideoInNewPlayer]
+  /// **push 新播放页**（v2.17.1+：push 前显式暂停本页防双音轨、返回时
+  /// 恢复本视频续播），不再走 playVideo 换源。
   Widget _buildEmbeddedComments() {
     return CommentListView(
       key: ValueKey('embedded-comments-${_video.bvid}-$_currentPageIndex'),
@@ -3510,7 +3672,7 @@ class _PlayerPageState extends State<PlayerPage> {
       controller: _commentScroll,
       countHeaderKey: _commentCountHeaderKey,
       showCountHeader: true,
-      onOpenVideo: (v) => unawaited(playVideo(v)),
+      onOpenVideo: openVideoInNewPlayer,
     );
   }
 

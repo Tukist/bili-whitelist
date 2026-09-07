@@ -2,6 +2,14 @@ import 'package:flutter/material.dart';
 
 import 'pages/playlist_page.dart';
 
+/// 全局路由观察者（v2.17.1+）：播放页 [RouteAware] 订阅它，感知「自己上面
+/// 又叠了一个新的播放页」→ 暂停当前播放（防双音轨）并记进度，返回时恢复
+/// 续播（见 player_page.dart 的 didPushNext / didPopNext）。判定依据是
+/// push PlayerPage 的路由统一带 [RouteSettings.name] = 'player'
+/// （[kPlayerRouteName]，见 player_page.dart）。
+final RouteObserver<ModalRoute<void>> routeObserver =
+    RouteObserver<ModalRoute<void>>();
+
 void main() {
   runApp(const BiliWhitelistApp());
 }
@@ -24,6 +32,7 @@ class BiliWhitelistApp extends StatelessWidget {
     return MaterialApp(
       title: '白名单点播',
       debugShowCheckedModeBanner: false,
+      navigatorObservers: [routeObserver],
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF00A1D6)),
         useMaterial3: true,

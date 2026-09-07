@@ -109,6 +109,7 @@ class _InboxPageState extends State<InboxPage> {
       if (!mounted) return;
       setState(() => _checking = false);
       Navigator.of(context).push(MaterialPageRoute<void>(
+        settings: const RouteSettings(name: kPlayerRouteName),
         builder: (_) => PlayerPage(video: v),
       ));
     } on BiliApiException catch (e) {

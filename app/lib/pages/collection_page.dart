@@ -439,6 +439,8 @@ class _CollectionPageState extends State<CollectionPage> {
                           : () {
                               Navigator.of(context).push(
                                 MaterialPageRoute<void>(
+                                  settings: const RouteSettings(
+                                      name: kPlayerRouteName),
                                   builder: (_) => PlayerPage(video: video),
                                 ),
                               );
