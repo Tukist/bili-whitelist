@@ -8,6 +8,24 @@
 
 ---
 
+## v2.16.23 (2026-09-07)
+
+**修复**
+
+- **修复"播放页打开评论区 → 点评论里的视频链接 → 跳转预览播放新视频时，旧视频音频仍继续播放"（双音轨）**：
+  - **现象**：播放页 P 播视频 A → 点底部「评论」push 评论区 C（P 正常继续播，边看边评的预期行为）→ C 里点视频链接 → 旧实现 push 第二个播放页 P2（叠在 C 上）→ 栈 [P, C, P2]——**P 的播放器未释放**，P2 播视频 B 时 P 的 A 音频仍在响 = 双音轨
+  - **根因**（`app/lib/pages/comment_page.dart` `_previewVideo`）：评论正文视频链接（v2.16.19+ 可点）走「fetchVideoMeta → push 新 PlayerPage」——新播放页叠加在旧播放页之上，旧页的播放器/定时器/事件订阅从未 dispose → 两个 Media3 实例同时出声
+  - **修复（点评论视频链接 = 切到该视频看：停旧播新，不叠页）**：
+    - `app/lib/pages/player_page.dart`：新增可复用换源方法 `playVideo(WhitelistVideo)`——**在当前播放页实例停旧播新**：先保存旧视频进度/写历史（`_saveExitProgress`，自 `dispose` 提取共用）→ dispose 旧播放器并完整清理关联状态（tick/浮层定时器、事件订阅、实时转写、字幕轨道与文本、弹幕渲染数据、进度/错误/缓冲/手势 hud 状态等）→ 更新当前视频状态 `_video`（页面内全部 `widget.video` 引用改走 `_video`，保证标题/取流/弹幕/下载/历史/评论入口一致切到新视频）→ **复用首次加载流程 `_init` 重新取流**（本地缓存优先、bvid/epId 取流分支、记忆进度恢复）→ 弹幕开关仍开则自动拉新视频弹幕。不重建页面、不新增 Navigator 页
+    - `app/lib/pages/comment_page.dart`：构造新增可选参数 `onOpenVideoPreview`（播放页打开评论区时传入）——点视频链接 → **回调播放页换源 + pop 评论页**回播放页即见新视频；无回调（评论页独立打开）→ 保持 push 新 PlayerPage 兜底
+    - **取舍（不回归）**：UP 主页链接仍 push UpownerPage、外链仍走 url_launcher 系统浏览器——此时旧视频继续播是「边浏览边听」的可接受行为（不产生双音轨），维持现状
+  - **单测**（`app/test/comment_video_link_test.dart` 新增，mock 原生播放器通道/HTTP 路由，全离线）：
+    - `PlayerPage.playVideo` 换源：旧播放器 dispose、只新建 1 个播放器（无双播放器）、页面不叠加（标题切到新视频）；同 bvid 点击跳过不重载
+    - `CommentPage` 有回调：点评论视频链接 → 回调拿目标视频 + pop 评论页；无回调 → 兜底 push 新 PlayerPage
+  - **模拟器实测（logcat / uiautomator dump 文本取证，不读媒体）**：播 A → 开评论 → 点评论里视频链接 → 回播放页播 B：logcat 见新 bvid 取流 + `onPrepared`、旧播放器 `dispose` 日志（单播放器生命周期），全程无双音轨；UP/外链入口不回归
+
+---
+
 ## v2.16.22 (2026-09-07)
 
 **修复**

@@ -12,6 +12,10 @@
 ///   白名单）；UP 空间 → UP 主页；番剧/电影 → 提示搜索页导入（App 无
 ///   通用番剧播放入口）；其他 http(s) → 系统浏览器。拆分见
 ///   utils/comment_links.dart
+/// - **评论视频链接换源（v2.16.23+，防双音轨）**：本页由播放页打开时，
+///   点视频链接 → 回调播放页 [CommentPage.onOpenVideoPreview] 当前实例
+///   换源（停旧播新）并 pop 回播放页；本页独立打开（无回调）→ 兜底
+///   push 新 PlayerPage。UP 主页 push / 外链浏览器仍照旧（不产生双音轨）
 /// - 楼中楼：根评论内嵌至多 3 条预览（缩进小字）；「N 条回复」展开 →
 ///   拉完整楼中楼（`x/v2/reply/reply`，pn 递增分页，hasMore 继续加载）
 /// - 空态/错误态：暂无评论 / 评论区已关闭（12002）/ 网络与风控（可重试）
@@ -63,10 +67,20 @@ class CommentPage extends StatefulWidget {
   /// 可选：外部已解析好的 aid（如播放页已有 view 数据），省一次请求。
   final int? initialAid;
 
+  /// 可选：评论内视频链接的回调（v2.16.23+）。
+  ///
+  /// 由播放页传入（评论页叠在播放页上打开时）：点视频链接 → 回调把链接
+  /// 视频交给播放页**当前实例换源**（停旧播新）后 pop 本页回播放页观看，
+  /// 避免旧实现 push 第二个 PlayerPage 造成双音轨。
+  /// 为 null（评论页从其他入口独立打开）→ 保持旧行为 push 新 PlayerPage
+  /// 预览播放。
+  final void Function(WhitelistVideo video)? onOpenVideoPreview;
+
   const CommentPage({
     super.key,
     required this.video,
     this.initialAid,
+    this.onOpenVideoPreview,
   });
 
   @override
@@ -318,8 +332,11 @@ class _CommentPageState extends State<CommentPage> {
     }
   }
 
-  /// 视频预览播放：fetchVideoMeta 补全元数据 → PlayerPage（**只播放，
-  /// 不加入白名单**）。
+  /// 视频预览播放：fetchVideoMeta 补全元数据 → **只播放，不加入白名单**。
+  ///
+  /// v2.16.23+（防双音轨）：有 [onOpenVideoPreview]（本页由播放页打开）→
+  /// 把视频交给播放页换源（停旧播新）+ pop 本页回播放页；无回调（本页
+  /// 独立打开）→ 兜底 push 新 PlayerPage 预览（旧行为）。
   Future<void> _previewVideo(
     String bvid, {
     required NavigatorState nav,
@@ -330,6 +347,16 @@ class _CommentPageState extends State<CommentPage> {
     try {
       final meta = await _api.fetchVideoMeta(bvid);
       final video = WhitelistWriter.videoFromMeta(meta, fallbackBvid: bvid);
+      final onOpen = widget.onOpenVideoPreview;
+      if (onOpen != null) {
+        // 播放页当前实例换源（同步段先停旧播放器 → 无旧音轨残留）→
+        // pop 本页回播放页，即见新视频播放（本页保持栈中不叠加）
+        debugPrint('[comment_page] 视频链接回调换源 bvid=$bvid '
+            'title=${video.title}');
+        onOpen(video);
+        nav.pop();
+        return;
+      }
       nav.push(MaterialPageRoute<void>(
         builder: (_) => PlayerPage(video: video),
       ));

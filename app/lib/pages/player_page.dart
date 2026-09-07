@@ -363,6 +363,12 @@ class PlayerPage extends StatefulWidget {
 }
 
 class _PlayerPageState extends State<PlayerPage> {
+  /// 当前播放的视频（initState 初始化为 _video；评论内视频链接换源
+  /// （[playVideo]）后更新为被点视频）。标题/取流/弹幕/下载/历史/评论
+  /// 等一律以 [_video] 为准——换源后仍引用 _video 会把旧视频记进
+  /// 历史/进度、下载与评论串到旧视频上。
+  late WhitelistVideo _video;
+
   final BiliApi _api = BiliApi();
 
   /// 翻译服务（副字幕「翻译（中文）」；配置在管理面板）。
@@ -522,7 +528,7 @@ class _PlayerPageState extends State<PlayerPage> {
 
   /// pages 列表：空/缺失视为单 P（返回 null）。
   List<PageInfo>? get _pages {
-    final pages = widget.video.pages;
+    final pages = _video.pages;
     return (pages == null || pages.isEmpty) ? null : pages;
   }
 
@@ -530,14 +536,14 @@ class _PlayerPageState extends State<PlayerPage> {
   int get _currentCid {
     final pages = _pages;
     if (pages != null) return pages[_currentPageIndex].cid;
-    return widget.video.cid;
+    return _video.cid;
   }
 
   /// 当前集的 part 标题（多 P 时用于 TopBar/占位界面展示）。
   String get _currentPartTitle {
     final pages = _pages;
     if (pages != null) return pages[_currentPageIndex].part;
-    return widget.video.title;
+    return _video.title;
   }
 
   // 错误 / 过期
@@ -563,9 +569,10 @@ class _PlayerPageState extends State<PlayerPage> {
   @override
   void initState() {
     super.initState();
+    _video = widget.video; // 换源前的初始视频（换源见 playVideo）
     // 历史记录续播：初始定位到对应分 P（越界 / 单 P 回落第 0 集）。
     // 必须在 _init 之前设置，_maybeRestoreProgress 按 _currentPageIndex 取进度。
-    final pages = widget.video.pages;
+    final pages = _video.pages;
     final maxIdx = (pages == null || pages.isEmpty) ? 0 : pages.length - 1;
     _currentPageIndex = widget.initialPageIndex < 0
         ? 0
@@ -592,22 +599,8 @@ class _PlayerPageState extends State<PlayerPage> {
     // 退出播放页：停止实时转写（标志位在块边界生效，不打断引擎单步）
     _realtime.stop();
     // 退出前保存一次进度 + 写入历史（fire-and-forget，防杀进程/直接返回
-    // 丢失进度）。播放器尚未释放，getPosition 可用；看完（_completed）
-    // 已清记忆，跳过进度保存（历史仍记录「看过」，位置=结尾无妨）。
-    final store = _progressStore;
-    final player = _player;
-    if (player != null) {
-      player.getPosition().then((pos) {
-        if (pos > 0) {
-          if (store != null && !_completed) {
-            store.saveProgress(widget.video.bvid, _currentPageIndex, pos);
-          }
-          unawaited(_writeHistory(pos));
-        }
-      }).catchError((Object _) {
-        // 原生通道异常：忽略，进度最多丢一次
-      });
-    }
+    // 丢失进度）。播放器尚未释放，getPosition 可用（见 _saveExitProgress）。
+    _saveExitProgress();
     _timer?.cancel();
     _hudTimer?.cancel();
     _eventSub?.cancel();
@@ -615,6 +608,26 @@ class _PlayerPageState extends State<PlayerPage> {
     _player?.dispose();
     _restoreSystemUi();
     super.dispose();
+  }
+
+  /// 退出/换源前保存一次进度 + 写入历史（fire-and-forget，防杀进程/直接
+  /// 返回丢失进度）。须在播放器释放前调用，getPosition 才可用；看完
+  /// （_completed）已清记忆，跳过进度保存（历史仍记录「看过」，位置=结尾
+  /// 无妨）。
+  void _saveExitProgress() {
+    final store = _progressStore;
+    final player = _player;
+    if (player == null) return;
+    player.getPosition().then((pos) {
+      if (pos > 0) {
+        if (store != null && !_completed) {
+          store.saveProgress(_video.bvid, _currentPageIndex, pos);
+        }
+        unawaited(_writeHistory(pos));
+      }
+    }).catchError((Object _) {
+      // 原生通道异常：忽略，进度最多丢一次
+    });
   }
 
   void _onCacheStateChanged() {
@@ -737,7 +750,7 @@ class _PlayerPageState extends State<PlayerPage> {
     if (player == null) return;
     // 本地缓存优先：命中则不请求网络流
     final cached =
-        _downloads.getCached(widget.video.bvid, _currentPageIndex);
+        _downloads.getCached(_video.bvid, _currentPageIndex);
     if (cached != null) {
       debugPrint('[player_page] 本地缓存播放 video=${cached.videoPath} '
           'audio=${cached.audioPath}');
@@ -750,14 +763,14 @@ class _PlayerPageState extends State<PlayerPage> {
       );
       return;
     }
-    final epId = widget.video.epId; // 番剧集 ep_id（普通视频/旧番剧数据 = null）
+    final epId = _video.epId; // 番剧集 ep_id（普通视频/旧番剧数据 = null）
     debugPrint(
-        '[player_page] 取流 bvid=${widget.video.bvid} cid=$_currentCid epId=$epId');
+        '[player_page] 取流 bvid=${_video.bvid} cid=$_currentCid epId=$epId');
     try {
       // 1) 普通 playurl（WBI）：普通视频/免费番剧集走这里（免费集普通接口
       //    720P 比 pgc 端点的更清晰，优先）
       var result = await _api.fetchPlayUrl(
-        bvid: widget.video.bvid,
+        bvid: _video.bvid,
         cid: _currentCid,
         qn: 80,
         fnval: 16, // DASH 双流（M2.1 实测定案：1080P 走路线 A）
@@ -766,7 +779,7 @@ class _PlayerPageState extends State<PlayerPage> {
       if (result.dashVideoUrls.isEmpty) {
         debugPrint('[player_page] fnval=16 无 DASH，降级 fnval=0');
         result = await _api.fetchPlayUrl(
-          bvid: widget.video.bvid,
+          bvid: _video.bvid,
           cid: _currentCid,
           qn: 80,
           fnval: 0,
@@ -1206,9 +1219,9 @@ class _PlayerPageState extends State<PlayerPage> {
     if (store == null || player == null || _completed) return;
     final pos = await player.getPosition();
     if (pos <= 0) return;
-    await store.saveProgress(widget.video.bvid, _currentPageIndex, pos);
+    await store.saveProgress(_video.bvid, _currentPageIndex, pos);
     debugPrint('[player_page] 保存进度 '
-        '${widget.video.bvid}#$_currentPageIndex $pos ms');
+        '${_video.bvid}#$_currentPageIndex $pos ms');
     // 与进度保存同节奏写历史（_tick 每 10s / 暂停 / 快进快退 / dispose 触发）
     await _writeHistory(pos);
   }
@@ -1219,18 +1232,18 @@ class _PlayerPageState extends State<PlayerPage> {
     try {
       await HistoryStore.instance.addOrUpdate(
         HistoryEntry(
-          bvid: widget.video.bvid,
+          bvid: _video.bvid,
           pageIndex: _currentPageIndex,
           cid: _currentCid,
-          title: widget.video.title,
-          cover: widget.video.cover,
-          upName: widget.video.upName,
+          title: _video.title,
+          cover: _video.cover,
+          upName: _video.upName,
           durationMs: _durationMs > 0
               ? _durationMs
-              : widget.video.duration * 1000,
+              : _video.duration * 1000,
           positionMs: positionMs,
           watchedAt: DateTime.now(),
-          pages: widget.video.pages,
+          pages: _video.pages,
         ),
       );
     } catch (_) {
@@ -1242,9 +1255,9 @@ class _PlayerPageState extends State<PlayerPage> {
   Future<void> _clearProgress() async {
     final store = _progressStore;
     if (store == null) return;
-    await store.clearProgress(widget.video.bvid, _currentPageIndex);
+    await store.clearProgress(_video.bvid, _currentPageIndex);
     debugPrint('[player_page] 清除进度 '
-        '${widget.video.bvid}#$_currentPageIndex');
+        '${_video.bvid}#$_currentPageIndex');
   }
 
   /// onPrepared 后尝试恢复记忆进度（仅首次进入 / 切集 / 手动重试后）：
@@ -1256,14 +1269,14 @@ class _PlayerPageState extends State<PlayerPage> {
     _pendingRestore = false;
     final store = _progressStore;
     if (store == null) return;
-    final saved = store.getProgress(widget.video.bvid, _currentPageIndex);
+    final saved = store.getProgress(_video.bvid, _currentPageIndex);
     if (saved == null || saved <= 5000) return;
     if (durationMs > 0 && saved >= durationMs - 3000) {
       await _clearProgress();
       return;
     }
     debugPrint('[player_page] 恢复进度 '
-        '${widget.video.bvid}#$_currentPageIndex $saved ms');
+        '${_video.bvid}#$_currentPageIndex $saved ms');
     await _player?.seekTo(saved);
     if (!mounted) return;
     _showSnackWithAction(
@@ -1748,11 +1761,21 @@ class _PlayerPageState extends State<PlayerPage> {
   }
 
   /// 打开评论区（只读查看；aid 在评论页内异步解析，失败页内提示重试）。
+  ///
+  /// v2.16.23+ 评论正文视频链接：通过 [CommentPage.onOpenVideoPreview] 回调
+  /// 本页 [playVideo] 换源（停旧播新，不叠第二个播放页）→ 评论页 pop 回本
+  /// 页即见新视频播放。UP 主页 push / 外链 url_launcher 维持现状（旧视频
+  /// 继续播可接受——边浏览 UP 主页边听，不产生双音轨，取舍见 comment_page）。
   Future<void> _openComments() async {
-    debugPrint('[player_page] 打开评论区 bvid=${widget.video.bvid} '
-        'epId=${widget.video.epId}');
+    debugPrint('[player_page] 打开评论区 bvid=${_video.bvid} '
+        'epId=${_video.epId}');
     await Navigator.of(context).push(
-      MaterialPageRoute<void>(builder: (_) => CommentPage(video: widget.video)),
+      MaterialPageRoute<void>(
+        builder: (_) => CommentPage(
+          video: _video,
+          onOpenVideoPreview: (v) => unawaited(playVideo(v)),
+        ),
+      ),
     );
   }
 
@@ -1870,7 +1893,7 @@ class _PlayerPageState extends State<PlayerPage> {
     onChanged?.call();
     try {
       final tracks =
-          await _api.fetchSubtitles(widget.video.bvid, _currentCid);
+          await _api.fetchSubtitles(_video.bvid, _currentCid);
       if (!mounted) return;
       _subtitleTracks = tracks;
       _subtitleLoading = false;
@@ -2282,7 +2305,7 @@ class _PlayerPageState extends State<PlayerPage> {
   Future<void> _startRealtime() async {
     if (_realtime.isRunning) return;
     try {
-      await _realtime.start(widget.video, _currentPageIndex);
+      await _realtime.start(_video, _currentPageIndex);
     } catch (e) {
       if (!mounted) return;
       _showSnack('实时转写失败：${_realtime.error.value ?? '$e'}');
@@ -2446,7 +2469,7 @@ class _PlayerPageState extends State<PlayerPage> {
       _showSnack('主字幕内容为空，无法翻译');
       return;
     }
-    final bvid = widget.video.bvid;
+    final bvid = _video.bvid;
     final cid = _currentCid;
     final lan = mainTrack.lan;
 
@@ -2505,7 +2528,7 @@ class _PlayerPageState extends State<PlayerPage> {
     if (_subtitleCues.containsKey(track.lan)) return;
     _api
         .downloadSubtitle(track,
-            bvid: widget.video.bvid, cid: _currentCid)
+            bvid: _video.bvid, cid: _currentCid)
         .then((cues) {
       if (!mounted) return;
       setState(() => _subtitleCues[track.lan] = cues);
@@ -2525,7 +2548,7 @@ class _PlayerPageState extends State<PlayerPage> {
     if (cached != null) return cached;
     try {
       final cues = await _api.downloadSubtitle(track,
-          bvid: widget.video.bvid, cid: _currentCid);
+          bvid: _video.bvid, cid: _currentCid);
       if (!mounted) return cues;
       setState(() => _subtitleCues[track.lan] = cues);
       return cues;
@@ -2541,11 +2564,11 @@ class _PlayerPageState extends State<PlayerPage> {
 
   /// 当前集缓存记录（无则 null）。
   CachedVideo? get _currentCached =>
-      _downloads.getCached(widget.video.bvid, _currentPageIndex);
+      _downloads.getCached(_video.bvid, _currentPageIndex);
 
   /// 当前集下载任务（下载中/排队；无则 null）。
   DownloadTask? get _currentTask => _downloads.tasks.value[
-      CachedVideo.keyOf(widget.video.bvid, _currentPageIndex)];
+      CachedVideo.keyOf(_video.bvid, _currentPageIndex)];
 
   /// 点击下载按钮：未缓存 → 下载菜单；已缓存 → 缓存操作菜单；下载中不响应。
   void _onDownloadTap() {
@@ -2587,11 +2610,11 @@ class _PlayerPageState extends State<PlayerPage> {
                   _confirmDownloadPage(_currentPageIndex);
                 },
               ),
-              if (widget.video.isMultiPage)
+              if (_video.isMultiPage)
                 ListTile(
                   leading: const Icon(Icons.download_done,
                       color: Colors.white),
-                  title: Text('下载全部集（${widget.video.pageCount} 集）',
+                  title: Text('下载全部集（${_video.pageCount} 集）',
                       style:
                           const TextStyle(color: Colors.white, fontSize: 15)),
                   onTap: () {
@@ -2638,7 +2661,7 @@ class _PlayerPageState extends State<PlayerPage> {
       context: context,
       builder: (dialogCtx) => AlertDialog(
         title: const Text('离线下载'),
-        content: Text('将下载《${partTitle.isEmpty ? widget.video.title : partTitle}》'
+        content: Text('将下载《${partTitle.isEmpty ? _video.title : partTitle}》'
             '到本地缓存（约需网络流量），之后可在无网时离线播放。'),
         actions: [
           TextButton(
@@ -2658,7 +2681,7 @@ class _PlayerPageState extends State<PlayerPage> {
 
   /// 确认下载全部 P（提示流量）→ 逐集入队。
   Future<void> _confirmDownloadAll() async {
-    final n = widget.video.pageCount;
+    final n = _video.pageCount;
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogCtx) => AlertDialog(
@@ -2683,10 +2706,10 @@ class _PlayerPageState extends State<PlayerPage> {
 
   /// 启动单集下载（入队后立即返回；完成/失败用 SnackBar 反馈）。
   void _startDownloadPage(int pageIndex) {
-    final future = _downloads.downloadVideo(widget.video, pageIndex);
+    final future = _downloads.downloadVideo(_video, pageIndex);
     future.then((_) {
       final cached =
-          _downloads.getCached(widget.video.bvid, pageIndex);
+          _downloads.getCached(_video.bvid, pageIndex);
       if (mounted) {
         _showSnack('已缓存：${cached?.partTitle ?? '第 ${pageIndex + 1} 集'}');
       }
@@ -2697,8 +2720,8 @@ class _PlayerPageState extends State<PlayerPage> {
 
   /// 启动全部 P 下载（逐集入队，内部串行执行）。
   void _startDownloadAll() {
-    _downloads.downloadAllPages(widget.video).then((_) {
-      if (mounted) _showSnack('全部 ${widget.video.pageCount} 集已缓存');
+    _downloads.downloadAllPages(_video).then((_) {
+      if (mounted) _showSnack('全部 ${_video.pageCount} 集已缓存');
     }).catchError((Object e) {
       if (mounted) _showSnack('下载未完成：${_shortErr(e)}');
     });
@@ -2725,7 +2748,7 @@ class _PlayerPageState extends State<PlayerPage> {
       ),
     );
     if (confirmed != true || !mounted) return;
-    await _downloads.deleteCache(widget.video.bvid, _currentPageIndex);
+    await _downloads.deleteCache(_video.bvid, _currentPageIndex);
     if (mounted) _showSnack('已删除缓存');
   }
 
@@ -2866,6 +2889,82 @@ class _PlayerPageState extends State<PlayerPage> {
     } catch (e) {
       if (!mounted) return;
       await _handleLoadFailure(e);
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 评论视频链接换源（v2.16.23+，防双音轨）
+  // -------------------------------------------------------------------------
+
+  /// 换源播放：评论内点击视频链接时由评论页回调（见 CommentPage
+  /// onOpenVideoPreview）→ **在当前播放页实例停旧播新**。
+  ///
+  /// 修复背景：旧实现是评论页 push 第二个 PlayerPage（叠加在本页之上），
+  /// 本页播放器未释放 → P(A)+P2(B) 同时出声 = 双音轨。现改为：
+  /// 1. dispose/停止当前播放器并清理关联状态（timer/订阅/字幕/弹幕/手势
+  ///    hud/进度等，同 dispose 语义）；
+  /// 2. 更新 [_video] 为被点视频（分 P 从 0 集起）；
+  /// 3. 复用首次加载流程 [_init] 重新取流（含 bvid/epId 的取流分支、本地
+  ///    缓存优先、记忆进度恢复）。
+  /// 不重建页面、不新增 Navigator 页；评论页由调用方 pop，本页保持在栈中。
+  Future<void> playVideo(WhitelistVideo video) async {
+    if (video.bvid == _video.bvid) {
+      debugPrint('[player_page] playVideo 同 bvid=${video.bvid}，跳过换源');
+      return;
+    }
+    debugPrint('[player_page] playVideo 换源 '
+        '${_video.bvid} -> ${video.bvid} title=${video.title}');
+    // 1) 先保存旧视频进度 + 写历史（播放器还在，getPosition 可用）
+    _saveExitProgress();
+    // 2) 停旧：取消 tick/浮层定时器与事件订阅，dispose 旧播放器
+    _timer?.cancel();
+    _timer = null;
+    _hudTimer?.cancel();
+    _hudTimer = null;
+    _eventSub?.cancel();
+    _eventSub = null;
+    final old = _player;
+    _player = null;
+    _textureId = null;
+    old?.dispose();
+    // 实时转写随视频重置（句子时间轴是旧视频音频，防串台）
+    _resetRealtime();
+    _expiredRetry = 0;
+    _pendingRestore = true; // 新视频 onPrepared 恢复其记忆进度（同首次进入）
+    setState(() {
+      _video = video;
+      _currentPageIndex = 0;
+      _playing = false;
+      _completed = false;
+      _positionMs = 0;
+      _durationMs = 0;
+      _aspectRatio = 16 / 9;
+      _error = null;
+      _loginPrompt = false;
+      _canRetry = true;
+      // 手势/浮层残态清理（换源瞬间若有 hud 显示则一并复位）
+      _dragging = false;
+      _seekDragging = false;
+      _panMode = null;
+      _panExcluded = false;
+      _panDx = 0;
+      _panDy = 0;
+      _adjustKind = null;
+      _adjustReady = false;
+      _hudKind = null;
+      _hudValue = 0;
+      _hudSeekPosMs = 0;
+      _listenMode = false; // 新视频正常显示画面
+      // 弹幕：清空旧视频渲染数据（缓存按 cid 保留，重开秒显示）
+      _danmaku = const [];
+    });
+    // 3) 复用首次加载流程重新取流（含新 tick 定时器）
+    await _init();
+    // 换源后弹幕开关仍开 → 自动拉新视频弹幕（与切集一致；异常静默）
+    try {
+      if (_danmakuEnabled && _error == null) await _loadDanmaku();
+    } catch (_) {
+      // 弹幕拉取异常静默（不阻塞换源播放）
     }
   }
 
@@ -3280,11 +3379,11 @@ class _PlayerPageState extends State<PlayerPage> {
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                if (widget.video.cover.isNotEmpty)
+                if (_video.cover.isNotEmpty)
                   ClipRRect(
                     borderRadius: BorderRadius.circular(8),
                     child: Image.network(
-                      widget.video.cover,
+                      _video.cover,
                       width: 200,
                       height: 113,
                       fit: BoxFit.cover,
@@ -3310,7 +3409,7 @@ class _PlayerPageState extends State<PlayerPage> {
                 Padding(
                   padding: const EdgeInsets.symmetric(horizontal: 32),
                   child: Text(
-                    widget.video.title,
+                    _video.title,
                     maxLines: 2,
                     overflow: TextOverflow.ellipsis,
                     textAlign: TextAlign.center,
@@ -3395,9 +3494,9 @@ class _PlayerPageState extends State<PlayerPage> {
             ),
             Expanded(
               child: Text(
-                widget.video.isMultiPage
-                    ? '${widget.video.title} · $_currentPartTitle'
-                    : widget.video.title,
+                _video.isMultiPage
+                    ? '${_video.title} · $_currentPartTitle'
+                    : _video.title,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 style: const TextStyle(color: Colors.white, fontSize: 15),
@@ -3456,7 +3555,7 @@ class _PlayerPageState extends State<PlayerPage> {
               child: Row(
                 children: [
                   // 选集按钮：仅多 P 显示（当前集 1/N），点按弹出选集列表
-                  if (widget.video.isMultiPage)
+                  if (_video.isMultiPage)
                     Expanded(
                       child: InkWell(
                         onTap: _player == null ? null : _showEpisodeSheet,
@@ -3468,7 +3567,7 @@ class _PlayerPageState extends State<PlayerPage> {
                             const SizedBox(width: 4),
                             Flexible(
                               child: Text(
-                                '选集 ${_currentPageIndex + 1}/${widget.video.pageCount}',
+                                '选集 ${_currentPageIndex + 1}/${_video.pageCount}',
                                 softWrap: false,
                                 overflow: TextOverflow.ellipsis,
                                 style: const TextStyle(
