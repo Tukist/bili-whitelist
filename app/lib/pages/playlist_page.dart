@@ -29,6 +29,7 @@ import 'login_page.dart';
 import 'search_page.dart';
 import 'update_dialog.dart';
 import 'upowner_page.dart';
+import 'watch_stats_page.dart';
 
 /// 唯一首页：合集卡片视图（两级导航第一级）。
 ///
@@ -56,9 +57,11 @@ import 'upowner_page.dart';
 ///   登录成功自动保存，之后每次进入静默恢复（登录一次长期保持）。
 ///   登录页可关闭：关闭 = 匿名，首页/播放页给明确「未登录仅 720P，
 ///   去登录解锁 1080P」提示入口（v2.16.21，不默认静默降级）
-/// - **主页 PageView 三页**（初始停在主页合集页，左右滑动切换）：
+/// - **主页 PageView 四页**（初始停在主页合集页，左右滑动切换）：
 ///   右滑 → 历史记录页（播放历史，点击续播；顶部历史图标可直达）；
-///   左滑 → 白名单 UP 主管理页
+///   左滑 → 白名单 UP 主管理页 → 再左滑 → **观看统计页**（v2.17.9+，
+///   真实观看时长按天的总览 + 蓝色热力，见 watch_stats_page.dart）；
+///   顶部「观看统计」图标可直达（animateToPage 到第 4 页）
 class PlaylistPage extends StatefulWidget {
   /// 测试注入：Gist 写操作替身（默认用真实实现）。
   /// 拖动排序/导入等写操作统一走 [GithubApi.saveToGist]。
@@ -106,17 +109,33 @@ class _PlaylistPageState extends State<PlaylistPage> {
 
   bool get _hasData => _data.videos.isNotEmpty;
 
-  /// 主页 PageView（三页：历史记录 / 合集主页 / UP 主管理），初始停在主页。
+  /// 主页 PageView（四页：历史记录 / 合集主页 / UP 主管理 / 观看统计），
+  /// 初始停在主页。
   final PageController _pageController = PageController(initialPage: 1);
 
   /// 历史页 State 的全局 key：切到历史页时刷新数据（PageView 相邻页存活，
   /// 用户可能刚从别处播放回来，需要重新读表）。
   final GlobalKey<HistoryPageState> _historyKey = GlobalKey<HistoryPageState>();
 
+  /// 观看统计页 State 的全局 key：切到统计页时刷新（播放返回/跨日后
+  /// 数据可能已变；PageView 页存活时也以切页为准重读，约定同历史页）。
+  final GlobalKey<WatchStatsPageState> _statsKey =
+      GlobalKey<WatchStatsPageState>();
+
   /// 顶部历史图标入口：动画切到历史页（第 0 页）。
   void _goToHistory() {
     _pageController.animateToPage(
       0,
+      duration: const Duration(milliseconds: 250),
+      curve: Curves.easeOut,
+    );
+  }
+
+  /// 顶部「观看统计」图标入口：动画切到观看统计页（第 4 页，index3；
+  /// 主页左滑两页可达，图标直达更方便）。
+  void _goToWatchStats() {
+    _pageController.animateToPage(
+      3,
       duration: const Duration(milliseconds: 250),
       curve: Curves.easeOut,
     );
@@ -796,6 +815,12 @@ class _PlaylistPageState extends State<PlaylistPage> {
             icon: const Icon(Icons.history),
             onPressed: _goToHistory,
           ),
+          // 观看统计入口（v2.17.9+）：主页左滑两页可到统计页，图标直达
+          IconButton(
+            tooltip: '观看统计',
+            icon: const Icon(Icons.insights_outlined),
+            onPressed: _goToWatchStats,
+          ),
           // 信箱入口：未读 > 0 时图标右上角显示小红点
           Stack(
             clipBehavior: Clip.none,
@@ -855,8 +880,9 @@ class _PlaylistPageState extends State<PlaylistPage> {
       body: PageView(
         controller: _pageController,
         onPageChanged: (index) {
-          // 切到历史页时重新读取（播放返回/时间推移后列表可能已变化）
+          // 切到历史页/统计页时重新读取（播放返回/时间推移后数据可能已变化）
           if (index == 0) _historyKey.currentState?.reload();
+          if (index == 3) _statsKey.currentState?.reload();
         },
         children: [
           HistoryPage(key: _historyKey),
@@ -869,6 +895,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
             onOpen: _openUpowner,
             onRemove: _removeUpowner,
           ),
+          WatchStatsPage(key: _statsKey),
         ],
       ),
     );
@@ -953,7 +980,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
         Padding(
           padding: const EdgeInsets.symmetric(vertical: 4),
           child: Text(
-            'v$_version · 左右滑动切换合集 / 历史 / UP 主',
+            'v$_version · 左右滑动：历史 / 合集 / UP 主 / 统计',
             style: theme.textTheme.labelSmall?.copyWith(
               color: theme.colorScheme.outline,
             ),

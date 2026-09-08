@@ -21,6 +21,7 @@ import '../services/danmaku_settings_store.dart';
 import '../services/device_media.dart';
 import '../services/history_store.dart';
 import '../services/realtime_transcriber.dart';
+import '../services/watch_stats.dart';
 import '../widgets/comment_list.dart';
 import '../widgets/danmaku_overlay.dart';
 import '../widgets/danmaku_settings_sheet.dart';
@@ -683,6 +684,21 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
   /// 500ms tick 计数：每 20 次（=10s）定时保存一次进度（防杀进程丢失）。
   int _tickCount = 0;
 
+  // 观看时长累计（v2.17.9+，供「观看统计」页；口径见 [_accumulateWatchTime]）
+  // ---------------------------------------------------------------------
+  /// 累计基线上一次 tick 位置（ms）。null = 无基线：首 tick 或 seek/换集/
+  /// 断点恢复跳变后重建基线用，**该 tick 本身不累计**（跳变前后的差值不是
+  /// 真实观看）。pause/resume 不重置——暂停时位置停住 Δ=0 自然不计。
+  int? _watchBaselineMs;
+
+  /// 内存待落盘的观看毫秒：每 tick 把「连续前进」的增量累进来，
+  /// 攒够 [kWatchFlushIntervalMs] 批量 [WatchStats.record] 一次
+  /// （避免每 500ms tick 都写 shared_preferences）；dispose 时把剩余落盘。
+  int _pendingWatchMs = 0;
+
+  /// 批量落盘间隔（≈10s 的真实观看）。
+  static const int kWatchFlushIntervalMs = 10000;
+
   // 路由可见性（v2.17.1+，评论链接跳新播放页 → 返回续播，防双音轨）
   // ---------------------------------------------------------------------
   // 评论链接跳新播放页由 [openVideoInNewPlayer] **在 push 前显式暂停**本页
@@ -746,6 +762,8 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     // 退出前保存一次进度 + 写入历史（fire-and-forget，防杀进程/直接返回
     // 丢失进度）。播放器尚未释放，getPosition 可用（见 _saveExitProgress）。
     _saveExitProgress();
+    // 退出播放页：把内存里不足一次批量阈值（10s）的观看秒数也落盘
+    _flushWatchTime();
     _timer?.cancel();
     _hudTimer?.cancel();
     _eventSub?.cancel();
@@ -1253,6 +1271,9 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     });
     // 首次进入 / 切集后恢复该集记忆进度（不打断自动播放）
     _maybeRestoreProgress(durationMs);
+    // 新流开始：观看时长累计基线重建（旧流位置与此无关；若本流 onPrepared
+    // 后还要 seek 恢复进度，_maybeRestoreProgress/seek 处会再次置 null）
+    _resetWatchBaseline();
   }
 
   void _onCompleted() {
@@ -1309,9 +1330,44 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     if (player == null || _dragging || _seekDragging) return;
     final pos = await player.getPosition();
     if (mounted) setState(() => _positionMs = pos);
+    // 观看时长累计（纯本地；每 500ms tick 增量判断真实播放，攒够批量落盘）
+    _accumulateWatchTime(pos);
     if (mounted) _updateSubtitleText(pos);
     // 播放中每 20 次 tick（=10s）保存一次进度（防杀进程丢失）
     if (++_tickCount % 20 == 0) _saveProgress();
+  }
+
+  /// 观看时长累计（口径）：仅当 **playing（含听视频纯音频模式）** 且相对
+  /// 上一 tick 的位置增量 `0 < Δ ≤ 5s` 时，视为真实播放的连续前进并累加：
+  /// - Δ ≤ 0：暂停 / 缓冲停住 / 看完 → 不计（听视频时画面隐藏但位置照常
+  ///   前进 → 照计；屏幕关闭后 Dart tick 被系统挂起 → 少计，见类注释取舍）
+  /// - Δ > 5s：seek（快进/拖动/断点恢复/链接定位）与跳变 → 跳过内容不算
+  ///   观看；seek 后 [_watchBaselineMs] 会被置 null 重建基线，避免把 seek
+  ///   前后相邻 tick 的差值误计
+  void _accumulateWatchTime(int posMs) {
+    if (!_playing || _completed) return; // 暂停 / 播放结束不计
+    final base = _watchBaselineMs;
+    _watchBaselineMs = posMs; // 无论是否累计，基线都要推进到本次位置
+    if (base == null) return; // 首 tick / seek 重建：只设基线不累计
+    final delta = posMs - base;
+    if (delta <= 0 || delta > WatchStats.maxTickDeltaMs) return;
+    _pendingWatchMs += delta;
+    if (_pendingWatchMs >= kWatchFlushIntervalMs) _flushWatchTime();
+  }
+
+  /// 把内存累计的观看秒数批量落盘（整秒取整；不足 1s 的残留亚秒留给下次）。
+  void _flushWatchTime() {
+    if (_pendingWatchMs < 1000) return;
+    final seconds = _pendingWatchMs ~/ 1000;
+    _pendingWatchMs = 0;
+    debugPrint('[player_page] 观看时长 +${seconds}s '
+        '（${_video.bvid}#$_currentPageIndex）');
+    unawaited(WatchStats.instance.record(seconds));
+  }
+
+  /// seek / 换集等位置跳变后重置观看时长累计基线（跳过/跳回的内容不计）。
+  void _resetWatchBaseline() {
+    _watchBaselineMs = null;
   }
 
   /// 当前主字幕数据源 cues：B 站主轨道下载结果。
@@ -1424,6 +1480,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     final target = pos > 3000 ? pos - 3000 : 0;
     debugPrint('[player_page] seekTo ${target}ms (快退 3 秒，原 ${pos}ms)');
     await player.seekTo(target);
+    _resetWatchBaseline(); // 位置跳变：跳过的内容不计观看时长
     if (mounted) setState(() => _positionMs = target);
     _saveProgress(); // 快退后保存，防快退丢失
   }
@@ -1440,6 +1497,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     final target = pos + 3000 < max ? pos + 3000 : max;
     debugPrint('[player_page] seekTo ${target}ms (快进 3 秒，原 ${pos}ms)');
     await player.seekTo(target);
+    _resetWatchBaseline(); // +3s 前进可能落在 5s 阈值内 → 必须重置基线防误计
     if (mounted) setState(() => _positionMs = target);
     _saveProgress(); // 快进后保存，防快进丢失
   }
@@ -1564,6 +1622,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
       _positionMs = v.round();
     });
     _player?.seekTo(v.round());
+    _resetWatchBaseline(); // 进度条拖动跳变：不计观看时长
   }
 
   void _toggleControls() {
@@ -1799,6 +1858,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     debugPrint('[player_page] 横屏 seekTo ${target}ms'
         '（比例 ${fraction.toStringAsFixed(2)}）');
     await _player?.seekTo(target);
+    _resetWatchBaseline(); // 横屏 seek 跳变：跳过内容不计观看时长
     if (mounted) setState(() => _positionMs = target);
     _saveProgress(); // seek 后保存，防滑到新位置丢进度
     _scheduleHudHide(const Duration(milliseconds: 600));
@@ -2206,6 +2266,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     debugPrint('[player_page] 评论链接同集跳进度 seekTo $target ms '
         '${_video.bvid}#$_currentPageIndex');
     await player.seekTo(target);
+    _resetWatchBaseline(); // 评论链接跳进度：跳过内容不计观看时长
     if (mounted) setState(() => _positionMs = target);
   }
 
