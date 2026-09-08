@@ -1,0 +1,183 @@
+// ManagePanel（v2.17.10 自首页 _ManageSheet 抽取，首页齿轮弹层与观看
+// 统计页底部内联共用）widget 测试：
+// - 内联模式（closeBeforeNavigate=false，统计页场景）：分区标题可用
+//   「设置」；各管理分区渲染；点「登录」调回调且不 pop（无路由可 pop）
+// - 保存 GitHub 配置走真实 GithubApi（secure storage channel mock）
+// - 已登录（模拟 SESSDATA 有效）显示「重新登录」文案
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_test/flutter_test.dart';
+
+import 'package:bili_whitelist_app/api/github_api.dart';
+import 'package:bili_whitelist_app/widgets/manage_panel.dart';
+
+/// 内存版 secure storage（mock 原生 MethodChannel，同 auto_login_test）。
+Map<String, String> _store = {};
+
+const MethodChannel _channel = MethodChannel(
+  'plugins.it_nomads.com/flutter_secure_storage',
+);
+
+void _mockSecureStorage() {
+  TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+      .setMockMethodCallHandler(_channel, (call) async {
+    final args = (call.arguments as Map?) ?? const {};
+    switch (call.method) {
+      case 'read':
+        return _store[args['key'] as String?];
+      case 'write':
+        final key = args['key'] as String?;
+        if (key == null) return false;
+        _store[key] = args['value'] as String? ?? '';
+        return true;
+      case 'delete':
+        _store.remove(args['key'] as String?);
+        return true;
+      default:
+        return null;
+    }
+  });
+}
+
+/// 构造可被 [BiliApi.sessdataExpireAt] 解析的（合成）SESSDATA：
+/// `urlencode(uid,<过期秒>,md5...)` 结构，仅用于登录态 UI 测试。
+String _fakeSessdata(Duration validFor) {
+  final expireSec =
+      DateTime.now().add(validFor).millisecondsSinceEpoch ~/ 1000;
+  return '12345,$expireSec,${'a' * 32}';
+}
+
+class _Spy {
+  int loginCalls = 0;
+  int checkUpdateCalls = 0;
+  int manageCollectionsCalls = 0;
+  final created = <String>[];
+
+  Future<void> create(String name) async => created.add(name);
+}
+
+Future<void> _pumpPanel(
+  WidgetTester tester,
+  ManagePanel panel,
+) async {
+  await tester.pumpWidget(MaterialApp(
+    home: Scaffold(body: SingleChildScrollView(child: panel)),
+  ));
+  await tester.pumpAndSettle();
+}
+
+ManagePanel _panel(
+  _Spy spy, {
+  String heading = '管理',
+  bool closeBeforeNavigate = false,
+  VoidCallback? onLoginExtra,
+}) {
+  return ManagePanel(
+    github: GithubApi(),
+    closeBeforeNavigate: closeBeforeNavigate,
+    headingTitle: heading,
+    onCollectionCreated: spy.create,
+    onManageCollections: () => spy.manageCollectionsCalls++,
+    onCheckUpdate: () => spy.checkUpdateCalls++,
+    onLogin: () {
+      spy.loginCalls++;
+      onLoginExtra?.call();
+    },
+  );
+}
+
+void main() {
+  TestWidgetsFlutterBinding.ensureInitialized();
+
+  setUp(() {
+    _store = {};
+    _mockSecureStorage();
+  });
+
+  tearDown(() {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(_channel, null);
+  });
+
+  group('ManagePanel 分区渲染（首页齿轮 / 统计页内联共用组件）', () {
+    testWidgets('内联模式：标题「设置」+ 各管理分区齐全', (tester) async {
+      final spy = _Spy();
+      await _pumpPanel(
+        tester,
+        _panel(spy, heading: '设置'),
+      );
+
+      // 标题与全部管理分区（「新建合集」同时是分区标题与按钮文案 → findsWidgets）
+      expect(find.text('设置'), findsOneWidget);
+      expect(find.text('B 站账号'), findsOneWidget);
+      expect(find.text('GitHub 配置'), findsOneWidget);
+      expect(find.text('新建合集'), findsWidgets);
+      expect(find.text('合集管理'), findsOneWidget);
+      expect(find.text('离线缓存'), findsOneWidget);
+      expect(find.text('翻译服务'), findsOneWidget);
+      expect(find.text('版本更新'), findsOneWidget);
+      // 未登录文案 + 登录按钮（无 SESSDATA → none）
+      expect(find.textContaining('登录后可解锁 1080P'), findsOneWidget);
+      expect(find.text('登录'), findsOneWidget);
+    });
+
+    testWidgets('内联模式点「登录」→ 调回调、不 pop（页面仍渲染）',
+        (tester) async {
+      final spy = _Spy();
+      await _pumpPanel(tester, _panel(spy, heading: '设置'));
+
+      await tester.tap(find.text('登录'));
+      await tester.pumpAndSettle();
+
+      expect(spy.loginCalls, 1);
+      // 内联（closeBeforeNavigate=false）没有 pop：面板仍在
+      expect(find.text('设置'), findsOneWidget);
+      expect(find.text('GitHub 配置'), findsOneWidget);
+    });
+
+    testWidgets('弹层模式（默认标题「管理」）：分区齐全、已登录显示「重新登录」',
+        (tester) async {
+      final spy = _Spy();
+      // 已登录场景：模拟 SESSDATA 仍有效 → 「重新登录」
+      _store['bili_sessdata'] = _fakeSessdata(const Duration(days: 30));
+      await _pumpPanel(
+        tester,
+        _panel(spy, closeBeforeNavigate: true),
+      );
+
+      expect(find.text('管理'), findsOneWidget);
+      expect(find.textContaining('已登录：B 站账号已连接'), findsOneWidget);
+      expect(find.text('重新登录'), findsOneWidget);
+      // 首页齿轮弹层的真实 pop+推登录链路由 auto_login_test（首页整页）覆盖
+      expect(spy.loginCalls, 0);
+    });
+
+    testWidgets('保存 GitHub 配置 → 写入 secure storage + 成功提示',
+        (tester) async {
+      final spy = _Spy();
+      await _pumpPanel(tester, _panel(spy));
+
+      // 填 token（第 0 个输入框 = GitHub Token）与 gist id（第 1 个）
+      await tester.enterText(find.byType(TextField).at(0), 'ghp_test_token');
+      await tester.enterText(find.byType(TextField).at(1), 'gist_abc123');
+      await tester.tap(find.text('保存配置'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('GitHub 配置已保存（仅存本机）'), findsOneWidget);
+      expect(_store['github_token'], 'ghp_test_token');
+      expect(_store['gist_id'], 'gist_abc123');
+    });
+
+    testWidgets('新建合集：把输入框名字交给回调', (tester) async {
+      final spy = _Spy();
+      await _pumpPanel(tester, _panel(spy));
+
+      // 第 2 个输入框 = 新建合集名称；按钮文案与分区标题重名 → 取 .last（按钮）
+      await tester.enterText(find.byType(TextField).at(2), '我的新合集');
+      await tester.tap(find.text('新建合集').last);
+      await tester.pumpAndSettle();
+
+      expect(spy.created, ['我的新合集']);
+    });
+  });
+}

@@ -2,7 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../models/whitelist_video.dart';
 import '../services/history_store.dart';
-import '../widgets/cover_image.dart';
+import '../widgets/history_tile.dart';
 import 'player_page.dart';
 
 /// 历史记录页（播放历史：记录看过的视频，点击续播）。
@@ -153,8 +153,11 @@ class HistoryPageState extends State<HistoryPage> {
                       padding: const EdgeInsets.all(12),
                       itemCount: _entries.length,
                       separatorBuilder: (_, __) => const SizedBox(height: 8),
-                      itemBuilder: (context, i) =>
-                          _HistoryTile(entry: _entries[i], onOpen: _openEntry, onRemove: _confirmRemove),
+                      itemBuilder: (context, i) => HistoryTile(
+                        entry: _entries[i],
+                        onOpen: () => _openEntry(_entries[i]),
+                        onRemove: () => _confirmRemove(_entries[i]),
+                      ),
                     ),
         ),
       ],
@@ -183,89 +186,6 @@ class HistoryPageState extends State<HistoryPage> {
           ),
         ),
       ],
-    );
-  }
-}
-
-/// 单条历史：封面 + 标题 + UP 主 + 上次看到位置/总时长 + 观看时间。
-class _HistoryTile extends StatelessWidget {
-  final HistoryEntry entry;
-  final void Function(HistoryEntry) onOpen;
-  final void Function(HistoryEntry) onRemove;
-
-  const _HistoryTile({
-    required this.entry,
-    required this.onOpen,
-    required this.onRemove,
-  });
-
-  /// 毫秒 → `mm:ss` / `h:mm:ss`。
-  static String _fmtMs(int ms) {
-    final s = (ms / 1000).round();
-    final h = s ~/ 3600;
-    final m = (s % 3600) ~/ 60;
-    final sec = s % 60;
-    return h > 0
-        ? '$h:${m.toString().padLeft(2, '0')}:${sec.toString().padLeft(2, '0')}'
-        : '$m:${sec.toString().padLeft(2, '0')}';
-  }
-
-  /// 观看时间相对描述：「刚刚 / N 分钟前 / N 小时前 / N 天前 / 日期」。
-  static String _relativeTime(DateTime t) {
-    final diff = DateTime.now().difference(t);
-    if (diff.inSeconds < 60) return '刚刚';
-    if (diff.inMinutes < 60) return '${diff.inMinutes} 分钟前';
-    if (diff.inHours < 24) return '${diff.inHours} 小时前';
-    if (diff.inDays < 7) return '${diff.inDays} 天前';
-    final m = t.month.toString().padLeft(2, '0');
-    final d = t.day.toString().padLeft(2, '0');
-    return '${t.year}-$m-$d';
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Material(
-      color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: .45),
-      borderRadius: BorderRadius.circular(12),
-      clipBehavior: Clip.antiAlias,
-      child: ListTile(
-        onTap: () => onOpen(entry),
-        onLongPress: () => onRemove(entry),
-        leading: ClipRRect(
-          borderRadius: BorderRadius.circular(4),
-          child: CoverImage(cover: entry.cover, width: 112, height: 63),
-        ),
-        title: Text(
-          entry.title,
-          maxLines: 2,
-          overflow: TextOverflow.ellipsis,
-          style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
-        ),
-        subtitle: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              '上次看到 ${_fmtMs(entry.positionMs)} / ${_fmtMs(entry.durationMs)}',
-              style: theme.textTheme.bodySmall?.copyWith(
-                color: theme.colorScheme.onSurfaceVariant,
-              ),
-            ),
-            Text(
-              '${entry.upName.isEmpty ? '未知 UP 主' : entry.upName}'
-              ' · ${_relativeTime(entry.watchedAt)}',
-              style: theme.textTheme.bodySmall?.copyWith(
-                color: theme.colorScheme.outline,
-              ),
-            ),
-          ],
-        ),
-        trailing: IconButton(
-          tooltip: '删除',
-          icon: const Icon(Icons.delete_outline, size: 20),
-          onPressed: () => onRemove(entry),
-        ),
-      ),
     );
   }
 }

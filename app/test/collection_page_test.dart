@@ -487,7 +487,7 @@ void main() {
     });
   });
 
-  group('观看统计入口（v2.17.9+）', () {
+  group('观看统计入口（v2.17.9+；v2.17.10 副标题更新）', () {
     testWidgets('顶栏「观看统计」图标存在，点击直达统计页（PageView 第 4 页）',
         (tester) async {
       SharedPreferences.setMockInitialValues({});
@@ -498,7 +498,7 @@ void main() {
       // 点图标 → 动画切到统计页：页内自含标题 + 空态（无数据时不渲染图例）
       await tester.tap(find.byTooltip('观看统计'));
       await tester.pumpAndSettle();
-      expect(find.text('右滑到这里 · 真实播放时长按天记录'), findsOneWidget);
+      expect(find.text('左滑到这里 · 点日期格看当天观看历史'), findsOneWidget);
       expect(find.text('开始观看后这里会生成你的观看热力'), findsOneWidget);
       expect(find.textContaining('档位：'), findsNothing); // 空态不渲染图例/网格
     });

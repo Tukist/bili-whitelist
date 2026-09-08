@@ -1,39 +1,63 @@
 import 'package:flutter/material.dart';
 
 import '../services/watch_stats.dart';
+import 'daily_history_page.dart';
 
-/// 观看统计页（v2.17.9+）：每日真实观看时长（本地记录）的总览 + GitHub 风格
-/// 蓝色热力图。
+/// 观看统计页（v2.17.10+ 重做：GitHub 官方样式克莱因蓝热力 + 总览下移
+/// + 点日进历史 + 底部内联设置区）。
 ///
 /// 作为主页 PageView 的一页（与主页共享 AppBar，**不带自己的 Scaffold**）：
-/// 主页右滑 → UP 主管理 → 再右滑到这里（index3）。数据源 [WatchStats]
-/// （shared_preferences，播放页 playing 时按位置增量累计，见 player_page）。
+/// 主页右滑两页到这里（index3）。数据源 [WatchStats]（shared_preferences，
+/// 播放页 playing 时按位置增量累计，见 player_page）。
 ///
-/// 布局（自含标题条，页内纵向滚动）：
-/// - 顶部淡色标题条「观看统计」（风格同历史记录页）
-/// - 4 张总览卡：今日观看 / 本周观看 / 累计观看 / 最长连续观看（streak）天
-/// - 副信息：近 400 天共 N 天有观看记录（· 平均每天 X 分钟）
-/// - **蓝色 GitHub 式热力卡**：近 53 周网格（行 = 周一..周日，列 = 周，
-///   今天在最右列），色块深浅 = 当天观看分钟数（0=浅灰、<5 浅蓝 .. ≥60 深蓝
-///   #0B5FFF）；点格子看「日期 · 分钟」；附月份标签 + 少→多图例；
-///   无数据时空态「开始观看后这里会生成你的观看热力」
+/// 页内纵向滚动，布局（v2.17.10）：
+/// - 顶部淡色标题条「观看统计」
+/// - **1）GitHub 官方 contribution 样式的单张大热力图卡**：近 53 周连续
+///   （今天在最右列），行 = 周一..周日，**圆角小方块**格子（格间距 2-3px）；
+///   主色 **克莱因蓝 #002FA7 + 白**：无观看 = 浅近白底 #EBEEF5，有观看按
+///   分钟数 5 档蓝阶（<5 分浅蓝 .. ≥60 分克莱因蓝，见 [kHeatLevelColors]）；
+///   列上方月份标签 + 少→多图例；窄屏横向滑动看更早的周（初始停在最近，
+///   今天可见），宽屏整图放下不滚动；**点某日格子 → push [DailyHistoryPage]
+///   看那一天的历史记录（当天观看视频列表，可续播）**
+/// - **2）总览统计在热力下方**：2×2 卡（今日 / 本周 / 累计 / 最长连续天）+
+///   副信息「N 天有观看记录 · 平均每天 X 分钟」
+/// - **3）设置区内联在页底**：接收外部传入的 [settingsSection]
+///   （首页把 [ManagePanel] 以「设置」为题嵌入，与首页齿轮弹层共用组件）
+/// - 无任何观看记录：热力卡内显示空态引导
 ///
 /// 外部刷新：主页 [PlaylistPage] 在 PageView 切到本页（index3）时经
 /// GlobalKey 调 [reload] 重读（同历史记录页约定）。
 
-/// 热力图配色（蓝阶，0=无观看浅灰；1..5 由浅到深蓝）。
-/// 展示/测试共用：格子颜色按 [WatchStats.watchLevel] 的 0..5 查表。
-const Color kHeatNoWatchColor = Color(0xFFEDEFF3); // 无观看：浅灰底
+/// 克莱因蓝（Klein Blue / International Klein Blue #002FA7）：热力最深档 /
+/// 页面强调主色。
+const Color kKleinBlue = Color(0xFF002FA7);
+
+/// 无观看格底色（浅近白，GitHub contribution 灰格风格）。
+const Color kHeatNoWatchColor = Color(0xFFEBEEF5);
+
+/// 热力图蓝阶（1..5 由浅蓝到克莱因蓝深；0 = 无观看用 [kHeatNoWatchColor]）。
+/// 档位按 [WatchStats.watchLevel] 的 0..5 查表：
+/// 1 = <5 分钟；2 = 5-15；3 = 15-30；4 = 30-60；5 = ≥60 分钟。
 const List<Color> kHeatLevelColors = [
-  Color(0xFFD5E5FF), // 1：<5 分钟（很浅蓝）
-  Color(0xFFA8C9FF), // 2：5-15 分钟
-  Color(0xFF74A8FF), // 3：15-30 分钟
-  Color(0xFF3E84FF), // 4：30-60 分钟
-  Color(0xFF0B5FFF), // 5：≥60 分钟（深蓝）
+  Color(0xFFC7D8FF), // 1：<5 分钟（最浅蓝）
+  Color(0xFF7FA6FF), // 2：5-15 分钟
+  Color(0xFF3D6EFF), // 3：15-30 分钟
+  Color(0xFF1546C8), // 4：30-60 分钟
+  kKleinBlue,        // 5：≥60 分钟（克莱因蓝）
 ];
 
-/// 热力格子占位（边长 13 + 间距 2），月份标签按此定列位。
+/// level → 格子颜色（纯函数，渲染/单测共用）：0 = 无观看浅底，1..5 蓝阶。
+Color heatColorForLevel(int level) {
+  if (level <= 0) return kHeatNoWatchColor;
+  if (level > kHeatLevelColors.length) return kKleinBlue;
+  return kHeatLevelColors[level - 1];
+}
+
+/// 热力格占位边长（格 13 + 右/下间距 2），月份标签按此定列位。
 const double _kSlot = 15.0;
+
+/// 圆角小方块圆角半径（GitHub 风格小圆角）。
+const double _kCellRadius = 3;
 
 /// 热力网格单格数据（纯数据，供渲染与单测）。
 class HeatCell {
@@ -155,7 +179,11 @@ class WatchStatsPage extends StatefulWidget {
   /// 测试注入：观看时长数据源（默认全局 [WatchStats.instance]）。
   final WatchStats? stats;
 
-  const WatchStatsPage({super.key, this.stats});
+  /// 页底内联的设置区（v2.17.10+）：首页把 [ManagePanel]（widgets/
+  /// manage_panel.dart）以「设置」为题传入；null = 不渲染（独立测试用）。
+  final Widget? settingsSection;
+
+  const WatchStatsPage({super.key, this.stats, this.settingsSection});
 
   @override
   WatchStatsPageState createState() => WatchStatsPageState();
@@ -167,8 +195,11 @@ class WatchStatsPageState extends State<WatchStatsPage> {
   /// 初始时 stats 已加载过（首次 record/读页时惰性 load）。
   bool _ready = false;
 
-  /// 数据有变化（播放后返回 / 页面可见时外部改日期）→ 无需整页 setState：
-  /// 统一走 [_refresh]（由 initState / 外部 reload 触发）。
+  /// 热力区横向滚动控制器 + 是否已锚定到最近端（今天可见，GitHub 打开
+  /// 默认看最近；只在热力首次渲染时跳一次）。
+  final ScrollController _heatHScroll = ScrollController();
+  bool _heatAnchored = false;
+
   @override
   void initState() {
     super.initState();
@@ -177,6 +208,7 @@ class WatchStatsPageState extends State<WatchStatsPage> {
 
   @override
   void dispose() {
+    _heatHScroll.dispose();
     super.dispose();
   }
 
@@ -202,7 +234,7 @@ class WatchStatsPageState extends State<WatchStatsPage> {
               Text('观看统计', style: theme.textTheme.titleSmall),
               const SizedBox(height: 2),
               Text(
-                '右滑到这里 · 真实播放时长按天记录',
+                '左滑到这里 · 点日期格看当天观看历史',
                 style: theme.textTheme.bodySmall?.copyWith(
                   color: theme.colorScheme.onSurfaceVariant,
                 ),
@@ -225,10 +257,32 @@ class WatchStatsPageState extends State<WatchStatsPage> {
       padding: const EdgeInsets.all(12),
       physics: const AlwaysScrollableScrollPhysics(),
       children: [
-        // 1) 总览统计 2×2
+        // 1) 单张大热力图（GitHub 官方样式，克莱因蓝阶）——放最上
+        _heatCard(theme, total),
+        // 2) 总览统计移到热力下方（v2.17.10）
+        const SizedBox(height: 12),
+        _overviewSection(theme, total),
+        // 3) 设置区内联页底（与首页齿轮共用 ManagePanel）
+        if (widget.settingsSection != null) ...[
+          const SizedBox(height: 8),
+          const Divider(height: 1),
+          const SizedBox(height: 16),
+          widget.settingsSection!,
+        ],
+      ],
+    );
+  }
+
+  /// 总览区：小标题 + 2×2 卡 + 活跃天数/平均每日副信息。
+  Widget _overviewSection(ThemeData theme, int total) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('观看总览', style: theme.textTheme.titleSmall),
+        const SizedBox(height: 8),
         _overviewGrid(theme),
         if (total > 0) ...[
-          const SizedBox(height: 6),
+          const SizedBox(height: 8),
           Center(
             child: Text(
               '${_stats.activeDays} 天有观看记录'
@@ -239,9 +293,6 @@ class WatchStatsPageState extends State<WatchStatsPage> {
             ),
           ),
         ],
-        const SizedBox(height: 12),
-        // 2) 蓝色 GitHub 式热力图
-        _heatCard(theme, total),
       ],
     );
   }
@@ -262,7 +313,7 @@ class WatchStatsPageState extends State<WatchStatsPage> {
                 label: '今日观看',
                 value: today.$1,
                 unit: today.$2,
-                valueColor: kHeatLevelColors[4],
+                accent: kKleinBlue,
               ),
             ),
             const SizedBox(width: 8),
@@ -272,7 +323,7 @@ class WatchStatsPageState extends State<WatchStatsPage> {
                 label: '本周观看',
                 value: week.$1,
                 unit: week.$2,
-                valueColor: kHeatLevelColors[3],
+                accent: kHeatLevelColors[3],
               ),
             ),
           ],
@@ -286,7 +337,7 @@ class WatchStatsPageState extends State<WatchStatsPage> {
                 label: '累计观看',
                 value: total.$1,
                 unit: total.$2,
-                valueColor: kHeatLevelColors[2],
+                accent: kHeatLevelColors[2],
               ),
             ),
             const SizedBox(width: 8),
@@ -296,7 +347,7 @@ class WatchStatsPageState extends State<WatchStatsPage> {
                 label: '最长连续',
                 value: streak.$1,
                 unit: streak.$2,
-                valueColor: const Color(0xFFFF8A3D),
+                accent: kKleinBlue,
               ),
             ),
           ],
@@ -306,11 +357,9 @@ class WatchStatsPageState extends State<WatchStatsPage> {
   }
 
   Widget _heatCard(ThemeData theme, int totalSeconds) {
-    final grid = buildHeatmapGrid(_stats.days, DateTime.now());
-    final labels = buildHeatMonthLabels(
-      heatGridStart(DateTime.now()),
-      DateTime.now(),
-    );
+    final now = DateTime.now();
+    final grid = buildHeatmapGrid(_stats.days, now);
+    final labels = buildHeatMonthLabels(heatGridStart(now), now);
     return Container(
       padding: const EdgeInsets.fromLTRB(12, 12, 12, 10),
       decoration: BoxDecoration(
@@ -341,9 +390,16 @@ class WatchStatsPageState extends State<WatchStatsPage> {
           else ...[
             _heatLegend(theme),
             const SizedBox(height: 8),
-            _heatMap(theme, grid, labels),
-            const SizedBox(height: 8),
-            _detailBar(theme),
+            _heatMap(theme, grid, labels, now),
+            const SizedBox(height: 4),
+            Center(
+              child: Text(
+                '点日期格查看当天观看历史（今天在最右列）',
+                style: theme.textTheme.labelSmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ),
           ],
         ],
       ),
@@ -409,165 +465,182 @@ class WatchStatsPageState extends State<WatchStatsPage> {
     );
   }
 
-  /// 当前点击的格子（null = 未点过）。
-  DateTime? _selected;
-
-  Widget _detailBar(ThemeData theme) {
-    final sel = _selected;
-    final String text;
-    if (sel == null) {
-      text = '点格子查看当天详情 · 格子=一天，今天在最右列';
-    } else {
-      final seconds = _stats.secondsOf(sel);
-      final dateKey = WatchStats.dateKey(sel);
-      text = seconds == 0
-          ? '$dateKey · 无观看记录'
-          : '$dateKey · 观看 ${formatWatchDuration(seconds)}';
-    }
-    return Container(
-      width: double.infinity,
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-      decoration: BoxDecoration(
-        color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: .35),
-        borderRadius: BorderRadius.circular(8),
-      ),
-      child: Text(
-        text,
-        style: theme.textTheme.bodySmall,
-      ),
-    );
-  }
-
-  /// 53 周热力网格：左侧固定周几栏（不随横向滚动）+ 右侧月份标签与网格
-  /// 一起横向滚动（内容约 53×15+留白 ≈ 830px，手机上横向滑动看更早的周）。
+  /// 53 周单张大热力：左侧固定周几栏（不随横向滚动）+ 右侧月份标签与
+  /// 网格一起横向滚动（内容约 53×15 ≈ 795px，手机宽度不够时右滑看更早的
+  /// 周；平板等宽屏直接整图放下）。v2.17.10：色块改克莱因蓝阶、圆角
+  /// 小方块、**点格子直接进当天观看历史**；首次渲染自动滚动到最近端
+  /// （今天在最右列可见，GitHub 打开默认看最近）。
   Widget _heatMap(
     ThemeData theme,
     List<List<HeatCell?>> grid,
     List<HeatMonthLabel> labels,
+    DateTime today,
   ) {
-    const slot = _kSlot; // 每格占位（含间距）
-    const gutter = 24.0; // 左侧周几栏宽
+    const gutter = 22.0; // 左侧周几栏宽
     final weekdays = const ['一', '二', '三', '四', '五', '六', '日'];
-    return Row(
+    final contentWidth = grid.length * _kSlot; // 网格 + 月标签内容总宽
+    _scheduleAnchorHeat(); // 布局就绪后滚动到最近端一次
+    final content = Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        // 固定周几标签栏
-        Container(
-          width: gutter,
-          padding: const EdgeInsets.only(top: 0),
-          child: Column(
+        // 月份标签层（绝对定位到列上方，允许溢出到相邻列）
+        SizedBox(
+          height: 16,
+          width: contentWidth,
+          child: Stack(
+            clipBehavior: Clip.none,
             children: [
-              // 与月份标签行同高，保持对齐
-              const SizedBox(height: 16),
-              for (final w in weekdays)
-                SizedBox(
-                  height: slot,
-                  child: Center(
-                    child: Text(
-                      w,
-                      style: theme.textTheme.labelSmall?.copyWith(
-                        fontSize: 9,
-                        color: theme.colorScheme.onSurfaceVariant,
-                        height: 1,
-                      ),
+              for (final l in labels)
+                Positioned(
+                  left: l.col * _kSlot,
+                  top: 0,
+                  child: Text(
+                    l.text,
+                    style: theme.textTheme.labelSmall?.copyWith(
+                      fontSize: 9,
+                      color: theme.colorScheme.onSurfaceVariant,
+                      height: 1,
                     ),
                   ),
                 ),
             ],
           ),
         ),
-        const SizedBox(width: 2),
-        // 月份标签 + 网格横向滚动区
-        Expanded(
-          child: SingleChildScrollView(
-            scrollDirection: Axis.horizontal,
-            reverse: false, // 初始在最左（月份从早到晚）；用户右滑可到最近
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                // 月份标签层（绝对定位到列上方，允许溢出到相邻列）
-                SizedBox(
-                  height: 16,
-                  width: grid.length * slot,
-                  child: Stack(
-                    clipBehavior: Clip.none,
-                    children: [
-                      for (final l in labels)
-                        Positioned(
-                          left: l.col * slot,
-                          top: 0,
-                          child: Text(
-                            l.text,
-                            style: theme.textTheme.labelSmall?.copyWith(
-                              fontSize: 9,
-                              color: theme.colorScheme.onSurfaceVariant,
-                              height: 1,
-                            ),
-                          ),
-                        ),
-                    ],
-                  ),
-                ),
-                // 7 行 × 53 列 网格（今天在最右列）
-                Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    for (var w = 0; w < grid.length; w++)
-                      Column(
-                        children: [
-                          for (var r = 0; r < 7; r++)
-                            _heatCell(theme, grid[w][r]),
-                        ],
-                      ),
-                  ],
-                ),
-              ],
-            ),
-          ),
+        // 7 行 × 53 列 网格（今天在最右列）
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            for (var w = 0; w < grid.length; w++)
+              Column(
+                children: [
+                  for (var r = 0; r < 7; r++)
+                    _heatCell(theme, grid[w][r], today),
+                ],
+              ),
+          ],
         ),
       ],
     );
-  }
-
-  /// 单格：色块 + 点击/长按查看详情。未来（null）= 不画占位。
-  Widget _heatCell(ThemeData theme, HeatCell? cell) {
-    return Container(
-      width: 13,
-      height: 13,
-      margin: const EdgeInsets.only(right: 2, bottom: 2),
-      child: cell == null
-          ? null
-          : GestureDetector(
-              behavior: HitTestBehavior.opaque,
-              onTap: () => setState(() => _selected = cell.date),
-              onLongPress: () => setState(() => _selected = cell.date),
-              child: DecoratedBox(
-                decoration: BoxDecoration(
-                  color: cell.level == 0
-                      ? kHeatNoWatchColor
-                      : kHeatLevelColors[cell.level - 1],
-                  borderRadius: BorderRadius.circular(2),
-                ),
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final avail = constraints.maxWidth - gutter - 4;
+        return Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // 固定周几标签栏
+            SizedBox(
+              width: gutter,
+              child: Column(
+                children: [
+                  const SizedBox(height: 16), // 与月份标签行同高
+                  for (final w in weekdays)
+                    SizedBox(
+                      height: _kSlot,
+                      child: Center(
+                        child: Text(
+                          w,
+                          style: theme.textTheme.labelSmall?.copyWith(
+                            fontSize: 9,
+                            color: theme.colorScheme.onSurfaceVariant,
+                            height: 1,
+                          ),
+                        ),
+                      ),
+                    ),
+                ],
               ),
             ),
+            const SizedBox(width: 2),
+            Expanded(
+              child: avail >= contentWidth
+                  // 宽屏：整图直接放下（不滚动）
+                  ? SizedBox(width: contentWidth, child: content)
+                  // 窄屏：横向滚动，初始锚到最近端
+                  : SingleChildScrollView(
+                      controller: _heatHScroll,
+                      scrollDirection: Axis.horizontal,
+                      child: SizedBox(width: contentWidth, child: content),
+                    ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  /// 热力首次渲染后把横向滚动锚到最右（今天可见）；数据更新重建时不再跳。
+  void _scheduleAnchorHeat() {
+    if (_heatAnchored) return;
+    _heatAnchored = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted || !_heatHScroll.hasClients) return;
+      _heatHScroll.jumpTo(_heatHScroll.position.maxScrollExtent);
+    });
+  }
+
+  /// 点日期格 → 进入该日历史页（当天观看视频列表，可续播）。
+  void _openDay(DateTime day) {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        settings: const RouteSettings(name: 'daily-history'),
+        builder: (_) => DailyHistoryPage(date: day),
+      ),
+    );
+  }
+
+  /// 单格：圆角小方块 + 无障碍标签；点任意非未来格 → 当天历史页。
+  /// 未来（null）= 不画占位（保留格子间距）。
+  Widget _heatCell(ThemeData theme, HeatCell? cell, DateTime today) {
+    if (cell == null) {
+      return Container(
+        width: 13,
+        height: 13,
+        margin: const EdgeInsets.only(right: 2, bottom: 2),
+      );
+    }
+    final dateKey = WatchStats.dateKey(cell.date);
+    final isToday = dateKey == WatchStats.dateKey(today);
+    final desc = cell.seconds > 0
+        ? '$dateKey 观看 ${formatWatchDuration(cell.seconds)}'
+        : '$dateKey 无观看记录';
+    return Semantics(
+      button: true,
+      label: desc,
+      child: GestureDetector(
+        key: ValueKey('heatcell-$dateKey'),
+        behavior: HitTestBehavior.opaque,
+        onTap: () => _openDay(cell.date),
+        child: Container(
+          width: 13,
+          height: 13,
+          margin: const EdgeInsets.only(right: 2, bottom: 2),
+          decoration: BoxDecoration(
+            color: heatColorForLevel(cell.level),
+            borderRadius: BorderRadius.circular(_kCellRadius),
+            border: isToday
+                ? Border.all(color: kKleinBlue.withValues(alpha: .9), width: 1.2)
+                : null,
+          ),
+        ),
+      ),
     );
   }
 }
 
-/// 总览统计卡：图标 + 标签 + 大数字 + 单位。
+/// 总览统计卡：图标 + 标签 + 大数字 + 单位（克莱因蓝强调）。
 class _StatCard extends StatelessWidget {
   final IconData icon;
   final String label;
   final String value; // 大数字文本（调用方已格式化好）
   final String unit;
-  final Color valueColor;
+  final Color accent;
 
   const _StatCard({
     required this.icon,
     required this.label,
     required this.value,
     required this.unit,
-    required this.valueColor,
+    required this.accent,
   });
 
   @override
@@ -591,10 +664,10 @@ class _StatCard extends StatelessWidget {
                 width: 20,
                 height: 20,
                 decoration: BoxDecoration(
-                  color: valueColor.withValues(alpha: .14),
+                  color: accent.withValues(alpha: .14),
                   borderRadius: BorderRadius.circular(6),
                 ),
-                child: Icon(icon, size: 13, color: valueColor),
+                child: Icon(icon, size: 13, color: accent),
               ),
               const SizedBox(width: 6),
               Expanded(
