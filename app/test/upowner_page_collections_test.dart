@@ -222,12 +222,17 @@ BiliApi _fakeApi(Map<String, Map<String, dynamic> Function()> handlers) {
   return BiliApi(dio: dio);
 }
 
-/// 常规 handlers：spi/nav/acc/info + 全部视频列表。
+/// 常规 handlers：spi/nav/acc/info + 全部视频列表 + 粉丝数（relation/stat）。
 Map<String, Map<String, dynamic> Function()> _baseHandlers() => {
   '/x/frontend/finger/spi': _spiBody,
   '/x/web-interface/nav': _navBody,
   '/x/space/wbi/acc/info': _accInfoBody,
   '/x/space/wbi/arc/search': _mainVideosBody,
+  '/x/relation/stat': () => {
+    'code': 0,
+    'message': 'OK',
+    'data': {'mid': 546195, 'follower': 100},
+  },
 };
 
 Future<void> _pumpPage(
@@ -248,6 +253,8 @@ void main() {
   setUp(() {
     _store.clear();
     _mockSecureStorage();
+    // UP 主信息会话缓存跨用例隔离（静态缓存会串数据）
+    UpownerPage.clearInfoCacheForTest();
   });
 
   testWidgets('有合集：出现「合集」区（chips 含合集/自建列表，'

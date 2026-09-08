@@ -378,6 +378,61 @@ void main() {
       expect(req.queryParameters['keyword'], 'flutter');
     });
 
+    test('请求带齐 wbi 签名（w_rid/wts）+ buvid3/4 指纹 Cookie（防风控）',
+        () async {
+      final adapter = _RoutingAdapter({
+        '/x/frontend/finger/spi': _spiBody,
+        '/x/web-interface/nav': _navBody,
+        '/x/space/wbi/arc/search': () => _videoListBody(vlist: []),
+      });
+      await _api(adapter).fetchUpownerVideos(12345);
+      final req = adapter.requests.lastWhere(
+        (r) => r.path == '/x/space/wbi/arc/search',
+      );
+      // wbi 签名参数齐全（wts 时间戳 + w_rid + dm 反风控参数）
+      expect(req.queryParameters['w_rid'], isNotEmpty);
+      expect(req.queryParameters['wts'], isNotEmpty);
+      expect(req.queryParameters['dm_img_str'], isNotEmpty);
+      // Cookie 头带 buvid3/buvid4 指纹（来自 spi 接口）
+      final cookie = req.headers['Cookie'] as String? ?? '';
+      expect(cookie, contains('buvid3=buvid3test'));
+      expect(cookie, contains('buvid4=buvid4test'));
+    });
+
+    test('totalCount 优先取 data.page.count（实测字段，list.count 为 null）',
+        () async {
+      final adapter = _RoutingAdapter({
+        '/x/frontend/finger/spi': _spiBody,
+        '/x/web-interface/nav': _navBody,
+        '/x/space/wbi/arc/search': () => {
+          'code': 0,
+          'message': 'OK',
+          'data': {
+            'list': {
+              // 真实响应 list 不含 count（只有 vlist/tlist/slist）
+              'vlist': List.generate(20, (i) => _oneVideo(bvid: 'BV$i')),
+            },
+            'page': {'pn': 1, 'ps': 20, 'count': 673},
+          },
+        },
+      });
+      final page = await _api(adapter).fetchUpownerVideos(12345);
+      expect(page.totalCount, 673);
+      expect(page.hasMore, isTrue); // 已加载 20 < 673
+    });
+
+    test('page.count 缺失时回退 list.count（兼容历史响应）', () async {
+      final adapter = _RoutingAdapter({
+        '/x/frontend/finger/spi': _spiBody,
+        '/x/web-interface/nav': _navBody,
+        '/x/space/wbi/arc/search': () =>
+            _videoListBody(vlist: [_oneVideo()], count: 1),
+      });
+      final page = await _api(adapter).fetchUpownerVideos(12345);
+      expect(page.totalCount, 1);
+      expect(page.hasMore, isFalse);
+    });
+
     test('length 含小时（"1:02:03"）→ 解析为 3723 秒', () async {
       final adapter = _RoutingAdapter({
         '/x/frontend/finger/spi': _spiBody,
@@ -505,6 +560,107 @@ void main() {
       expect(
         () => _api(adapter).fetchUpownerInfo(1),
         throwsA(isA<BiliApiException>().having((e) => e.code, 'code', -412)),
+      );
+    });
+
+    test('请求带齐 wbi 签名 + buvid3/4 指纹 Cookie（防风控）', () async {
+      final adapter = _RoutingAdapter({
+        '/x/frontend/finger/spi': _spiBody,
+        '/x/web-interface/nav': _navBody,
+        '/x/space/wbi/acc/info': () => _upownerInfoBody(),
+      });
+      await _api(adapter).fetchUpownerInfo(100);
+      final req = adapter.requests.lastWhere(
+        (r) => r.path == '/x/space/wbi/acc/info',
+      );
+      expect(req.queryParameters['mid'], '100');
+      expect(req.queryParameters['w_rid'], isNotEmpty);
+      expect(req.queryParameters['wts'], isNotEmpty);
+      final cookie = req.headers['Cookie'] as String? ?? '';
+      expect(cookie, contains('buvid3=buvid3test'));
+      expect(cookie, contains('buvid4=buvid4test'));
+    });
+
+    test('2026-09 实测 acc/info data 不含 fans 字段 → fans=null（不崩）',
+        () async {
+      // 真实响应字段：name/face/sign/level_info/...，无 fans、无 card
+      final adapter = _RoutingAdapter({
+        '/x/frontend/finger/spi': _spiBody,
+        '/x/web-interface/nav': _navBody,
+        '/x/space/wbi/acc/info': () => {
+          'code': 0,
+          'message': 'OK',
+          'data': {
+            'name': '某UP主',
+            'face': 'https://i0.hdslb.com/bfs/face/x.jpg',
+            'sign': '简介',
+          },
+        },
+      });
+      final info = await _api(adapter).fetchUpownerInfo(100);
+      expect(info.name, '某UP主');
+      expect(info.sign, '简介');
+      expect(info.fans, isNull);
+    });
+  });
+
+  group('fetchUpownerFollower', () {
+    Map<String, dynamic> statBody({int code = 0, int? follower}) => {
+      'code': code,
+      'message': code == 0 ? 'OK' : '业务错误',
+      'data': {'mid': 546195, 'following': 5, 'follower': follower ?? 20766601},
+    };
+
+    test('请求 vmid 参数 + buvid Cookie；解析 data.follower', () async {
+      final adapter = _RoutingAdapter({
+        '/x/frontend/finger/spi': _spiBody,
+        '/x/relation/stat': () => statBody(follower: 20766601),
+      });
+      final api = _api(adapter);
+      final fans = await api.fetchUpownerFollower(546195);
+      expect(fans, 20766601);
+      final req = adapter.requests.lastWhere(
+        (r) => r.path == '/x/relation/stat',
+      );
+      expect(req.queryParameters['vmid'], '546195');
+      final cookie = req.headers['Cookie'] as String? ?? '';
+      expect(cookie, contains('buvid3=buvid3test'));
+      expect(cookie, contains('buvid4=buvid4test'));
+    });
+
+    test('data.follower 缺失 → 抛异常（不返回 null 猜测值）', () async {
+      final adapter = _RoutingAdapter({
+        '/x/frontend/finger/spi': _spiBody,
+        '/x/relation/stat': () => {'code': 0, 'message': 'OK', 'data': {}},
+      });
+      expect(
+        () => _api(adapter).fetchUpownerFollower(1),
+        throwsA(isA<BiliApiException>()),
+      );
+    });
+
+    test('-412 / 其他业务码 → 抛 BiliApiException', () async {
+      for (final code in [-412, -352, -404]) {
+        final adapter = _RoutingAdapter({
+          '/x/frontend/finger/spi': _spiBody,
+          '/x/relation/stat': () => statBody(code: code),
+        });
+        expect(
+          () => _api(adapter).fetchUpownerFollower(1),
+          throwsA(
+            isA<BiliApiException>().having((e) => e.code, 'code', code),
+          ),
+          reason: 'code=$code 应抛 BiliApiException',
+        );
+      }
+    });
+
+    test('网络连接失败 → 抛 DioException', () async {
+      final dio = Dio(BaseOptions(baseUrl: kBiliApi, headers: biliHeaders()));
+      dio.httpClientAdapter = _ThrowingAdapter();
+      expect(
+        () => BiliApi(dio: dio).fetchUpownerFollower(1),
+        throwsA(isA<DioException>()),
       );
     });
   });

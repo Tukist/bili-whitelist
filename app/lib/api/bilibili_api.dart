@@ -252,7 +252,8 @@ class UpownerVideosPage {
   });
 }
 
-/// UP 主详情数据（`x/space/wbi/acc/info` 返回的常用字段集合）。
+/// UP 主详情数据（`x/space/wbi/acc/info` 常用字段；[fans] 不自 acc/info——
+/// 该接口无粉丝字段，由 [BiliApi.fetchUpownerFollower]（relation/stat）提供）。
 class UpownerInfo {
   final String name;
   final String face;
@@ -1879,7 +1880,11 @@ class BiliApi {
     final d = data?['data'] as Map<String, dynamic>?;
     final list = d?['list'] as Map<String, dynamic>?;
     final vlist = list?['vlist'];
-    final totalRaw = list?['count'];
+    // 2026-09 实测：总数在 `data.page.count`（list.count 不存在，旧解析恒为
+    // null → hasMore 只能走「装满 20」兜底，末尾多打一次空页）。page.count
+    // 优先，list.count 兜底（兼容历史 mock/响应）。
+    final page = d?['page'] as Map<String, dynamic>?;
+    final totalRaw = page?['count'] ?? list?['count'];
     final totalCount = (totalRaw is num) ? totalRaw.toInt() : null;
     if (vlist is! List) {
       return UpownerVideosPage(
@@ -1940,8 +1945,9 @@ class BiliApi {
 
   /// UP 主详情（`x/space/wbi/acc/info?mid=`）。
   ///
-  /// 字段：`name` / `face` / `fans` / `sign` / `level_info.current_level` /
-  /// `official_verify.desc` / `official_verify.type`。我们只取常用字段。
+  /// 字段：`name` / `face` / `sign`（**不含 fans**——2026-09 实测该接口的
+  /// data 无 fans 字段，粉丝数请用 [fetchUpownerFollower]（relation/stat））。
+  /// 解析保留对 `data.fans` 的容错读取：若 B 站未来回归该字段可直接读到。
   Future<UpownerInfo> fetchUpownerInfo(int mid) async {
     await _injectAuth();
     final (imgKey, subKey) = await _ensureWbiKeys();
@@ -1994,6 +2000,56 @@ class BiliApi {
       fans: (d['fans'] as num?)?.toInt(),
       sign: d['sign'] as String? ?? '',
     );
+  }
+
+  /// UP 主粉丝数（`x/relation/stat?vmid=`，返回 `data.follower`）。
+  ///
+  /// 2026-09 匿名实测：**匿名可用、稳定**（带完整头 + [_injectAuth] 的
+  /// buvid 指纹更稳）——acc/info 不含粉丝字段且匿名易 -352，粉丝数改由
+  /// 本接口提供（B 站网页 UP 主页的粉丝数同样取自 relation/stat）。
+  ///
+  /// 错误分类与 [fetchUpownerVideos] 一致：code=-412 / -352 / 其他业务码抛
+  /// [BiliApiException]，网络失败（[DioException]）原样上抛。
+  Future<int> fetchUpownerFollower(int mid) async {
+    await _injectAuth();
+    debugPrint('[bili_api] fetchUpownerFollower mid=$mid');
+    final resp = await _dio.get<Map<String, dynamic>>(
+      '/x/relation/stat',
+      queryParameters: {'vmid': '$mid'},
+    );
+    final data = resp.data;
+    final code = data?['code'] as int?;
+    if (code == -412) {
+      throw const BiliApiException(
+        code: -412,
+        message: '粉丝数接口被风控拦截，请稍后再试',
+        path: '/x/relation/stat',
+      );
+    }
+    if (code == -352) {
+      throw const BiliApiException(
+        code: -352,
+        message: '粉丝数接口被限流，请稍后再试',
+        path: '/x/relation/stat',
+      );
+    }
+    if (code != 0) {
+      throw BiliApiException(
+        code: code ?? -1,
+        message: data?['message'] as String? ?? '粉丝数获取失败',
+        path: '/x/relation/stat',
+      );
+    }
+    final d = data?['data'] as Map<String, dynamic>?;
+    final follower = (d?['follower'] as num?)?.toInt();
+    if (follower == null) {
+      throw const BiliApiException(
+        code: -1,
+        message: '粉丝数接口未返回数据',
+        path: '/x/relation/stat',
+      );
+    }
+    return follower;
   }
 
   // -------------------------------------------------------------------------

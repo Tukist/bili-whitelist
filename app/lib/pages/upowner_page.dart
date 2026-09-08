@@ -13,9 +13,14 @@
 /// - 列表项长按 → 弹菜单「加入白名单视频」/「取消」（两个视图共用）
 /// - 顶部右上角「管理」按钮：移除 UP 主（从白名单删除，写 Gist）
 ///
-/// 与 BiliApi.fetchUpownerVideos / fetchUpownerInfo / fetchVideoMeta /
-/// fetchUpownerCollections / fetchSeasonArchives / fetchSeriesArchives 共用：
-/// 不写 Gist；视频不入库，仅供点播。UP 主信息可缓存（mid → info）。
+/// 与 BiliApi.fetchUpownerVideos / fetchUpownerInfo / fetchUpownerFollower /
+/// fetchVideoMeta / fetchUpownerCollections / fetchSeasonArchives /
+/// fetchSeriesArchives 共用：不写 Gist；视频不入库，仅供点播。
+///
+/// 容错（v2.17.8）：UP 主信息按 mid 会话级缓存（_upInfoCache），重进直接
+/// 显示不重复请求；粉丝数走 relation/stat（acc/info 实测不含 fans 字段）；
+/// 信息/视频列表失败均自动重试（短退避），吸收 B 站 space wbi 接口对匿名/
+/// 高频请求的间歇风控（-352/-412，实测等待后重试即恢复）。
 library;
 
 import 'dart:async';
@@ -98,6 +103,11 @@ class UpownerPage extends StatefulWidget {
     this.api,
   });
 
+  /// 仅测试用：清空 UP 主信息会话缓存（避免 widget 测试跨用例串数据）。
+  @visibleForTesting
+  static void clearInfoCacheForTest() =>
+      _UpownerPageState.debugClearUpownerInfoCache();
+
   @override
   State<UpownerPage> createState() => _UpownerPageState();
 }
@@ -122,6 +132,24 @@ class _UpownerPageState extends State<UpownerPage> {
 
   /// 是否有视频正在「拉详情」（cid 为 0 时进入播放前 fetch）
   bool _fetchingMeta = false;
+
+  /// 头部信息是否在加载/自动重试中（防并发重复触发）。
+  bool _loadingInfo = false;
+
+  /// 「全部视频」列表代际号：搜索/排序/清空触发的每次全新加载 +1；在途
+  /// 请求（含失败后的自动重试）发现代际不一致即放弃，防止过期结果串入
+  /// 新列表（自动重试使等待窗口变长，旧代码的「后到覆盖」竞态会被放大）。
+  int _listGen = 0;
+
+  /// 会话级 UP 主信息缓存（mid → 完整成功信息：acc/info 资料 + stat 粉丝数，
+  /// 静态跨页面实例共享）。同一 App 会话内重进同一位 UP 主的主页直接展示
+  /// 缓存、不再请求 space wbi 接口——该类接口对匿名/高频请求有间歇风控
+  /// （-352/-412，实测等待后重试即恢复），少请求即少触发、也无需重复等待。
+  static final Map<int, UpownerInfo> _upInfoCache = {};
+
+  /// 清空会话缓存（@visibleForTesting：widget 测试跨用例隔离用）。
+  @visibleForTesting
+  static void debugClearUpownerInfoCache() => _upInfoCache.clear();
 
   // -------------------------------------------------------------------------
   // 「合集·列表」区（v2.17.4+）：chips 选合集 → 下方列表显示该合集视频。
@@ -193,13 +221,54 @@ class _UpownerPageState extends State<UpownerPage> {
     _loadPage(_page + 1);
   }
 
-  /// 头部信息：拿最新 UP 主详情（fans/sign 可能更新）。
+  /// 头部信息加载（v2.17.8：缓存优先 + 自动重试 + 粉丝数独立兜底）：
+  ///
+  /// 1. 会话缓存命中（同一位 UP 主此前完整加载成功）→ 直接展示，不再请求；
+  ///    缓存里恰好缺粉丝数时补拉一次 stat（不影响展示）
+  /// 2. 粉丝数走 [BiliApi.fetchUpownerFollower]（relation/stat——acc/info
+  ///    实测不含 fans 字段且匿名易 -352，2026-09 验证）：失败自动重试
+  ///    （1s → 2s）后仍失败则保留 initial 值或显示 '—'，不阻塞页面
+  /// 3. 资料（名字/头像/简介）走 [BiliApi.fetchUpownerInfo]（acc/info）：
+  ///    匿名可能被 -352 拦截——同样自动重试，最终失败静默降级（标题/头像
+  ///    回退 initial 或列表作者名），不弹整页错误
+  /// 4. 资料成功（= 完整结果）才写会话缓存，重进本 UP 主页不再请求
   Future<void> _loadInfo() async {
+    if (_loadingInfo) return; // 防并发：重试在途时不重复触发
+    _loadingInfo = true;
     setState(() => _infoError = null);
+
+    // 1) 会话缓存命中：直接展示，不重复请求（减少 space wbi 风控触发）
+    final cached = _upInfoCache[widget.mid];
+    if (cached != null) {
+      _loadingInfo = false;
+      setState(() => _info = cached);
+      // 上次进页 stat 恰好失败 → 缓存缺粉丝数：补拉一次 stat 不影响展示
+      if (cached.fans == null) unawaited(_refreshCachedFans());
+      return;
+    }
+
+    // 2) 粉丝数（独立于资料：资料被风控时粉丝数照常显示）
+    var profileOk = false;
     try {
-      final info = await _api.fetchUpownerInfo(widget.mid);
+      final fans = await _retryWithBackoff(
+        () => _api.fetchUpownerFollower(widget.mid),
+      );
       if (!mounted) return;
-      setState(() => _info = info);
+      setState(() => _info = _infoWithFans(fans));
+    } catch (e) {
+      // 重试后仍失败：保留 initial 的 fans（或 null → _fmtFans 显示 '—'）
+      debugPrint('[upowner] 粉丝数最终失败 mid=${widget.mid}: $e');
+    }
+    if (!mounted) return;
+
+    // 3) 资料（acc/info）——失败静默降级（标题/头像用 initial 或列表作者名）
+    try {
+      final profile = await _retryWithBackoff(
+        () => _api.fetchUpownerInfo(widget.mid),
+      );
+      profileOk = true;
+      if (!mounted) return;
+      setState(() => _info = _applyProfile(profile));
     } on BiliApiException catch (e) {
       if (!mounted) return;
       setState(() => _infoError = e.message);
@@ -207,17 +276,92 @@ class _UpownerPageState extends State<UpownerPage> {
       if (!mounted) return;
       setState(() => _infoError = '网络请求失败');
     }
+    if (!mounted) return;
+    _loadingInfo = false;
+
+    // 4) 资料成功 = 完整信息（资料 + stat 粉丝数）→ 写会话缓存
+    if (profileOk) {
+      final best = _info;
+      if (best != null) _upInfoCache[widget.mid] = best;
+    }
   }
 
-  /// 加载第一页视频列表。
+  /// 短退避自动重试：失败后等 1s → 2s 再试，最多重试 2 次（共 3 次尝试）。
+  ///
+  /// 吸收 B 站 space wbi 接口对匿名/高频请求的间歇风控（-352/-412，实测
+  /// 等待后重试即恢复）——用户手动「重试几次才正常」在此被自动吸收。
+  /// 页面已销毁时放弃退避与后续重试（不无限循环、不并发重复）。
+  Future<T> _retryWithBackoff<T>(Future<T> Function() op) async {
+    const delays = [Duration(seconds: 1), Duration(seconds: 2)];
+    for (var attempt = 0; ; attempt++) {
+      try {
+        return await op();
+      } catch (_) {
+        if (attempt >= delays.length) rethrow;
+        if (!mounted) rethrow; // 页面已销毁：不再等退避/重试
+        await Future<void>.delayed(delays[attempt]);
+        if (!mounted) rethrow;
+      }
+    }
+  }
+
+  /// 「当前已知资料 + 最新粉丝数」：资料（acc/info）匿名被风控时，
+  /// 粉丝数仍可独立展示（资料字段沿用 initial/已展示内容，可为空）。
+  UpownerInfo _infoWithFans(int fans) {
+    final cur = _info;
+    final init = widget.initial;
+    return UpownerInfo(
+      name: cur?.name ?? init?.name ?? '',
+      face: cur?.face ?? init?.face ?? '',
+      fans: fans,
+      sign: cur?.sign ?? '',
+    );
+  }
+
+  /// 用 acc/info 资料覆盖头部信息；acc/info 不含 fans（2026-09 实测），
+  /// 覆盖时保留已由 stat 拿到的粉丝数（profile.fans 兜底容错）。
+  UpownerInfo _applyProfile(UpownerInfo profile) {
+    final cur = _info;
+    return UpownerInfo(
+      name: profile.name,
+      face: profile.face,
+      sign: profile.sign,
+      fans: profile.fans ?? cur?.fans,
+    );
+  }
+
+  /// 缓存命中但缺粉丝数时补拉一次 stat（单次、不重试，失败静默）。
+  Future<void> _refreshCachedFans() async {
+    try {
+      final fans = await _api.fetchUpownerFollower(widget.mid);
+      final cur = _info;
+      if (!mounted || cur == null) return;
+      final merged = UpownerInfo(
+        name: cur.name,
+        face: cur.face,
+        fans: fans,
+        sign: cur.sign,
+      );
+      setState(() => _info = merged);
+      _upInfoCache[widget.mid] = merged;
+    } catch (e) {
+      debugPrint('[upowner] 缓存粉丝数补拉失败 mid=${widget.mid}: $e');
+    }
+  }
+
+  /// 加载第一页视频列表（进入/搜索/排序/清空共用入口）。
+  ///
+  /// 每次全新加载把代际号 [_listGen] +1：旧的在途请求（含失败后的自动
+  /// 重试）看到代际不一致即放弃，防止过期结果串入新列表。
   Future<void> _loadFirstPage() async {
+    final gen = ++_listGen;
     setState(() {
       _videos.clear();
       _page = 1;
       _hasMore = true;
       _error = null;
     });
-    await _loadPage(1);
+    await _loadPage(1, gen: gen);
   }
 
   String get _currentKeyword => _searchCtrl.text.trim();
@@ -237,16 +381,19 @@ class _UpownerPageState extends State<UpownerPage> {
   }
 
   /// 加载指定页视频（page=1 时也走这里，_videos 已在 _loadFirstPage 清空）。
-  Future<void> _loadPage(int pn) async {
-    setState(() => _loadingMore = true);
+  ///
+  /// 失败自动重试（v2.17.8）：B 站 space wbi 接口对匿名/高频请求有间歇
+  /// 风控（-352/-412，实测等待后重试即恢复）——指数退避（失败后等 1s →
+  /// 再失败等 2s）最多重试 2 次，仍失败才落错误态（首屏整页错误+重试 /
+  /// 翻页静默），把用户手动「重试几次才正常」吸收掉。重试期间 [_loadingMore]
+  /// 保持 true（转圈），不会并发重复；[gen] 代际变化（用户切搜索/排序）或
+  /// 页面销毁时放弃在途重试。
+  Future<void> _loadPage(int pn, {int? gen}) async {
+    final current = gen ?? _listGen;
+    if (!_loadingMore) setState(() => _loadingMore = true);
     try {
-      final result = await _api.fetchUpownerVideos(
-        widget.mid,
-        pn: pn,
-        order: _order,
-        keyword: _currentKeyword,
-      );
-      if (!mounted) return;
+      final result = await _fetchVideosWithRetry(pn, current);
+      if (!mounted || current != _listGen) return;
       // 接口 keyword 参数在部分环境下不生效（B 站风控/接口行为变化，实测
       // keyword=AI 仍返回未过滤列表），客户端按标题子串兜底过滤，保证搜索可用。
       final filtered = filterUpownerVideosByKeyword(
@@ -260,6 +407,10 @@ class _UpownerPageState extends State<UpownerPage> {
         for (final v in filtered)
           if (!existing.contains(v.bvid)) v,
       ];
+      // 资料兜底：acc/info 被风控拿不到名字/简介时，用列表作者名填头部
+      // （粉丝数已由 stat 独立拿到时也一并保留）——匿名下 UP 主页不至于
+      // 标题空/头像问号。
+      final listAuthor = filtered.isNotEmpty ? filtered.first.upName : '';
       setState(() {
         _videos
           ..clear()
@@ -267,19 +418,53 @@ class _UpownerPageState extends State<UpownerPage> {
         _page = pn;
         _hasMore = result.hasMore;
         _loadingMore = false;
+        _error = null;
+        final curInfo = _info;
+        if (listAuthor.isNotEmpty &&
+            (curInfo == null || curInfo.name.isEmpty)) {
+          _info = UpownerInfo(
+            name: listAuthor,
+            face: curInfo?.face ?? '',
+            fans: curInfo?.fans,
+            sign: curInfo?.sign ?? '',
+          );
+        }
       });
     } on BiliApiException catch (e) {
-      if (!mounted) return;
+      if (!mounted || current != _listGen) return;
       setState(() {
         _loadingMore = false;
         _error = e.message;
       });
     } on DioException {
-      if (!mounted) return;
+      if (!mounted || current != _listGen) return;
       setState(() {
         _loadingMore = false;
         _error = '网络请求失败，请检查网络后重试';
       });
+    }
+  }
+
+  /// 视频列表请求 + 自动重试（指数退避 1s → 2s，共 3 次尝试）。
+  ///
+  /// [gen] 代际不一致（用户在此期间切了搜索/排序，或重进首屏）或页面销毁
+  /// 时不再等退避，直接抛出（由 [_loadPage] 按代际丢弃，不落错误态）。
+  Future<UpownerVideosPage> _fetchVideosWithRetry(int pn, int gen) async {
+    const delays = [Duration(seconds: 1), Duration(seconds: 2)];
+    for (var attempt = 0; ; attempt++) {
+      try {
+        return await _api.fetchUpownerVideos(
+          widget.mid,
+          pn: pn,
+          order: _order,
+          keyword: _currentKeyword,
+        );
+      } catch (_) {
+        if (attempt >= delays.length) rethrow;
+        if (!mounted || gen != _listGen) rethrow; // 放弃在途重试
+        await Future<void>.delayed(delays[attempt]);
+        if (!mounted || gen != _listGen) rethrow;
+      }
     }
   }
 
