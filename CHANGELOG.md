@@ -8,6 +8,26 @@
 
 ---
 
+## v2.17.6 (2026-09-08)
+
+**评论视频链接带进度跳转：正文贴 `?p=` / `?t=` 分享链接可跳到指定分 P 与进度**
+
+B 站评论**没有专用的「跳转进度」标签**（web 评论仅纯文本链接），评论里想指到「某视频某分 P 的某个时刻」时，惯例是贴一条带 `?p=`/`?t=` 的完整分享链接（web 播放器直接支持这两种参数）。本版让 App 端评论链接同样认这两种参数：点击后**先跳对应分 P、再定位到指定进度**（覆盖该集的记忆进度——「链接定位」语义优先于「历史续播」）。
+
+- **链接解析（`app/lib/utils/comment_links.dart`）**：新增纯函数 `parseVideoLinkPosition(url)`——解析完整视频 URL 的 `?p=<分P号 1起>` 与 `?t=<秒>`，输出 `pageIndex`（0 起）/ `positionMs`（毫秒）；`CommentLink` 新增这两个字段（video/b23 分类携带，裸 BV / 无参数链接 = null 维持旧行为）。**`t` 支持格式**：纯数字秒（整数 / 小数，如 `129`、`129.0`）与带单位 `Xs` / `XmYs`（如 `30s`、`2m5s`=125s，分/秒均可小数）——`mm:ss` 冒号与 `XhYmZs` 等其余格式**不支持**（保守按无 t 处理，避免错误定位）。`p`/`t` 越界不在解析层钳制（解析时不知道实际 pages），由播放端按实际集数/时长兜底。b23 短链：点击 resolveShortLink 后按**最终落点 URL** 再分类，天然拿到落点的 `p`/`t`。单测覆盖全部格式与非法/越界边界
+- **播放页初始定位（`app/lib/pages/player_page.dart`）**：`PlayerPage` 新增可选 `initialPositionMs`——>0 时首次 onPrepared **直接 seek 到该位置并覆盖该集记忆进度**（不弹「已从上次…继续」）；null/<=0 保持原记忆进度恢复。内部引入一次性 `_pendingSeekMs`（用掉即清）：同视频跳分 P（`_switchToPage` 增可选 `seekMs`）、播放器未就绪时的入队定位都走它，切集/内部换源会显式清除防过期定位串台
+- **评论点击分发（`app/lib/widgets/comment_list.dart` / `app/lib/pages/comment_page.dart`）**：`onOpenVideo`/`onNavigateToVideo` 回调新增 `pageIndex`/`positionMs` 命名参数（typedef `OpenCommentVideo`）；`_previewVideo` 把链接携带的 p/t 一路透传（b23 落点同）。分发语义（`openVideoInNewPlayer`）：
+  - **带 p/t** = 明确的「跳到该视频该分P该时间」：**同 bvid → 本页内跳**（目标集=当前集 → 直接 seek t；其他分 P 且本页 pages 覆盖 → `_switchToPage` 切集 + 定位；pages 覆盖不了 → 兜底叠新页）；**异 bvid → 叠新播放页**并传 `initialPageIndex`+`initialPositionMs`（新页首次定位覆盖其记忆进度）
+  - **无参数**：完全维持 v2.17.1 行为（同 bvid 正播第 1 集跳过、其余 push 新页从开头播）
+  - **取舍**：同 bvid 带参用「本页内跳」而非叠新页——返回键语义仍是「回上一个视频」、省一个播放器实例（防双音轨机制只对叠页需要），且与选集 UI 的原地切集体验一致；无回调兜底 push 同样透传定位参数
+- 验证：解析与分发逻辑由单测/行为测试覆盖（定位 seek 目标在 widget 测试中通过
+  播放器通道日志断言：initialPositionMs → `seekTo 120000`、同 bvid 切分P →
+  `seekTo 30000`、同集带 t → `seekTo 45000`，均覆盖对应集记忆进度）；debug
+  APK 装机模拟器冷启动回归：进程正常、无崩溃/无 Dart 异常（真实评论里带
+  `?p/?t` 链接样本难找，见 README 已知限制说明，点击链路由同一套分发代码承担）
+
+---
+
 ## v2.17.5 (2026-09-08)
 
 **B 站收藏夹 → 白名单互通（导入方向 MVP）：登录后把自己的收藏夹一键批量导入白名单**

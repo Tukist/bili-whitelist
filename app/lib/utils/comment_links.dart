@@ -1,4 +1,4 @@
-/// 评论正文链接识别与分类（v2.16.19+）。
+/// 评论正文链接识别与分类（v2.16.19+；v2.17.6+ 视频链接带 ?p/?t 定位解析）。
 ///
 /// 纯 Dart 无 Flutter 依赖（可单测）。职责：
 /// - [splitCommentLinks]：把评论正文（纯文本，已由 decodeCommentMessage 清洗）
@@ -6,7 +6,12 @@
 ///   （链接段蓝色下划线可点，纯文本段原样显示）。
 /// - [classifyUrl]：把单个链接字符串分类成站内可跳转的目标（视频 BV /
 ///   b23 短链 / UP 主页 / 番剧 / 其他通用链接），分类为纯正则（可单测）；
-///   b23 短链**不在此处网络解析**（随机短码需重定向，点击时再解析）。
+///   b23 短链**不在此处网络解析**（随机短码需重定向，点击时再解析，落点
+///   再经 [classifyUrl] 拿到定位参数）。
+/// - [parseVideoLinkPosition]：解析完整视频链接 query 的 `?p=`（分 P 序号，
+///   1 起）与 `?t=`（进度：纯数字秒/小数、`Xs`、`XmYs`）→ 0 起 pageIndex +
+///   毫秒 positionMs；无/非法参数返回 null（维持旧行为）。点击分发据此
+///   「跳分 P + 定位进度」（B 站评论无专用跳转标签，正文贴分享链接实现）。
 ///
 /// 识别的链接形态（与需求正则覆盖一致）：
 /// - 完整视频链接：`https?://(www.|m.)?bilibili.com/video/BVxxxxx...`
@@ -54,12 +59,26 @@ class CommentLink {
   /// [kind]=bangumi 时的引用串（`ep<id>` / `ss<id>`，仅提示用）。
   final String? bangumiRef;
 
+  /// [kind]=video/b23 链接携带的**跳转定位参数**（v2.17.6+ 解析 B 站分享链接
+  /// query 的 `?p=`（分 P 序号，1 起）与 `?t=`（进度秒），见
+  /// [parseVideoLinkPosition]；裸 BV / 无参数链接 → 均为 null）。
+  ///
+  /// - [pageIndex]：目标分 P 下标（0 起；`p=1` → 0 = 首集，有 p 即非 null）。
+  /// - [positionMs]：目标进度（毫秒；有 t 且格式合法才非 null）。
+  ///
+  /// 点击分发语义：带参 → 「跳到该视频该分 P 该时间」（见 comment_list/
+  /// player_page 分发注释）；无参 → 维持旧行为（从目标视频开头/记忆进度）。
+  final int? pageIndex;
+  final int? positionMs;
+
   const CommentLink({
     required this.kind,
     required this.raw,
     this.bvid,
     this.upMid,
     this.bangumiRef,
+    this.pageIndex,
+    this.positionMs,
   });
 
   @override
@@ -139,6 +158,57 @@ String _trimUrlPunct(String raw) {
   }
 }
 
+/// 解析完整视频 URL 携带的「分 P + 进度」跳转参数（纯解析，无网络）。
+///
+/// 对应 B 站 web 播放器分享链接的 `?p=<分P序号(1起)>&t=<秒>`：
+/// - `p`：整数分 P 号 → 返回 pageIndex（0 起）；缺失/非数字/<=0 → null。
+/// - `t`：进度秒 → positionMs（毫秒，支持小数）。支持两种形态：
+///   1) 纯数字秒：整数或小数（如 `129`、`129.0`）；
+///   2) 带单位：`Xs`（如 `30s`）/ `XmYs`（如 `2m5s` = 125s，分/秒均可小数）。
+///   其余格式（`mm:ss` 冒号、`XhYmZs`、负值等）→ null（保守：超出支持范围
+///   按无 t 处理，从视频开头/记忆进度播，避免错误定位）。
+///
+/// 返回值：pageIndex/positionMs 可为 null（无对应参数/非法 = 维持旧行为）；
+/// p/t 越界（如 p 超过实际分 P 数）在此**不做钳制**——解析时不知道 pages，
+/// 由播放端 initState/切集处按实际集数钳制。
+({int? pageIndex, int? positionMs}) parseVideoLinkPosition(String url) {
+  int? pageIndex;
+  int? positionMs;
+  final uri = Uri.tryParse(url);
+  if (uri == null) return (pageIndex: null, positionMs: null);
+  final p = uri.queryParameters['p'];
+  if (p != null && p.isNotEmpty) {
+    final n = int.tryParse(p);
+    if (n != null && n >= 1) pageIndex = n - 1; // p 是 1 起序号 → 0 起下标
+  }
+  final t = uri.queryParameters['t'];
+  if (t != null && t.isNotEmpty) {
+    final sec = _parseTSeconds(t);
+    if (sec != null && sec > 0) positionMs = (sec * 1000).round();
+  }
+  return (pageIndex: pageIndex, positionMs: positionMs);
+}
+
+/// 解析 B 站进度参数 `t` → 秒（double，支持小数）。支持范围见
+/// [parseVideoLinkPosition] 注释；格式不支持 → null。
+double? _parseTSeconds(String t) {
+  final s = t.trim();
+  // 纯数字秒：整数 / 小数（`129`、`129.0`）
+  if (RegExp(r'^\d+(\.\d+)?$').hasMatch(s)) return double.tryParse(s);
+  // `Xs`：纯秒带单位（`30s`）
+  final sOnly = RegExp(r'^(\d+(\.\d+)?)s$', caseSensitive: false).firstMatch(s);
+  if (sOnly != null) return double.tryParse(sOnly.group(1)!);
+  // `XmYs`：分+秒（`2m5s`、`2m5.5s`）
+  final mAndS =
+      RegExp(r'^(\d+)m(\d+(\.\d+)?)s$', caseSensitive: false).firstMatch(s);
+  if (mAndS != null) {
+    final min = int.tryParse(mAndS.group(1)!);
+    final sec = double.tryParse(mAndS.group(2)!);
+    if (min != null && sec != null) return min * 60.0 + sec;
+  }
+  return null;
+}
+
 /// 把单个链接字符串分类为 [CommentLink]（纯正则，无网络）。
 ///
 /// [raw] 可以是带协议头的完整 URL，也可以是无协议头的裸引用
@@ -152,7 +222,15 @@ CommentLink? classifyUrl(String raw) {
   final bvid =
       _videoBvidRe.firstMatch(url)?.group(1) ?? _bareBvidRe.firstMatch(url)?.group(0);
   if (bvid != null) {
-    return CommentLink(kind: CommentLinkKind.video, raw: url, bvid: bvid);
+    // 完整视频链接带 ?p/?t 才解析定位参数；裸 BV 号无查询串，天然 null
+    final pos = parseVideoLinkPosition(url);
+    return CommentLink(
+      kind: CommentLinkKind.video,
+      raw: url,
+      bvid: bvid,
+      pageIndex: pos.pageIndex,
+      positionMs: pos.positionMs,
+    );
   }
 
   // 2) b23 短链（随机短码；识别到即分类为 b23，落点点击时解析）

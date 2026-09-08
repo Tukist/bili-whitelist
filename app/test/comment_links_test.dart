@@ -190,4 +190,151 @@ void main() {
       expect(classifyUrl(''), isNull);
     });
   });
+
+  group('parseVideoLinkPosition ?p/?t 定位参数解析（v2.17.6+）', () {
+    test('?p=2&t=129.0 → pageIndex=1 + positionMs=129000（p 1起转0起、t 小数秒）', () {
+      final pos = parseVideoLinkPosition(
+          'https://www.bilibili.com/video/BV1GJ411x7h7/?p=2&t=129.0');
+      expect(pos.pageIndex, 1);
+      expect(pos.positionMs, 129000);
+    });
+
+    test('?p=1 → pageIndex=0（首集，等同默认）', () {
+      final pos = parseVideoLinkPosition(
+          'https://www.bilibili.com/video/BV1GJ411x7h7?p=1');
+      expect(pos.pageIndex, 0);
+      expect(pos.positionMs, isNull);
+    });
+
+    test('t 整数秒无单位（?t=129）→ 129000ms', () {
+      final pos = parseVideoLinkPosition(
+          'https://www.bilibili.com/video/BV1GJ411x7h7?t=129');
+      expect(pos.pageIndex, isNull);
+      expect(pos.positionMs, 129000);
+    });
+
+    test('t=Xs / t=XmYs 带单位形式（30s、2m5s、2m5.5s）', () {
+      expect(
+        parseVideoLinkPosition(
+                'https://www.bilibili.com/video/BV1GJ411x7h7?t=30s')
+            .positionMs,
+        30000,
+      );
+      expect(
+        parseVideoLinkPosition(
+                'https://www.bilibili.com/video/BV1GJ411x7h7?t=2m5s')
+            .positionMs,
+        125000,
+      );
+      expect(
+        parseVideoLinkPosition(
+                'https://www.bilibili.com/video/BV1GJ411x7h7?p=3&t=1m30s')
+            .positionMs,
+        90000,
+      );
+      expect(
+        parseVideoLinkPosition(
+                'https://www.bilibili.com/video/BV1GJ411x7h7?t=2m5.5s')
+            .positionMs,
+        125500,
+      );
+    });
+
+    test('无 p/t 参数 / 空查询 → 双 null（维持全视频/记忆行为）', () {
+      expect(
+        parseVideoLinkPosition('https://www.bilibili.com/video/BV1GJ411x7h7'),
+        (pageIndex: null, positionMs: null),
+      );
+      expect(
+        parseVideoLinkPosition(
+            'https://www.bilibili.com/video/BV1GJ411x7h7?vd_source=abc'),
+        (pageIndex: null, positionMs: null),
+      );
+      // 裸 BV 号（正文引用形态）也没有定位参数
+      expect(
+        parseVideoLinkPosition('BV1GJ411x7h7'),
+        (pageIndex: null, positionMs: null),
+      );
+    });
+
+    test('多 P 边界：p 大序号原样保留（越界钳制留给播放端实际集数）', () {
+      final pos = parseVideoLinkPosition(
+          'https://www.bilibili.com/video/BV1GJ411x7h7?p=10&t=60');
+      expect(pos.pageIndex, 9);
+      expect(pos.positionMs, 60000);
+    });
+
+    test('非法参数按无处理：p=0/负数/非数字、t 空/负/字母/冒号/小时制', () {
+      // p 非法 → pageIndex null（不分 P）；t 不受影响
+      for (final p in ['0', '-1', 'abc']) {
+        final pos =
+            parseVideoLinkPosition('https://www.bilibili.com/video/BV1xx?p=$p&t=10');
+        expect(pos.pageIndex, isNull, reason: 'p=$p 应判无分P');
+        expect(pos.positionMs, 10000);
+      }
+      // t 非法（格式不支持：冒号 mm:ss / XhYmZs / 空 / 负 / 纯字母）→ null
+      for (final t in ['', '-5', 'abc', '2:05', '1h2m3s']) {
+        final pos = parseVideoLinkPosition(
+            'https://www.bilibili.com/video/BV1xx?t=$t');
+        expect(pos.positionMs, isNull, reason: 't=$t 应判无进度');
+      }
+    });
+
+    test('m./无协议头完整视频链接同样解析（www/m/裸 host 均带 query）', () {
+      expect(
+        parseVideoLinkPosition('https://m.bilibili.com/video/BV1GJ411x7h7?p=2&t=129.0'),
+        (pageIndex: 1, positionMs: 129000),
+      );
+      expect(
+        parseVideoLinkPosition('m.bilibili.com/video/BV1GJ411x7h7?p=2&t=129.0'),
+        (pageIndex: 1, positionMs: 129000),
+      );
+      expect(
+        parseVideoLinkPosition('www.bilibili.com/video/BV1GJ411x7h7?t=2m5s'),
+        (pageIndex: null, positionMs: 125000),
+      );
+    });
+  });
+
+  group('CommentLink 携带定位参数（video 链接 ?p/?t → 点击分发用）', () {
+    test('完整视频链接 + ?p/?t → kind=video 且带 pageIndex/positionMs', () {
+      final link = classifyUrl(
+          'https://www.bilibili.com/video/BV1GJ411x7h7?p=2&t=129.0');
+      expect(link!.kind, CommentLinkKind.video);
+      expect(link.bvid, 'BV1GJ411x7h7');
+      expect(link.pageIndex, 1);
+      expect(link.positionMs, 129000);
+    });
+
+    test('splitCommentLinks 拆分后链接段保留 ?p/?t 参数', () {
+      final segs = splitCommentLinks(
+          '推荐 https://m.bilibili.com/video/BV1GJ411x7h7?p=2&t=30s 这段');
+      expect(segs.length, 3);
+      final link = segs[1].link!;
+      expect(link.kind, CommentLinkKind.video);
+      expect(link.pageIndex, 1);
+      expect(link.positionMs, 30000);
+      // 纯文本段不受影响
+      expect(segs[0].text, '推荐 ');
+      expect(segs[2].text, ' 这段');
+    });
+
+    test('无参数视频链接 / 裸 BV → pageIndex/positionMs 均 null（维持旧行为）', () {
+      expect(classifyUrl('https://www.bilibili.com/video/BV1GJ411x7h7')!.pageIndex,
+          isNull);
+      expect(classifyUrl('https://www.bilibili.com/video/BV1GJ411x7h7')!.positionMs,
+          isNull);
+      expect(classifyUrl('BV1fK4y1s7Uz')!.pageIndex, isNull);
+      expect(classifyUrl('BV1fK4y1s7Uz')!.positionMs, isNull);
+    });
+
+    test('非 video 分类（b23/up/番剧/other）不带定位参数', () {
+      expect(classifyUrl('https://b23.tv/spVKBAi')!.pageIndex, isNull);
+      expect(classifyUrl('https://space.bilibili.com/42')!.pageIndex, isNull);
+      expect(
+          classifyUrl('https://www.bilibili.com/bangumi/play/ep123456')!.positionMs,
+          isNull);
+      expect(classifyUrl('https://example.com/a?p=2&t=30s')!.positionMs, isNull);
+    });
+  });
 }

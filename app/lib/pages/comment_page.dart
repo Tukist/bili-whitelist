@@ -5,11 +5,13 @@
 /// 本页职责仅剩：Scaffold + AppBar「评论 N」标题，正文交给
 /// [CommentListView]（置顶/分页/楼中楼/图片放大保存/链接跳转见其文档）。
 ///
-/// 评论内视频链接（v2.17.1+ 跳转语义，阶段 B）：
+/// 评论内视频链接（v2.17.1+ 跳转语义，阶段 B；v2.17.6+ 支持 ?p/?t 定位跳）：
 /// - 播放页打开本站（传 [CommentPage.onNavigateToVideo]）→ 点视频链接时
 ///   先 pop 本站回播放页（薄壳在栈中移出，让播放页重新成为顶层），再回调
 ///   播放页 push 新播放页——新播放页叠上时旧页经 RouteAware（路由名
-///   'player'）自动暂停防双音轨，返回后旧页恢复续播；
+///   'player'）自动暂停防双音轨，返回后旧页恢复续播；链接带 ?p/?t（v2.17.6+）
+///   时回调携带 pageIndex/positionMs，宿主按「同 bvid 本页跳分P进度 / 异
+///   bvid 新播放页带初始定位」处理（见 player_page.openVideoInNewPlayer）；
 /// - 无回调（本站独立打开，当前无任何入口会这样——只有播放页会 push 本站）
 ///   → CommentListView 兜底直接 push 新 PlayerPage（说明：若真有宿主播放页
 ///   在下方且未传回调，兜底叠页不会触发旧页暂停，仍有双音轨隐患；取舍：
@@ -31,14 +33,15 @@ class CommentPage extends StatefulWidget {
   final int? initialAid;
 
   /// 可选：评论内视频链接的回调（v2.16.23+ 换源回调 → v2.17.1+ 改为跳转
-  /// 回调 [CommentPage.onNavigateToVideo]）。
+  /// 回调 [CommentPage.onNavigateToVideo]；v2.17.6+ 链接带 ?p/?t 时随回调
+  /// 携带 pageIndex/positionMs 定位参数，见 [OpenCommentVideo]）。
   ///
   /// 由播放页传入（评论页叠在播放页上打开时）：点视频链接 → **先 pop 本站
   /// 回播放页**，再回调播放页 push 新播放页（播放页 RouteAware 自动暂停旧
   /// 页防双音轨，返回后续播；语义见 player_page._openVideoInNewPlayer）。
   /// 为 null（评论页从其他入口独立打开，当前无此场景）→ CommentListView
   /// 兜底 push 新 PlayerPage 预览播放。
-  final void Function(WhitelistVideo video)? onNavigateToVideo;
+  final OpenCommentVideo? onNavigateToVideo;
 
   const CommentPage({
     super.key,
@@ -55,19 +58,27 @@ class _CommentPageState extends State<CommentPage> {
   /// 评论总数（标题「评论 N」用；由列表 onCountChanged 回报）。
   int _total = 0;
 
-  /// 视频链接跳转包装（v2.17.1+ 语义）：
+  /// 视频链接跳转包装（v2.17.1+ 语义；v2.17.6+ 转发 ?p/?t 定位参数）：
   /// 1. 先 pop 本站（薄壳移出栈 → 下方播放页 P 重新成为顶层）；
   /// 2. 再回调宿主 P「push 新播放页」——P2 叠上时 P 经 didPushNext 自动
   ///    暂停并记进度（无双音轨）；P2 返回 → P didPopNext 恢复续播。
   /// 顺序不能反：若先 push P2 再 pop 本站，P 不会收到 didPushNext（P2 叠在
   /// C 上而非 P 上），且本站 pop 会让 P 误触发 didPopNext → P 未停即出声。
-  void _onOpenVideo(WhitelistVideo video) {
+  /// 链接带 ?p/?t（pageIndex/positionMs 非 null）→ 一并转发，宿主据此定位
+  /// （同 bvid 本页跳 / 异 bvid 新页带初始定位，见 player_page）。
+  void _onOpenVideo(
+    WhitelistVideo video, {
+    int? pageIndex,
+    int? positionMs,
+  }) {
     final onNav = widget.onNavigateToVideo;
     if (onNav == null) return;
-    debugPrint('[comment_page] 评论链接 bvid=${video.bvid} → '
+    debugPrint('[comment_page] 评论链接 bvid=${video.bvid}'
+        '${pageIndex != null ? ' p=${pageIndex + 1}' : ''}'
+        '${positionMs != null ? ' t=${positionMs}ms' : ''} → '
         '先关本页，再交由播放页 push 新播放页');
     if (mounted) Navigator.of(context).pop();
-    onNav(video);
+    onNav(video, pageIndex: pageIndex, positionMs: positionMs);
   }
 
   @override

@@ -427,10 +427,18 @@ class PlayerPage extends StatefulWidget {
   /// 默认 0 = 第一集/单 P）。
   final int initialPageIndex;
 
+  /// 初始定位进度（毫秒；评论视频链接 ?t / 跳转定位用，v2.17.6+）。
+  ///
+  /// >0 时首次 onPrepared 直接 seek 到该位置并**覆盖记忆进度**（语义=「跳到
+  /// 链接指定的进度」，不弹「已从上次…继续」——用户明确要这个位置）；
+  /// null/<=0 = 保持原有记忆进度恢复行为。
+  final int? initialPositionMs;
+
   const PlayerPage({
     super.key,
     required this.video,
     this.initialPageIndex = 0,
+    this.initialPositionMs,
   });
 
   @override
@@ -664,6 +672,14 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
   /// URL 过期续播等自动换源不置 true（沿用续播位置，不被记忆覆盖）。
   bool _pendingRestore = true;
 
+  /// 下一次 onPrepared 时**直接定位**的位置（毫秒；>0 时优先于记忆进度，见
+  /// [_maybeRestoreProgress]；null = 走记忆）。来源（v2.17.6+ 评论 ?t 跳转）：
+  /// - PlayerPage.initialPositionMs（链接 ?t 跳新视频/历史入口）；
+  /// - 同 bvid 链接带 t 的本页跳：切集（_switchToPage seekMs）或当前集播放器
+  ///   未就绪（_seekCurrentTo 先入队，等 onPrepared 定位）。
+  /// 一次性消费：_maybeRestoreProgress 用掉即置 null（此后恢复记忆进度）。
+  int? _pendingSeekMs;
+
   /// 500ms tick 计数：每 20 次（=10s）定时保存一次进度（防杀进程丢失）。
   int _tickCount = 0;
 
@@ -697,6 +713,10 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     _currentPageIndex = widget.initialPageIndex < 0
         ? 0
         : (widget.initialPageIndex > maxIdx ? maxIdx : widget.initialPageIndex);
+    // 评论 ?t 跳转初始定位（v2.17.6+）：>0 时首次 onPrepared 直接 seek 到该处，
+    // 覆盖该集记忆进度（链接定位语义优先于历史记忆）。
+    final initialMs = widget.initialPositionMs;
+    if (initialMs != null && initialMs > 0) _pendingSeekMs = initialMs;
     // 监听缓存状态变化（下载进度/完成/删除），驱动下载按钮与进度刷新
     _downloads.cached.addListener(_onCacheStateChanged);
     _downloads.tasks.addListener(_onCacheStateChanged);
@@ -1476,13 +1496,28 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
         '${_video.bvid}#$_currentPageIndex');
   }
 
-  /// onPrepared 后尝试恢复记忆进度（仅首次进入 / 切集 / 手动重试后）：
-  /// - 无记忆或 <=5s → 从头播，不打扰
-  /// - 距结尾 <3s → 视为已看完，清除记忆后从头播
-  /// - 其余 → seekTo(记忆位置)（不打断自动播放）+ SnackBar「从头播放」action
+  /// onPrepared 后定位（仅首次进入 / 切集 / 手动重试后触发）：
+  /// - 带明确的 ?t 定位（[_pendingSeekMs]，评论链接跳转 / initialPositionMs
+  ///   v2.17.6+）→ 直接 seek 到该位置（**覆盖记忆进度**）且不弹「已从上次…
+  ///   继续」（用户明确要链接指定的位置，无需打扰）；超出当前集时长按结尾
+  ///   处理（与 B 站 web 相同：贴结尾从末尾附近播）。
+  /// - 否则按记忆进度恢复：无记忆或 <=5s → 从头播，不打扰；距结尾 <3s →
+  ///   视为已看完，清除记忆后从头播；其余 → seekTo(记忆位置) + SnackBar
+  ///   「从头播放」action。
   Future<void> _maybeRestoreProgress(int durationMs) async {
     if (!_pendingRestore) return;
     _pendingRestore = false;
+    final overrideMs = _pendingSeekMs;
+    _pendingSeekMs = null; // 一次性消费：本次定位用掉即清（之后回到记忆进度）
+    if (overrideMs != null && overrideMs > 0) {
+      var target = overrideMs;
+      final maxMs = durationMs - 1000;
+      if (maxMs > 0 && target > maxMs) target = maxMs;
+      debugPrint('[player_page] 按链接/入参定位 seekTo $target ms '
+          '${_video.bvid}#$_currentPageIndex');
+      await _player?.seekTo(target);
+      return;
+    }
     final store = _progressStore;
     if (store == null) return;
     final saved = store.getProgress(_video.bvid, _currentPageIndex);
@@ -2043,36 +2078,143 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     }
   }
 
-  /// 评论内视频链接（内嵌评论区 / 独立评论页 [CommentPage]）→ **push 新
-  /// 播放页**（v2.17.1+ 语义，替换 v2.16.23+ 的「playVideo 当前页换源」）。
+  /// 评论内视频链接（内嵌评论区 / 独立评论页 [CommentPage]）点击分发
+  /// （v2.17.1+ 跳转语义 → v2.17.6+ 支持 ?p/?t 定位）。
   ///
-  /// 行为：先 [_pauseBeforePushingNewPlayer] 暂停本页（旧视频 A）并保存
-  /// 进度（无双音轨），再在路由栈上叠一个路由名为 [kPlayerRouteName] 的新
-  /// [PlayerPage]：
-  /// - 新页放视频 B，进度/历史独立；
-  /// - 用户在新页返回 → 本页 [didPopNext] **恢复 A 续播**（从离开处）。
+  /// [pageIndex]（0 起分 P）/ [positionMs]（毫秒进度）来自链接 query ?p/?t
+  /// （见 utils/comment_links.dart；无参数链接两者均 null）。分发语义：
   ///
-  /// playVideo 换源语义保留给多 P 切集等**内部**换源场景（不再由评论触发）。
+  /// **无定位参数**（维持 v2.17.1+ 行为）：
+  /// - 同 bvid 且在播第 0 集（点的是本视频自身第 1 集链接）→ 不暂停不叠页；
+  /// - 其余 → 叠新 [PlayerPage]（从目标视频开头播，进度/历史独立；返回 →
+  ///   本页 [didPopNext] 恢复 A 续播）。
   ///
-  /// 同 bvid 且在播第 0 集（点的是本视频自身，如多 P 视频评论区里的第 1 集
-  /// 链接）→ 不暂停不叠页（与 playVideo 同 bvid 判定一致）；多 P 时点自家
-  /// 其他分 P 的评论链接仍会叠页（播放该分 P 从其记忆进度开始）。
-  void openVideoInNewPlayer(WhitelistVideo video) {
+  /// **带 ?p/?t**（v2.17.6+，语义 = 「跳到该视频该分 P 该时间」，链接定位
+  /// 优先于记忆进度）：
+  /// - 同 bvid：**本页内跳**（[_switchToPage] 切分 P + [_seekCurrentTo] 定位
+  ///   t）——不叠页不打断，返回键仍回上一个视频、省一个播放器实例（取舍：
+  ///   多 P 视频评论区点自家另一集链接 = 原地切集，与选集 UI 一致；详见
+  ///   分发注释）；目标分 P 超出本页已加载 pages 时兜底叠新页（新页拿到的
+  ///   video 自带全量 pages，initState 会按实际集数钳制）。
+  /// - 不同 bvid：叠新 [PlayerPage] 并传 initialPageIndex + initialPositionMs
+  ///   （新页首次定位即覆盖其记忆进度——用户明确点了链接指定位置）。
+  ///
+  /// 叠页前先 [_pauseBeforePushingNewPlayer] 暂停本页（旧视频 A）并保存进度
+  /// （无双音轨）；返回 → 本页 [didPopNext] 恢复 A 续播。playVideo 换源语义
+  /// 保留给多 P 切集等**内部**换源场景（不再由评论触发）。
+  void openVideoInNewPlayer(
+    WhitelistVideo video, {
+    int? pageIndex,
+    int? positionMs,
+  }) {
     if (!mounted) return;
-    if (video.bvid == _video.bvid && _currentPageIndex == 0) {
-      debugPrint('[player_page] 评论链接同 bvid=${video.bvid}，跳过叠页');
+    final sameBvid = video.bvid == _video.bvid;
+    final hasJump = pageIndex != null || positionMs != null;
+
+    if (!hasJump) {
+      // 无 ?p/?t：维持 v2.17.1+ 语义（无定位 = 从目标视频开头播）
+      if (sameBvid && _currentPageIndex == 0) {
+        debugPrint('[player_page] 评论链接同 bvid=${video.bvid}，跳过叠页');
+        return;
+      }
+      _pushNewPlayer(video);
       return;
     }
+
+    // 带 ?p/?t → 明确「跳到该视频该分P该时间」
+    final targetIdx = pageIndex ?? _currentPageIndex; // 无 p 视为当前集
+    final pages = _pages;
+    final canSwitchInPlace =
+        pages != null && targetIdx >= 0 && targetIdx < pages.length;
+    if (sameBvid) {
+      if (targetIdx == _currentPageIndex) {
+        // 目标 = 正在播的集：只需定位 t（无 t → 原地无动作）
+        if (positionMs != null && positionMs > 0) {
+          debugPrint('[player_page] 评论链接同 bvid 同集带 t=${positionMs}ms，'
+              '本页定位');
+          unawaited(_seekCurrentTo(positionMs));
+        } else {
+          debugPrint('[player_page] 评论链接同 bvid 同集无 t，原地无动作');
+        }
+        return;
+      }
+      if (canSwitchInPlace) {
+        // 目标为其他分 P 且本页 pages 可覆盖 → 原地切集（t 交给切集后定位）
+        debugPrint('[player_page] 评论链接同 bvid 跳分P '
+            '$targetIdx${positionMs != null ? ' +t=${positionMs}ms' : ''}，'
+            '本页切集');
+        unawaited(_switchToPage(targetIdx, seekMs: positionMs));
+        return;
+      }
+      // 本页 pages 覆盖不了（单 P 数据缺 pages / 越界）：落到叠新页兜底
+    }
+    _pushNewPlayer(video,
+        initialPageIndex: targetIdx, initialPositionMs: positionMs);
+  }
+
+  /// 叠新 [PlayerPage]（评论链接跳不同视频 / 同 bvid 兜底共用）。
+  ///
+  /// [initialPageIndex]/[initialPositionMs] 只在链接带 ?p/?t 时非默认（由调用
+  /// 方按 [openVideoInNewPlayer] 的 pageIndex/positionMs 换算传入）：>0 分 P /
+  /// >0 进度 → 新页首备后直接定位（覆盖其记忆进度）；不带参时维持 v2.17.1+
+  /// 从开头播/记忆进度行为。
+  void _pushNewPlayer(
+    WhitelistVideo video, {
+    int initialPageIndex = 0,
+    int? initialPositionMs,
+  }) {
     debugPrint('[player_page] 评论链接 push 新播放页(name=$kPlayerRouteName) '
-        '${_video.bvid}#$_currentPageIndex -> ${video.bvid} '
+        '${_video.bvid}#$_currentPageIndex -> ${video.bvid}'
+        '${initialPageIndex != 0 ? ' p${initialPageIndex + 1}' : ''}'
+        '${initialPositionMs != null ? ' t=${initialPositionMs}ms' : ''} '
         'title=${video.title}');
     // 先暂停自己（防双音轨）+ 保存进度；再从自己头上叠新播放页。
     // 顺序不能反：若先 push，新页出声时本页还在播 → 双音轨瞬间成立。
     _pauseBeforePushingNewPlayer();
     Navigator.of(context).push(MaterialPageRoute<void>(
       settings: const RouteSettings(name: kPlayerRouteName),
-      builder: (_) => PlayerPage(video: video),
+      builder: (_) => PlayerPage(
+        video: video,
+        initialPageIndex: initialPageIndex,
+        initialPositionMs: initialPositionMs,
+      ),
     ));
+  }
+
+  /// 同视频同集带 t：把当前集定位到链接进度（覆盖记忆；[pageIndex] 未指定/
+  /// 等于当前集时由 [openVideoInNewPlayer] 调用）。
+  ///
+  /// - 播放器已就绪（loaded）→ 直接 seekTo（按当前集时长钳制贴结尾进度）；
+  /// - 首备/取流中（未 loaded 且 [_pendingRestore] 未消费）→ 先记
+  ///   [_pendingSeekMs]，等 onPrepared 时由 [_maybeRestoreProgress] 定位；
+  /// - 无播放器/错误态（不在可定位窗口）→ 忽略（保持现状，不强跳）。
+  Future<void> _seekCurrentTo(int positionMs) async {
+    final player = _player;
+    if (player == null || (!_loaded && !_pendingRestore)) {
+      debugPrint('[player_page] 同集 t 跳转跳过（player=${player != null} '
+          'loaded=$_loaded pendingRestore=$_pendingRestore）');
+      return;
+    }
+    if (!_loaded) {
+      // 首备未完成：并入队给 onPrepared 定位（此时时长未知，不预钳制）
+      _pendingSeekMs = positionMs;
+      debugPrint('[player_page] 同集 t 跳转入队（onPrepared 定位）'
+          ' ${_video.bvid}#$_currentPageIndex $positionMs ms');
+      return;
+    }
+    final target = _clampSeekPosition(positionMs);
+    debugPrint('[player_page] 评论链接同集跳进度 seekTo $target ms '
+        '${_video.bvid}#$_currentPageIndex');
+    await player.seekTo(target);
+    if (mounted) setState(() => _positionMs = target);
+  }
+
+  /// 把请求的定位进度钳到当前集时长内（留 1s 余量让播放器能自然触发完成；
+  /// 链接 t 超出时长/贴结尾 → 从末尾附近开始，与 B 站 web 语义一致）。
+  int _clampSeekPosition(int ms) {
+    final maxMs = _durationMs - 1000;
+    if (maxMs > 0 && ms > maxMs) return maxMs;
+    return ms;
   }
 
   // -------------------------------------------------------------------------
@@ -3140,13 +3282,19 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
   /// 切换选集：更新当前集 → 重新取流（position 从 0 开始）→
   /// 恢复倍速（换源后原生倍速被重置为 1x）；听视频状态为 Dart 状态自然保持。
   /// 取流失败按 _handleLoadFailure 分类提示（-412/62002/-101 等），不崩溃。
-  Future<void> _switchToPage(int index) async {
+  ///
+  /// [seekMs]（v2.17.6+ 评论 ?p/?t 同视频跳分 P）：>0 时切集后 onPrepared
+  /// 直接 seek 到该位置（覆盖该集记忆进度）；null = 切集后按该集记忆进度
+  /// 恢复（选集 UI 原行为）。无论哪种，都会清除上一次遗留的 [_pendingSeekMs]
+  /// 覆盖（防过期定位串到新集）。
+  Future<void> _switchToPage(int index, {int? seekMs}) async {
     final pages = _pages;
     if (pages == null || index < 0 || index >= pages.length) return;
     if (index == _currentPageIndex) return;
     debugPrint('[player_page] switchToPage ${index + 1}/${pages.length} '
         'cid=${pages[index].cid} part=${pages[index].part}');
     _pendingRestore = true; // 切集后 onPrepared 恢复新集记忆进度
+    _pendingSeekMs = (seekMs != null && seekMs > 0) ? seekMs : null;
     // 实时转写（sherpa）随集重置：停止 + 清句子（句子时间轴是当前集音频）
     _resetRealtime();
     setState(() {
@@ -3232,6 +3380,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     _resetRealtime();
     _expiredRetry = 0;
     _pendingRestore = true; // 新视频 onPrepared 恢复其记忆进度（同首次进入）
+    _pendingSeekMs = null; // 内部换源不带 ?t 覆盖（防旧定位串到新视频）
     setState(() {
       _video = video;
       _currentPageIndex = 0;

@@ -17,7 +17,9 @@
 ///   「push 新播放页」回调，v2.17.1+——旧页暂停防双音轨、返回续播，见
 ///   player_page._openVideoInNewPlayer）；无回调 → 兜底 push 新 PlayerPage
 ///   预览；UP 空间 → UP 主页；番剧/电影 → 提示搜索页导入；其他 http(s) →
-///   系统浏览器。拆分见 utils/comment_links.dart
+///   系统浏览器。拆分见 utils/comment_links.dart。视频链接带 **?p/?t 定位
+///   参数**（v2.17.6+，如 `.../BVxxx?p=2&t=129.0`）→ 跳转时定位到对应分 P
+///   与进度（同 bvid 本页跳、异 bvid 新播放页带初始定位，见分发注释）
 /// - 楼中楼：根评论内嵌至多 3 条预览（缩进小字）；「N 条回复」展开 →
 ///   拉完整楼中楼（`x/v2/reply/reply`，pn 递增分页，hasMore 继续加载）
 /// - 空态/错误态：暂无评论 / 评论区已关闭（12002）/ 网络与风控（可重试）
@@ -52,6 +54,19 @@ const Map<String, String> _imgHeaders = {
   'Referer': kBiliReferer,
 };
 
+/// 评论内视频链接点击回调：把目标视频交给宿主打开，可携带链接 ?p/?t 定位
+/// 参数（v2.17.6+；来源见 utils/comment_links.dart 的 CommentLink.pageIndex /
+/// positionMs）。
+///
+/// - [pageIndex]：目标分 P 下标（0 起；null = 无 p 参数 → 第 1 集/保持默认）；
+/// - [positionMs]：目标进度毫秒（null = 无 t 参数 → 从头/记忆进度）。
+/// 两参均 null 等价于旧版「只给视频」（维持全视频/记忆行为）。
+typedef OpenCommentVideo = void Function(
+  WhitelistVideo video, {
+  int? pageIndex,
+  int? positionMs,
+});
+
 /// 楼中楼展开的一页状态：已加载子回复 + 是否还有下一页 + 下次请求的 pn。
 class _ChildrenState {
   final List<CommentReply> replies;
@@ -74,15 +89,19 @@ class CommentListView extends StatefulWidget {
   /// 可选：外部已解析好的 aid（如播放页已有 view 数据），省一次请求。
   final int? initialAid;
 
-  /// 评论内视频链接的回调（语义由调用方定义，接口 v2.16.23+ 起不变）。
+  /// 评论内视频链接的回调（语义由调用方定义，接口 v2.17.1+ 起为「跳新播放
+  /// 页」，v2.17.6+ 携带 ?p/?t 定位参数，见 [OpenCommentVideo]）。
   ///
   /// 非 null（播放页内嵌 / 播放页打开的独立评论页传入）：点视频链接 →
   /// 回调交给宿主。v2.17.1+（阶段 B）播放页统一传「push 新播放页」语义：
   /// 内嵌场景本页不 pop、直接回调（新播放页叠上时宿主经 RouteAware 自动
   /// 暂停旧页）；独立评论页由 CommentPage 薄壳先 pop 自己再回调（让宿主
-  /// 重新成为顶层后叠页才能触发暂停）。
-  /// 为 null（独立打开、无宿主）→ 兜底 push 新 PlayerPage 预览播放。
-  final void Function(WhitelistVideo video)? onOpenVideo;
+  /// 重新成为顶层后叠页才能触发暂停）。链接带 ?p/?t（v2.17.6+）时随回调
+  /// 传 pageIndex/positionMs，宿主据此定位（同 bvid 本页跳 / 异 bvid 带初始
+  /// 进度 push，见 player_page.openVideoInNewPlayer）。
+  /// 为 null（独立打开、无宿主）→ 兜底 push 新 PlayerPage 预览播放（同样
+  /// 携带定位参数）。
+  final OpenCommentVideo? onOpenVideo;
 
   /// 评论总数变化回调（如独立页 AppBar「评论 N」标题；内嵌页如需在列表
   /// 外的固定区显示总数可复用；null = 不关心）。
@@ -369,7 +388,15 @@ class _CommentListViewState extends State<CommentListView> {
       case CommentLinkKind.video:
         final bvid = link.bvid;
         if (bvid != null) {
-          await _previewVideo(bvid, nav: nav, messenger: messenger);
+          // 链接带 ?p/?t（pageIndex/positionMs 非 null）→ 宿主据此跳分 P +
+          // 定位进度（分发语义见 player_page.openVideoInNewPlayer）
+          await _previewVideo(
+            bvid,
+            pageIndex: link.pageIndex,
+            positionMs: link.positionMs,
+            nav: nav,
+            messenger: messenger,
+          );
         }
       case CommentLinkKind.b23:
         await _resolveB23(link, nav: nav, messenger: messenger);
@@ -393,6 +420,10 @@ class _CommentListViewState extends State<CommentListView> {
 
   /// 视频预览播放：fetchVideoMeta 补全元数据 → **只播放，不加入白名单**。
   ///
+  /// [pageIndex]/[positionMs]（v2.17.6+，链接 ?p/?t）：非 null 时随回调/兜底
+  /// push 传给宿主播放页做定位（同 bvid 本页跳分P进度 / 异 bvid 新页带初始
+  /// 定位）；均为 null 维持旧行为。
+  ///
   /// - 有 [widget.onOpenVideo]（本列表由播放页内嵌 / 播放页打开的独立页传
   ///   入）→ 把视频交给宿主处理（v2.17.1+：播放页 push 新播放页，旧页经
   ///   RouteAware 暂停防双音轨、返回续播；独立页由薄壳先 pop 自己再回调）；
@@ -401,6 +432,8 @@ class _CommentListViewState extends State<CommentListView> {
   ///   仍会正确暂停，防双音轨）。
   Future<void> _previewVideo(
     String bvid, {
+    int? pageIndex,
+    int? positionMs,
     required NavigatorState nav,
     required ScaffoldMessengerState messenger,
   }) async {
@@ -414,15 +447,23 @@ class _CommentListViewState extends State<CommentListView> {
         // 宿主处理（push 新播放页，语义见 widget.onOpenVideo 文档；独立页
         // 薄壳在回调里已先 pop 自己）
         debugPrint('[comment_list] 视频链接回调宿主 bvid=$bvid '
-            'title=${video.title}');
-        onOpen(video);
+            'title=${video.title}'
+            '${pageIndex != null ? ' p=${pageIndex + 1}' : ''}'
+            '${positionMs != null ? ' t=${positionMs}ms' : ''}');
+        onOpen(video, pageIndex: pageIndex, positionMs: positionMs);
         return;
       }
       nav.push(MaterialPageRoute<void>(
         settings: const RouteSettings(name: kPlayerRouteName),
-        builder: (_) => PlayerPage(video: video),
+        builder: (_) => PlayerPage(
+          video: video,
+          initialPageIndex: pageIndex ?? 0,
+          initialPositionMs: positionMs,
+        ),
       ));
-      debugPrint('[comment_list] 链接预览播放 bvid=$bvid title=${video.title}');
+      debugPrint('[comment_list] 链接预览播放 bvid=$bvid title=${video.title}'
+          '${pageIndex != null ? ' p=${pageIndex + 1}' : ''}'
+          '${positionMs != null ? ' t=${positionMs}ms' : ''}');
     } on BiliApiException catch (e) {
       _tipSnack(messenger, '打开视频失败：${e.message}');
     } on DioException {

@@ -13,6 +13,9 @@
 // - CommentPage 有回调（onNavigateToVideo，由播放页传）：点评论视频链接 →
 //   pop 评论页 + 回调把新视频交给宿主（宿主 push 新播放页）
 // - CommentPage 无回调：点评论视频链接 → 兜底 push 新 PlayerPage（name 'player'）
+// - 链接带 ?p/?t 定位参数（v2.17.6+）：解析/回调透传 pageIndex+positionMs；
+//   异 bvid → 叠新播放页带 initialPageIndex/initialPositionMs；同 bvid → 本页
+//   定位/切集（不叠页不暂停）
 //
 // 测试环境说明（复用 speed_sheet_test 骨架 + 按路径路由的 HTTP fake）：
 // - mock 原生播放器 MethodChannel（create 返回递增 textureId、记录调用）
@@ -32,6 +35,7 @@ import 'package:bili_whitelist_app/main.dart';
 import 'package:bili_whitelist_app/models/whitelist_video.dart';
 import 'package:bili_whitelist_app/pages/comment_page.dart';
 import 'package:bili_whitelist_app/pages/player_page.dart';
+import 'package:bili_whitelist_app/widgets/comment_list.dart';
 
 /// 初始播放的视频 A（评论入口所在视频）。
 const String kVideoA = 'BV1AAAA11111';
@@ -58,6 +62,30 @@ WhitelistVideo _videoB() => const WhitelistVideo(
       upName: 'upB',
       addedAt: '2026-01-01',
     );
+
+/// 多 P 版视频 A（两集）——同 bvid 评论链接带 ?p 跳自家另一集（本页内切集）
+/// 的测试样本。
+WhitelistVideo _videoAMulti() => const WhitelistVideo(
+      bvid: kVideoA,
+      cid: 1001,
+      title: '视频A(多P)',
+      cover: '',
+      duration: 120,
+      upName: 'upA',
+      addedAt: '2026-01-01',
+      pages: [
+        PageInfo(cid: 1001, part: '第1集', duration: 120),
+        PageInfo(cid: 1002, part: '第2集', duration: 120),
+      ],
+    );
+
+/// 评论正文里带 ?p/?t 定位参数的完整视频链接（B 站 web 分享串形态：
+/// p=分P号(1起)、t=秒（可小数））。target：分 P 2 + 129s。
+const String kVideoBLinkP2T129 =
+    'https://www.bilibili.com/video/BV2BBBB22222?p=2&t=129.0';
+
+/// 同上但仅 ?t（无 p → 不分 P，只定位进度 45s）。
+const String kVideoBLinkT45 = 'https://www.bilibili.com/video/BV2BBBB22222?t=45';
 
 // ---------------------------------------------------------------------------
 // mock HTTP：flutter_test 默认把所有 HTTP 请求 mock 成 400 空响应，这里按
@@ -336,14 +364,18 @@ Map<String, dynamic> _replyJson({
       'content': {'message': message},
     };
 
+/// 可覆盖的评论正文（默认裸 BV 链接；带 ?p/?t 完整链接的分发用例改为完整
+/// 分享链接，见 ?p/?t 组）。测试顺序执行，用例开头设置即可。
+String _replyMessage = kVideoB;
+
 Map<String, dynamic> _replyMainBody() => {
       'code': 0,
       'message': 'success',
       'data': {
-        // 正文只含裸 BV 引用（评论里最常见的贴视频号形态）→ 整段渲染为
+        // 正文只含一个链接引用（默认裸 BV，或 ?p/?t 完整链接）→ 整段渲染为
         // 可点链接（RichText 单链接段，便于 tap 命中中心即链接）
         'replies': [
-          _replyJson(rpid: 5001, oid: 1001, message: kVideoB),
+          _replyJson(rpid: 5001, oid: 1001, message: _replyMessage),
         ],
         'top_replies': [],
         'cursor': {'next': 0, 'is_end': true, 'all_count': 1},
@@ -420,7 +452,7 @@ void _installEnv(WidgetTester tester, List<String> playerLog) {
 Future<void> _pushCommentPage(
   WidgetTester tester,
   GlobalKey<NavigatorState> navKey, {
-  void Function(WhitelistVideo video)? onNavigateToVideo,
+  OpenCommentVideo? onNavigateToVideo,
 }) async {
   navKey.currentState!.push(MaterialPageRoute<void>(
     builder: (_) => CommentPage(
@@ -505,7 +537,8 @@ void main() {
         navigatorKey: navKey,
         home: const Scaffold(body: Center(child: Text('宿主页'))),
       ));
-      await _pushCommentPage(tester, navKey, onNavigateToVideo: (v) {
+      await _pushCommentPage(tester, navKey, onNavigateToVideo: (v,
+          {int? pageIndex, int? positionMs}) {
         opened = v;
       });
       expect(find.byType(CommentPage), findsOneWidget);
@@ -608,7 +641,9 @@ void main() {
       navKey.currentState!.push(MaterialPageRoute<void>(
         builder: (_) => CommentPage(
           video: _videoA(),
-          onNavigateToVideo: (v) => state.openVideoInNewPlayer(v),
+          onNavigateToVideo: (v, {int? pageIndex, int? positionMs}) =>
+              state.openVideoInNewPlayer(v,
+                  pageIndex: pageIndex, positionMs: positionMs),
         ),
       ));
       await tester.pumpAndSettle();
@@ -655,6 +690,140 @@ void main() {
           reason: '同 bvid 不应叠新播放页');
       expect(find.byType(PlayerPage), findsOneWidget);
       expect(find.text('视频A'), findsOneWidget);
+    });
+  });
+
+  group('评论视频链接 ?p/?t 定位跳转（v2.17.6+）', () {
+    testWidgets('完整链接带 ?p=2&t=129.0：点击 → 回调宿主拿到 pageIndex=1/'
+        'positionMs=129000（薄壳先 pop 再转发）', (tester) async {
+      final log = <String>[];
+      _installEnv(tester, log);
+      final navKey = GlobalKey<NavigatorState>();
+      WhitelistVideo? opened;
+      int? gotP;
+      int? gotT;
+      _replyMessage = kVideoBLinkP2T129; // 评论正文 = 完整分享链接（带 p/t）
+      await tester.pumpWidget(MaterialApp(
+        navigatorKey: navKey,
+        home: const Scaffold(body: Center(child: Text('宿主页'))),
+      ));
+      await _pushCommentPage(tester, navKey, onNavigateToVideo:
+          (v, {int? pageIndex, int? positionMs}) {
+        opened = v;
+        gotP = pageIndex;
+        gotT = positionMs;
+      });
+      // 评论正文 = 带 ?p/?t 的完整分享链接（整段渲染为可点链接）
+      final linkFinder = find.text(kVideoBLinkP2T129, findRichText: true);
+      expect(linkFinder, findsOneWidget);
+      await tester.ensureVisible(linkFinder);
+      await tester.pump();
+      // 长链接在 776px 宽内折成两行，中心点可能落在字形间隙 → 点第一行左端
+      // 字形处（真实点击同理命中文本即触发 recognizer）
+      final tl = tester.getTopLeft(linkFinder);
+      await tester.tapAt(tl + const Offset(30, 10));
+      await _pumpNetwork(tester);
+      await tester.pumpAndSettle();
+
+      expect(opened, isNotNull, reason: '应回调宿主拿到目标视频');
+      expect(opened!.bvid, kVideoB);
+      expect(gotP, 1, reason: 'p=2（1起）→ pageIndex=1（0起）');
+      expect(gotT, 129000, reason: 't=129.0 秒 → 129000ms（小数秒支持）');
+      expect(find.byType(CommentPage), findsNothing, reason: '薄壳已 pop 回宿主');
+    });
+
+    testWidgets('无回调兜底：push 新 PlayerPage 透传 initialPageIndex=0 + '
+        'initialPositionMs=45000（仅 ?t=45）', (tester) async {
+      final log = <String>[];
+      _installEnv(tester, log);
+      final navKey = GlobalKey<NavigatorState>();
+      _replyMessage = kVideoBLinkT45; // 评论正文 = 仅带 ?t 的完整链接
+      await tester.pumpWidget(MaterialApp(
+        navigatorKey: navKey,
+        home: const Scaffold(body: Center(child: Text('宿主页'))),
+      ));
+      await _pushCommentPage(tester, navKey); // 不传回调 → 列表兜底 push
+      expect(find.text(kVideoBLinkT45, findRichText: true), findsOneWidget);
+      await tester.tap(find.text(kVideoBLinkT45, findRichText: true));
+      await _pumpNetwork(tester);
+      await tester.pumpAndSettle();
+
+      expect(find.byType(PlayerPage), findsOneWidget);
+      final page = tester.widget<PlayerPage>(find.byType(PlayerPage));
+      expect(page.initialPageIndex, 0, reason: '无 p → 默认第 1 集');
+      expect(page.initialPositionMs, 45000, reason: 't=45 → 初始定位 45s');
+    });
+
+    testWidgets('异 bvid + p/t：叠新播放页（initialPageIndex/initialPositionMs '
+        '透传）且旧页暂停防双音轨', (tester) async {
+      final log = <String>[];
+      _installEnv(tester, log);
+      final navKey = GlobalKey<NavigatorState>();
+      await tester.pumpWidget(MaterialApp(
+        navigatorKey: navKey,
+        navigatorObservers: [routeObserver],
+        home: PlayerPage(video: _videoA()),
+      ));
+      await tester.pumpAndSettle();
+
+      final state = tester.state(find.byType(PlayerPage)) as dynamic;
+      state.openVideoInNewPlayer(_videoB(), pageIndex: 1, positionMs: 45000);
+      await tester.pumpAndSettle();
+
+      expect(log.where((m) => m == 'pause'), hasLength(1),
+          reason: 'push 新播放页前应暂停当前播放');
+      // opaque 路由叠页：旧页不在可见树中（其 State 保留），可见的只剩新页
+      expect(find.byType(PlayerPage), findsOneWidget,
+          reason: '叠上新播放页后可见 PlayerPage 为新页');
+      final pushed = tester.widget<PlayerPage>(find.byType(PlayerPage));
+      expect(pushed.video.bvid, kVideoB);
+      expect(pushed.initialPageIndex, 1, reason: 'p=2 → 新页初始分P下标 1');
+      expect(pushed.initialPositionMs, 45000,
+          reason: 't=45 → 新页初始定位（覆盖该页记忆进度）');
+    });
+
+    testWidgets('同 bvid 同集链接带 t：本页定位，不叠页不暂停不新建播放器',
+        (tester) async {
+      final log = <String>[];
+      _installEnv(tester, log);
+      await tester.pumpWidget(MaterialApp(home: PlayerPage(video: _videoA())));
+      await tester.pumpAndSettle();
+      final createsBefore = log.where((m) => m == 'create').length;
+
+      final state = tester.state(find.byType(PlayerPage)) as dynamic;
+      state.openVideoInNewPlayer(_videoA(), positionMs: 45000);
+      await tester.pumpAndSettle();
+
+      expect(find.byType(PlayerPage), findsOneWidget, reason: '同 bvid 不叠页');
+      expect(log.where((m) => m == 'pause'), isEmpty, reason: '同 bvid 不暂停');
+      expect(log.where((m) => m == 'create'), hasLength(createsBefore),
+          reason: '同 bvid 不新建播放器');
+      expect(log.where((m) => m == 'dispose'), isEmpty);
+      // 注：测试环境无原生 onPrepared（播放器不进入 loaded），同集 t 走
+      // 「入队等 onPrepared 定位」（_pendingSeekMs）；真实设备 seek 证据见
+      // 模拟器实测日志。
+    });
+
+    testWidgets('同 bvid 异分P链接（?p=2）+t：本页内切集重取流，不叠页',
+        (tester) async {
+      final log = <String>[];
+      _installEnv(tester, log);
+      await tester.pumpWidget(MaterialApp(home: PlayerPage(video: _videoAMulti())));
+      await tester.pumpAndSettle();
+      final createsBefore = log.where((m) => m == 'create').length;
+      final loadsBefore = log.where((m) => m == 'setDataSource').length;
+
+      final state = tester.state(find.byType(PlayerPage)) as dynamic;
+      state.openVideoInNewPlayer(_videoAMulti(), pageIndex: 1, positionMs: 30000);
+      await tester.pumpAndSettle();
+
+      expect(find.byType(PlayerPage), findsOneWidget,
+          reason: '同 bvid 分P跳本页切集，不叠第二个播放页');
+      expect(log.where((m) => m == 'pause'), isEmpty);
+      expect(log.where((m) => m == 'create'), hasLength(createsBefore));
+      expect(log.where((m) => m == 'setDataSource'),
+          hasLength(loadsBefore + 1),
+          reason: '切到第 2 集重取流（本页内）');
     });
   });
 }
