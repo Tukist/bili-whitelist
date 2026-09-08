@@ -24,6 +24,7 @@ import '../services/realtime_transcriber.dart';
 import '../widgets/comment_list.dart';
 import '../widgets/danmaku_overlay.dart';
 import '../widgets/danmaku_settings_sheet.dart';
+import '../widgets/expandable_text.dart';
 import '../widgets/upowner_badge.dart';
 import 'comment_page.dart';
 import 'login_page.dart';
@@ -365,6 +366,25 @@ double brightnessPercent({
 /// 「已成功拉取过 view owner」的页面直接复用，不再重复请求 view 接口。
 final Map<String, ({int mid, String name, String face})> _upMetaCache = {};
 
+// -------------------------------------------------------------------------
+// 信息行简介区（v2.17.3+）：desc 运行时补拉 + 会话内缓存
+//
+// 背景：WhitelistVideo.desc 是 v2.17.3 新增字段，**旧白名单数据没有 desc**。
+// 播放页简介优先用 WhitelistVideo.desc（新导入/油猴写入即带）；为空时若该
+// 视频不是番剧（番剧简介是季级，逐集导入留空且不拉 pgc view——见 writer
+// 取舍），则搭 UP 主元数据那次 fetchVideoMeta 的顺风车补拉 view data.desc
+// （同一次响应、零额外请求）。结果按 bvid 缓存在 [_viewDescCache]。
+// -------------------------------------------------------------------------
+
+/// 从 view 接口返回的 `data` map 解析简介（data.desc，含 \n 换行原样）。
+/// 缺失/类型异常 → 空串（调用方不显示简介区）。
+String viewDescOf(Map<String, dynamic> data) =>
+    data['desc'] is String ? data['desc'] as String : '';
+
+/// 会话内简介缓存（bvid → desc）：与 [_upMetaCache] 同一次 view 响应写入，
+/// 让同一 bvid 的后续播放页（缓存命中跳过请求）也能拿到 desc。
+final Map<String, String> _viewDescCache = {};
+
 /// 播放页：进入即取流（DASH 双流 fnval=16，老视频降级 mp4 单流），
 /// 原生 ExoPlayer MergingMediaSource 合并播放。
 ///
@@ -470,6 +490,12 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
   // _ownerMeta 为当前视频的 UP 主信息（null = 未拉取/失败/番剧无入口）。
   // 换源（playVideo 换 _video）后必须复位重拉，防止残留上一个视频的 UP。
   ({int mid, String name, String face})? _ownerMeta;
+
+  // _runtimeDesc：当前视频的运行时简介（v2.17.3+，旧数据无 desc 时搭 UP
+  // 元数据那次 view 请求补拉，见 viewDescOf/_viewDescCache）。显示优先级：
+  // WhitelistVideo.desc 非空用它；为空才用 _runtimeDesc（旧数据/评论链路上
+  // 用 videoFromMeta 现构的无 desc 视频）。换源复位。
+  String _runtimeDesc = '';
 
 
   // B 站式快捷手势（v2.16.7+）
@@ -3211,6 +3237,8 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
       _currentPageIndex = 0;
       // UP 主信息随换源复位（不残留上一个视频的头像/名字）
       _ownerMeta = null;
+      // 运行时简介随换源复位（desc 优先 _video.desc，旧数据等重拉补齐）
+      _runtimeDesc = '';
       _playing = false;
       _completed = false;
       _positionMs = 0;
@@ -3658,11 +3686,17 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     );
   }
 
-  /// 竖屏（非全屏）视频信息行：标题（含分 P）+ UP 主入口 + 时长。
+  /// 竖屏（非全屏）视频信息行：标题（含分 P）+ UP 主入口 + 时长 + 简介。
   ///
   /// 阶段 C：UP 主区从 v2.17.0 的「person 图标 + up_name 文本占位」升级为
   /// [UpownerBadge]（圆形头像 + 名字，可点进 [UpownerPage]）；番剧/电影
-  /// （带 epId）按阶段 C 取舍弱化（见 [_buildVideoInfoBar] 内注释）。
+  /// （带 epId）按阶段 C 取舍弱化（见方法内注释）。
+  ///
+  /// v2.17.3+ 简介区：数据 = WhitelistVideo.desc（新导入/油猴写入即带），
+  /// 为空时用 [_runtimeDesc]（旧数据搭 UP 元数据那次 view 请求补拉）；
+  /// 两路都空（番剧/拉取失败）→ **不显示、不占位**。长简介超 3 行折叠 +
+  /// 「展开」看全文、「收起」复原；展开态封顶高度内可滚动（防超长简介把
+  /// 固定信息行撑爆布局，见 [_descMaxExpandedHeight]）。
   Widget _buildVideoInfoBar(BuildContext context) {
     final theme = Theme.of(context);
     final subStyle = TextStyle(fontSize: 12.5, color: Colors.grey.shade600);
@@ -3674,6 +3708,10 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     final durMs = _durationMs > 0
         ? _durationMs
         : (_video.duration > 0 ? _video.duration * 1000 : 0);
+    // 简介（含换行原样；trim 去首尾空行——导入/接口常有结尾 \n）。
+    // 多 P 视频简介是视频级：换分 P 不换简介（_video 不变）。
+    final videoDesc = _video.desc.isNotEmpty ? _video.desc : _runtimeDesc;
+    final desc = videoDesc.trim();
     // 番剧/电影（带 epId）→ 剧集标签：pgc 内容挂靠官方/搬运号，点进其
     // 「主页」无白名单点播价值且易误导（观感像进了 UP 空间其实是官方号），
     // 取舍为**弱化**——不拉 view owner、无头像、不可点（名字为导入数据
@@ -3729,35 +3767,72 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
             Text(_fmtMs(durMs), style: subStyle),
           ],
         ),
+        // 简介区：desc 空（无简介/番剧/拉取失败）不占位，避免空行喧宾夺主
+        if (desc.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: ExpandableText(
+              text: desc,
+              style: subStyle.copyWith(height: 1.45),
+              foldLines: 3,
+              // 简介无链接、展开后整段都在滚动区内 → 无需长按复制兜底；
+              // selectable=false：完整态用 Text（不引入选择手势与滚动打架）
+              selectable: false,
+              // 展开态封顶（超高内部滚动，收起按钮在滚动区外）
+              maxExpandedHeight: _descMaxExpandedHeight(context),
+            ),
+          ),
       ],
     );
   }
 
-  /// 信息行 UP 主入口的元数据拉取（阶段 C）：fetchVideoMeta 拿 view 接口
-  /// data.owner{mid,name,face} 补齐头像与 UP 主页入口（结果按 bvid 缓存在
-  /// [_upMetaCache]，多播放页/切集不重复请求）。
+  /// 简介展开态封顶高度：竖屏下方剩余高度（屏幕 − 视频区）扣掉信息行标题
+  /// /UP 行/边距等固有高度后的安全余量，夹在 [80, 220] 之间——防超长简介
+  /// 把固定信息行撑高到把评论区挤没、整列溢出（短视频/高视频时余量小，
+  /// 展开区也相应矮，超高部分内部滚动）。
+  double _descMaxExpandedHeight(BuildContext context) {
+    final screen = MediaQuery.sizeOf(context);
+    final belowVideo = screen.height - _portraitVideoHeight(screen);
+    const reservedForInfoBar = 120.0; // 标题(≤2行) + UP 行 + 内边距 + 简介顶距
+    return (belowVideo - reservedForInfoBar).clamp(80.0, 220.0);
+  }
+
+  /// 信息行 UP 主入口的元数据拉取（阶段 C）+ 简介运行时补拉（v2.17.3+）：
+  /// fetchVideoMeta 拿 view 接口 data.owner{mid,name,face} 补齐头像与 UP 主页
+  /// 入口，同时拿 data.desc 补旧数据缺的简介（结果按 bvid 分别缓存在
+  /// [_upMetaCache]/[_viewDescCache]，多播放页/切集不重复请求）。
   ///
   /// 番剧（epId != null）**不拉取**——阶段 C 取舍为弱化展示（见
-  /// [_buildVideoInfoBar] 注释），避免为官方号做无意义请求。
+  /// [_buildVideoInfoBar] 注释），避免为官方号做无意义请求；简介同理
+  /// （番剧简介是季级、逐集导入留空，运行时也不补——见 whitelist_writer
+  /// videoFromPgcEpisode 取舍）。
   Future<void> _refreshUpownerMeta() async {
-    if (_video.epId != null) return; // 番剧：无 UP 入口，不请求
+    if (_video.epId != null) return; // 番剧：无 UP 入口/无简介，不请求
     final bvid = _video.bvid;
     final cached = _upMetaCache[bvid];
     if (cached != null) {
       _ownerMeta = cached;
+      // 缓存命中（同会话再次进入同一视频）：顺带恢复 desc（同一响应写入）
+      _runtimeDesc = _viewDescCache[bvid] ?? _runtimeDesc;
       return; // 会话内缓存命中（无需 setState：build 前同步赋值即可）
     }
     try {
       final data = await _api.fetchVideoMeta(bvid);
       final parsed = parseViewOwner(data);
+      final desc = viewDescOf(data);
       if (parsed != null) _upMetaCache[bvid] = parsed;
+      if (desc.isNotEmpty) _viewDescCache[bvid] = desc;
       // 拉取期间可能换源/退出：按 bvid 对账，防把旧视频的 UP 信息串到新视频
       if (!mounted || _video.bvid != bvid) return;
-      setState(() => _ownerMeta = parsed);
+      setState(() {
+        _ownerMeta = parsed;
+        _runtimeDesc = desc;
+      });
       debugPrint('[player_page] UP 主信息 bvid=$bvid '
           'mid=${parsed?.mid} name=${parsed?.name}');
     } catch (e) {
-      // 失败静默：信息行保持 up_name 文本展示；点击时提示无法获取
+      // 失败静默：信息行保持 up_name 文本展示；点击时提示无法获取；
+      // 简介区保持隐藏（desc 空时不占位）
       debugPrint('[player_page] 拉取 UP 主信息失败 bvid=$bvid error=$e');
     }
   }

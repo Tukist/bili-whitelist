@@ -76,6 +76,9 @@ class WhitelistWriter {
   /// 从 B 站 view 接口元数据构造 [WhitelistVideo]（未分类、当前时间 added_at）。
   ///
   /// 与 playlist_page 原私有 `_videoFromMeta` 语义一致（M5 迁移到此处共用）。
+  /// desc = view 接口 data.desc（简介，含 \n 换行；多 P 视频简介是视频级，
+  /// 所有分 P 共享同一条）。非 String（脏类型）按字符串化容错处理，
+  /// 缺失 → 空串。
   static WhitelistVideo videoFromMeta(
     Map<String, dynamic> meta, {
     required String fallbackBvid,
@@ -102,7 +105,19 @@ class WhitelistWriter {
       collection: '',
       // view 接口 data.pubdate = Unix 秒；0/缺失（脏数据）→ null（不写脏值）
       pubdate: _positiveInt(meta['pubdate']),
+      // view 接口 data.desc = 简介文本；缺失/脏类型 → 空串（不写脏值）。
+      // String 原样（保留 \n），非 String（脏类型如数字）toString 容错。
+      desc: _stringify(meta['desc']),
     );
+  }
+
+  /// 防御：把任意脏类型转字符串（null/缺省 → ''，其余 toString）。
+  /// 简介字段用：view data.desc 正常是 String；接口异常给数字等脏类型时
+  /// 不崩、不强写非字符串进白名单。
+  static String _stringify(dynamic raw) {
+    if (raw == null) return '';
+    if (raw is String) return raw;
+    return raw.toString();
   }
 
   /// 防御：Unix 秒时间戳，正数才返回，0/缺失/脏类型 → null。
@@ -159,6 +174,12 @@ class WhitelistWriter {
   ///   pubdate = 该集 pub_time（Unix 秒，API 原值不带单位换算——2026-09 实测
   ///   pgc episodes[].pub_time 与普通 view data.pubdate 同为秒；0 → null）
   ///   added_at = [now]（可注入测试用，缺省当前 UTC）
+  /// - **desc 留空**（取舍说明）：简介在 pgc 是**季级**字段（整季一段简介，
+  ///   不是每集一段），而番剧导入是**逐集**写 WhiltelistVideo（一集一条，
+  ///   简介若按季复制会污染每集、冗余且后续季简介更新要批量改）；播放页
+  ///   简介区在 desc 为空时不显示也不占位，观感无缺口。如需显示可后续做
+  ///   「季级简介」：季导入入口把 season 简介存合集级/单独字段，播放时按
+  ///   seasonId 取——本批次不做。
   static WhitelistVideo videoFromPgcEpisode(
     PgcSeason season,
     PgcEpisode ep, {

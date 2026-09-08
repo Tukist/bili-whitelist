@@ -187,4 +187,45 @@ void main() {
       expect(v.copyWith().epId, 98603);
     });
   });
+
+  group('WhitelistVideo.desc（v2.17.3 视频简介）', () {
+    test('fromJson 解析 desc + toJson 序列化（含 \\n 换行原样保留）', () {
+      final v = WhitelistVideo.fromJson({
+        ..._v2Video('BVdesc'),
+        'desc': '第一行简介\n第二行简介',
+      });
+      expect(v.desc, '第一行简介\n第二行简介');
+      expect(v.toJson()['desc'], '第一行简介\n第二行简介');
+    });
+
+    test('旧数据无 desc → 空串，toJson 不回写多余字段（向后兼容）', () {
+      final v = WhitelistVideo.fromJson(_v2Video('BV1'));
+      expect(v.desc, '');
+      expect(v.toJson().containsKey('desc'), isFalse);
+    });
+
+    test('desc 脏类型（非 String）→ 空串不崩', () {
+      final v = WhitelistVideo.fromJson({..._v2Video('BVdirty'), 'desc': 123});
+      expect(v.desc, '');
+    });
+
+    test('fromJson → toJson 往返保留 desc', () {
+      final original = WhitelistVideo.fromJson({
+        ..._v2Video('BVdesc'),
+        'desc': '含 \n 换行\n与结尾',
+        'pubdate': 1682899200,
+      });
+      final back = WhitelistVideo.fromJson(original.toJson());
+      expect(back.desc, '含 \n 换行\n与结尾');
+      expect(back.pubdate, 1682899200);
+      expect(back.bvid, 'BVdesc');
+    });
+
+    test('copyWith 改合集不丢 desc（合集移动/重排后播放页仍显示简介）', () {
+      final v = WhitelistVideo.fromJson(
+          {..._v2Video('BVdesc'), 'desc': '简介'});
+      expect(v.copyWith(collection: '动画').desc, '简介');
+      expect(v.copyWith().desc, '简介');
+    });
+  });
 }

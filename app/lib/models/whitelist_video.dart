@@ -5,6 +5,10 @@
 /// 不升顶层 version——旧读者忽略该键，新读者缺省 null = 普通视频）。
 /// v2.16.16 起普通视频/番剧导入的视频带可选 `pubdate`（发布时间，Unix 秒，
 /// 同为视频级附加字段向后兼容：旧读者忽略，新读者缺省 null = 未知）。
+/// v2.17.3 起视频带可选 `desc`（简介，多 P 视频简介是视频级不分 P；含 \n
+/// 换行原样保留；旧数据缺省空串 = 无简介）。普通视频导入写 view 接口
+/// data.desc；番剧导入逐集写、简介是季级（见 whitelist_writer 取舍说明），
+/// 本批次番剧简介留空。
 library;
 
 import 'upowner.dart';
@@ -50,6 +54,7 @@ class WhitelistVideo {
   final int order; // 合集内排序号（拖拽排序用）；旧数据缺省 0 = 按 added_at 倒序
   final int? epId; // 番剧/电影集 ep_id（v2.16.4+ 番剧导入写入；普通视频/旧数据 = null）
   final int? pubdate; // 发布时间（Unix 秒；v2.16.16+ 导入写入；旧数据/未知 = null）
+  final String desc; // 简介（v2.17.3+ 普通视频导入写入 view data.desc，含 \n；旧数据/番剧 = ''）
 
   const WhitelistVideo({
     required this.bvid,
@@ -64,6 +69,7 @@ class WhitelistVideo {
     this.order = 0,
     this.epId,
     this.pubdate,
+    this.desc = '',
   });
 
   factory WhitelistVideo.fromJson(Map<String, dynamic> json) {
@@ -86,6 +92,8 @@ class WhitelistVideo {
       epId: json['epId'] is num ? (json['epId'] as num).toInt() : null,
       // 旧数据无 pubdate / 脏类型 → null（UI 不显示发布时间）
       pubdate: json['pubdate'] is num ? (json['pubdate'] as num).toInt() : null,
+      // 旧数据无 desc / 脏类型（非 String）→ 空串（信息行不显示简介，不崩）
+      desc: json['desc'] is String ? json['desc'] as String : '',
     );
   }
 
@@ -103,6 +111,8 @@ class WhitelistVideo {
         if (epId != null) 'epId': epId,
         // pubdate 非空才输出（旧数据/未知不回写多余字段）
         if (pubdate != null) 'pubdate': pubdate,
+        // desc 非空才输出（无简介/旧数据不回写多余字段，保持数据干净）
+        if (desc.isNotEmpty) 'desc': desc,
         if (pages != null)
           'pages': pages!.map((p) => p.toJson()).toList(),
       };
@@ -112,9 +122,10 @@ class WhitelistVideo {
 
   /// 复制并修改合集归属（管理操作「移动到合集」用）。
   ///
-  /// epId/pubdate 不被本方法修改：未传时沿用原值（合集移动/重排不丢
-  /// 番剧集标识与发布时间）。
-  WhitelistVideo copyWith({String? collection, int? order, int? epId, int? pubdate}) =>
+  /// epId/pubdate/desc 不被本方法修改：未传时沿用原值（合集移动/重排不丢
+  /// 番剧集标识、发布时间与简介）。
+  WhitelistVideo copyWith(
+          {String? collection, int? order, int? epId, int? pubdate, String? desc}) =>
       WhitelistVideo(
         bvid: bvid,
         cid: cid,
@@ -128,6 +139,7 @@ class WhitelistVideo {
         order: order ?? this.order,
         epId: epId ?? this.epId,
         pubdate: pubdate ?? this.pubdate,
+        desc: desc ?? this.desc,
       );
 
   /// 分 P 数量：pages 缺失或为空 → 单 P（1）。

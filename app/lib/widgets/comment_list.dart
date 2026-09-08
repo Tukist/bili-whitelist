@@ -23,13 +23,14 @@
 /// - 空态/错误态：暂无评论 / 评论区已关闭（12002）/ 网络与风控（可重试）
 ///
 /// 只读：本组件不做任何点赞/发评论等写操作。aid 解析失败 / 首屏失败均给
-/// 重试入口。长内容不截断（可滚动，取舍：不打断阅读节奏）。
+/// 重试入口。正文过长（v2.17.3+ 折叠）：超 5 行折叠省略 + 「展开」点击
+/// 看全文、「收起」复原（纯文本/链接混排都支持；无链接短评保持可直接
+/// 选择复制，见 _LinkifiedBody 说明）。
 library;
 
 import 'package:dio/dio.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter/services.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../api/bilibili_api.dart';
@@ -42,6 +43,7 @@ import '../utils/import_parser.dart';
 import '../pages/image_viewer_page.dart';
 import '../pages/player_page.dart';
 import '../pages/upowner_page.dart';
+import 'expandable_text.dart';
 
 /// 图片/头像请求兜底头：B 站图床（i*.hdslb.com）一般无需 Referer，
 /// 带上浏览器头更稳（防个别域名/防盗链策略拦截）。
@@ -1212,12 +1214,17 @@ class _Avatar extends StatelessWidget {
   }
 }
 
-/// 正文渲染：按链接拆分。
+/// 正文渲染：按链接拆分 + 长文折叠（v2.17.3+）。
 ///
-/// - 无链接 → SelectableText（保留选择/复制能力）；
-/// - 有链接 → RichText：链接段主色 + 下划线、点击回调 [onLinkTap]
-///   （分发站内跳转/浏览器打开），纯文本段原样；RichText 本身不可选，
-///   长按整段复制兜底（SnackBar 提示）。
+/// 统一走 [ExpandableText]（折叠逻辑一份，播放页简介同组件）：
+/// - 无链接 → 纯文本形态：超 [foldLines]（默认 5）行折叠 + 「展开」，完整态
+///   保持 SelectableText（保留选择/复制能力，原交互不丢）；
+/// - 有链接 → 富文本形态：链接段主色 + 下划线、点击回调 [onLinkTap]
+///   （分发站内跳转/浏览器打开），纯文本段原样；折叠/展开共存——折叠在
+///   Text.rich 层截断（ellipsis），展开恢复完整链接混排；
+/// - 折叠态 / 富文本整段不可长按选择 → 长按整段复制兜底（SnackBar 提示）。
+/// 展开状态按条存在 [ExpandableText] 内部 State：同屏翻页/楼中楼加载等
+/// 父级重建不丢；滚出 ListView 视口销毁后重折叠（简单方案，可接受）。
 class _LinkifiedBody extends StatelessWidget {
   final String text;
   final TextStyle style;
@@ -1232,45 +1239,35 @@ class _LinkifiedBody extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final segments = splitCommentLinks(text);
-    if (segments.length == 1 && !segments.first.isLink) {
-      // 纯文本：保持旧版 SelectableText 交互（选择/复制）
-      return SelectableText(text, style: style);
+    final hasLinks =
+        segments.length > 1 || (segments.isNotEmpty && segments.first.isLink);
+    // 长按整段复制兜底提示（折叠态纯文本与富文本形态用）
+    const copyTip = '已复制评论内容';
+    if (!hasLinks) {
+      // 纯文本：完整态保持 SelectableText 交互（选择/复制）
+      return ExpandableText(text: text, style: style, copyTip: copyTip);
     }
     final primary = Theme.of(context).colorScheme.primary;
-    return GestureDetector(
-      // RichText 不可长按选择，复制能力兜底：长按整段复制到剪贴板
-      onLongPress: () async {
-        await Clipboard.setData(ClipboardData(text: text));
-        if (!context.mounted) return;
-        ScaffoldMessenger.of(context)
-          ..hideCurrentSnackBar()
-          ..showSnackBar(const SnackBar(
-            content: Text('已复制评论内容'),
-            duration: Duration(seconds: 1),
-            behavior: SnackBarBehavior.floating,
-          ));
-      },
-      child: RichText(
-        text: TextSpan(
-          style: style,
-          children: [
-            for (final seg in segments)
-              if (seg.isLink)
-                TextSpan(
-                  text: seg.text,
-                  style: TextStyle(
-                    color: primary,
-                    decoration: TextDecoration.underline,
-                    decorationColor: primary,
-                  ),
-                  recognizer: TapGestureRecognizer()
-                    ..onTap = () => onLinkTap(seg.link!),
-                )
-              else
-                TextSpan(text: seg.text),
-          ],
-        ),
-      ),
+    return ExpandableText(
+      text: text,
+      style: style,
+      copyTip: copyTip,
+      richChildren: [
+        for (final seg in segments)
+          if (seg.isLink)
+            TextSpan(
+              text: seg.text,
+              style: TextStyle(
+                color: primary,
+                decoration: TextDecoration.underline,
+                decorationColor: primary,
+              ),
+              recognizer: TapGestureRecognizer()
+                ..onTap = () => onLinkTap(seg.link!),
+            )
+          else
+            TextSpan(text: seg.text),
+      ],
     );
   }
 }

@@ -1,6 +1,7 @@
 // 信息行 UP 主入口元数据解析单测（阶段 C）：
 // fetchVideoMeta(bvid) 返回 view 接口的 data map → parseViewOwner 抽
-// owner{mid,name,face}（普通视频 UP 入口的 mid/头像来源）。
+// owner{mid,name,face}（普通视频 UP 入口的 mid/头像来源）；
+// v2.17.3+ 追加 viewDescOf（view data.desc → 简介，播放页简介区运行时补拉）。
 //
 // 纯函数无网络；逻辑见 lib/pages/player_page.dart 顶部。
 import 'package:flutter_test/flutter_test.dart';
@@ -45,6 +46,22 @@ void main() {
 
     test('mid 为字符串数字（脏数据）→ 按 0 处理返回 null，不崩', () {
       expect(parseViewOwner({'owner': {'mid': '123', 'name': 'x'}}), isNull);
+    });
+  });
+
+  group('viewDescOf（view data → 简介，v2.17.3）', () {
+    test('data.desc 原样返回（含 \\n 换行）', () {
+      expect(
+        viewDescOf({'desc': '第一行\n第二行简介'}),
+        '第一行\n第二行简介',
+      );
+    });
+
+    test('无 desc / 类型异常（非 String）→ 空串', () {
+      expect(viewDescOf({'bvid': 'BV1xx'}), '');
+      expect(viewDescOf({'desc': 123}), '');
+      expect(viewDescOf({'desc': <int>[1, 2]}), '');
+      expect(viewDescOf(<String, dynamic>{}), '');
     });
   });
 }

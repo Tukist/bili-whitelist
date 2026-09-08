@@ -8,6 +8,25 @@
 
 ---
 
+## v2.17.3 (2026-09-08)
+
+**视频简介（desc）：导入存储 + 播放页信息行显示 + 简介/评论过长折叠展开**
+
+承接 v2.17.2（UP 主入口）。本版把「视频简介」接入全链路——白名单数据模型加 `desc` 字段并随导入写入（普通视频导入 + 油猴脚本），播放页竖屏信息行在标题/UP 主下方显示简介（过长折叠），评论区正文过长也折叠（评论/简介长文都支持「展开 / 收起」）：
+
+- **数据模型 `WhitelistVideo.desc`（`app/lib/models/whitelist_video.dart`）**：新字段 `desc`（String，默认空串），视频级（多 P 视频简介不分 P、各分 P 共享）；`fromJson` 缺失/脏类型 → 空串不崩，`toJson` 非空才输出（无简介/旧数据不回写多余字段，与 epId/pubdate 约定一致），`copyWith` 沿用原值（合集移动/重排不丢简介）。兼容旧数据：无 desc 条目照常解析
+- **导入路径写入 desc**：
+  - **普通视频**（`app/lib/services/whitelist_writer.dart` `videoFromMeta`）：写 view 接口 `data.desc`（含 `\n` 换行原样；非 String 脏类型 toString 容错、缺失 → 空串）
+  - **番剧/电影**（`videoFromPgcEpisode`）：**简介留空**（取舍说明见代码注释）——pgc 简介是**季级**字段（整季一段简介，不是每集一段），而番剧导入是**逐集**写 WhitelistVideo（一集一条），按季复制会污染每集且季简介更新要批量改；播放页简介区在 desc 为空时不显示也不占位，观感无缺口。「季级简介」留待后续（季导入入口把 season 简介存合集级/单独字段再按 seasonId 取）
+  - **油猴脚本**（`bili-whitelist.user.js` v2.3.2 → **v2.3.3**）：`fetchVideoInfo` 两路（页面 `__INITIAL_STATE__.videoData.desc` / view API `data.desc`）都写 desc；parse/build 依旧整条透传/整对象序列化——新条目含 desc 随合并写回不丢、旧条目原样保留（遵循历史「upowners/collections 丢失」防丢字段教训，视频条目不做字段级重建）。node 逻辑自测：videoData 分支（零请求）/view API 分支写 desc、旧条目透传均通过
+- **播放页信息行简介区（`app/lib/pages/player_page.dart` `_buildVideoInfoBar`）**：标题/UP 主行下方显示简介（小字灰色、紧凑）。数据优先 `WhitelistVideo.desc`；为空（旧数据/评论链接现构视频）→ **运行时补拉**：搭 UP 主元数据那次 `fetchVideoMeta` 的顺风车取 view `data.desc`（零额外请求；纯函数 `viewDescOf` 解析；结果按 bvid 会话内缓存 `_viewDescCache`，换源复位、按 bvid 对账防串台）。desc 为空（无简介/番剧季级取舍/拉取失败）→ **不显示简介区、不占位**。长简介超 3 行折叠省略 + 「展开」点击看全文、「收起」复原；展开态封顶高度内可滚动（防超长简介把固定信息行撑爆布局，`_descMaxExpandedHeight` 按屏高/视频区高动态取值）
+- **折叠组件 `ExpandableText`（新 `app/lib/widgets/expandable_text.dart`，播放页简介与评论正文共用一份折叠逻辑）**：按**行数**折叠（LayoutBuilder 拿可用宽 → TextPainter 按 foldLines 布局 → didExceedMaxLines 超行即折叠，换行/宽字符/字号按真实排版算，比字符数阈值准）。纯文本形态（完整态 SelectableText 保选择复制；折叠态 Text+ellipsis）与富文本形态（链接混排，折叠/展开 Text.rich，识别器复用安全）都支持；`copyTip` 长按整段复制兜底、`maxExpandedHeight` 展开封顶内部滚动可配
+- **评论区正文折叠（`app/lib/widgets/comment_list.dart`）**：`_LinkifiedBody` 改走 `ExpandableText`——评论正文超 5 行折叠 + 「展开」，点击展开全文 + 「收起」复原；纯文本短评保持原 SelectableText 选择/复制交互；**与链接渲染共存**：正文含链接时折叠态 Text.rich 截断、展开恢复完整链接混排（链接可点、URL 尾随标点裁剪语义不变），折叠态/富文本整段长按复制兜底保留。展开状态按条存在组件 State 内：同屏父级重建不丢；滚出 ListView 视口销毁后重折叠（简单方案，注释说明）
+- **验证**：`flutter analyze` 0 issue；全量单测 **634 通过**（620 → 新增 14：模型 desc 序列化/脏类型/往返/copyWith 5、`videoFromMeta` 写 desc/脏类型容错 + `videoFromPgcEpisode` desc 留空 3、`viewDescOf` 2、`ExpandableText` 折叠展开 widget 测试 4——纯文本短文不折叠/长文展开收起/富文本链接混排折叠/封顶滚动）；模拟器实测（匿名 720P）：旧数据（无 desc）播放正常、信息行无简介区不占位（dump 证据）；真实 view 接口拉取正常（logcat `UP 主信息 mid=…`）；简介折叠交互由 `flutter test integration_test/desc_fold_flow_test.dart -d emulator-5554` 在模拟器真实运行验证（条目标注 desc → 折叠「展开」→ 全文「收起」→ 复原；旧数据无 desc → 运行时补拉显示简介区；无简介视频不占位）
+- 说明：本机模拟器匿名登录态下 Gist 写入/大会员取流受环境限制，导入写 Gist 链路未在模拟器端到端复测（由单测 + 油猴 node 自测覆盖写入 JSON 含 desc 与透传），播放页简介显示链路已用「运行时补拉」等价路径实机验证（同一 `ExpandableText` 与简介区代码路径）
+
+---
+
 ## v2.17.2 (2026-09-07)
 
 **播放页 UP 主入口（阶段 C 收尾：竖屏信息行 UP 主区仿 B 站——头像 + 名字进 UP 主页）**

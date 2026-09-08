@@ -304,6 +304,40 @@ void main() {
           fallbackBvid: 'BV1');
       expect(withStr.pubdate, isNull);
     });
+
+    test('meta desc → WhitelistVideo.desc（多 P 简介视频级，含换行原样）', () {
+      final meta = {
+        'bvid': 'BV1xx411c7mD',
+        'cid': 62131,
+        'title': '测试视频',
+        'pic': 'https://i0.hdslb.com/a.jpg',
+        'duration': 600,
+        'desc': '这是简介\n第二行（多P视频不分P，所有分P共享）',
+        'owner': {'name': 'UP主'},
+        'pages': [
+          {'cid': 62131, 'part': 'P1', 'duration': 300},
+          {'cid': 62132, 'part': 'P2', 'duration': 300},
+        ],
+      };
+      final v = WhitelistWriter.videoFromMeta(meta, fallbackBvid: 'BV1xx411c7mD');
+      expect(v.desc, '这是简介\n第二行（多P视频不分P，所有分P共享）');
+      // toJson 往返保留（导入 → Gist → 拉回 → 播放页简介链路不丢）
+      final back = WhitelistVideo.fromJson(v.toJson());
+      expect(back.desc, '这是简介\n第二行（多P视频不分P，所有分P共享）');
+      expect(back.toJson()['desc'], isNotNull);
+    });
+
+    test('meta 无 desc / 脏类型 → 空串不写脏值（老接口或缺字段容错）', () {
+      final noDesc = WhitelistWriter.videoFromMeta(
+          {'bvid': 'BV1', 'cid': 1, 'title': 't'}, fallbackBvid: 'BV1');
+      expect(noDesc.desc, '');
+      expect(noDesc.toJson().containsKey('desc'), isFalse);
+      // 脏类型（数字等）：字符串化容错为 '123'（不崩、不丢字段语义）
+      final dirty = WhitelistWriter.videoFromMeta(
+          {'bvid': 'BV1', 'cid': 1, 'title': 't', 'desc': 123},
+          fallbackBvid: 'BV1');
+      expect(dirty.desc, '123');
+    });
   });
 
   group('番剧（pgc）单集 → WhitelistVideo', () {
@@ -419,6 +453,16 @@ void main() {
       final back = WhitelistVideo.fromJson(free.toJson());
       expect(back.epId, 98603);
       expect(back.title, '小林家的龙女仆 第1话 史上最强女仆、托尔！');
+    });
+
+    test('videoFromPgcEpisode：desc 留空（简介季级取舍；逐集导入不写）', () {
+      final v = WhitelistWriter.videoFromPgcEpisode(season, season.episodes[0],
+          now: DateTime.utc(2026, 9, 1));
+      expect(v.desc, '');
+      // toJson 不含 desc 键（不写空值；播放页无简介不占位）
+      expect(v.toJson().containsKey('desc'), isFalse);
+      final back = WhitelistVideo.fromJson(v.toJson());
+      expect(back.desc, '');
     });
   });
 

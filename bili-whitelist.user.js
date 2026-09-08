@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         白名单助手 (Bili-Whitelist) 直连版
 // @namespace    https://github.com/Tukist/bili-whitelist
-// @version      2.3.2
+// @version      2.3.3
 // @description  B站视频页一键加入白名单（支持多P合集/自定义合集）：直连 GitHub Gist API 读写白名单，零本地服务依赖
 // @match        https://www.bilibili.com/video/*
 // @grant        GM_xmlhttpRequest
@@ -16,7 +16,7 @@
  * ==================== 功能 / 使用 / 配置 ====================
  * 【功能】
  *   在 B 站视频页点按钮，把当前视频信息（bvid/cid/title/cover/duration/up_name/
- *   pubdate/pages）直接写入 GitHub Gist 里的 whitelist.json，手机白名单点播 App
+ *   pubdate/desc/pages）直接写入 GitHub Gist 里的 whitelist.json，手机白名单点播 App
  *   拉取 Gist 即见。
  *   完全直连，不再需要本机 whitelist.py / serve 服务。
  *   v2.2.0 起支持多 P 合集：pages 字段存全部分 P（cid/part/duration），
@@ -32,6 +32,11 @@
  *   bvid 整条目透传 + buildWhitelistJson 整对象序列化 → 读到的旧条目原样保留
  *   含 pubdate（新增字段随合并写回不丢，遵循历史「upowners/collections 丢失」
  *   教训——视频条目不做字段级重建，只整体透传）。
+ *   v2.3.3 起新条目带 desc（视频简介，含 \n 换行，App v2.17.3 播放页信息行
+ *   显示）：页面 __INITIAL_STATE__.videoData.desc / view API data.desc 两路
+ *   取值（App 旧数据无 desc 时播放页也可运行时补）；parse/build 依旧整条
+ *   透传/整对象序列化 → 旧条目原样保留（含 desc 的新条目随合并写回不丢）。
+ *   desc 为多 P 视频级字段：App 端所有分 P 共享同一条简介，不区分 P。
  *
  * 【使用】
  *   1. 浏览器安装 Tampermonkey（油猴），新建脚本粘贴保存
@@ -190,6 +195,7 @@
                         duration: vd.duration || 0,
                         up_name: (vd.owner && vd.owner.name) || '',
                         pubdate: toPubdate(vd.pubdate),
+                        desc: (typeof vd.desc === 'string') ? vd.desc : '',
                         pages: normalizePages(vd.pages, vd.cid, vd.title, vd.duration),
                     });
                     return;
@@ -223,6 +229,7 @@
                                     duration: v.duration || 0,
                                     up_name: (v.owner && v.owner.name) || '',
                                     pubdate: toPubdate(v.pubdate),
+                                    desc: (typeof v.desc === 'string') ? v.desc : '',
                                     pages: normalizePages(v.pages, v.cid, v.title, v.duration),
                                 });
                             }
