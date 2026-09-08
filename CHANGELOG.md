@@ -8,6 +8,30 @@
 
 ---
 
+## v2.17.5 (2026-09-08)
+
+**B 站收藏夹 → 白名单互通（导入方向 MVP）：登录后把自己的收藏夹一键批量导入白名单**
+
+「收藏夹与白名单互通」的导入方向打通——在 App 里登录 B 站账号后，可读取自己创建的收藏夹列表（默认夹/自建夹），选一个收藏夹把里面的视频**一键批量加入白名单**（查重跳过已在白名单的、失效稿件自动跳过）。反向（白名单新增自动收藏回 B 站）与双向自动同步超出本批次，见「取舍说明」。
+
+- **API 层（`app/lib/api/bilibili_api.dart`）**：新增两个**需登录**的封装（登录态 Cookie 注入；接口均不需要 WBI 签名）：
+  - `fetchMyFavorites()`：登录门禁（无 SESSDATA → 抛 -101「请先登录」）→ nav 接口拿自己的 mid（`data.mid`，会话内缓存）→ `x/v3/fav/folder/created/list-all?up_mid=<mid>&pn=1&ps=20` → 收藏夹列表（mediaId/title/mediaCount/cover，`media_id` 缺失时兜底 `id`、封面补 https、脏条目过滤）。**attr 位义未实测，不做过滤**（私密/默认夹等都返回，权限由 B 站接口控制）
+  - `fetchFavoriteVideos(mediaId, {pn, ps})`：`x/v3/fav/resource/list?media_id=&pn=&ps=&platform=web` → 单页视频列表（bvid/title/cover/duration/pubdate/upName 雏形）+ totalCount + hasMore；type≠2（音频/专栏/剧集）与无 bvid 脏条目过滤
+  - 错误分类与既有接口一致：-101（区分「请先登录」/「登录已失效」）/ -412 风控「请稍后再试」/ 其他业务码带接口 message / 网络 DioException 原样上抛
+- **导入逻辑（`app/lib/services/whitelist_writer.dart`）**：`importFavoriteFolder(mediaId, folderTitle, {onProgress})` → 结果汇总 {total/added/skipped/failed/interrupted}：
+  - 开头**一次**拉当前白名单 bvid 集合（失败不阻塞，addVideo 内部查重兜底）→ 翻页拉收藏夹全部视频（has_more 服务端给，防御上限 200 页）
+  - 逐条：**bvid 查重跳过**（不发 view 请求）→ `fetchVideoMeta` view 复检补全 meta（cid/pages/desc/pubdate 等）→ 构造完整 WhitelistVideo → [addVideo] 写 Gist（再查重兜底 + 写本地缓存）
+  - **失效条目**：view 复检失败 code 62002「稿件已失效」/ -404 已删除 → 计 failed 跳过、**不中断**其余导入；拉列表阶段失败（BiliApiException/DioException）在写任何东西前上抛
+  - 逐条写盘失败不抛：中断并汇总（interrupted + interruptReason），已写条数见 added
+- **UI（`app/lib/widgets/favorites_import_dialog.dart` + 首页）**：首页右上角「导入」对话框内新增「**从 B 站收藏夹批量导入**」入口（放导入入口而非管理面板——新增白名单语义与粘贴导入一致，管理面板保持「管理只允许合集/配置」的防沉迷边界）：
+  - 流程：配置门禁（GitHub token/gist）→ **登录门禁**（无 SESSDATA → 提示「收藏夹导入需要登录 B 站账号」+ 引导进登录页；登录成功继续、保持匿名中止）→ 收藏夹列表弹层（loading / 失败重试 / 空态 / 列表展示封面+名称+数量）→ 选夹确认（提示夹内 N 个视频，说明自动跳过已在白名单/失效）→ 进度对话框「导入中 i/N」逐条写入 → 结果汇总 snack「已导入 X，跳过 Y（已在白名单），失败 Z」→ 刷新列表
+- **取舍说明**：
+  - **仅导入方向**：本批次做「收藏夹 → 白名单」批量导入（用户主动、确认式，符合防沉迷「新增须主动决策」原则）；反向（白名单新增自动收藏回 B 站）与双向自动同步是另一个方向（涉及 B 站写接口 + 双向状态一致性），不在本批次，后续可按需做
+  - **单夹选择**：一次导入一个收藏夹（列表弹层选择后确认）；多收藏夹批量勾选导入留待后续（导入循环与进度已支持任意条数，扩展成本低）
+  - **attr 不做过滤**：收藏夹 attr 位义未实测，全部原样列出由用户自己选（私密夹 B 站侧会校验登录态）
+  - **失效条目不重试**：view 复检 62002/-404 计失败跳过；已失效内容 B 站收藏夹接口本身也不再返回
+- **测试**：`test/favorites_api_test.dart`（登录门禁 / nav mid 解析与缓存 / list-all 参数与解析（media_id 兜底 id）/ resource/list 分页参数与解析 / -101 两种文案 / -412 / 其他业务码 / 网络）+ `test/favorites_import_test.dart`（导入核心逻辑：查重跳过省 view 请求、62002 失败不中断、拉列表失败未写 Gist、空夹；UI：未登录提示 + 引导、空夹弹层空态、首页入口存在与未登录引导）
+
 ## v2.17.4 (2026-09-08)
 
 **UP 主主页「合集/列表」区（仿 B 站 UP 主页：展示该 UP 主的合集与列表，点合集看其视频，可播放/加入白名单）**

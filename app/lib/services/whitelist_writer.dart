@@ -28,6 +28,38 @@ class AddResult {
   });
 }
 
+/// 收藏夹批量导入结果汇总（v2.17.5+，首页导入入口用）。
+class FavoriteImportSummary {
+  /// 收藏夹内实际拉取到的视频数（已排除 B 站过滤掉的非视频/无 bvid 脏条目，
+  /// 可小于收藏夹列表页展示的 media_count——后者含失效条目）。
+  final int total;
+
+  /// 成功新增到白名单的视频数。
+  final int added;
+
+  /// 已在白名单被跳过（查重命中，未重复写入）。
+  final int skipped;
+
+  /// 失败数（含「稿件已失效 62002/已删除」等 view 复检失败的条目，
+  /// 这类不中断导入、计为失败跳过；中断导致的未处理不计入）。
+  final int failed;
+
+  /// 是否中途中断（拉列表/单条 view/保存失败，未跑完全部视频）。
+  final bool interrupted;
+
+  /// 中断原因（[interrupted] 为 true 时有值：网络请求失败 / 保存失败原因）。
+  final String interruptReason;
+
+  const FavoriteImportSummary({
+    required this.total,
+    required this.added,
+    required this.skipped,
+    required this.failed,
+    required this.interrupted,
+    this.interruptReason = '',
+  });
+}
+
 /// 整季（番剧/电影）导入结果汇总（v2.16.5+，首页与搜索页共用）。
 class PgcImportSummary {
   /// 拉到的整季信息（标题/封面/季内集数等，结果反馈用）。
@@ -238,6 +270,137 @@ class WhitelistWriter {
       video: video,
       data: next,
       message: '已加入：$displayTitle',
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // 收藏夹批量导入（v2.17.5+）：首页「从 B 站收藏夹导入」入口用。纯逻辑无 UI
+  // （进度经回调上报）。与番剧整季导入（importPgcSeason）不同：收藏夹列表
+  // 只给雏形（无 cid/无 pages/简介等），须**逐条 view 复检补全**再写。
+  // ---------------------------------------------------------------------------
+
+  /// 收藏夹批量导入：拉收藏夹内视频（[BiliApi.fetchFavoriteVideos] 翻页）→
+  /// 逐条：**bvid 查重跳过** → view 复检补 meta（cid/pages/desc/pubdate 等）
+  /// → [videoFromMeta] 构造 → [addVideo] 写 Gist。
+  ///
+  /// - [onProgress] 可选：进度文案回调（UI 进度框用），覆盖「正在读取收藏夹
+  ///   视频…」/ 逐条「导入中 i/N」。
+  /// - 失效条目：view 复检失败（code 62002「稿件已失效」/ 404 已删除）→
+  ///   跳过并计入 [FavoriteImportSummary.failed]（不中断）；拉列表阶段
+  ///   接口就把失效条目过滤掉（count 含失效但 medias 不含）。
+  ///
+  /// 异常契约（调用方 UI 据此分类提示）：
+  /// - **拉收藏夹列表阶段**：B 站失败抛 [BiliApiException]、网络失败抛
+  ///   [DioException]（此时未写任何 Gist）
+  /// - **逐条写盘阶段**失败不抛：中断并汇总到 [FavoriteImportSummary]
+  ///   （interrupted=true + interruptReason，已写条数见 added/skipped）
+  Future<FavoriteImportSummary> importFavoriteFolder({
+    required int mediaId,
+    required String folderTitle,
+    void Function(String status)? onProgress,
+  }) async {
+    // 0) 预取白名单现有 bvid 集合（避免对已在白名单的视频白打 view 复检；
+    //    失败不阻塞——addVideo 内部查重兜底）
+    final existingBvids = <String>{};
+    try {
+      final current = await github.fetchFromGist();
+      existingBvids.addAll(
+        (current?.videos ?? const []).map((v) => v.bvid),
+      );
+    } catch (_) {
+      // 拉取白名单失败（网络等）：继续，addVideo 内部会再查重
+    }
+
+    // 1) 翻页拉全部视频（单夹视频数通常不大；has_more 由服务端给）
+    final videos = <FavoriteVideo>[];
+    var pn = 1;
+    while (true) {
+      onProgress?.call(
+        pn == 1
+            ? '正在读取收藏夹「$folderTitle」…'
+            : '正在读取收藏夹「$folderTitle」（第 $pn 页）…',
+      );
+      final page = await api.fetchFavoriteVideos(mediaId, pn: pn);
+      videos.addAll(page.videos);
+      if (!page.hasMore) break;
+      pn++;
+      if (pn > 200) break; // 防御：异常响应下防死循环
+    }
+    final total = videos.length;
+    if (total == 0) {
+      return const FavoriteImportSummary(
+        total: 0,
+        added: 0,
+        skipped: 0,
+        failed: 0,
+        interrupted: false,
+      );
+    }
+
+    // 2) 逐条导入：bvid 查重跳过 → view 补 meta → 写盘
+    var added = 0, skipped = 0, failed = 0;
+    var interrupted = false;
+    var interruptReason = '';
+    for (var i = 0; i < videos.length; i++) {
+      final fav = videos[i];
+      final displayTitle = fav.title.isEmpty ? fav.bvid : fav.title;
+      onProgress?.call('导入中 ${i + 1}/$total：$displayTitle');
+
+      // 2.1) 查重跳过（本地集合：初始白名单 + 本次已新增；省 view 请求）
+      if (existingBvids.contains(fav.bvid)) {
+        skipped++;
+        continue;
+      }
+
+      // 2.2) view 复检补全 meta（失效 → 计失败跳过，不中断）
+      final Map<String, dynamic> meta;
+      try {
+        meta = await api.fetchVideoMeta(fav.bvid);
+      } on BiliApiException catch (e) {
+        if (e.code == 62002 || e.code == -404) {
+          failed++; // 稿件已失效/已删除：跳过
+          continue;
+        }
+        interrupted = true;
+        interruptReason = e.message;
+        break;
+      } on DioException {
+        interrupted = true;
+        interruptReason = '网络请求失败';
+        break;
+      }
+
+      // 2.3) 写盘（addVideo 内部再查重兜底 + 落 Gist + 本地缓存）
+      final video = videoFromMeta(meta, fallbackBvid: fav.bvid);
+      try {
+        final result = await addVideo(video);
+        if (result.added) {
+          added++;
+          existingBvids.add(fav.bvid);
+        } else if (result.message.contains('已在白名单')) {
+          skipped++;
+        } else {
+          interrupted = true;
+          interruptReason = result.message;
+          break;
+        }
+      } on DioException {
+        interrupted = true;
+        interruptReason = '网络请求失败';
+        break;
+      } on GithubApiException catch (e) {
+        interrupted = true;
+        interruptReason = e.message;
+        break;
+      }
+    }
+    return FavoriteImportSummary(
+      total: total,
+      added: added,
+      skipped: skipped,
+      failed: failed,
+      interrupted: interrupted,
+      interruptReason: interruptReason,
     );
   }
 

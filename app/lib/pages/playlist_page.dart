@@ -19,6 +19,7 @@ import '../services/update_service.dart';
 import '../services/update_storage.dart';
 import '../services/whitelist_writer.dart';
 import '../utils/import_parser.dart';
+import '../widgets/favorites_import_dialog.dart';
 import '../widgets/pgc_import_dialog.dart';
 import 'collection_page.dart';
 import 'history_page.dart';
@@ -461,7 +462,30 @@ class _PlaylistPageState extends State<PlaylistPage> {
   void _openImport() {
     showDialog<void>(
       context: context,
-      builder: (_) => _ImportDialog(onImport: _importVideo),
+      builder: (_) => _ImportDialog(
+        onImport: _importVideo,
+        // 收藏夹批量导入入口：对话框内按钮会先关闭自身再回调（见
+        // _ImportDialog 的 onImportFavorites），这里只负责拉起独立流程
+        onImportFavorites: _importFromFavorites,
+      ),
+    );
+  }
+
+  /// 从 B 站收藏夹批量导入（v2.17.5+）：配置门禁 → 登录引导 → 收藏夹列表
+  /// → 逐视频导入。UI 编排在 [runFavoritesImportFlow]（与番剧整季导入的
+  /// runPgcSeasonImport 同模式），这里只负责注入登录回调与刷新列表。
+  Future<void> _importFromFavorites() async {
+    await runFavoritesImportFlow(
+      context: context,
+      writer: _writer,
+      configHint: '请先到右上角管理入口配置 GitHub token 与 Gist ID',
+      openLogin: () async {
+        // 引导登录（复用「B 站账号」入口同一登录页；测试注入替身）
+        await _openLogin(context);
+        // 登录页返回后重查：已登录 → 继续走收藏夹列表
+        return (await _writer.api.readSessdata())?.isNotEmpty ?? false;
+      },
+      onDone: (_) async => _load(),
     );
   }
 
@@ -1261,11 +1285,15 @@ class _CollectionCard extends StatelessWidget {
   }
 }
 
-/// 导入对话框：多行输入框粘贴 B 站分享链接/文本，确认后交回页面执行导入。
+/// 导入对话框：多行输入框粘贴 B 站分享链接/文本，确认后交回页面执行导入；
+/// 下方提供「从 B 站收藏夹导入」批量入口（v2.17.5+，需登录）。
 class _ImportDialog extends StatefulWidget {
   final Future<void> Function(String text) onImport;
 
-  const _ImportDialog({required this.onImport});
+  /// 收藏夹批量导入入口回调：按钮点击时先关闭本对话框再回调（独立流程）。
+  final VoidCallback? onImportFavorites;
+
+  const _ImportDialog({required this.onImport, this.onImportFavorites});
 
   @override
   State<_ImportDialog> createState() => _ImportDialogState();
@@ -1321,6 +1349,32 @@ class _ImportDialogState extends State<_ImportDialog> {
               color: theme.colorScheme.onSurfaceVariant,
             ),
           ),
+          if (widget.onImportFavorites != null) ...[
+            const SizedBox(height: 12),
+            const Divider(height: 1),
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                // 收藏夹属于个人账号数据：需登录（未登录会引导登录）
+                icon: const Icon(Icons.bookmarks_outlined, size: 18),
+                label: const Text('从 B 站收藏夹批量导入'),
+                onPressed: () {
+                  // 先关闭粘贴导入对话框，再走独立的收藏夹导入流程
+                  Navigator.of(context).pop();
+                  widget.onImportFavorites!();
+                },
+              ),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              '把整个收藏夹（默认夹/自建夹）里的视频一键批量加入白名单，'
+              '已在白名单的自动跳过。',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ],
         ],
       ),
       actions: [

@@ -352,6 +352,91 @@ class UpownerCollectionsResult {
   bool get isEmpty => seasons.isEmpty && series.isEmpty;
 }
 
+/// 收藏夹列表条目（v2.17.5+，`x/v3/fav/folder/created/list-all` 的 data.list[]）。
+///
+/// 2026-09 实测字段：`media_id`（部分时期接口返回 `id`，同值，两处都兜底）/
+/// `title` / `media_count` / `cover`。`attr` 位义未实测，仅 UI 展示不做过滤。
+class FavoriteFolder {
+  final int mediaId;
+  final String title;
+  final int mediaCount;
+  final String cover;
+
+  const FavoriteFolder({
+    required this.mediaId,
+    required this.title,
+    required this.mediaCount,
+    required this.cover,
+  });
+
+  factory FavoriteFolder.fromJson(Map<String, dynamic> json) {
+    final rawId = json['media_id'] ?? json['id'];
+    final rawCount = json['media_count'];
+    return FavoriteFolder(
+      mediaId: rawId is String
+          ? (int.tryParse(rawId) ?? 0)
+          : (rawId as num?)?.toInt() ?? 0,
+      title: json['title'] as String? ?? '',
+      mediaCount: rawCount is String
+          ? (int.tryParse(rawCount) ?? 0)
+          : (rawCount as num?)?.toInt() ?? 0,
+      cover: SearchResult.normalizeCover(json['cover'] as String? ?? ''),
+    );
+  }
+}
+
+/// 收藏夹内视频条目（v2.17.5+，`x/v3/fav/resource/list` 的 data.medias[]）。
+///
+/// 2026-09 实测字段：`bvid` / `title` / `cover` / `duration`(**秒**) /
+/// `pubtime`(Unix 秒) / `upper.name`。type 存在且非 2（视频）的条目
+/// （音频/专栏/剧集等）由调用方过滤，此处只做字段解析。
+class FavoriteVideo {
+  final String bvid;
+  final String title;
+  final String cover;
+  final int duration; // 秒
+  final int? pubdate; // Unix 秒；0/缺失 → null
+  final String upName;
+
+  const FavoriteVideo({
+    required this.bvid,
+    required this.title,
+    required this.cover,
+    required this.duration,
+    this.pubdate,
+    required this.upName,
+  });
+
+  factory FavoriteVideo.fromJson(Map<String, dynamic> json) {
+    final pub = (json['pubtime'] as num?)?.toInt() ?? 0;
+    final upper = json['upper'] as Map<String, dynamic>? ?? const {};
+    return FavoriteVideo(
+      bvid: json['bvid'] as String? ?? '',
+      title: json['title'] as String? ?? '',
+      cover: SearchResult.normalizeCover(json['cover'] as String? ?? ''),
+      duration: (json['duration'] as num?)?.toInt() ?? 0,
+      pubdate: pub > 0 ? pub : null,
+      upName: upper['name'] as String? ?? '',
+    );
+  }
+}
+
+/// 收藏夹视频分页响应（v2.17.5+，`x/v3/fav/resource/list`）。
+///
+/// [videos] 单页清洗结果；[totalCount] = data.count（夹内视频总数，可能含
+/// 已失效条目）；[hasMore] = data.has_more（服务端翻页标志，权威）。
+class FavoriteVideosPage {
+  final List<FavoriteVideo> videos;
+  final int totalCount;
+  final bool hasMore;
+
+  const FavoriteVideosPage({
+    required this.videos,
+    required this.totalCount,
+    required this.hasMore,
+  });
+}
+
 /// B 站 media 搜索类型（`wbi/search/type` 的 search_type 取值，v2.16.5+）。
 ///
 /// 2026-09 匿名实测：
@@ -439,6 +524,13 @@ class BiliApi {
 
   /// WBI key 会话内缓存（img_key, sub_key）。
   (String, String)? _wbiKeys;
+
+  /// 我的 mid（nav 接口 data.mid，会话内缓存；v2.17.5+ 收藏夹导入用）。
+  ///
+  /// 与 wbi key 同源（nav 一次可同时拿 key 与 mid），但 _ensureWbiKeys
+  /// 只解析 wbi_img、不存 mid，因此收藏夹导入单独走 _ensureMyMid 再发一次
+  /// nav（会话内只多发 1 次，缓存后不再重复）。
+  int? _myMid;
 
   /// 浏览器指纹 cookie（buvid3/buvid4，spi 接口获取，会话内缓存）。
   ///
@@ -802,6 +894,209 @@ class BiliApi {
       );
     }
     return PgcSeason.fromResult(result);
+  }
+
+  // -------------------------------------------------------------------------
+  // 我的收藏夹（v2.17.5+）：x/v3/fav/folder/created/list-all（列表）
+  // + x/v3/fav/resource/list（夹内视频）。均**需登录 SESSDATA**
+  // （匿名 list-all 实测 data=null）；无需 WBI 签名，注入 Cookie 即可。
+  // -------------------------------------------------------------------------
+
+  /// 我的 mid（nav 接口 data.mid，会话内缓存；登录态才有意义）。
+  ///
+  /// 错误分类：
+  /// - nav code=-101（cookie 失效）→ [BiliApiException](-101,「登录已失效」)
+  /// - nav code=0 但 data.mid 缺失/为 0（匿名态）→ 同上 -101（视为未登录）
+  /// - 其他业务码 → [BiliApiException]（带接口 message）
+  /// - 网络失败（[DioException]）→ 原样上抛
+  Future<int> _ensureMyMid() async {
+    if (_myMid != null && _myMid! > 0) return _myMid!;
+    await _injectAuth();
+    final resp = await _dio.get<Map<String, dynamic>>('/x/web-interface/nav');
+    final data = resp.data;
+    final code = data?['code'] as int?;
+    if (code == -101) {
+      throw const BiliApiException(
+        code: -101,
+        message: '登录已失效，请重新登录',
+        path: '/x/web-interface/nav',
+      );
+    }
+    if (code != 0 || code == null) {
+      throw BiliApiException(
+        code: code ?? -1,
+        message: data?['message'] as String? ?? '登录状态获取失败',
+        path: '/x/web-interface/nav',
+      );
+    }
+    final d = data?['data'] as Map<String, dynamic>?;
+    final midRaw = d?['mid'];
+    final mid = midRaw is num
+        ? midRaw.toInt()
+        : (midRaw is String ? int.tryParse(midRaw) ?? 0 : 0);
+    if (mid <= 0) {
+      throw const BiliApiException(
+        code: -101,
+        message: '登录已失效，请重新登录',
+        path: '/x/web-interface/nav',
+      );
+    }
+    _myMid = mid;
+    return mid;
+  }
+
+  /// 拉取我的收藏夹列表（`x/v3/fav/folder/created/list-all`，v2.17.5+）。
+  ///
+  /// **需登录**：无 SESSDATA → 抛 [BiliApiException](-101,「请先登录 B 站
+  /// 账号」)；有 SESSDATA 但已失效 → nav 拿 mid 时抛 -101「登录已失效」。
+  /// 登录态下注入 Cookie，然后带 `up_mid=<自己的 mid>`（nav 拿，缓存）请求
+  /// 自己的收藏夹列表。
+  ///
+  /// 返回收藏夹列表（mediaId/title/mediaCount/cover）；空/无 data.list →
+  /// 空列表。attr 位义未实测，**不做过滤**（私密/默认夹等都原样返回，
+  /// 由 UI 标注；B 站侧权限由接口自行控制）。
+  ///
+  /// 错误分类：
+  /// - code=-101 → [BiliApiException](-101)（未登录/登录失效，message 区分）
+  /// - code=-412 → [BiliApiException](-412)（风控，message「请稍后再试」）
+  /// - 其他业务码 → [BiliApiException]（带接口 message）
+  /// - 网络失败（[DioException]）→ 原样上抛
+  Future<List<FavoriteFolder>> fetchMyFavorites() async {
+    final sess = await readSessdata();
+    if (sess == null || sess.isEmpty) {
+      throw const BiliApiException(
+        code: -101,
+        message: '请先登录 B 站账号，再导入收藏夹',
+        path: '/x/v3/fav/folder/created/list-all',
+      );
+    }
+    await _injectAuth();
+    final mid = await _ensureMyMid();
+    debugPrint('[bili_api] fetchMyFavorites up_mid=$mid');
+    final resp = await _dio.get<Map<String, dynamic>>(
+      '/x/v3/fav/folder/created/list-all',
+      queryParameters: {'up_mid': '$mid', 'pn': '1', 'ps': '20'},
+    );
+    final data = resp.data;
+    final code = data?['code'] as int?;
+    if (code == -101) {
+      throw const BiliApiException(
+        code: -101,
+        message: '登录已失效，请重新登录',
+        path: '/x/v3/fav/folder/created/list-all',
+      );
+    }
+    if (code == -412) {
+      throw const BiliApiException(
+        code: -412,
+        message: '收藏夹接口被风控拦截，请稍后再试',
+        path: '/x/v3/fav/folder/created/list-all',
+      );
+    }
+    if (code != 0) {
+      throw BiliApiException(
+        code: code ?? -1,
+        message: data?['message'] as String? ?? '收藏夹列表获取失败',
+        path: '/x/v3/fav/folder/created/list-all',
+      );
+    }
+    final d = data?['data'] as Map<String, dynamic>?;
+    final list = d?['list'];
+    if (list is! List) return const [];
+    return list
+        .whereType<Map<String, dynamic>>()
+        .map(FavoriteFolder.fromJson)
+        // 防御：media_id/id 都缺失或标题为空的脏条目丢弃
+        .where((f) => f.mediaId > 0 && f.title.isNotEmpty)
+        .toList();
+  }
+
+  /// 拉收藏夹内视频一页（`x/v3/fav/resource/list`，v2.17.5+）。
+  ///
+  /// 带登录 Cookie（[._injectAuth]）。响应 `data{count, has_more, medias[]}`；
+  /// medias[] 项含 bvid/title/cover/duration(秒)/pubtime/upper.name，解析为
+  /// [FavoriteVideo] 雏形（cid 不在其中——进白名单走 view 接口补全，见
+  /// [WhitelistWriter.importFavoriteFolder]）。
+  ///
+  /// [hasMore] 用服务端 data.has_more（权威）；[totalCount] = data.count
+  /// （夹内总数，可能含已失效，仅展示/进度用）。medias 缺失/非 List →
+  /// 空页。type 非 2（视频）或无 bvid 的条目过滤（音频/专栏/剧集等不进
+  /// 视频白名单）。
+  ///
+  /// 错误分类与 [fetchMyFavorites] 一致（-101/-412/其他/网络）。
+  Future<FavoriteVideosPage> fetchFavoriteVideos(
+    int mediaId, {
+    int pn = 1,
+    int ps = 20,
+  }) async {
+    await _injectAuth();
+    debugPrint('[bili_api] fetchFavoriteVideos media_id=$mediaId pn=$pn ps=$ps');
+    final resp = await _dio.get<Map<String, dynamic>>(
+      '/x/v3/fav/resource/list',
+      queryParameters: {
+        'media_id': '$mediaId',
+        'pn': '$pn',
+        'ps': '$ps',
+        'platform': 'web',
+      },
+    );
+    final data = resp.data;
+    final code = data?['code'] as int?;
+    if (code == -101) {
+      throw const BiliApiException(
+        code: -101,
+        message: '登录已失效，请重新登录',
+        path: '/x/v3/fav/resource/list',
+      );
+    }
+    if (code == -412) {
+      throw const BiliApiException(
+        code: -412,
+        message: '收藏夹接口被风控拦截，请稍后再试',
+        path: '/x/v3/fav/resource/list',
+      );
+    }
+    if (code != 0) {
+      throw BiliApiException(
+        code: code ?? -1,
+        message: data?['message'] as String? ?? '收藏夹视频获取失败',
+        path: '/x/v3/fav/resource/list',
+      );
+    }
+    final d = data?['data'] as Map<String, dynamic>?;
+    if (d == null) {
+      // code=0 但无 data → 空页（收藏夹可能已失效/无内容）
+      return const FavoriteVideosPage(
+        videos: [],
+        totalCount: 0,
+        hasMore: false,
+      );
+    }
+    final rawCount = d['count'];
+    final totalCount = rawCount is String
+        ? (int.tryParse(rawCount) ?? 0)
+        : (rawCount as num?)?.toInt() ?? 0;
+    final hasMore = d['has_more'] == true;
+    final raw = d['medias'];
+    if (raw is! List) {
+      return FavoriteVideosPage(
+        videos: const [],
+        totalCount: totalCount,
+        hasMore: hasMore,
+      );
+    }
+    final videos = raw
+        .whereType<Map<String, dynamic>>()
+        // type 非 2（音频/专栏/剧集等）不入视频白名单；无 type 字段按视频处理
+        .where((j) => ((j['type'] as num?)?.toInt() ?? 2) == 2)
+        .map(FavoriteVideo.fromJson)
+        .where((v) => v.bvid.isNotEmpty)
+        .toList();
+    return FavoriteVideosPage(
+      videos: videos,
+      totalCount: totalCount,
+      hasMore: hasMore,
+    );
   }
 
   /// 搜索 B 站视频（`x/web-interface/wbi/search/type`，search_type=video）。
