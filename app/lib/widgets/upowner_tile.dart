@@ -1,9 +1,10 @@
 /// 搜索 UP 主结果列表项：头像（圆角 24x24）+ 名字 + 认证描述 + 粉丝数 +
-/// 「加入白名单」/「已加入」按钮。
+/// 「关注/已关注」按钮（v2.17.12+：关注 = 加入白名单 UP 主，与 UP 详情页
+/// 顶部按钮同一语义，替换原「加入/已加入」文案）。
 ///
 /// 复用搜索页的视觉风格：参考 [VideoTile] 的 ListTile 结构，按钮文案 + 状态
-/// 与搜索页视频结果一致（未加入 = FilledButton「加入」；已加入 =
-/// FilledButton.tonal「已加入」灰态）。
+/// 与搜索页视频结果一致（未关注 = FilledButton「关注」；已关注 =
+/// FilledButton.tonal「已关注」灰态）。
 library;
 
 import 'package:flutter/material.dart';
@@ -13,9 +14,9 @@ import '../models/upowner.dart';
 
 /// 搜索 UP 主结果列表项。
 ///
-/// - [onJoin] 点「加入白名单」按钮时回调（页面层负责调用 [UpownerWriter.add]）
-/// - [joining] 该 UP 主正在「加入」中（防连点；按钮置 Loading 圈）
-/// - [added] 该 UP 主已在白名单（按钮显示「已加入」灰态、不可点）
+/// - [onJoin] 点「关注」按钮时回调（页面层负责调用 [UpownerWriter.add]）
+/// - [joining] 该 UP 主正在「关注」中（防连点；按钮置 Loading 圈）
+/// - [added] 该 UP 主已关注（= 已在白名单；按钮显示「已关注」灰态、不可点）
 class UpownerTile extends StatelessWidget {
   final Upowner upowner;
   final bool added;
@@ -54,7 +55,7 @@ class UpownerTile extends StatelessWidget {
       trailing: added
           ? const FilledButton.tonal(
               onPressed: null,
-              child: Text('已加入'),
+              child: Text('已关注'),
             )
           : FilledButton(
               onPressed: joining ? null : onJoin,
@@ -64,7 +65,7 @@ class UpownerTile extends StatelessWidget {
                       height: 14,
                       child: CircularProgressIndicator(strokeWidth: 2),
                     )
-                  : const Text('加入'),
+                  : const Text('关注'),
             ),
     );
   }

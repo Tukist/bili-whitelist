@@ -11,7 +11,9 @@
 /// - 列表项点击 → 构造 WhitelistVideo（缺 cid 时实时 fetchVideoMeta 拿，
 ///   两个视图共用）→ push 到 PlayerPage
 /// - 列表项长按 → 弹菜单「加入白名单视频」/「取消」（两个视图共用）
-/// - 顶部右上角「管理」按钮：移除 UP 主（从白名单删除，写 Gist）
+/// - 顶部右上角「关注/已关注」按钮（v2.17.12+ 统一文案）：关注 = 加入白名单
+///   UP 主、已关注 = 从白名单移除（取消关注确认弹窗；操作走 [UpownerWriter]）
+///   ——与「从 B 站收藏夹/搜索/关注列表加入」共用同一份 upowners 数据
 ///
 /// 与 BiliApi.fetchUpownerVideos / fetchUpownerInfo / fetchUpownerFollower /
 /// fetchVideoMeta / fetchUpownerCollections / fetchSeasonArchives /
@@ -95,12 +97,16 @@ class UpownerPage extends StatefulWidget {
   /// 注入 B 站 API（widget 测试用 mock；缺省走真实实现）。
   final BiliApi? api;
 
+  /// 注入 UP 主写入服务（widget 测试用 mock；缺省走真实实现）。
+  final UpownerWriter? writer;
+
   const UpownerPage({
     super.key,
     required this.mid,
     this.initial,
     this.isInWhitelist = false,
     this.api,
+    this.writer,
   });
 
   /// 仅测试用：清空 UP 主信息会话缓存（避免 widget 测试跨用例串数据）。
@@ -114,6 +120,7 @@ class UpownerPage extends StatefulWidget {
 
 class _UpownerPageState extends State<UpownerPage> {
   late final BiliApi _api = widget.api ?? BiliApi();
+  late final UpownerWriter _upwriter = widget.writer ?? UpownerWriter();
   final ScrollController _scrollCtrl = ScrollController();
   final TextEditingController _searchCtrl = TextEditingController();
   Timer? _searchDebounce;
@@ -170,7 +177,15 @@ class _UpownerPageState extends State<UpownerPage> {
   bool _colLoadingMore = false;
   String? _colError;
 
-  bool get _inWhitelist => widget.isInWhitelist;
+  /// 当前是否「关注」（= 白名单 UP 主）。初始取进入时的 [widget.isInWhitelist]；
+  /// 页面内「关注/取消关注」成功后更新（与外部数据源 Gist 同步由写入结果驱动）。
+  late bool _followed = widget.isInWhitelist;
+
+  /// 关注/取消关注操作进行中（防连点）。
+  bool _followBusy = false;
+
+  /// 本页会话内是否改过关注状态：pop 返回 true 让上层刷新白名单列表。
+  bool _changed = false;
 
   @override
   void initState() {
@@ -671,33 +686,76 @@ class _UpownerPageState extends State<UpownerPage> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return Scaffold(
-      appBar: AppBar(
-        title: Text(_info?.name ?? widget.initial?.name ?? 'UP 主'),
-        actions: [
-          if (_inWhitelist)
-            IconButton(
-              tooltip: '从白名单移除',
-              icon: const Icon(Icons.bookmark_remove_outlined),
-              onPressed: _confirmRemove,
-            ),
-        ],
-      ),
-      body: Column(
-        children: [
-          _buildHeader(theme),
-          // 搜索/排序只作用于「全部视频」；选中合集时隐藏（合集视频按
-          // 合集自身顺序展示，与 B 站一致，不受站内搜索影响）
-          if (_activeCollection == null) _buildVideoSearchBar(),
-          _buildCollectionBar(),
-          if (_activeCollection == null) _buildOrderBar(),
-          const Divider(height: 1),
-          Expanded(
-            child: _activeCollection == null
-                ? _buildVideoList()
-                : _buildCollectionVideoList(),
+    // 返回上一页时把「本页是否改过关注状态」带给调用方（true → 上层刷新
+    // 白名单列表；未改动 → 与普通返回一致）。canPop:false + 手动 pop 才能
+    // 附带返回值。
+    return PopScope<bool>(
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) {
+        if (didPop) return;
+        Navigator.of(context).pop(_changed ? true : null);
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          // 显式返回按钮：PopScope(canPop:false) 会抑制自动 back，需手动带
+          // 返回值 pop（_changed → true，上层刷新白名单列表）
+          leading: BackButton(
+            onPressed: () =>
+                Navigator.of(context).pop(_changed ? true : null),
           ),
-        ],
+          title: Text(_info?.name ?? widget.initial?.name ?? 'UP 主'),
+          actions: [
+            // 「关注/已关注」统一文案（v2.17.12+）：关注 = 加入白名单 UP 主，
+            // 已关注 = 从白名单移除（确认后取消关注），操作走 [UpownerWriter]
+            Padding(
+              padding: const EdgeInsets.only(right: 8),
+              child: Center(
+                child: FilledButton.tonalIcon(
+                  onPressed: _followBusy
+                      ? null
+                      : (_followed ? _confirmUnfollow : _follow),
+                  style: FilledButton.styleFrom(
+                    visualDensity: VisualDensity.compact,
+                    padding: const EdgeInsets.symmetric(horizontal: 12),
+                    textStyle: const TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                  icon: _followBusy
+                      ? const SizedBox(
+                          width: 14,
+                          height: 14,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : Icon(
+                          _followed
+                              ? Icons.check_circle_outline
+                              : Icons.person_add_alt_1,
+                          size: 18,
+                        ),
+                  label: Text(_followed ? '已关注' : '关注'),
+                ),
+              ),
+            ),
+          ],
+        ),
+        body: Column(
+          children: [
+            _buildHeader(theme),
+            // 搜索/排序只作用于「全部视频」；选中合集时隐藏（合集视频按
+            // 合集自身顺序展示，与 B 站一致，不受站内搜索影响）
+            if (_activeCollection == null) _buildVideoSearchBar(),
+            _buildCollectionBar(),
+            if (_activeCollection == null) _buildOrderBar(),
+            const Divider(height: 1),
+            Expanded(
+              child: _activeCollection == null
+                  ? _buildVideoList()
+                  : _buildCollectionVideoList(),
+            ),
+          ],
+        ),
       ),
     );
   }
@@ -1011,13 +1069,48 @@ class _UpownerPageState extends State<UpownerPage> {
     );
   }
 
-  /// 「从白名单移除 UP 主」确认弹窗 → UpownerWriter.removeByMid → pop 回上一级。
-  Future<void> _confirmRemove() async {
+  /// 「关注」该 UP 主（= 加入白名单 upowners）：查重由 [UpownerWriter.add]
+  /// 完成（已在白名单 → 返回 ok=false + 最新白名单，同样视为已关注）。
+  Future<void> _follow() async {
+    if (_followBusy) return;
+    setState(() => _followBusy = true);
+    try {
+      final up = Upowner(
+        mid: widget.mid,
+        name: _info?.name ?? widget.initial?.name ?? 'UP 主',
+        face: _info?.face ?? widget.initial?.face ?? '',
+        fans: _info?.fans ?? widget.initial?.fans,
+        addedAt: DateTime.now().toUtc(),
+      );
+      final result = await _upwriter.add(up);
+      if (!mounted) return;
+      setState(() {
+        _followBusy = false;
+        // add 返回的最新白名单为准：ok（新增成功）或已存在（查重返回）都算已关注
+        final inList =
+            result.data?.upowners.any((u) => u.mid == widget.mid) ?? false;
+        _followed = result.ok || inList;
+        _changed = _followed;
+      });
+      _showSnack(result.message);
+    } on GithubApiException catch (e) {
+      if (!mounted) return;
+      setState(() => _followBusy = false);
+      _showSnack('关注失败：${e.message}');
+    }
+  }
+
+  /// 「取消关注」确认弹窗 → [UpownerWriter.removeByMid]（从白名单移除）。
+  /// 取消后留在本页（按钮回到「关注」），返回上一页时带出刷新信号。
+  Future<void> _confirmUnfollow() async {
+    final name = _info?.name ?? widget.initial?.name ?? 'UP 主';
     final ok = await showDialog<bool>(
       context: context,
       builder: (dialogCtx) => AlertDialog(
-        title: Text('从白名单移除「${_info?.name ?? 'UP 主'}」？'),
-        content: const Text('移除后将不再检查该 UP 主的新视频（不影响已加入的白名单视频）。'),
+        title: Text('取消关注「$name」？'),
+        content: const Text(
+            '取消关注 = 从白名单移除该 UP 主：之后不再检查其新视频'
+            '（不影响已加入白名单的视频），随时可以重新关注。'),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx, false),
@@ -1025,23 +1118,28 @@ class _UpownerPageState extends State<UpownerPage> {
           ),
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx, true),
-            child: const Text('移除', style: TextStyle(color: Colors.red)),
+            child: const Text('取消关注', style: TextStyle(color: Colors.red)),
           ),
         ],
       ),
     );
     if (ok != true || !mounted) return;
+    setState(() => _followBusy = true);
     try {
-      final writer = UpownerWriter();
-      if (!await writer.hasConfig()) {
-        _showSnack('请先到首页「管理」入口配置 GitHub token 与 Gist ID');
-        return;
-      }
-      final result = await writer.removeByMid(widget.mid);
+      final result = await _upwriter.removeByMid(widget.mid);
+      if (!mounted) return;
+      setState(() {
+        _followBusy = false;
+        if (result.ok) {
+          _followed = false;
+          _changed = true;
+        }
+      });
       _showSnack(result.message);
-      if (mounted) Navigator.of(context).pop(true);
     } on GithubApiException catch (e) {
-      _showSnack('移除失败：${e.message}');
+      if (!mounted) return;
+      setState(() => _followBusy = false);
+      _showSnack('取消失败：${e.message}');
     }
   }
 }

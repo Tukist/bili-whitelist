@@ -15,6 +15,7 @@ import '../services/apk_installer.dart';
 import '../services/service_locator.dart';
 import '../services/update_service.dart';
 import '../services/update_storage.dart';
+import '../services/upowner_writer.dart';
 import '../services/whitelist_writer.dart';
 import '../utils/import_parser.dart';
 import '../widgets/favorites_import_dialog.dart';
@@ -22,6 +23,7 @@ import '../widgets/manage_panel.dart';
 import '../widgets/pgc_import_dialog.dart';
 import 'collection_page.dart';
 import 'favorites_page.dart';
+import 'followings_import_page.dart';
 import 'history_page.dart';
 import 'inbox_page.dart';
 import 'login_page.dart';
@@ -91,6 +93,9 @@ class _PlaylistPageState extends State<PlaylistPage> {
 
   /// 白名单写入服务：导入 / 搜索「加入」共用（构造视频 + 查重 + 写 Gist）。
   final WhitelistWriter _writer = WhitelistWriter();
+
+  /// UP 主写入服务：UP 管理页「导入我关注的 UP」批量加入（v2.17.12+）。
+  final UpownerWriter _upwriter = UpownerWriter();
 
   /// 底部显示的版本号：优先 package_info_plus 读 Android versionName，
   /// 异常（测试环境无原生通道）时回退 config.dart 的 kAppVersion。
@@ -543,6 +548,24 @@ class _PlaylistPageState extends State<PlaylistPage> {
     );
   }
 
+  /// 从 B 站「我关注的 UP」批量导入（v2.17.12+）：配置门禁 → 登录引导 →
+  /// 勾选页（全选/取消全选，最多前 200 位）→ 批量加入白名单 UP 主。
+  /// UI 编排在 [runFollowingsImportFlow]，这里只负责注入登录回调与刷新列表。
+  Future<void> _importFollowings() async {
+    await runFollowingsImportFlow(
+      context: context,
+      writer: _upwriter,
+      configHint: '请先到右上角管理入口配置 GitHub token 与 Gist ID',
+      openLogin: () async {
+        // 引导登录（复用「B 站账号」入口同一登录页；测试注入替身）
+        await _openLogin(context);
+        // 登录页返回后重查：已登录 → 继续拉关注列表
+        return (await _upwriter.api.readSessdata())?.isNotEmpty ?? false;
+      },
+      onDone: () async => _load(),
+    );
+  }
+
   /// 导入入口（普通视频 + 番剧/电影共用）。
   ///
   /// 先试番剧引用解析（本地正则命中 ep/ss 链接、裸号；b23 番剧短码
@@ -927,6 +950,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
             onSearch: () => _openSearch(initialTab: 2),
             onOpen: _openUpowner,
             onRemove: _removeUpowner,
+            onImportFollowings: _importFollowings,
           ),
           WatchStatsPage(key: _statsKey, settingsSection: _statsManagePanel()),
         ],
@@ -1054,6 +1078,9 @@ class _UpownerManagePage extends StatelessWidget {
   final bool syncing;
   final Future<void> Function() onRefresh;
   final VoidCallback onSearch;
+
+  /// 「导入我关注的 UP」（v2.17.12+）：把 B 站关注列表批量加入白名单。
+  final VoidCallback onImportFollowings;
   final void Function(Upowner upowner) onOpen;
   final void Function(Upowner upowner) onRemove;
 
@@ -1062,6 +1089,7 @@ class _UpownerManagePage extends StatelessWidget {
     required this.syncing,
     required this.onRefresh,
     required this.onSearch,
+    required this.onImportFollowings,
     required this.onOpen,
     required this.onRemove,
   });
@@ -1073,31 +1101,40 @@ class _UpownerManagePage extends StatelessWidget {
       children: [
         Container(
           width: double.infinity,
-          padding: const EdgeInsets.fromLTRB(16, 10, 16, 8),
+          padding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
           color: theme.colorScheme.surfaceContainerHighest.withValues(
             alpha: .4,
           ),
-          child: Row(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('白名单 UP 主', style: theme.textTheme.titleSmall),
-                    const SizedBox(height: 2),
-                    Text(
-                      '右滑到这里管理已加入的 UP 主',
-                      style: theme.textTheme.bodySmall?.copyWith(
-                        color: theme.colorScheme.onSurfaceVariant,
-                      ),
-                    ),
-                  ],
+              Text('白名单 UP 主', style: theme.textTheme.titleSmall),
+              const SizedBox(height: 2),
+              Text(
+                '关注 UP 主 = 加入白名单；右滑到这里管理，可移除或从 B 站关注列表批量导入',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
                 ),
               ),
-              FilledButton.icon(
-                onPressed: onSearch,
-                icon: const Icon(Icons.person_search, size: 18),
-                label: const Text('搜索 UP 主'),
+              const SizedBox(height: 8),
+              Row(
+                children: [
+                  Expanded(
+                    child: OutlinedButton.icon(
+                      onPressed: onImportFollowings,
+                      icon: const Icon(Icons.download_outlined, size: 18),
+                      label: const Text('导入我关注的 UP'),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: FilledButton.icon(
+                      onPressed: onSearch,
+                      icon: const Icon(Icons.person_search, size: 18),
+                      label: const Text('搜索 UP 主'),
+                    ),
+                  ),
+                ],
               ),
             ],
           ),

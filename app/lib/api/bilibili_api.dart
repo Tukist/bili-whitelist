@@ -438,6 +438,24 @@ class FavoriteVideosPage {
   });
 }
 
+/// 我关注的 UP 分页响应（v2.17.12+，`x/relation/followings`）。
+///
+/// [upowners] 单页清洗结果（转 [Upowner]，addedAt=当前时间）；[totalCount] =
+/// `data.total`（我的关注总数，服务端权威；缺失/解析失败为 0）；
+/// [hasMore] 是否有下一页（total>0 时按 `pn*ps < total` 推算——自己的关注
+/// 列表可看全部页；total 缺失时按「装满一页 → 还有」兜底）。
+class FollowingsPage {
+  final List<Upowner> upowners;
+  final int totalCount;
+  final bool hasMore;
+
+  const FollowingsPage({
+    required this.upowners,
+    required this.totalCount,
+    required this.hasMore,
+  });
+}
+
 /// B 站 media 搜索类型（`wbi/search/type` 的 search_type 取值，v2.16.5+）。
 ///
 /// 2026-09 匿名实测：
@@ -2050,6 +2068,130 @@ class BiliApi {
       );
     }
     return follower;
+  }
+
+  // -------------------------------------------------------------------------
+  // 我关注的 UP（v2.17.12+）：x/relation/followings（需登录 SESSDATA）
+  // -------------------------------------------------------------------------
+
+  /// 拉取「我关注的 UP」一页（`x/relation/followings?vmid=<我的mid>`）。
+  ///
+  /// **需登录**（关注列表属于个人账号数据；2026-09 匿名实测该接口对未带
+  /// SESSDATA 的请求一律返回 code=-101「账号未登录」——无法匿名验证字段，
+  /// 字段形态按 bilibili-API-collect 文档实现 + 防御解析）：
+  /// - 无 SESSDATA → 抛 [BiliApiException](-101,「请先登录…」)（不发请求）
+  /// - 有 SESSDATA 但已失效 → [._ensureMyMid] 的 nav 返回 -101
+  ///   → 抛 -101「登录已失效」
+  ///
+  /// 登录态下注入 Cookie（[._injectAuth]），用 nav 拿到的自己 mid 请求
+  /// （会话内缓存，同一会话只多发一次 nav）。响应 `data{list[], total}`：
+  /// list[] 单项 `mid` / `uname` / `face`（可能 `//` 开头），解析为
+  /// [Upowner]（addedAt=当前时间）；缺 mid 的脏条目过滤。list 缺失/非
+  /// List → 空页；[totalCount] 取 data.total（num/String 兼容容错）。
+  ///
+  /// 错误分类与 [fetchMyFavorites] 一致：-101（登录/失效，message 区分）
+  /// / -412（风控）/ -352（限流）/ 其他业务码 → [BiliApiException]；
+  /// 网络失败（[DioException]）原样上抛。
+  Future<FollowingsPage> fetchFollowingsOfMine({
+    int pn = 1,
+    int ps = 20,
+  }) async {
+    final sess = await readSessdata();
+    if (sess == null || sess.isEmpty) {
+      throw const BiliApiException(
+        code: -101,
+        message: '请先登录 B 站账号，再导入我关注的 UP',
+        path: '/x/relation/followings',
+      );
+    }
+    await _injectAuth();
+    final mid = await _ensureMyMid();
+    debugPrint('[bili_api] fetchFollowingsOfMine vmid=$mid pn=$pn ps=$ps');
+    final resp = await _dio.get<Map<String, dynamic>>(
+      '/x/relation/followings',
+      queryParameters: {'vmid': '$mid', 'pn': '$pn', 'ps': '$ps'},
+    );
+    final data = resp.data;
+    final code = data?['code'] as int?;
+    if (code == -101) {
+      throw const BiliApiException(
+        code: -101,
+        message: '登录已失效，请重新登录',
+        path: '/x/relation/followings',
+      );
+    }
+    if (code == -412) {
+      throw const BiliApiException(
+        code: -412,
+        message: '关注列表接口被风控拦截，请稍后再试',
+        path: '/x/relation/followings',
+      );
+    }
+    if (code == -352) {
+      throw const BiliApiException(
+        code: -352,
+        message: '关注列表接口被限流，请稍后再试',
+        path: '/x/relation/followings',
+      );
+    }
+    if (code != 0) {
+      throw BiliApiException(
+        code: code ?? -1,
+        message: data?['message'] as String? ?? '关注列表获取失败',
+        path: '/x/relation/followings',
+      );
+    }
+    final d = data?['data'] as Map<String, dynamic>?;
+    if (d == null) {
+      return const FollowingsPage(
+        upowners: [],
+        totalCount: 0,
+        hasMore: false,
+      );
+    }
+    final rawTotal = d['total'];
+    var totalCount = rawTotal is String
+        ? (int.tryParse(rawTotal) ?? 0)
+        : (rawTotal as num?)?.toInt() ?? 0;
+    if (totalCount < 0) totalCount = 0; // 防御：负数按缺失处理
+    final raw = d['list'];
+    if (raw is! List) {
+      return FollowingsPage(
+        upowners: const [],
+        totalCount: totalCount,
+        hasMore: false,
+      );
+    }
+    final upowners = raw
+        .whereType<Map<String, dynamic>>()
+        .map(_parseFollowingItem)
+        .where((u) => u.mid != 0) // 缺 mid 的视为脏数据丢弃
+        .toList();
+    final hasMore = totalCount > 0
+        ? pn * ps < totalCount
+        : upowners.length == ps; // total 缺失时按装满一页兜底
+    return FollowingsPage(
+      upowners: upowners,
+      totalCount: totalCount,
+      hasMore: hasMore,
+    );
+  }
+
+  /// 解析关注列表单项（data.list[] 元素）为 [Upowner]。
+  ///
+  /// 字段（按 bilibili-API-collect 文档）：`mid` num / `uname` String /
+  /// `face` String（可能空或 `//` 开头，补全 https: 协议头）。缺 mid 返回
+  /// mid=0，由调用方统一过滤。
+  Upowner _parseFollowingItem(Map<String, dynamic> json) {
+    var face = json['face'] as String? ?? '';
+    if (face.startsWith('//')) face = 'https:$face';
+    return Upowner(
+      mid: (json['mid'] as num?)?.toInt() ?? 0,
+      name: json['uname'] as String? ?? '',
+      face: face,
+      fans: (json['fans'] as num?)?.toInt(),
+      addedAt: DateTime.now().toUtc(),
+    );
   }
 
   // -------------------------------------------------------------------------

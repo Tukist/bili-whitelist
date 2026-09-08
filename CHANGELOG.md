@@ -8,6 +8,21 @@
 
 ---
 
+## v2.17.12 (2026-09-09)
+
+**关注 UP 体系：App 内统一「关注 = 加入白名单 UP 主」+「导入我关注的 UP」批量加入（B 站关注列表 → 白名单，一个方向）**
+
+- **B 站「我关注的 UP」接口（`app/lib/api/bilibili_api.dart` 新增 `fetchFollowingsOfMine`，v2.17.12）**：`x/relation/followings?vmid=<自己的 mid>`（需登录：无 SESSDATA 抛 -101「请先登录」；有 SESSDATA 但失效 → nav 拿 mid 抛 -101「登录已失效」）——mid 走 `_ensureMyMid`（nav 会话缓存，同收藏夹导入）；`pn/ps` 分页，解析 `data.list[]{mid/uname/face}` 转 [Upowner]（face `//` 补 https:；缺 mid 脏条目过滤；total 数字串兼容，负数/缺失按 0）；错误分类 -101/-412/-352/其他业务码 → [BiliApiException]、网络 [DioException] 上抛。**字段验证说明**：2026-09 实测本机匿名请求该接口一律返回 -101「账号未登录」（关注列表现在属个人账号数据，无法匿名看结构）——字段形态按 bilibili-API-collect 文档口径 + 防御解析实现；登录态真实列表需真机验证（模拟器无法收短信登录码）
+- **「导入我关注的 UP」入口（新 `app/lib/pages/followings_import_page.dart`，UP 主管理页顶部第二按钮）**：首页 UP 主管理页（主页左滑第 2 页）标题下方新增「导入我关注的 UP」按钮（与「搜索 UP 主」并排）——点击走 [runFollowingsImportFlow]：**配置门禁**（未配 GitHub token/gist_id 先提示，不发请求）→ **登录门禁**（无 SESSDATA 提示「关注列表属于个人账号数据」并引导登录，登录成功继续/保持匿名中止）→ **勾选页**：页头「B 站关注共 N 位 · 已加载 M」（关注很多只拉**前 200 位**，超出提示「其余请分批搜索加入」——取舍：避免为全量关注反复请求触发风控）、列表行 = 勾选框 + 名字 + mid（已在白名单的关注项直接标「已关注」灰色不可选）、底部「全选/取消全选」+「加入白名单（已选 K）」、「加载更多」翻页（20 条/页，翻完提示已加载全部/已达上限）
+- **批量加入只写一次盘（`UpownerWriter.addBatch` 新增）**：一次拉 Gist → 入参去重（内部重复/无效 mid 剔除）→ mid 查重（已在白名单跳过，计入 skipped）→ 合并 **一次 saveToGist → 一次写本地缓存**（非逐条 add 的 N 次拉/写）；全部已存在不发写请求；结果 [UpownerBatchResult]（ok/data/added/skipped），UI 汇总「已添加 X，跳过 Y（已在白名单）」；写入成功返回上一页自动刷新管理列表（pop(true) → onDone → 首页 `_load`）
+- **App 内关注/取关（`app/lib/pages/upowner_page.dart` 顶部按钮统一文案）**：UP 详情页 AppBar 从「仅白名单时移除图标」改为**常驻「关注 / 已关注」文字按钮**（未关注：FilledButton.tonal「关注」→ `UpownerWriter.add` 加入白名单，成功变「已关注」+ snack「已关注：xx」；已关注：点按弹确认「取消关注 = 从白名单移除该 UP 主，不影响已加入视频，可随时重新关注」→ `removeByMid` 移除变回「关注」，留在本页可再关注）——**播放页 UP 入口 / 评论 UP 链接 / 搜索 UP 结果 / 白名单管理页**等一切进 UP 详情页的途径都可用；页面内改过关注状态后返回 pop(true)（PopScope 带返回值），上层刷新白名单快照（搜索页回跳刷新「关注」按钮与白名单 Tab）。搜索 UP 结果按钮文案由「加入/已加入」统一为**「关注 / 已关注」**（UpownerTile）；管理页副标题同步说明「关注 UP 主 = 加入白名单」
+- **真实写入边界**：关注/取关/批量导入都要写 Gist——模拟器上未配置真实 GitHub token/gist_id，点击均走「请先到右上角管理入口配置…」门禁提示不落盘（配置后真机即可用）；**upowners 落库（Gist 内容 + 本地缓存）由 widget 测试用内存 GistApi + 记录型假同步服务验证**
+- **反向同步取舍**：App 内关注/取关**只写白名单 Gist，不回写 B 站关注关系**（`x/relation/modify` 是官方账号操作、需 csrf 且属敏感动作，第三方客户端不代写）——「导入我关注的 UP」也只做 B 站 → 白名单单方向；若日后要双端一致需另行评估官方 OAuth/接口策略
+- 测试：`fetchFollowingsOfMine` 单测 9 例（登录门禁不发请求 / nav mid 缓存与 vmid/pn/ps 参数 / face 补 https + total 字符串 + 脏条目过滤 / hasMore total 在场与兜底两分支 / list 缺失空页 / -101/-412/-352/其他业务码 / nav -101 / 网络 DioException）+ `UpownerWriter.add/addBatch/removeByMid` 单测 9 例（关注与取关文案、批量一次写盘、内部去重、已在跳过计数、全跳过不写盘、未配置门禁）+ UP 详情页关注按钮 widget 测试 5 例（关注写 Gist+缓存变已关注 / 取消关注确认移除回未关注 / 弹窗取消不变 / 未配置提示 / 返回 pop 结果）+ 导入流程 widget 测试 4 例（配置门禁 / 登录门禁中止 / 全选批量加入汇总与 Gist+缓存 / 翻页加载更多）；`flutter analyze` 0 issue、全量 `flutter test` 通过（797 例）
+- 验证：debug APK 装机模拟器 uiautomator dump——UP 管理页出现「导入我关注的 UP」按钮、点击提示配置门禁；搜索 UP 结果行「关注」按钮、非白名单 UP 详情页顶部「关注」按钮可见可点（无配置不落盘、状态不变）；真实关注列表导入（登录态）需真机验证
+
+---
+
 ## v2.17.11 (2026-09-09)
 
 **收藏夹内搜索：夹内视频页加搜索框，输入自动拉全夹后本地按标题 / UP 主过滤（收藏夹直看补齐「找得到」短板）**

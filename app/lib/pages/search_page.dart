@@ -3,7 +3,7 @@
 ///   番剧·电影·电视剧，v2.16.5+），结果可一键「加入/整季导入」白名单
 /// - 「我的白名单」：对当前白名单数据本地过滤（标题 / UP 主包含关键词）
 /// - 「搜索 UP 主」（v2.13.0+）：搜 B 站全网用户（[BiliApi.searchUpowner]），
-///   结果可一键「加入白名单 UP 主」
+///   结果可一键「关注」（= 加入白名单 UP 主，v2.17.12+ 统一文案）
 ///
 /// 防风控：输入防抖 600ms 自动搜 + 手动搜索按钮；搜索失败分类提示
 /// （-412 风控 / -352 限流 / -1200 降级 / 网络失败），返回空数组时显示「无结果」。
@@ -677,7 +677,7 @@ class _SearchPageState extends State<SearchPage>
     return _whitelist?.videos.any((v) => v.epId == firstEp) ?? false;
   }
 
-  /// UP 主加入白名单（搜索页 UP 主 Tab 用）。
+  /// UP 主加入白名单（搜索页 UP 主 Tab 用；文案统一为「关注」）。
   Future<void> _joinUpowner(Upowner up) async {
     if (_joiningUpowners.contains(up.mid)) return;
     setState(() => _joiningUpowners.add(up.mid));
@@ -689,13 +689,13 @@ class _SearchPageState extends State<SearchPage>
       });
       _showSnack(result.message);
     } on GithubApiException catch (e) {
-      _showSnack('加入失败：${e.message}');
+      _showSnack('关注失败：${e.message}');
     } finally {
       if (mounted) setState(() => _joiningUpowners.remove(up.mid));
     }
   }
 
-  /// 该 mid 是否已在白名单（搜索页 UP 主 Tab「已加入」判断）。
+  /// 该 mid 是否已关注（搜索页 UP 主 Tab「已关注」按钮状态判断）。
   bool _isUpownerAdded(int mid) =>
       _whitelist?.upowners.any((u) => u.mid == mid) ?? false;
 
@@ -1146,7 +1146,7 @@ class _SearchPageState extends State<SearchPage>
         icon: Icons.person_search,
         message:
             '输入 UP 主昵称，搜索 B 站用户\n'
-            '结果可一键加入白名单（加入前会查重）',
+            '结果可一键关注（= 加入白名单 UP 主，加入前会查重）',
       );
     }
     if (results.isEmpty) {
@@ -1172,10 +1172,12 @@ class _SearchPageState extends State<SearchPage>
           added: _isUpownerAdded(up.mid),
           joining: _joiningUpowners.contains(up.mid),
           onJoin: () => _joinUpowner(up),
-          onTap: () {
+          onTap: () async {
             // 跳 UP 主详情页（v2.13.0+）：展示 UP 主信息 + 视频列表
-            Navigator.of(context).push(
-              MaterialPageRoute<void>(
+            // v2.17.12+：详情页可「关注/取消关注」，返回 true（改过状态）
+            // 时刷新本页白名单快照（「关注」按钮状态与白名单 Tab 同步）
+            final changed = await Navigator.of(context).push<bool>(
+              MaterialPageRoute(
                 builder: (_) => UpownerPage(
                   mid: up.mid,
                   initial: up,
@@ -1183,6 +1185,9 @@ class _SearchPageState extends State<SearchPage>
                 ),
               ),
             );
+            if (changed == true && mounted) {
+              await _loadWhitelist();
+            }
           },
         );
       },

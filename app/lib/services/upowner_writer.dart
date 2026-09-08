@@ -28,17 +28,43 @@ class UpownerWriteResult {
   });
 }
 
+/// 「UP 主批量加入」的结果（v2.17.12+，导入 B 站关注列表用）。
+///
+/// - [ok]=false：配置缺失等整体失败，[message] 可直接展示（未开始写盘）
+/// - [ok]=true：[added] 实际新增个数；[skipped] 已存在白名单被跳过个数
+///   （含所选内互相重复）；[data] 可能为 null（无需写盘时也可能为 null）
+class UpownerBatchResult {
+  final bool ok;
+  final WhitelistData? data;
+  final String message;
+  final int added;
+  final int skipped;
+
+  const UpownerBatchResult({
+    required this.ok,
+    this.data,
+    required this.message,
+    this.added = 0,
+    this.skipped = 0,
+  });
+}
+
 /// UP 主写入服务（白名单 Gist 写路径）。
 ///
 /// 异常契约：
-/// - [add] / [removeByMid] / [updateLastSeen]：Gist 读写失败抛
+/// - [add] / [addBatch] / [removeByMid] / [updateLastSeen]：Gist 读写失败抛
 /// [GithubApiException]；B 站接口失败抛 [BiliApiException]；网络失败抛
 /// [DioException]。
 /// - 配置门禁：调用 [hasConfig] 自行判断（add 时也会再次校验并返回错误信息）。
 class UpownerWriter {
   final GithubApi github;
 
-  UpownerWriter({GithubApi? github}) : github = github ?? GithubApi();
+  /// B 站 API（导入「我关注的 UP」拉列表用；测试可注入 mock）。
+  final BiliApi api;
+
+  UpownerWriter({GithubApi? github, BiliApi? api})
+    : github = github ?? GithubApi(),
+      api = api ?? BiliApi();
 
   /// token + gist_id 是否都已配置（写操作前调用）。
   Future<bool> hasConfig() => github.hasConfig();
@@ -59,7 +85,7 @@ class UpownerWriter {
       return UpownerWriteResult(
         ok: false,
         data: data,
-        message: '已在白名单：${up.name}',
+        message: '「${up.name}」已在白名单（无需重复关注）',
       );
     }
     final next = addUpowner(data, up);
@@ -75,7 +101,77 @@ class UpownerWriter {
     return UpownerWriteResult(
       ok: true,
       data: next,
-      message: '已加入：${up.name}',
+      message: '已关注：${up.name}',
+    );
+  }
+
+  /// 批量加入 UP 主（v2.17.12+，导入 B 站关注列表用）。
+  ///
+  /// 与逐个 [add] 的区别：**只拉一次 Gist → 查重合并 → 一次 saveToGist →
+  /// 一次写缓存**（导入可能上百个，逐个 add 会 N 次拉/写 Gist）。
+  ///
+  /// - mid 已在白名单 / 所选内部重复 → 跳过（计入 [UpownerBatchResult.skipped]）
+  /// - 全部被跳过（无需写盘）→ ok=true、added=0、data=null（不发写请求）
+  /// - 未配置 → ok=false（不发 Gist 请求，[message] 引导配置）
+  /// - Gist 拉取/保存/缓存失败 → 抛 [GithubApiException]（由调用方分类提示）
+  Future<UpownerBatchResult> addBatch(List<Upowner> ups) async {
+    // 清洗入参：去掉无效条目（mid<=0 或空名）与所选内部重复
+    final seen = <int>{};
+    final clean = <Upowner>[];
+    for (final u in ups) {
+      if (u.mid <= 0 || u.name.trim().isEmpty) continue;
+      if (seen.contains(u.mid)) continue;
+      seen.add(u.mid);
+      clean.add(u);
+    }
+    if (clean.isEmpty) {
+      return const UpownerBatchResult(
+        ok: true,
+        message: '所选 UP 无效（无 mid/无名字），未添加',
+      );
+    }
+    if (!await github.hasConfig()) {
+      return const UpownerBatchResult(
+        ok: false,
+        message: '请先在首页右上角「管理」入口配置 GitHub token 与 Gist ID',
+      );
+    }
+    final current = await github.fetchFromGist();
+    final data = current ?? WhitelistData.empty();
+    final existingMids = data.upowners.map((u) => u.mid).toSet();
+    final toAdd = <Upowner>[];
+    for (final u in clean) {
+      if (existingMids.contains(u.mid)) continue; // 已在白名单 → 跳过
+      toAdd.add(u);
+    }
+    final skipped = clean.length - toAdd.length;
+    if (toAdd.isEmpty) {
+      return UpownerBatchResult(
+        ok: true,
+        data: data,
+        message: '所选 UP 已全部在白名单（无需添加）',
+        added: 0,
+        skipped: skipped,
+      );
+    }
+    final next = data.copyWith(upowners: [...data.upowners, ...toAdd]);
+    final ok = await github.saveToGist(next);
+    if (!ok) {
+      return UpownerBatchResult(
+        ok: false,
+        data: data,
+        message: '保存到 Gist 失败，请重试',
+        added: 0,
+        skipped: skipped,
+      );
+    }
+    await ServiceLocator.syncService.saveToCache(next);
+    return UpownerBatchResult(
+      ok: true,
+      data: next,
+      message: '已关注 ${toAdd.length} 位 UP 主',
+      added: toAdd.length,
+      skipped: skipped,
     );
   }
 
@@ -96,7 +192,7 @@ class UpownerWriter {
       return UpownerWriteResult(
         ok: false,
         data: current,
-        message: 'UP 主（mid=$mid）不在白名单中',
+        message: '该 UP 主未在白名单（未关注）',
       );
     }
     final ok = await github.saveToGist(next);
@@ -111,7 +207,7 @@ class UpownerWriter {
     return UpownerWriteResult(
       ok: true,
       data: next,
-      message: '已移除 UP 主',
+      message: '已取消关注（已从白名单移除）',
     );
   }
 
