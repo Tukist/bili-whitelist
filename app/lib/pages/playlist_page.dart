@@ -22,6 +22,7 @@ import '../utils/import_parser.dart';
 import '../widgets/favorites_import_dialog.dart';
 import '../widgets/pgc_import_dialog.dart';
 import 'collection_page.dart';
+import 'favorites_page.dart';
 import 'history_page.dart';
 import 'inbox_page.dart';
 import 'login_page.dart';
@@ -39,6 +40,10 @@ import 'upowner_page.dart';
 /// - **新增白名单的入口**：导入（解析 B 站分享链接/文本，与电脑端油猴脚本
 ///   等价）+ 搜索页「加入」（搜 B 站全网后一键加入，M7）
 /// - 管理功能仅限：新建/重命名/删除合集、移动/删除视频（防沉迷原则不变）
+/// - **固定「收藏夹」卡（v2.17.7+）**：合集区顶部常驻入口（点开 = 我的 B 站
+///   收藏夹，三级浏览：首页收藏夹卡 → 收藏夹列表 → 夹内视频直接点播，
+///   白名单外可播模式，见 [FavoritesPage]/[FavoriteVideosPage]）；收藏夹属
+///   个人账号数据，未登录先提示并引导登录
 /// - 右上角搜索入口：B 站全网搜索 + 白名单内过滤两个 Tab
 /// - 右上角导入入口：粘贴分享链接/文本（视频 BV/b23.tv 短链/完整链接；
 ///   番剧/电影 ep|ss 链接与 b23 番剧短码 → 整季逐集加入白名单，v2.16.2）
@@ -456,6 +461,35 @@ class _PlaylistPageState extends State<PlaylistPage> {
       ],
     );
     await _saveAndRefresh(next);
+  }
+
+  /// 打开收藏夹总览页（v2.17.7+ 首页固定「收藏夹」卡）。
+  ///
+  /// 登录门禁：收藏夹属个人账号数据——无 SESSDATA 先提示并引导登录（复用
+  /// [_openLogin]），登录成功才进总览；有会话但已失效 → 总览页内遇 -101
+  /// 会再引导重登（兜底，见 FavoritesPage）。
+  Future<void> _openFavorites() async {
+    Future<String?> readSess() async {
+      try {
+        return await _writer.api.readSessdata();
+      } catch (_) {
+        return null; // 存储异常按未登录（页面内仍有 -101 引导兜底）
+      }
+    }
+
+    var sess = await readSess();
+    if (sess == null || sess.isEmpty) {
+      if (!mounted) return;
+      _showSnack('收藏夹浏览需要登录 B 站账号（收藏夹属于个人账号数据）');
+      await _openLogin(context);
+      if (!mounted) return;
+      sess = await readSess();
+      if (sess == null || sess.isEmpty) return; // 仍匿名 → 中止
+    }
+    if (!mounted) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(builder: (_) => const FavoritesPage()),
+    );
   }
 
   /// 打开导入对话框（解析分享链接 → 加入白名单）。
@@ -881,6 +915,11 @@ class _PlaylistPageState extends State<PlaylistPage> {
           sourceName: _sourceName,
           error: _error,
         ),
+        // 固定「收藏夹」入口卡（v2.17.7+）：不随合集列表滚动、空名单也显示
+        Padding(
+          padding: const EdgeInsets.fromLTRB(12, 4, 12, 0),
+          child: _FavoritesCard(onTap: _openFavorites),
+        ),
         Expanded(
           child: RefreshIndicator(
             onRefresh: _load,
@@ -1279,6 +1318,88 @@ class _CollectionCard extends StatelessWidget {
           isUncategorized ? Icons.inbox_outlined : Icons.video_library_outlined,
           size: 32,
           color: theme.colorScheme.onSecondaryContainer.withValues(alpha: .55),
+        ),
+      ),
+    );
+  }
+}
+
+/// 首页固定「收藏夹」入口卡（v2.17.7+）：样式同合集卡（行式 + 圆角 + 64 视觉
+/// 位），但用 folder_special 图标 + 独立渐变与副标「我的 B 站收藏」作视觉
+/// 区分；不参与拖拽排序（合集区顶部常驻，未登录/空名单也显示）。
+class _FavoritesCard extends StatelessWidget {
+  final VoidCallback onTap;
+
+  const _FavoritesCard({required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Material(
+      color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: .5),
+      borderRadius: BorderRadius.circular(12),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.all(10),
+          child: Row(
+            children: [
+              // 代表视觉：收藏夹专属渐变 + folder_special 图标（区别于合集封面）
+              ClipRRect(
+                borderRadius: BorderRadius.circular(8),
+                child: Container(
+                  width: 64,
+                  height: 64,
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(
+                      begin: Alignment.topLeft,
+                      end: Alignment.bottomRight,
+                      colors: [
+                        theme.colorScheme.tertiaryContainer,
+                        theme.colorScheme.primaryContainer,
+                      ],
+                    ),
+                  ),
+                  child: Center(
+                    child: Icon(
+                      Icons.folder_special_outlined,
+                      size: 32,
+                      color: theme.colorScheme
+                          .onTertiaryContainer
+                          .withValues(alpha: .55),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      '收藏夹',
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: theme.textTheme.titleSmall,
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      '我的 B 站收藏',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Icon(
+                Icons.chevron_right,
+                size: 20,
+                color: theme.colorScheme.outline.withValues(alpha: .55),
+              ),
+            ],
+          ),
         ),
       ),
     );
