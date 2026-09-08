@@ -8,6 +8,27 @@
 
 ---
 
+## v2.17.4 (2026-09-08)
+
+**UP 主主页「合集/列表」区（仿 B 站 UP 主页：展示该 UP 主的合集与列表，点合集看其视频，可播放/加入白名单）**
+
+承接 v2.17.2（播放页 UP 主入口）。进入 UP 主详情页后，顶部新增「合集」区——列出该 UP 主的合集（season）与列表（series），点合集在其内浏览视频（点击播放 / 长按加入白名单），补充了 UP 主页的合集维度（此前只能看「全部视频」投稿流）：
+
+- **API 层（`app/lib/api/bilibili_api.dart`）**：新增三个**匿名可用、无需 WBI 签名**的封装（带完整浏览器头 + buvid 指纹，与评论区接口同策略；登录态存在时照常注入 SESSDATA）：
+  - `fetchUpownerCollections(mid)`（`x/polymer/web-space/seasons_series_list`）→ `UpownerCollectionsResult{seasons[], series[]}`，每项 `UpownerCollection{kind(season/series), id(season_id/series_id), name, cover, description, total, creator}`；`items_lists` 缺失 → 空结果（该 UP 主无合集非错误）；id/total 数字串（String）容错；脏条目（id≤0/空名）过滤；`creator='auto'` 的系列以 `isAuto` 标记（由页面层决定取舍，API 原样返回两类）
+  - `fetchSeasonArchives(seasonId, {page})`（`x/polymer/web-space/seasons_archives_list`）→ `UpownerVideosPage`：`data.archives[]` **无 cid / 无 upper 名**（有 aid/bvid/title/pic/duration(秒)/pubdate），解析为 cid=0 的 WhitelistVideo（播放时 view 补齐）+ pubdate 记录，`page.total` 分页判断
+  - `fetchSeriesArchives(mid, seriesId, {page})`（`x/series/archives`，参数 pn/ps）→ 同结构（`page{num,size,total}` 与 season 的 `page{page_num,page_size,total}` 字段不同，统一只取 total）
+  - 错误分类与既有接口一致：-412 风控 / -352 限流 / 其他业务码带接口 message / 网络 DioException 原样上抛；code=0 无 data → 合集/系列视频接口按空页处理、合集清单接口抛「未返回数据」
+- **页面（`app/lib/pages/upowner_page.dart`）**：顶部「合集」区（**只在拿到 ≥1 个合集/列表时显示**，无合集整区隐藏不占位、加载失败静默隐藏不影响主列表）——区头「合集」+ 横向 chips 行：第一个「全部视频」（默认，即原主列表），其后各合集/列表（season 名带「合集·」前缀、series 名带「 · 列表」后缀，均与 B 站展示一致）；点合集 chip → 下方视频列表**切换为该合集视频视图**（fetchSeasonArchives / fetchSeriesArchives 按类型自动选接口、独立分页滚动到底加载 20 条/页），此时**搜索框与排序 chips 隐藏**（搜索/排序仍只作用于「全部视频」原列表——合集视频按合集自身顺序展示）；点「全部视频」chip 切回原列表（搜索/排序恢复）。两个视图共用行组件与交互（点击 → 缺 cid 走现有 `fetchVideoMeta` view 补齐再进播放页；长按 → 「加入白名单视频 / 取消」）；切换视图自动滚回顶部；请求进行中切走 → 过期结果丢弃不污染新视图；按 bvid 去重防接口重复条目；滚动监听按当前视图分发翻页
+- **取舍说明**：
+  - **series `creator='auto'`（直播回放等系统自动生成列表）过滤不显示**：页面层把 `isAuto` 系列从「合集」区剔除（`fetchUpownerCollections` 原样返回、不丢数据）——与 B 站网页端 UP 主页一致：这类列表是系统按直播回放/视频自动归集的、非 UP 主动整理内容，放进来会污染该区（老番茄等 UP 的 auto 系列动辄十几个）；想看直播回放可回 B 站看
+  - **合集/列表视频项无 cid / 无 upper 名** → 列表项 cid=0、upName 空串：点击播放复用现有「view 接口实时补 cid」流程（与 UP 主全部视频、信箱同款，实机验证取流日志带真实 cid）；UP 主页列表行本就不展示 upName，加入白名单走 view 补齐真实元数据
+  - 合集/列表清单一次取一页（page_size=20，UP 主页一般 < 20 个；极端超 20 只显示第一页，注释已说明）
+- **测试**：`UpownerPage` 增可选 `api` 注入参数（widget 测试注入 mock BiliApi）；新增 `app/test/upowner_collection_api_test.dart`（**17 个单测**：三个接口的 URL/参数构造、seasons_series_list `items_lists` 结构解析（seasons/series 分开）、meta 字段解析与 total/id 数字串容错、creator=auto → isAuto、脏条目过滤、空 items_lists、-412/-352/无 data 错误分类、seasons/series 视频 archives 解析（cid=0/duration 秒/pubdate/封面补全）与 page.total 分页、空页/脏 bvid 丢弃）；新增 `app/test/upowner_page_collections_test.dart`（**5 个 widget 测试**：有合集显示「合集」区 + chips（auto 系列被过滤）/ 无合集整区隐藏 / 点合集 chip 切换列表（搜索排序隐藏）+ 点「全部视频」切回恢复 / 点自建列表走 x/series/archives / 合集视频长按弹「加入白名单视频」菜单可取消关闭）
+- **验证**：`flutter analyze` 0 issue；全量单测 **656 通过**（634 → 新增 22：API 17 + widget 5）；模拟器实测（真实网络 + 真实 App，匿名 720P）：首页合集卡「コデ」→ 串流教程视频（摄影师云飞）→ 播放页点 UP 主 → 进 UP 主页——**合集区出现**（uiautomator dump 文本证据：区头「合集」+「全部视频」chip +「合集·摄影师云飞的手机、平板测评」+「合集·智能手表」chips）；点合集 chip → logcat `fetchSeasonArchives season_id=754991`、下方列表切换为该合集视频（dump：搜索框/排序 chips 隐藏、9 个视频行）；点合集视频 → 进播放页 logcat `取流 bvid=BV11tbT6MEWv cid=41673623143`（合集接口视频无 cid，**真实 cid 由 view 补齐**）+ 720P DASH 取流成功 + 播放进度正常保存；返回后合集视图状态保留；集成测试 `integration_test/upowner_collection_flow_test.dart`（`flutter test integration_test/... -d emulator-5554`）真实网络通过：合集区出现 → 点「合集·摄影师云飞的手机、平板测评」→ 9 个视频行 → 点「全部视频」切回主列表（搜索/排序恢复）
+
+---
+
 ## v2.17.3 (2026-09-08)
 
 **视频简介（desc）：导入存储 + 播放页信息行显示 + 简介/评论过长折叠展开**

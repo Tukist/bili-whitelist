@@ -1,13 +1,20 @@
 /// UP 主详情页（v2.13.0+ 起）：
 /// - 顶部 UP 主信息卡：头像（大）+ 名字 + 粉丝 + 简介
+/// - 「合集·列表」区（v2.17.4+，仿 B 站 UP 主页）：页面顶部一排横向 chips——
+///   第一个「全部视频」（默认），其后为该 UP 主的合集（season）与列表
+///   （series，过滤 creator='auto' 的直播回放等系统自动列表——与 B 站网页端
+///   UP 主页一致，非 UP 主动整理内容不进此区）；无合集/列表时整区隐藏
 /// - 视频列表：分页（滚动到底加载更多 20 条/页）+ 排序 chip（最新发布 /
-///   最多播放 / 最多收藏）
-/// - 列表项点击 → 构造 WhitelistVideo（缺 cid 时实时 fetchVideoMeta 拿）
-///   → push 到 PlayerPage
-/// - 列表项长按 → 弹菜单「加入白名单视频」/「取消」
+///   最多播放 / 最多收藏）+ 站内搜索（搜索/排序只作用于「全部视频」）
+/// - 合集/列表视频视图（选中某合集后）：独立分页列表（fetchSeasonArchives /
+///   fetchSeriesArchives），不受搜索/排序影响
+/// - 列表项点击 → 构造 WhitelistVideo（缺 cid 时实时 fetchVideoMeta 拿，
+///   两个视图共用）→ push 到 PlayerPage
+/// - 列表项长按 → 弹菜单「加入白名单视频」/「取消」（两个视图共用）
 /// - 顶部右上角「管理」按钮：移除 UP 主（从白名单删除，写 Gist）
 ///
-/// 与 BiliApi.fetchUpownerVideos / fetchUpownerInfo / fetchVideoMeta 共用：
+/// 与 BiliApi.fetchUpownerVideos / fetchUpownerInfo / fetchVideoMeta /
+/// fetchUpownerCollections / fetchSeasonArchives / fetchSeriesArchives 共用：
 /// 不写 Gist；视频不入库，仅供点播。UP 主信息可缓存（mid → info）。
 library;
 
@@ -80,11 +87,15 @@ class UpownerPage extends StatefulWidget {
   final Upowner? initial; // 搜索结果跳过来时预填信息（可缺省走 fetchUpownerInfo）
   final bool isInWhitelist;
 
+  /// 注入 B 站 API（widget 测试用 mock；缺省走真实实现）。
+  final BiliApi? api;
+
   const UpownerPage({
     super.key,
     required this.mid,
     this.initial,
     this.isInWhitelist = false,
+    this.api,
   });
 
   @override
@@ -92,7 +103,7 @@ class UpownerPage extends StatefulWidget {
 }
 
 class _UpownerPageState extends State<UpownerPage> {
-  final BiliApi _api = BiliApi();
+  late final BiliApi _api = widget.api ?? BiliApi();
   final ScrollController _scrollCtrl = ScrollController();
   final TextEditingController _searchCtrl = TextEditingController();
   Timer? _searchDebounce;
@@ -112,6 +123,25 @@ class _UpownerPageState extends State<UpownerPage> {
   /// 是否有视频正在「拉详情」（cid 为 0 时进入播放前 fetch）
   bool _fetchingMeta = false;
 
+  // -------------------------------------------------------------------------
+  // 「合集·列表」区（v2.17.4+）：chips 选合集 → 下方列表显示该合集视频。
+  // 合集视频列表独立于「全部视频」列表（搜索/排序不影响它）。
+  // -------------------------------------------------------------------------
+
+  /// 该 UP 主的合集 + 列表（series 已过滤 creator='auto' 系统自动项）；
+  /// 空 = 没有合集/列表 → 整区不显示。
+  final List<UpownerCollection> _collections = [];
+
+  /// 当前选中的合集/列表（null = 全部视频）。
+  UpownerCollection? _activeCollection;
+
+  /// 当前合集/列表内视频 + 翻页（选中合集时用）。
+  final List<WhitelistVideo> _colVideos = [];
+  int _colPage = 1;
+  bool _colHasMore = true;
+  bool _colLoadingMore = false;
+  String? _colError;
+
   bool get _inWhitelist => widget.isInWhitelist;
 
   @override
@@ -130,6 +160,7 @@ class _UpownerPageState extends State<UpownerPage> {
     _scrollCtrl.addListener(_onScroll);
     _loadInfo();
     _loadFirstPage();
+    _loadCollections();
   }
 
   @override
@@ -141,12 +172,17 @@ class _UpownerPageState extends State<UpownerPage> {
     super.dispose();
   }
 
-  /// 滚动监听：距底部 ≤ 200px 触发加载下一页。
+  /// 滚动监听：距底部 ≤ 200px 触发加载下一页（当前是合集视图就翻合集的页，
+  /// 否则翻「全部视频」的页）。
   void _onScroll() {
     if (!_scrollCtrl.hasClients) return;
     final pos = _scrollCtrl.position;
     if (pos.pixels >= pos.maxScrollExtent - 200) {
-      _loadMore();
+      if (_activeCollection != null) {
+        _loadCollectionMore();
+      } else {
+        _loadMore();
+      }
     }
   }
 
@@ -252,6 +288,108 @@ class _UpownerPageState extends State<UpownerPage> {
     if (newOrder == _order) return;
     setState(() => _order = newOrder);
     _loadFirstPage();
+  }
+
+  // -------------------------------------------------------------------------
+  // 「合集·列表」区逻辑
+  // -------------------------------------------------------------------------
+
+  /// 拉 UP 主合集/列表清单。失败静默隐藏整区（不影响主视频列表，
+  /// 下次进入本页会重试）；「合集」区只在拿到 ≥1 项后显示。
+  Future<void> _loadCollections() async {
+    try {
+      final result = await _api.fetchUpownerCollections(widget.mid);
+      if (!mounted) return;
+      final kept = <UpownerCollection>[
+        ...result.seasons,
+        // 过滤 creator='auto' 的系统自动列表（直播回放等）：
+        // B 站网页端 UP 主页同样不展示这类列表（非 UP 主动整理），
+        // 放进来会污染「合集/列表」区（老番茄等 UP 有大量 auto 系列）
+        ...result.series.where((s) => !s.isAuto),
+      ];
+      setState(() {
+        _collections
+          ..clear()
+          ..addAll(kept);
+      });
+    } on BiliApiException {
+      // 合集接口失败（风控/限流等）：静默，仅不显示合集区
+    } on DioException {
+      // 网络失败：静默，仅不显示合集区
+    }
+  }
+
+  /// 两个合集条目是否同一（null == null；同 kind 且同 id）。
+  bool _sameCollection(UpownerCollection? a, UpownerCollection? b) {
+    if (a == null || b == null) return a == b;
+    return a.kind == b.kind && a.id == b.id;
+  }
+
+  /// 选中/切回合集（null = 切回「全部视频」）。
+  void _selectCollection(UpownerCollection? c) {
+    if (_sameCollection(_activeCollection, c)) return;
+    setState(() {
+      _activeCollection = c;
+      _colVideos.clear();
+      _colPage = 1;
+      _colHasMore = true;
+      _colLoadingMore = false;
+      _colError = null;
+    });
+    // 切视图时滚动回顶部（主/合集两个列表共用一个 controller）
+    if (_scrollCtrl.hasClients) _scrollCtrl.jumpTo(0);
+    if (c != null) _loadCollectionPage(1);
+  }
+
+  /// 加载合集/列表内指定页视频（page=1 时 _colVideos 已在 _selectCollection
+  /// 清空）。合集用 season 接口、列表用 series 接口。
+  Future<void> _loadCollectionPage(int pn) async {
+    final c = _activeCollection;
+    if (c == null) return;
+    setState(() => _colLoadingMore = true);
+    try {
+      final result = c.kind == UpownerCollectionKind.season
+          ? await _api.fetchSeasonArchives(c.id, page: pn)
+          : await _api.fetchSeriesArchives(widget.mid, c.id, page: pn);
+      if (!mounted) return;
+      // 等待期间用户切走了 → 丢弃本次结果，不污染新视图
+      if (!_sameCollection(_activeCollection, c)) return;
+      // 去重（按 bvid；防接口重复条目）
+      final existing = _colVideos.map((v) => v.bvid).toSet();
+      final appended = [
+        ..._colVideos,
+        for (final v in result.videos)
+          if (!existing.contains(v.bvid)) v,
+      ];
+      setState(() {
+        _colVideos
+          ..clear()
+          ..addAll(appended);
+        _colPage = pn;
+        _colHasMore = result.hasMore;
+        _colLoadingMore = false;
+        _colError = null;
+      });
+    } on BiliApiException catch (e) {
+      if (!mounted || !_sameCollection(_activeCollection, c)) return;
+      setState(() {
+        _colLoadingMore = false;
+        _colError = e.message;
+      });
+    } on DioException {
+      if (!mounted || !_sameCollection(_activeCollection, c)) return;
+      setState(() {
+        _colLoadingMore = false;
+        _colError = '网络请求失败，请检查网络后重试';
+      });
+    }
+  }
+
+  /// 滚动到底翻合集/列表下一页。
+  void _loadCollectionMore() {
+    if (_colLoadingMore || !_colHasMore) return;
+    if (_colVideos.isEmpty) return;
+    _loadCollectionPage(_colPage + 1);
   }
 
   /// 点击视频：缺 cid 时 fetch view 补齐 → push PlayerPage。
@@ -363,10 +501,17 @@ class _UpownerPageState extends State<UpownerPage> {
       body: Column(
         children: [
           _buildHeader(theme),
-          _buildVideoSearchBar(),
-          _buildOrderBar(),
+          // 搜索/排序只作用于「全部视频」；选中合集时隐藏（合集视频按
+          // 合集自身顺序展示，与 B 站一致，不受站内搜索影响）
+          if (_activeCollection == null) _buildVideoSearchBar(),
+          _buildCollectionBar(),
+          if (_activeCollection == null) _buildOrderBar(),
           const Divider(height: 1),
-          Expanded(child: _buildVideoList()),
+          Expanded(
+            child: _activeCollection == null
+                ? _buildVideoList()
+                : _buildCollectionVideoList(),
+          ),
         ],
       ),
     );
@@ -514,6 +659,59 @@ class _UpownerPageState extends State<UpownerPage> {
     );
   }
 
+  /// 「合集·列表」区：横向 chips 行（第一个「全部视频」+ 该 UP 主各合集/
+  /// 列表）。UP 主没有合集/列表时整区隐藏（不占位）。选中某合集后列表区
+  /// 切换到该合集视频（[._buildCollectionVideoList]），本行仍保留在顶部
+  /// 方便随时切回「全部视频」或换合集。
+  Widget _buildCollectionBar() {
+    if (_collections.isEmpty) return const SizedBox.shrink();
+    final theme = Theme.of(context);
+    return Container(
+      width: double.infinity,
+      color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: .3),
+      padding: const EdgeInsets.fromLTRB(12, 8, 0, 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Padding(
+            padding: const EdgeInsets.only(bottom: 6, right: 12),
+            child: Text(
+              '合集',
+              style: theme.textTheme.labelMedium?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+          SingleChildScrollView(
+            scrollDirection: Axis.horizontal,
+            child: Row(
+              children: [
+                ChoiceChip(
+                  label: const Text('全部视频'),
+                  selected: _activeCollection == null,
+                  onSelected: (_) => _selectCollection(null),
+                ),
+                const SizedBox(width: 8),
+                for (final c in _collections) ...[
+                  ChoiceChip(
+                    // season 名已含「合集·」前缀（与 B 站一致）；series 为纯名
+                    label: Text(c.kind == UpownerCollectionKind.season
+                        ? c.name
+                        : '${c.name} · 列表'),
+                    selected: _sameCollection(_activeCollection, c),
+                    onSelected: (_) => _selectCollection(c),
+                  ),
+                  const SizedBox(width: 8),
+                ],
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   /// 视频列表。
   Widget _buildVideoList() {
     if (_loadingMore && _videos.isEmpty) {
@@ -534,52 +732,97 @@ class _UpownerPageState extends State<UpownerPage> {
       separatorBuilder: (_, __) => const Divider(height: 1, indent: 88),
       itemBuilder: (context, i) {
         if (i >= _videos.length) {
-          if (_loadingMore) {
-            return const Padding(
-              padding: EdgeInsets.symmetric(vertical: 16),
-              child: Center(
-                child: SizedBox(
-                  width: 18,
-                  height: 18,
-                  child: CircularProgressIndicator(strokeWidth: 2),
-                ),
-              ),
-            );
-          }
-          return Padding(
-            padding: const EdgeInsets.symmetric(vertical: 16),
-            child: Center(
-              child: Text(
-                '没有更多了',
-                style: Theme.of(context).textTheme.bodySmall?.copyWith(
-                  color: Theme.of(context).colorScheme.outline,
-                ),
-              ),
-            ),
-          );
+          return _buildListFooter(_loadingMore);
         }
-        final v = _videos[i];
-        return ListTile(
-          leading: ClipRRect(
-            borderRadius: BorderRadius.circular(4),
-            child: CoverImage(cover: v.cover, width: 72, height: 45),
-          ),
-          title: Text(
-            v.title,
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
-            style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
-          ),
-          subtitle: Text(
-            _fmtDuration(v.duration),
-            style: Theme.of(context).textTheme.bodySmall?.copyWith(
-              color: Theme.of(context).colorScheme.onSurfaceVariant,
-            ),
-          ),
-          onTap: () => _openVideo(v),
-          onLongPress: () => _onLongPress(v),
-        );
+        return _buildVideoTile(_videos[i]);
       },
+    );
+  }
+
+  /// 合集/列表视频视图（选中某合集后取代主列表）。
+  Widget _buildCollectionVideoList() {
+    if (_colLoadingMore && _colVideos.isEmpty) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (_colError != null && _colVideos.isEmpty) {
+      return _ErrorView(
+        message: _colError!,
+        onRetry: () => _loadCollectionPage(1),
+      );
+    }
+    if (_colVideos.isEmpty) {
+      return Center(
+        child: Text(
+          _activeCollection?.kind == UpownerCollectionKind.season
+              ? '该合集暂无视频'
+              : '该列表暂无视频',
+          style: const TextStyle(color: Colors.grey),
+        ),
+      );
+    }
+    final extraSlots = (_colLoadingMore || !_colHasMore) ? 1 : 0;
+    return ListView.separated(
+      controller: _scrollCtrl,
+      itemCount: _colVideos.length + extraSlots,
+      separatorBuilder: (_, __) => const Divider(height: 1, indent: 88),
+      itemBuilder: (context, i) {
+        if (i >= _colVideos.length) {
+          return _buildListFooter(_colLoadingMore);
+        }
+        return _buildVideoTile(_colVideos[i]);
+      },
+    );
+  }
+
+  /// 列表底部占位：加载中转圈 / 「没有更多了」。主视频列表与合集列表共用。
+  Widget _buildListFooter(bool loading) {
+    if (loading) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 16),
+        child: Center(
+          child: SizedBox(
+            width: 18,
+            height: 18,
+            child: CircularProgressIndicator(strokeWidth: 2),
+          ),
+        ),
+      );
+    }
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 16),
+      child: Center(
+        child: Text(
+          '没有更多了',
+          style: Theme.of(context).textTheme.bodySmall?.copyWith(
+            color: Theme.of(context).colorScheme.outline,
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 单个视频行（封面 + 标题 + 时长）：点击播放、长按加入白名单。
+  /// 「全部视频」与「合集/列表」两个视图共用同一行样式与交互。
+  Widget _buildVideoTile(WhitelistVideo v) {
+    return ListTile(
+      leading: ClipRRect(
+        borderRadius: BorderRadius.circular(4),
+        child: CoverImage(cover: v.cover, width: 72, height: 45),
+      ),
+      title: Text(
+        v.title,
+        maxLines: 2,
+        overflow: TextOverflow.ellipsis,
+        style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+      ),
+      subtitle: Text(
+        _fmtDuration(v.duration),
+        style: Theme.of(context).textTheme.bodySmall?.copyWith(
+          color: Theme.of(context).colorScheme.onSurfaceVariant,
+        ),
+      ),
+      onTap: () => _openVideo(v),
+      onLongPress: () => _onLongPress(v),
     );
   }
 

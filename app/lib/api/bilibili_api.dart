@@ -267,6 +267,91 @@ class UpownerInfo {
   });
 }
 
+/// UP 主主页「合集/列表」条目类型（`seasons_series_list` 的两种列表）。
+enum UpownerCollectionKind {
+  /// 合集（season）：UP 主主动整理的系列投稿。
+  season,
+
+  /// 列表（series）：UP 主自建或系统自动生成（creator='auto'，直播回放等）。
+  series,
+}
+
+/// UP 主主页「合集/列表」区单条（v2.17.4+，`x/polymer/web-space/
+/// seasons_series_list` 的 seasons_list[] / series_list[] 单项 meta）。
+///
+/// 2026-09 实测字段：
+/// - season meta：`season_id`（int）/ `name`（形如 `合集·xxx`）/ `cover` /
+///   `description` / `total`（视频数，int）
+/// - series meta：`series_id` / `name`（纯名称）/ `cover` / `description` /
+///   `total` / `creator`（`auto` = 直播回放等系统自动生成；空 = 用户自建）
+///
+/// [total] / [id] 对数字串（String）容错，脏类型按 0。
+class UpownerCollection {
+  final UpownerCollectionKind kind;
+  final int id; // season_id / series_id
+  final String name; // 展示名（season 已含「合集·」前缀，与 B 站一致）
+  final String cover;
+  final String description;
+  final int total; // 视频数
+  final String creator; // series 才有意义：'' 用户自建 / 'auto' 系统生成
+
+  const UpownerCollection({
+    required this.kind,
+    required this.id,
+    required this.name,
+    required this.cover,
+    required this.description,
+    required this.total,
+    required this.creator,
+  });
+
+  /// 是否为系统自动生成的列表（直播回放等）。UP 主页展示时过滤这类列表，
+  /// 与 B 站网页端一致（非 UP 主动整理的内容不进「合集/列表」区）。
+  bool get isAuto =>
+      kind == UpownerCollectionKind.series && creator.trim() == 'auto';
+
+  /// 从 `seasons_series_list` 列表项（`{archives, meta}`）的 meta 构造。
+  factory UpownerCollection.fromListMeta(
+    UpownerCollectionKind kind,
+    Map<String, dynamic> meta,
+  ) {
+    final rawId = meta[kind == UpownerCollectionKind.season
+        ? 'season_id'
+        : 'series_id'];
+    final rawTotal = meta['total'];
+    final creator = kind == UpownerCollectionKind.series
+        ? meta['creator'] as String? ?? ''
+        : '';
+    return UpownerCollection(
+      kind: kind,
+      id: rawId is String ? (int.tryParse(rawId) ?? 0) : (rawId as num?)?.toInt() ?? 0,
+      name: meta['name'] as String? ?? '',
+      cover: SearchResult.normalizeCover(meta['cover'] as String? ?? ''),
+      description: meta['description'] as String? ?? '',
+      total: rawTotal is String
+          ? (int.tryParse(rawTotal) ?? 0)
+          : (rawTotal as num?)?.toInt() ?? 0,
+      creator: creator,
+    );
+  }
+}
+
+/// UP 主主页「合集/列表」（`seasons_series_list`）整体结果：
+/// seasons_list 与 series_list 两个列表分开返回，页面层自行取舍展示
+/// （如过滤 [UpownerCollection.isAuto] 的系统自动列表）。
+class UpownerCollectionsResult {
+  final List<UpownerCollection> seasons;
+  final List<UpownerCollection> series;
+
+  const UpownerCollectionsResult({
+    required this.seasons,
+    required this.series,
+  });
+
+  /// 是否既无合集也无列表。
+  bool get isEmpty => seasons.isEmpty && series.isEmpty;
+}
+
 /// B 站 media 搜索类型（`wbi/search/type` 的 search_type 取值，v2.16.5+）。
 ///
 /// 2026-09 匿名实测：
@@ -1613,6 +1698,248 @@ class BiliApi {
       face: face,
       fans: (d['fans'] as num?)?.toInt(),
       sign: d['sign'] as String? ?? '',
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // UP 主主页「合集/列表」区（v2.17.4+ 起）
+  //   seasons_series_list（列表）+ seasons_archives_list（合集内视频）
+  //   + x/series/archives（列表内视频）
+  // -------------------------------------------------------------------------
+
+  /// UP 主主页「合集/列表」列表（`x/polymer/web-space/seasons_series_list`）。
+  ///
+  /// 2026-09 匿名实测结论：**匿名可用**（带完整头 + [_injectAuth] 的 buvid
+  /// 指纹/登录态更稳，注入 SESSDATA 亦不影响），**无需 WBI 签名**——与
+  /// 评论区接口同策略。
+  ///
+  /// 响应结构：`data.items_lists{page{total}, seasons_list[], series_list[]}`，
+  /// 每项为 `{archives(内嵌最近视频), meta}`。合集 season 与列表 series 的
+  /// meta 同构（仅 id 字段名不同：season_id / series_id），统一解析为
+  /// [UpownerCollection]，再按 [UpownerCollectionsResult.seasons] /
+  /// [.series] 分开返回，页面层按需取舍（如过滤 [UpownerCollection.isAuto]
+  /// 的直播回放类系统自动列表）。
+  ///
+  /// 错误分类（UI 据此提示）：
+  /// - code=-412 → [BiliApiException]「被风控拦截，请稍后再试」
+  /// - code=-352 → [BiliApiException]「被限流，请稍后再试」
+  /// - 其他业务码 → [BiliApiException]（带接口 message）
+  /// - code=0 但无 data → [BiliApiException]「未返回数据」
+  /// - 网络失败（[DioException]）→ 原样上抛
+  Future<UpownerCollectionsResult> fetchUpownerCollections(
+    int mid, {
+    int pageNum = 1,
+    int pageSize = 20,
+  }) async {
+    await _injectAuth();
+    debugPrint('[bili_api] fetchUpownerCollections mid=$mid '
+        'page_num=$pageNum page_size=$pageSize');
+    final resp = await _dio.get<Map<String, dynamic>>(
+      '/x/polymer/web-space/seasons_series_list',
+      queryParameters: {'mid': '$mid', 'page_num': '$pageNum', 'page_size': '$pageSize'},
+    );
+    final data = resp.data;
+    final code = data?['code'] as int?;
+    if (code == -412) {
+      throw const BiliApiException(
+        code: -412,
+        message: 'UP 主合集接口被风控拦截，请稍后再试',
+        path: '/x/polymer/web-space/seasons_series_list',
+      );
+    }
+    if (code == -352) {
+      throw const BiliApiException(
+        code: -352,
+        message: 'UP 主合集接口被限流，请稍后再试',
+        path: '/x/polymer/web-space/seasons_series_list',
+      );
+    }
+    if (code != 0) {
+      throw BiliApiException(
+        code: code ?? -1,
+        message: data?['message'] as String? ?? 'UP 主合集列表获取失败',
+        path: '/x/polymer/web-space/seasons_series_list',
+      );
+    }
+    final d = data?['data'] as Map<String, dynamic>?;
+    if (d == null) {
+      throw const BiliApiException(
+        code: -1,
+        message: 'UP 主合集接口未返回数据',
+        path: '/x/polymer/web-space/seasons_series_list',
+      );
+    }
+    // items_lists 缺失/为空 → 该 UP 主没有合集/列表，返回空结果（非错误）
+    final items = d['items_lists'] as Map<String, dynamic>? ?? const {};
+    List<UpownerCollection> parseList(
+      String key,
+      UpownerCollectionKind kind,
+    ) {
+      final raw = items[key];
+      if (raw is! List) return const [];
+      return raw
+          .whereType<Map<String, dynamic>>()
+          .map((item) {
+            final meta = item['meta'] as Map<String, dynamic>? ?? const {};
+            return UpownerCollection.fromListMeta(kind, meta);
+          })
+          .where((c) => c.id > 0 && c.name.isNotEmpty)
+          .toList();
+    }
+
+    return UpownerCollectionsResult(
+      seasons: parseList('seasons_list', UpownerCollectionKind.season),
+      series: parseList('series_list', UpownerCollectionKind.series),
+    );
+  }
+
+  /// 合集（season）内视频分页（`x/polymer/web-space/seasons_archives_list`，
+  /// v2.17.4+）。匿名可用、无需 WBI 签名（与 [fetchUpownerCollections] 同）。
+  ///
+  /// 响应 `data{archives[], meta, page{page_num,page_size,total}}`；archives[]
+  /// 项**无 cid / 无 upper 名**（有 aid/bvid/title/pic/duration(秒)/pubdate），
+  /// 因此解析出的 [WhitelistVideo] cid=0，进播放页时由 view 接口实时补 cid
+  /// （与 UP 主全部视频、信箱同款流程）。
+  ///
+  /// 错误分类与 [fetchUpownerCollections] 一致。
+  Future<UpownerVideosPage> fetchSeasonArchives(
+    int seasonId, {
+    int page = 1,
+    int pageSize = 20,
+  }) async {
+    await _injectAuth();
+    debugPrint('[bili_api] fetchSeasonArchives season_id=$seasonId '
+        'page_num=$page page_size=$pageSize');
+    final resp = await _dio.get<Map<String, dynamic>>(
+      '/x/polymer/web-space/seasons_archives_list',
+      queryParameters: {
+        'season_id': '$seasonId',
+        'page_num': '$page',
+        'page_size': '$pageSize',
+      },
+    );
+    return _parseArchivesPage(resp, '/x/polymer/web-space/seasons_archives_list');
+  }
+
+  /// 列表（series）内视频分页（`x/series/archives`，v2.17.4+）。匿名可用、
+  /// 无需 WBI 签名。
+  ///
+  /// 响应 `data{archives[], page{num,size,total}}`（注意 page 字段名与
+  /// seasons_archives_list 不同：num/size/total）；archives[] 项同无 cid /
+  /// 无 upper 名（比 season 多 upMid 字段），cid 同样由播放时补。
+  ///
+  /// 错误分类与 [fetchUpownerCollections] 一致。
+  Future<UpownerVideosPage> fetchSeriesArchives(
+    int mid,
+    int seriesId, {
+    int page = 1,
+    int pageSize = 20,
+  }) async {
+    await _injectAuth();
+    debugPrint('[bili_api] fetchSeriesArchives mid=$mid series_id=$seriesId '
+        'pn=$page ps=$pageSize');
+    final resp = await _dio.get<Map<String, dynamic>>(
+      '/x/series/archives',
+      queryParameters: {
+        'mid': '$mid',
+        'series_id': '$seriesId',
+        'pn': '$page',
+        'ps': '$pageSize',
+      },
+    );
+    return _parseArchivesPage(resp, '/x/series/archives');
+  }
+
+  /// 合集/列表视频分页响应的公共解析：
+  /// `data.archives[]` → [WhitelistVideo]（[._videoFromArchive]），
+  /// `data.page.total` → 总条数（无 page 时回退「本页装满即还有」）。
+  UpownerVideosPage _parseArchivesPage(
+    Response<Map<String, dynamic>> resp,
+    String path,
+  ) {
+    final data = resp.data;
+    final code = data?['code'] as int?;
+    if (code == -412) {
+      throw BiliApiException(
+        code: -412,
+        message: '合集视频接口被风控拦截，请稍后再试',
+        path: path,
+      );
+    }
+    if (code == -352) {
+      throw BiliApiException(
+        code: -352,
+        message: '合集视频接口被限流，请稍后再试',
+        path: path,
+      );
+    }
+    if (code != 0) {
+      throw BiliApiException(
+        code: code ?? -1,
+        message: data?['message'] as String? ?? '合集视频获取失败',
+        path: path,
+      );
+    }
+    final d = data?['data'] as Map<String, dynamic>?;
+    if (d == null) {
+      // code=0 但无 data → 当空页处理（合集可能已失效/无视频）
+      return const UpownerVideosPage(
+        videos: [],
+        totalCount: 0,
+        hasMore: false,
+      );
+    }
+    // page.total：seasons_archives_list 与 x/series/archives 的 page 字段
+    // 结构不同（{page_num,page_size,total} / {num,size,total}），但都带 total
+    final page = d['page'] as Map<String, dynamic>?;
+    final totalRaw = page?['total'];
+    final totalCount = totalRaw is String
+        ? (int.tryParse(totalRaw) ?? 0)
+        : (totalRaw as num?)?.toInt();
+    final raw = d['archives'];
+    if (raw is! List) {
+      return UpownerVideosPage(
+        videos: const [],
+        totalCount: totalCount,
+        hasMore: _computeHasMore(loaded: 0, totalCount: totalCount),
+      );
+    }
+    final videos = raw
+        .whereType<Map<String, dynamic>>()
+        .map(_videoFromArchive)
+        .where((v) => v.bvid.isNotEmpty)
+        .toList();
+    return UpownerVideosPage(
+      videos: videos,
+      totalCount: totalCount,
+      hasMore: _computeHasMore(loaded: videos.length, totalCount: totalCount),
+    );
+  }
+
+  /// 从合集/列表 archives[] 单项构造 [WhitelistVideo]。
+  ///
+  /// archives 字段：`bvid` / `title` / `pic`(可能 // 开头) / `duration`(**秒**，
+  /// 数字，与 vlist 的 "mm:ss" 字符串不同) / `pubdate`(Unix 秒) / `aid`。
+  /// 无 cid → 填 0（播放页 view 补）；无 upper 名 → upName 空串（UP 主页
+  /// 列表项不展示 upName；加入白名单走 view 补齐真实元数据）。
+  WhitelistVideo _videoFromArchive(Map<String, dynamic> j) {
+    final pub = (j['pubdate'] as num?)?.toInt() ?? 0;
+    final addedAt = pub > 0
+        ? DateTime.fromMillisecondsSinceEpoch(
+            pub * 1000,
+          ).toUtc().toIso8601String()
+        : DateTime.now().toUtc().toIso8601String();
+    return WhitelistVideo(
+      bvid: j['bvid'] as String? ?? '',
+      cid: 0, // 播放页会调 view 补 cid
+      title: j['title'] as String? ?? '',
+      cover: SearchResult.normalizeCover(j['pic'] as String? ?? ''),
+      duration: (j['duration'] as num?)?.toInt() ?? 0,
+      upName: '',
+      addedAt: addedAt,
+      collection: '',
+      order: 0,
+      pubdate: pub > 0 ? pub : null,
     );
   }
 
