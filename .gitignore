@@ -9,6 +9,7 @@
 sync_config.json
 # B 站登录 cookie（SESSDATA 等）
 cookie.txt
+cookie_new.txt
 # Gist 同步备份（含真实白名单数据）
 *.gistbak*
 # 各类密钥文件

@@ -130,6 +130,71 @@ int? autoRecoverDelayMs(int attempt) =>
 const String kAutoRecoverGiveUpMessage = '播放中断（网络或视频流异常），请重试';
 
 // -------------------------------------------------------------------------
+// 流 URL deadline 解析 + 主动预取换源决策（v2.17.15+，纯函数，便于单测）
+//
+// 背景：B 站 `.bilivideo.com` 流 URL 带 `deadline`（过期时间戳）+ `upsig`
+// 签名，过期后读取必然失败（403/2001）。2026-09 实测：普通/番剧 DASH
+// video/audio 与 mp4 durl 的 deadline 均为**固定 2 小时（7200s）**（跨 4 条
+// 视频 × 全部流类型稳定，单位是 Unix **秒**）。普通长度视频播放中不会到期，
+// 但「超长视频（>2h 一次看完）/ 长时间暂停后续播」仍可能用完 URL 剩余有效期
+// → 读到过期 URL 必中断。方案：解析流 URL deadline → 播放中周期判定「当前
+// URL 剩余有效期不足以播完剩余内容 + 提前量」→ 到期前主动 fetchPlayUrl 换
+// 新 URL（setDataSource+seek，URL 尚有效时主动做，播放几乎无感）；无法解析
+// deadline（本地缓存/无此参数）不预取，回退 v2.17.14 被动 onUrlExpired 续播。
+// -------------------------------------------------------------------------
+
+/// 主动预取提前量（毫秒）：判定换源时给「重取 playurl + 重建源 + 新源首缓冲」
+/// 留的余量——URL 剩余有效期比「剩余内容播放时长」多出不足该值即触发。
+const int kPrefetchLeadMs = 60000;
+
+/// 两次预取尝试的最小间隔（毫秒）：成功/失败都占位，防网络异常时每 10s
+/// 反复打 playurl 形成请求风暴（超长视频「换源后仍不够播完」的连续触发
+/// 场景也按此节流，每 90s 才重试一次）。
+const int kPrefetchMinIntervalMs = 90000;
+
+/// 解析流 URL 的 `deadline` 参数（过期时刻，归一为 Unix **毫秒**）。
+///
+/// 实测该参数单位是 Unix 秒（~1.7e9，2026-09）；部分渠道/历史版本可能是
+/// 毫秒（~1.7e12）——按量级统一归一为毫秒（阈值 1e11 ≈ 公元 5138 年，
+/// 秒/毫秒两态都远低于/高于该界）。缺参数 / 非数字 / URL 非法 → null
+/// （无法预取，由被动恢复兜底）。
+int? streamDeadlineMs(String url) {
+  final uri = Uri.tryParse(url);
+  if (uri == null) return null;
+  final raw = uri.queryParameters['deadline'];
+  if (raw == null) return null;
+  final v = int.tryParse(raw);
+  if (v == null) return null;
+  return v < 100000000000 ? v * 1000 : v;
+}
+
+/// 流 URL 距离过期的剩余毫秒（[deadlineMs] 减当前时刻；已过期 → ≤0）。
+/// [deadlineMs] 为 null（无 deadline）→ null。
+int? streamDeadlineRemainMs(int? deadlineMs, {required int nowMs}) {
+  if (deadlineMs == null) return null;
+  return deadlineMs - nowMs;
+}
+
+/// 主动预取换源决策（纯函数）：
+///
+/// 需要提前换源 ⇔ 「当前 URL 剩余有效期 [deadlineRemainMs]」不足以比
+/// 「剩余内容播放时长 [videoRemainMs]」多出 [leadMs] 提前量——即按 1x 继续
+/// 用当前 URL 播，会在 URL 到期前后脚才放完，到期前必须换新 URL（换源本身
+/// 耗时由 [leadMs] 覆盖）。两者都在播放中按 1:1 递减，差值不变，因此
+/// 判定对「何时会触发」是稳定且单调的。
+///
+/// 任一输入不可用（deadline 缺失 [deadlineRemainMs]=null / 剩余时长未知
+/// ≤0）→ false（不预取，回退被动恢复）。
+bool shouldPrefetchSource({
+  required int? deadlineRemainMs,
+  required int videoRemainMs,
+  int leadMs = kPrefetchLeadMs,
+}) {
+  if (deadlineRemainMs == null || videoRemainMs <= 0) return false;
+  return deadlineRemainMs - videoRemainMs < leadMs;
+}
+
+// -------------------------------------------------------------------------
 // B 站式播放快捷手势（v2.16.7+）纯函数（便于单测）
 //
 // 手势总览（参照 B 站手机端播放器；冲突处理见 build 中手势层注释）：
@@ -439,6 +504,13 @@ final Map<String, String> _viewDescCache = {};
 ///   setDataSource(新流, 位置) 续播（不弹错误打断观看）；续播失败按退避
 ///   1s→2s→4s 自动重试**有限次**（每段播放独立预算，成功 READY 清零），仍失败
 ///   才显示错误 + 重试按钮（手动兜底）
+/// - 主动预取 + 平滑换源（v2.17.15+，根治「读到过期 URL → 2001/失败」的必然中断）：
+///   实测 B 站流 URL deadline 有效期固定 **2 小时**（普通视频播放中不会到期，主因仍是
+///   网络瞬时错误——由上方 v2.17.14 自动续播兜底）；但超长视频（>2h）/ 长时间暂停后
+///   续播仍会用完 URL 剩余有效期 → 到期后读取必失败。播放中每 10s 解析当前网络流
+///   deadline 并判定「剩余有效期不足以播完剩余内容 + 60s」→ 到期前主动重取 playurl
+///   换新 URL（setDataSource+seek，URL 尚有效时切换，几乎无感）；deadline 缺失
+///   （本地缓存等）不预取，回退被动 onUrlExpired
 /// - 错误分类：403 防盗链异常 / -412 风控（指数退避 1s→2s→4s 重试）/ 62002 稿件失效 /
 ///   -101 登录失效（引导去登录页）
 /// - 会员集播放（v2.16.4+）：番剧导入的视频带 epId，播放时**先走普通 playurl**（免费集
@@ -698,6 +770,23 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
   // 防重入（原生错误事件可能比 Dart 处理快）。
   int _autoRecoverFails = 0;
   bool _autoRecovering = false;
+
+  // 主动预取 + 平滑换源（流 URL deadline 到期前换新 URL，v2.17.15+）
+  // ---------------------------------------------------------------------
+  // 见文件顶部「流 URL deadline 解析 + 主动预取换源决策」纯函数与类注释。
+  // [_prefetching] 与 [_autoRecovering] 互斥（入口各自检查对方），避免与
+  // 被动自动续播并发换源造成双 setDataSource；[_initSession] 代次校验在
+  // await 间隙播放器被重建（重进/手动重试/换源）时安全退出。
+  /// 当前网络流 URL 的过期时刻（epoch 毫秒）。null = 本地缓存播放 / 上条流
+  /// 未带 deadline / 尚未取到——此时不预取，回退被动 onUrlExpired 续播。
+  int? _netStreamDeadlineMs;
+
+  /// 主动预取换源流程进行中（防重入；也供被动自动续播让路，见 [_onAutoRecover]）。
+  bool _prefetching = false;
+
+  /// 上次预取尝试的墙钟毫秒（成功/失败都占位：防网络异常时 10s 周期反复打
+  /// playurl；见 [kPrefetchMinIntervalMs]）。
+  int _lastPrefetchAttemptMs = 0;
 
   /// 播放器重建代次：_init 每次（首次进入/手动重试/换源/切集后恢复）自增。
   /// 自动续播流程 await 间隙若有重建（_init 必经），凭代次差异安全退出，
@@ -989,6 +1078,10 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
       // （新播放器从零开始，续播成功 READY 后还会在 onPrepared 再次清零）
       _autoRecoverFails = 0;
       _autoRecovering = false;
+      // 重新初始化（重试/重进/换源）→ 主动预取状态复位：旧流的 deadline
+      // 不再适用，新流 setDataSource 后由 _playStream 重新记录
+      _prefetching = false;
+      _netStreamDeadlineMs = null;
       // 重新初始化（重试/重进）→ 清空字幕状态，等下次面板打开/切集再拉
       _subtitleTracks = const [];
       _subtitleLoading = false;
@@ -1062,6 +1155,9 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
             : Uri.file(cached.audioPath).toString(),
         positionMs: positionMs,
       );
+      // 本地缓存播放无 deadline（也不应去取网络流）：主动预取不适用，
+      // 标记清除（防上一次网络流的 deadline 残留误触发）
+      _netStreamDeadlineMs = null;
       return;
     }
     final epId = _video.epId; // 番剧集 ep_id（普通视频/旧番剧数据 = null）
@@ -1111,22 +1207,38 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     }
   }
 
-  /// 把解析好的流交给播放器播放（dash 双流 / mp4 单流）。
+  /// 把解析好的流交给播放器播放（dash 双流 / mp4 单流），并记录网络流
+  /// URL 的 deadline（主动预取换源判定用，v2.17.15+）。
   ///
   /// [result] 须 [PlayUrlResult.hasStream] 为真（调用方保证）。
   Future<void> _playStream(PlayUrlResult result,
       {required int positionMs}) async {
     final player = _player;
     if (player == null) return;
+    final String videoUrl;
+    final String? audioUrl;
     if (result.dashVideoUrls.isNotEmpty) {
-      await player.setDataSource(
-        result.dashVideoUrls.first,
-        audioUrl:
-            result.dashAudioUrls.isEmpty ? null : result.dashAudioUrls.first,
-        positionMs: positionMs,
-      );
+      videoUrl = result.dashVideoUrls.first;
+      audioUrl = result.dashAudioUrls.isEmpty ? null : result.dashAudioUrls.first;
     } else {
-      await player.setDataSource(result.mp4Url!, positionMs: positionMs);
+      videoUrl = result.mp4Url!;
+      audioUrl = null;
+    }
+    await player.setDataSource(videoUrl,
+        audioUrl: audioUrl, positionMs: positionMs);
+    // 记录当前网络流 URL 的过期时刻：主动预取判定依据（解析失败=URL 无
+    // deadline → null → 回退被动恢复）。仅记录不换源，换源由
+    // [_maybePrefetchSource] 按剩余时间决策。
+    _netStreamDeadlineMs = streamDeadlineMs(videoUrl);
+    final deadline = _netStreamDeadlineMs;
+    if (deadline != null) {
+      final remainS =
+          (deadline - DateTime.now().millisecondsSinceEpoch) ~/ 1000;
+      debugPrint('[player_page] 网络流 deadline 剩余≈${remainS}s '
+          '${_video.bvid}#$_currentPageIndex');
+    } else {
+      debugPrint('[player_page] 网络流 URL 无 deadline，不主动预取 '
+          '（回退被动 onUrlExpired）${_video.bvid}#$_currentPageIndex');
     }
   }
 
@@ -1360,6 +1472,12 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
       debugPrint('[player] 自动续播流程进行中，忽略重复事件');
       return;
     }
+    if (_prefetching) {
+      // 主动预取换源正在进行（它本身就在重取 playurl → 换新源）：URL 过期
+      // 事件交给它解决，避免并发双换源；其失败路径会再调回本方法兜底
+      debugPrint('[player] 主动预取进行中，onUrlExpired 交给预取流程');
+      return;
+    }
     _autoRecovering = true;
     final session = _initSession; // 代次校验：await 间隙播放器被重建则退出
     try {
@@ -1395,6 +1513,72 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     }
   }
 
+  /// 主动预取 + 平滑换源（v2.17.15+）：在流 URL 到期前换新 URL，消除
+  /// 「读到过期 URL → 2001/失败」的必然中断（被动 onUrlExpired 是失败后才
+  /// 恢复，这里 URL 尚有效就主动做，播放几乎无感）。
+  ///
+  /// 由 [_tick] 每 10s（20 × 500ms）调用一次，纯判定 + 按需执行：
+  /// - 前置：READY 播放中、无错误/缓冲/完成、不与被动自动续播或本次预取并发、
+  ///   播放器未重建（代次一致）；
+  /// - 判定：当前网络流 deadline 剩余 < 剩余内容时长 + [kPrefetchLeadMs]
+  ///   （[shouldPrefetchSource]，deadline 缺失/时长未知 → 不预取回退被动）；
+  /// - 触发：节流（距上次尝试 ≥ [kPrefetchMinIntervalMs]）后重取 playurl →
+  ///   记位置 → setDataSource 平滑换源（同 [_onAutoRecover] 的续播路径，
+  ///   但此刻 URL 仍有效，不会失败）；
+  /// - 失败：静默（不弹错），URL 尚有效则下轮再试；期间原生若因 URL 真过期
+  ///   报 onUrlExpired 会被 [_prefetching] 让路并最终走回 [_onAutoRecover]。
+  Future<void> _maybePrefetchSource() async {
+    final player = _player;
+    if (player == null || !mounted) return;
+    if (!_loaded || !_playing || _buffering || _completed || _error != null) {
+      return;
+    }
+    if (_autoRecovering || _prefetching) return; // 与被动续播互斥，防双换源
+    if (_dragging || _seekDragging) return; // 用户 seek 拖动中不打断
+    final deadline = _netStreamDeadlineMs;
+    final duration = _durationMs;
+    if (deadline == null || duration <= 0) return; // 本地/无 deadline/时长未知
+    final session = _initSession; // 代次校验：await 间隙播放器被重建则退出
+    // 位置取一次就够（判定基准）；换源前会再取最新位置
+    final pos = await player.getPosition();
+    if (!mounted || session != _initSession) return;
+    final now = DateTime.now().millisecondsSinceEpoch;
+    final remainMs = streamDeadlineRemainMs(deadline, nowMs: now);
+    final videoRemainMs = math.max(0, duration - pos);
+    if (!shouldPrefetchSource(
+        deadlineRemainMs: remainMs, videoRemainMs: videoRemainMs)) {
+      return;
+    }
+    if (now - _lastPrefetchAttemptMs < kPrefetchMinIntervalMs) {
+      return; // 节流：距上次尝试不足（上次失败/刚换完源都占位）
+    }
+    _lastPrefetchAttemptMs = now;
+    _prefetching = true;
+    var needRecoverFallback = false; // 预取失败且可能已丢 onUrlExpired → 走被动兜底
+    try {
+      debugPrint('[player_page] 主动预取换源：URL 剩余≈${remainMs! ~/ 1000}s '
+          '视频剩余≈${videoRemainMs ~/ 1000}s '
+          '（${_video.bvid}#$_currentPageIndex）');
+      if (mounted) setState(() => _buffering = true); // 换源短暂转缓冲
+      final posNow = await player.getPosition();
+      if (!mounted || session != _initSession) return;
+      await _loadStreamAndPlay(positionMs: posNow); // 同集同清晰度重取流换源
+      await player.setPlaybackSpeed(_speed); // 换源后原生倍速被重置为 1x
+      // 新流 READY 时 onPrepared 会把 _buffering 置 false 并续 _playing
+    } catch (e) {
+      debugPrint('[player_page] 主动预取换源失败（静默，稍后重试或被动兜底）：$e');
+      needRecoverFallback = true;
+      if (mounted) setState(() => _buffering = false); // 不弹错、不留转缓冲
+    } finally {
+      _prefetching = false;
+    }
+    if (needRecoverFallback && mounted && _error == null) {
+      // 预取失败：当前 URL 可能已真过期（原生 onUrlExpired 被上面让路吞掉），
+      // 回退被动自动续播（自带退避重试与放弃文案）兜底
+      unawaited(_onAutoRecover());
+    }
+  }
+
   // -------------------------------------------------------------------------
   // 控制动作
   // -------------------------------------------------------------------------
@@ -1407,8 +1591,13 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     // 观看时长累计（纯本地；每 500ms tick 增量判断真实播放，攒够批量落盘）
     _accumulateWatchTime(pos);
     if (mounted) _updateSubtitleText(pos);
-    // 播放中每 20 次 tick（=10s）保存一次进度（防杀进程丢失）
-    if (++_tickCount % 20 == 0) _saveProgress();
+    // 播放中每 20 次 tick（=10s）保存一次进度（防杀进程丢失）+ 判定一次
+    // 是否需要主动预取换源（v2.17.15+，见 _maybePrefetchSource：普通视频
+    // deadline 2h 足够，判定不通过即零开销返回）
+    if (++_tickCount % 20 == 0) {
+      _saveProgress();
+      unawaited(_maybePrefetchSource());
+    }
   }
 
   /// 观看时长累计（口径）：仅当 **playing（含听视频纯音频模式）** 且相对
