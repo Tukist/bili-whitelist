@@ -2179,19 +2179,28 @@ class BiliApi {
 
   /// 解析关注列表单项（data.list[] 元素）为 [Upowner]。
   ///
-  /// 字段（按 bilibili-API-collect 文档）：`mid` num / `uname` String /
-  /// `face` String（可能空或 `//` 开头，补全 https: 协议头）。缺 mid 返回
-  /// mid=0，由调用方统一过滤。
+  /// 字段（按 bilibili-API-collect 文档）：`mid` num（**部分接口时期返回
+  /// 数字串，v2.17.13 起 num/String 兼容容错**——若按 num-only 解析会把
+  /// 整批关注当成缺 mid 脏条目丢弃，表现为"导入后白名单几乎没 UP"）/
+  /// `uname` String / `face` String（可能空或 `//` 开头，补全 https: 协议头）。
+  /// 缺 mid / mid<=0 → 返回 mid=0，由调用方统一过滤。
   Upowner _parseFollowingItem(Map<String, dynamic> json) {
     var face = json['face'] as String? ?? '';
     if (face.startsWith('//')) face = 'https:$face';
     return Upowner(
-      mid: (json['mid'] as num?)?.toInt() ?? 0,
+      mid: _parseMid(json['mid']),
       name: json['uname'] as String? ?? '',
       face: face,
       fans: (json['fans'] as num?)?.toInt(),
       addedAt: DateTime.now().toUtc(),
     );
+  }
+
+  /// 解析关注列表单项的 mid（num / 数字串兼容；非法 → 0 由上层过滤）。
+  static int _parseMid(Object? raw) {
+    if (raw is num) return raw.toInt();
+    if (raw is String) return int.tryParse(raw) ?? 0;
+    return 0;
   }
 
   // -------------------------------------------------------------------------

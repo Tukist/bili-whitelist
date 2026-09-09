@@ -12,6 +12,7 @@ import '../models/update_info.dart';
 import '../models/upowner.dart';
 import '../models/whitelist_video.dart';
 import '../services/apk_installer.dart';
+import '../services/followings_auto_sync.dart';
 import '../services/service_locator.dart';
 import '../services/update_service.dart';
 import '../services/update_storage.dart';
@@ -113,6 +114,12 @@ class _PlaylistPageState extends State<PlaylistPage> {
   /// 启动 5 秒后触发信箱检查的定时器（dispose 时取消，避免测试报错）。
   Timer? _inboxCheckTimer;
 
+  /// 启动 4s 后静默执行一次「B 站关注自动同步」的定时器（dispose 取消）。
+  Timer? _followingsSyncTimer;
+
+  /// 关注自动同步是否正在执行（防启动定时器与登录成功回调并发重复同步）。
+  bool _followingsSyncRunning = false;
+
   bool get _hasData => _data.videos.isNotEmpty;
 
   /// 主页 PageView（四页：历史记录 / 合集主页 / UP 主管理 / 观看统计），
@@ -173,12 +180,16 @@ class _PlaylistPageState extends State<PlaylistPage> {
     _startupUpdateTimer = Timer(const Duration(seconds: 5), () {
       _silentCheckUpdate();
     });
+    // 启动 4s 后静默执行一次「B 站关注自动同步」（登录态恢复后延迟执行，
+    // 避免启动抢网络；见 _runFollowingsAutoSync / FollowingsAutoSyncService）。
+    _scheduleFollowingsAutoSync();
   }
 
   @override
   void dispose() {
     _startupUpdateTimer?.cancel();
     _inboxCheckTimer?.cancel();
+    _followingsSyncTimer?.cancel();
     _pageController.dispose();
     super.dispose();
   }
@@ -400,6 +411,43 @@ class _PlaylistPageState extends State<PlaylistPage> {
       context,
     ).push(MaterialPageRoute<void>(builder: (_) => const InboxPage()));
     if (mounted) await _refreshInboxCount();
+  }
+
+  /// 启动 4 秒后静默执行一次关注自动同步（登录态恢复后延迟执行，避免启动
+  /// 抢网络；与信箱/更新检查同风格：静默，失败下次启动再试）。
+  /// 详见 [FollowingsAutoSyncService] —— 未登录/未配置 GitHub/10 分钟内已
+  /// 同步过都会跳过（不发请求）；有新关注加入才刷新列表。
+  void _scheduleFollowingsAutoSync() {
+    _followingsSyncTimer?.cancel();
+    _followingsSyncTimer = Timer(const Duration(seconds: 4), () {
+      unawaited(_runFollowingsAutoSync());
+    });
+  }
+
+  /// 执行一次关注自动同步：B 站关注（前 200）增量加入白名单；有新加入 →
+  /// 刷新数据（UP 管理页/信箱检查立即可见）。全程静默不打扰。
+  Future<void> _runFollowingsAutoSync() async {
+    if (_followingsSyncRunning) return;
+    _followingsSyncRunning = true;
+    try {
+      final result = await FollowingsAutoSyncService().syncOnce();
+      if (result.hasAdded && mounted) {
+        debugPrint(
+            '[followings-sync] 有新关注入白名单（+${result.added}），刷新列表');
+        await _load();
+      }
+    } catch (e) {
+      // 全兜底：任何异常都不打扰用户（服务内部已收敛为结果，这里再兜一层）
+      debugPrint('[followings-sync] 自动同步兜底异常已忽略: $e');
+    } finally {
+      _followingsSyncRunning = false;
+    }
+  }
+
+  /// 手动移除白名单 UP 后，把 mid 记入关注自动同步的跳过名单（避免自动
+  /// 同步把用户主动移除的 UP 悄悄加回）。移除本身仍是本地操作，不阻塞。
+  void _rememberManualUpownerRemoval(int mid) {
+    unawaited(FollowingsAutoSyncService().rememberManualRemoval(mid));
   }
 
   /// 读取本地缓存 + 尝试网络同步（两者并行，UI 立即展示缓存）。
@@ -835,6 +883,9 @@ class _PlaylistPageState extends State<PlaylistPage> {
       return;
     }
     await _saveAndRefresh(next);
+    // 记入自动同步跳过名单：若该 UP 在 B 站仍被关注，启动自动同步不再加回
+    // （"手动移除"优先于"自动同步跟随关注"）。
+    _rememberManualUpownerRemoval(up.mid);
   }
 
   /// 合集拖动排序：重排 collections（未分类固定最后、不可拖）→ 落库。
@@ -1069,6 +1120,18 @@ class _PlaylistPageState extends State<PlaylistPage> {
       );
     }
     await _refreshLoginHint();
+    // 登录页返回后若已登录 → 顺手触发一次关注自动同步（启动自动登录/手动
+    // 登录后立即把关注同步进白名单；失败静默，且与启动定时器同服务节流
+    // —— 10 分钟内不会重复执行）。
+    if (!mounted) return;
+    try {
+      final sess = await _upwriter.api.readSessdata();
+      if (sess != null && sess.isNotEmpty) {
+        unawaited(_runFollowingsAutoSync());
+      }
+    } catch (_) {
+      // 读登录态异常（测试环境无原生插件等）：跳过本次触发
+    }
   }
 }
 

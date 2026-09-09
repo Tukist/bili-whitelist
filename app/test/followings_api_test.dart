@@ -243,6 +243,27 @@ void main() {
       expect(page.hasMore, isTrue); // 20 < 45
     });
 
+    test('mid 数字串容错（v2.17.13 修复：整批字符串 mid 不再被当脏数据丢弃）',
+        () async {
+      final adapter = _RoutingAdapter({
+        '/x/frontend/finger/spi': () => _spiBody(),
+        '/x/web-interface/nav': () => _navBody(mid: 777),
+        '/x/relation/followings': () => _followingsBody(
+              total: 2,
+              list: [
+                {'mid': '1001', 'uname': '串号UP', 'face': ''},
+                {'mid': 'abc', 'uname': '非法串', 'face': ''}, // 非数字串 → 0 → 丢弃
+              ],
+            ),
+      });
+      final api = _api(adapter);
+      final page = await api.fetchFollowingsOfMine();
+      expect(page.totalCount, 2);
+      expect(page.upowners.length, 1, reason: '数字串 mid 正常解析');
+      expect(page.upowners.single.mid, 1001);
+      expect(page.upowners.single.name, '串号UP');
+    });
+
     test('total 缺失：装满一页 → hasMore=true；不满一页 → false', () async {
       final full = _RoutingAdapter({
         '/x/frontend/finger/spi': () => _spiBody(),

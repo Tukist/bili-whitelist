@@ -34,6 +34,7 @@ import '../api/bilibili_api.dart';
 import '../api/github_api.dart';
 import '../models/upowner.dart';
 import '../models/whitelist_video.dart';
+import '../services/followings_auto_sync.dart';
 import '../services/upowner_writer.dart';
 import '../services/whitelist_writer.dart';
 import '../widgets/cover_image.dart';
@@ -1135,6 +1136,11 @@ class _UpownerPageState extends State<UpownerPage> {
           _changed = true;
         }
       });
+      if (result.ok) {
+        // 手动取消关注 = 从白名单移除：记入自动同步跳过名单，若该 UP 在
+        // B 站仍被关注，启动自动同步不再把它加回（手动优先于自动跟随）。
+        unawaited(FollowingsAutoSyncService().rememberManualRemoval(widget.mid));
+      }
       _showSnack(result.message);
     } on GithubApiException catch (e) {
       if (!mounted) return;
