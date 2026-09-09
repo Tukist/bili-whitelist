@@ -6,7 +6,8 @@ import 'package:flutter/widgets.dart';
 /// B 站 DASH 双流播放器（Dart 侧封装，对应 android 原生插件 `BiliDashPlayerPlugin`）。
 ///
 /// 原生侧负责：双流合并（MergingMediaSource）、防盗链请求头（Referer + UA）、
-/// URL 过期识别（onUrlExpired 事件）。Dart 侧负责：取流、过期续播、UI 状态。
+/// 可自动恢复的数据源错误识别（流 URL 过期 / 瞬时网络错误 → onUrlExpired 事件）。
+/// Dart 侧负责：取流、自动续播、UI 状态。
 ///
 /// 生命周期：
 /// ```dart
@@ -155,7 +156,7 @@ class BiliDashCompletedEvent extends BiliDashEvent {
   const BiliDashCompletedEvent({required super.textureId});
 }
 
-/// 播放错误（非 URL 过期）：code/message。
+/// 播放错误（不可自动恢复，即非 URL 过期 / 瞬时网络类）：code/message。
 class BiliDashErrorEvent extends BiliDashEvent {
   final int code;
   final String message;
@@ -167,7 +168,9 @@ class BiliDashErrorEvent extends BiliDashEvent {
   });
 }
 
-/// 流 URL 过期（403/404/410）——播放页负责重取 playurl 后 setDataSource 续播。
+/// 流 URL 过期（403/404/410/429/5xx）或瞬时网络错误（超时/断连，如 2001
+/// timeout）——原生判定为**可自动恢复**的数据源错误，播放页负责重取 playurl
+/// 后 setDataSource 续播（保留位置），不弹错误打断观看。
 class BiliDashUrlExpiredEvent extends BiliDashEvent {
   const BiliDashUrlExpiredEvent({required super.textureId});
 }

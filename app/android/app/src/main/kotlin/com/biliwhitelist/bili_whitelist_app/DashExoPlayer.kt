@@ -16,6 +16,9 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.MergingMediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import io.flutter.view.TextureRegistry
+import java.net.SocketException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 
 /**
  * 单播放器封装：B 站 DASH 双流（video/audio 各一条 .m4s）合并播放。
@@ -46,10 +49,11 @@ class DashExoPlayer(
         /** 播放到结尾。 */
         fun onCompleted()
 
-        /** 非 URL 过期的播放错误：[code] 为 ExoPlayer errorCode，[msg] 为可读信息。 */
+        /** 不可自动恢复的播放错误：[code] 为 ExoPlayer errorCode，[msg] 为可读信息。 */
         fun onError(code: Int, msg: String)
 
-        /** 流 URL 过期（403/404/410 等）：Dart 侧重取 playurl 后调 prepare 续播。 */
+        /** 可自动恢复的数据源错误（URL 过期 / 瞬时网络错误）：Dart 侧重取 playurl
+         *  后调 prepare 续播（保留位置），避免弹错误打断观看。 */
         fun onUrlExpired()
     }
 
@@ -59,9 +63,19 @@ class DashExoPlayer(
     }
     private val surface = Surface(surfaceTexture)
 
-    /** 共享数据源工厂：video/audio 两个 ProgressiveMediaSource 共用防盗链头。 */
+    /** 共享数据源工厂：video/audio 两个 ProgressiveMediaSource 共用防盗链头。
+     *
+     * 超时取值（v2.17.14）：Media3 DefaultHttpDataSource 默认 connect/read 均为 8s，
+     * 弱网/抖动（慢速读流、秒级断流）容易在 8s 处被误判超时 → 弹「播放失败（2001）」
+     * 打断观看。调大为 connect 15s / read 20s：
+     * - connect 15s：弱网建连、首字节慢时不再误判连接失败；
+     * - read 20s：单次 socket 读超时——正常传输数据是连续的，超过 20s 收不到任何
+     *   字节 ≈ 连接已死；宁可多等，配合原生重试/自动续播兜底，不在慢网上误弹错。
+     */
     private val dataSourceFactory = DefaultHttpDataSource.Factory()
         .setAllowCrossProtocolRedirects(true)
+        .setConnectTimeoutMs(15_000)
+        .setReadTimeoutMs(20_000)
         .setDefaultRequestProperties(
             mapOf(
                 "Referer" to "https://www.bilibili.com/",
@@ -96,8 +110,9 @@ class DashExoPlayer(
             }
 
             override fun onPlayerError(error: PlaybackException) {
-                if (isUrlExpiredError(error)) {
-                    // URL 过期（403/404/410）：Dart 侧重取 playurl 后调 prepare 续播
+                if (isRecoverableSourceError(error)) {
+                    // URL 过期或瞬时网络错误（超时/断连/5xx 等）：交给 Dart 侧重取
+                    // playurl 续播（保留位置），不弹错误打断观看
                     listener.onUrlExpired()
                 } else {
                     listener.onError(
@@ -174,12 +189,30 @@ class DashExoPlayer(
         listener.onPrepared(size.width, size.height, duration)
     }
 
-    /** URL 过期特征：错误根因链里出现 HttpDataSource 403/404/410。 */
-    private fun isUrlExpiredError(error: PlaybackException): Boolean {
+    /**
+     * 可自动恢复的数据源错误判定：URL 过期或瞬时网络错误 → true（Dart 重取流续播）。
+     *
+     * 沿 cause 链查找两类特征：
+     * 1) URL 过期/被拦：HttpDataSource 403/404/410（流地址 deadline/upsig 过期、
+     *    防盗链）；429/5xx 属 CDN/网关瞬时故障，重取流（换新签名地址）同样可自愈；
+     * 2) 瞬时网络错误：读/建连超时（SocketTimeoutException）、域名解析失败
+     *    （UnknownHostException）、连接被重置/拒绝/断开（SocketException 及其子类
+     *    ConnectException）——网络抖动多属此类。
+     *    Media3 1.5.x 已移除 HttpDataSource.TimeoutException，超时以
+     *    HttpDataSourceException 包装 SocketTimeoutException 呈现（本函数沿 cause
+     *    链可达内层），因此按 java.net 原生异常判定，不依赖 media3 具体包装类型。
+     *
+     * 其余（格式损坏/解码失败/本地文件缺失等）为真失败 → 走 onError 弹错误。
+     */
+    private fun isRecoverableSourceError(error: PlaybackException): Boolean {
         var cause: Throwable? = error.cause ?: error
         while (cause != null) {
-            if (cause is HttpDataSource.InvalidResponseCodeException &&
-                cause.responseCode in setOf(403, 404, 410)
+            if (cause is HttpDataSource.InvalidResponseCodeException) {
+                val code = cause.responseCode
+                if (code in setOf(403, 404, 410, 429) || code in 500..599) return true
+            }
+            if (cause is SocketTimeoutException || cause is UnknownHostException ||
+                cause is SocketException
             ) {
                 return true
             }

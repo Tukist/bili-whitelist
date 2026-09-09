@@ -106,6 +106,30 @@ String pgcFallbackMessage(PgcFallbackAction action) {
 }
 
 // -------------------------------------------------------------------------
+// 播放错误自动续播决策（v2.17.14+，纯函数，便于单测）
+//
+// 背景：播放中途遇到流 URL 过期（403/404/410）或瞬时网络错误（超时/断连，
+// 原生统一归为 onUrlExpired）时，Dart 侧重取 playurl → setDataSource 续播
+// （保留位置）。网络抖动可能一次不成功：按 [kAutoRecoverBackoffMs] 退避重试
+// **有限次**，仍失败才显示错误（保留手动重试兜底）——避免网络抖动弹
+// 「播放失败」打断观看。
+// -------------------------------------------------------------------------
+
+/// 自动续播尝试间的退避毫秒表（长度即最大尝试次数）：第 0/1/2 次尝试前
+/// 分别等 1s/2s/4s（给网络喘息）；第 3 次起不再自动尝试（放弃显示错误）。
+const List<int> kAutoRecoverBackoffMs = [1000, 2000, 4000];
+
+/// 自动续播第 [attempt]（0 起）次尝试前的退避毫秒；attempt 越界（超上限，
+/// 应放弃、显示错误交手动重试）/负数 → null。
+int? autoRecoverDelayMs(int attempt) =>
+    attempt >= 0 && attempt < kAutoRecoverBackoffMs.length
+        ? kAutoRecoverBackoffMs[attempt]
+        : null;
+
+/// 自动续播耗尽（连续失败超过上限）后的错误文案（保留「重试」按钮兜底）。
+const String kAutoRecoverGiveUpMessage = '播放中断（网络或视频流异常），请重试';
+
+// -------------------------------------------------------------------------
 // B 站式播放快捷手势（v2.16.7+）纯函数（便于单测）
 //
 // 手势总览（参照 B 站手机端播放器；冲突处理见 build 中手势层注释）：
@@ -409,8 +433,12 @@ final Map<String, String> _viewDescCache = {};
 ///   控制层全部绑定在视频区矩形内（不再整屏黑底、不覆盖下方评论区）；
 ///   控制层「评论」按钮：竖屏 = 滚动定位到评论区，横屏全屏 = 打开独立
 ///   评论页（原行为）。全屏（横屏）保持整屏播放布局（无下方内容区）。
-/// - URL 过期（onUrlExpired）：重取 playurl → 记位置 → setDataSource(新流, 位置) 续播，
-///   续播后按当前倍速/听视频状态恢复；重试 1 次仍失败显示「视频流过期，请重试」+ 重试按钮
+/// - 播放错误自动续播（v2.17.14+，onUrlExpired）：原生把**可自动恢复**的数据源错误
+///   （流 URL 过期 403/404/410/429/5xx + 瞬时网络错误：超时/断连/解析失败，含
+///   2001 timeout）统一归为 onUrlExpired → Dart 重取 playurl → 记位置 →
+///   setDataSource(新流, 位置) 续播（不弹错误打断观看）；续播失败按退避
+///   1s→2s→4s 自动重试**有限次**（每段播放独立预算，成功 READY 清零），仍失败
+///   才显示错误 + 重试按钮（手动兜底）
 /// - 错误分类：403 防盗链异常 / -412 风控（指数退避 1s→2s→4s 重试）/ 62002 稿件失效 /
 ///   -101 登录失效（引导去登录页）
 /// - 会员集播放（v2.16.4+）：番剧导入的视频带 epId，播放时**先走普通 playurl**（免费集
@@ -660,7 +688,21 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
   String? _error;
   bool _loginPrompt = false;
   bool _canRetry = true;
-  int _expiredRetry = 0;
+
+  // 自动续播（流 URL 过期 / 瞬时网络错误，v2.17.14+）
+  // ---------------------------------------------------------------------
+  // 原生把「可自动恢复的数据源错误」统一发 onUrlExpired 事件，Dart 重取
+  // playurl 续播（保留位置）。网络抖动可能一次不成功，按退避重试有限次：
+  // [_autoRecoverFails] 连续失败计数（新流成功 READY / 手动重试 / 换源 /
+  // 重进清零 → 每段播放独立的恢复预算）；[_autoRecovering] 续播流程进行中
+  // 防重入（原生错误事件可能比 Dart 处理快）。
+  int _autoRecoverFails = 0;
+  bool _autoRecovering = false;
+
+  /// 播放器重建代次：_init 每次（首次进入/手动重试/换源/切集后恢复）自增。
+  /// 自动续播流程 await 间隙若有重建（_init 必经），凭代次差异安全退出，
+  /// 防止向新播放器重复 setDataSource 造成双源竞争。
+  int _initSession = 0;
 
   String? _loginExpiryText;
   Timer? _timer;
@@ -935,6 +977,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
   Future<void> _init() async {
     // 实时转写（sherpa）随页重置：停止 + 清句子/partial/错误
     _resetRealtime();
+    _initSession++; // 播放器重建代次自增（自动续播流程据此安全退出，见字段注释）
     setState(() {
       _error = null;
       _loginPrompt = false;
@@ -942,6 +985,10 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
       _buffering = true;
       _loaded = false;
       _completed = false;
+      // 重新初始化（重试/重进/换源）→ 自动续播预算与进行中标记重置
+      // （新播放器从零开始，续播成功 READY 后还会在 onPrepared 再次清零）
+      _autoRecoverFails = 0;
+      _autoRecovering = false;
       // 重新初始化（重试/重进）→ 清空字幕状态，等下次面板打开/切集再拉
       _subtitleTracks = const [];
       _subtitleLoading = false;
@@ -1254,7 +1301,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
       case BiliDashErrorEvent(:final code, :final message):
         _onNativeError(code, message);
       case BiliDashUrlExpiredEvent():
-        _onUrlExpired();
+        _onAutoRecover();
     }
   }
 
@@ -1268,6 +1315,9 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
       _completed = false;
       _durationMs = durationMs;
       if (width > 0 && height > 0) _aspectRatio = width / height;
+      // 新流成功 READY → 自动续播预算清零：每段播放独立预算，
+      // 播放中多次零星网络抖动各自都能拿到完整重试次数
+      _autoRecoverFails = 0;
     });
     // 首次进入 / 切集后恢复该集记忆进度（不打断自动播放）
     _maybeRestoreProgress(durationMs);
@@ -1299,25 +1349,49 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     });
   }
 
-  /// 流 URL 过期续播：重取 playurl → 记当前位置 → setDataSource 续播。
-  /// 已重试过 1 次仍失败 → 显示「视频流过期，请重试」。
-  Future<void> _onUrlExpired() async {
-    if (!mounted) return;
-    if (_expiredRetry >= 1) {
-      _showFatal('视频流过期，请重试');
+  /// 自动续播（流 URL 过期 / 瞬时网络错误，原生已统一归类为可恢复）：
+  /// 重取 playurl → 记当前位置 → setDataSource 续播（保留位置），失败按
+  /// [kAutoRecoverBackoffMs] 退避重试**有限次**（预算 [_autoRecoverFails]，
+  /// 新流成功 READY 后清零），仍失败才显示 [kAutoRecoverGiveUpMessage]——
+  /// 保留「重试」按钮手动兜底，网络抖动弹错打断观看成为极少情况。
+  Future<void> _onAutoRecover() async {
+    if (!mounted || _error != null) return;
+    if (_autoRecovering) {
+      debugPrint('[player] 自动续播流程进行中，忽略重复事件');
       return;
     }
-    _expiredRetry++;
-    setState(() => _buffering = true);
-    final position = await _player?.getPosition() ?? 0;
+    _autoRecovering = true;
+    final session = _initSession; // 代次校验：await 间隙播放器被重建则退出
     try {
-      await _loadStreamAndPlay(positionMs: position);
-      // 续播成功：按当前倍速与听视频状态恢复（换源后原生倍速会被重置为 1x）
-      await _player?.setPlaybackSpeed(_speed);
-      if (mounted) setState(() => _buffering = false);
-    } catch (e) {
-      if (!mounted) return;
-      _showFatal('视频流过期，请重试');
+      while (mounted && _error == null && session == _initSession) {
+        final attempt = _autoRecoverFails; // 本次为第 attempt+1 次尝试
+        final delay = autoRecoverDelayMs(attempt);
+        if (delay == null) {
+          // 连续失败超过上限：显示错误（手动重试兜底），不再自动折腾
+          debugPrint('[player] 自动续播 $attempt 次均失败，放弃自动恢复');
+          _showFatal(kAutoRecoverGiveUpMessage);
+          return;
+        }
+        _autoRecoverFails = attempt + 1; // 预扣一次（成功 READY 后在 onPrepared 清零）
+        debugPrint('[player] 自动续播第 ${attempt + 1} 次，退避 ${delay}ms');
+        if (mounted) setState(() => _buffering = true); // 转缓冲，不弹错误
+        await Future<void>.delayed(Duration(milliseconds: delay));
+        if (!mounted || _error != null || session != _initSession) return;
+        final position = await _player?.getPosition() ?? 0;
+        try {
+          await _loadStreamAndPlay(positionMs: position);
+          // 续播成功：按当前倍速恢复（换源后原生倍速会被重置为 1x）
+          await _player?.setPlaybackSpeed(_speed);
+          if (mounted) setState(() => _buffering = false);
+          return;
+        } catch (e) {
+          debugPrint('[player] 自动续播第 ${attempt + 1} 次失败：$e');
+          // 继续 while：按下一档退避再试；原生侧若已自行再次上报事件则被
+          // _autoRecovering 拦下（本循环统一驱动，避免并发多次续播）
+        }
+      }
+    } finally {
+      _autoRecovering = false;
     }
   }
 
@@ -3439,7 +3513,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     old?.dispose();
     // 实时转写随视频重置（句子时间轴是旧视频音频，防串台）
     _resetRealtime();
-    _expiredRetry = 0;
+    _autoRecoverFails = 0; // 换源：自动续播预算重置（_init 内也会重置）
     _pendingRestore = true; // 新视频 onPrepared 恢复其记忆进度（同首次进入）
     _pendingSeekMs = null; // 内部换源不带 ?t 覆盖（防旧定位串到新视频）
     setState(() {
@@ -3597,7 +3671,8 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
   }
 
   void _retry() {
-    _expiredRetry = 0;
+    _autoRecoverFails = 0; // 手动重试：自动续播预算重置（_init 内也会重置）
+    _autoRecovering = false;
     _eventSub?.cancel();
     _eventSub = null;
     final old = _player;

@@ -8,6 +8,19 @@
 
 ---
 
+## v2.17.14 (2026-09-09)
+
+**播放中断自愈：网络抖动/读流超时（「播放失败（2001）：Source error」）不再打断观看——自动重取流续播 + 数据源超时调大**
+
+- **根因**：原生 `DashExoPlayer` 只把 HTTP 403/404/410（流 URL 过期）归为 `onUrlExpired` 自动恢复；**读流超时（Media3 errorCode 2001 = `ERROR_CODE_TIMEOUT`）/ 瞬时网络 IO 错误（断连/解析失败）全走 `onError` → Dart 弹「播放失败（2001）：Source error」打断观看，需手动重试**。叠加 `DefaultHttpDataSource` 默认 connect/read 超时都只有 **8s**——弱网/抖动（慢速读流、秒级断流）很容易在 8s 处被误判超时
+- **错误分类扩展（原生 `app/android/.../DashExoPlayer.kt`，v2.17.14）**：`onPlayerError` 的分类改为 `isRecoverableSourceError`——**URL 过期**（HTTP 403/404/410，另把 429/5xx 这类 CDN/网关瞬时故障一并纳入——重取流换新签名地址即可自愈）∪ **瞬时网络错误**（读/建连超时 `SocketTimeoutException`、域名解析失败 `UnknownHostException`、连接被重置/拒绝/断开 `SocketException` 等）→ 统一走 `onUrlExpired` 让 Dart **重取 playurl + setDataSource 续播（保留位置）**，不再弹错误；只有真失败（格式损坏/解码失败/本地文件缺失等）才走 `onError`。判定按 java.net 原生异常沿 cause 链查找，不依赖 media3 包装类型（1.5.x 已移除 `HttpDataSource.TimeoutException`，超时由 `HttpDataSourceException` 包 `SocketTimeoutException` 呈现，链式可达）
+- **数据源超时调大（原生）**：connect **8s → 15s**（弱网建连/首字节慢不再误判）、read **8s → 20s**（单次 socket 读超时：正常传输数据连续，>20s 收不到任何字节 ≈ 连接已死；宁可多等配合自动续播兜底，不在慢网上误弹错）
+- **Dart 自动续播（`app/lib/pages/player_page.dart`）**：`onUrlExpired` 事件语义扩展为「可自动恢复的数据源错误」，续播失败按退避 **1s→2s→4s 自动重试最多 3 次**（`kAutoRecoverBackoffMs`/`autoRecoverDelayMs` 纯函数）——**每段播放独立预算**：新流成功 READY / 手动重试 / 换源 / 重进清零，播放中多次零星网络抖动各自都有完整重试次数；防重入（`_autoRecovering`）+ 播放器重建代次校验（`_initSession`，防 await 间隙向新播放器重复 setDataSource）。**仍失败才显示「播放中断（网络或视频流异常），请重试」+ 重试按钮（手动兜底保留）**——2001 弹错打断观看成为极少情况
+- 测试：新增 `player_auto_recover_test.dart` 7 例（退避表 1s→2s→4s 且递增、放弃文案非空、`autoRecoverDelayMs` 第 0/1/2 次分别 1000/2000/4000、第 3 次起超限返回 null、负数防御、预算与上限自洽）；原生错误分类无可复用 Kotlin 单测设施（`android/app/src` 无 test 源集），由 Dart 决策纯函数 + 代码审查 + 构建覆盖；`flutter analyze` 0 issue、全量 `flutter test` 通过（820 例）
+- 验证：debug APK 装机模拟器（Pixel 9 API 35，软件渲染）实测——**① 正常播放回归**：真实白名单视频（火柴人 VS 我的世界，BV163426vE3s）起流 → `onPrepared 852x480 duration=740s`、进度持续前进并 10s 定时落盘（`保存进度 …9682 ms`），无回归；**② 自动恢复现场复现**：播放中一次真实 connect 失败（DefaultHttpDataSource 建连异常）→ 原生按新分类发 `onUrlExpired`（**未走 onError**）→ Dart 日志「自动续播第 1 次，退避 1000ms」→ 重取 playurl（dashV=4/dashA=3）→ setDataSource → `onVideoSizeChanged`/继续出帧——全程无「播放失败」弹错，旧代码此路径会直接弹错打断；**③ 手动重试兜底**：wifi+蜂窝数据全断后进入播放 → 取流失败显示错误视图（重试/返回按钮）→ 恢复网络点「重试」→ 再次 `onPrepared` 正常播放。**2001 读超时主动复现边界**：模拟器网络快，Progressive 源近整段 m4s 提前缓冲 + 蜂窝兜底链路，长时间断网不触发读超时——超时分类由真实 connect 失败现场（同一条 isRecoverableSourceError 链）+ 单测 + 代码审查覆盖；弱网真机上的实测反馈待后续版本收集
+
+---
+
 ## v2.17.13 (2026-09-09)
 
 **启动自动同步关注 → 白名单（增量静默）：每次进 App 自动把新关注的 UP 加进白名单；关注导入链路加固（"导入后白名单没几个"的解析容错修复）**
