@@ -202,8 +202,8 @@ bool shouldPrefetchSource({
 // - 滑动统一走 Pan + 主导方向判定（v2.16.9+）：斜向滑动按**位移主方向**
 //   归类——水平主导 → 全屏横屏 seek（位移/屏宽 = 时长比例，松手 seekTo）；
 //   垂直主导 → 起点左半屏亮度 / 右半屏音量（原生通道 bili_whitelist/media，
-//   见 services/device_media.dart）。竖屏只保留亮度/音量（水平主导忽略，
-//   无 seek 防误触）。
+//   见 services/device_media.dart）。非全屏（竖屏 / v2.17.17 横屏置顶）只
+//   保留亮度/音量（水平主导忽略，无 seek 防误触）。
 // - 手势起点豁免带（v2.16.14+ 顶/底 → v2.16.17+ 四边）：起点落在屏幕
 //   底部/顶部/左/右任一条豁免带内的 Pan 整体忽略（不 seek / 不调亮度音量）
 //   ——横屏全屏从**物理屏幕底部**滑动（旋转后 = 逻辑左/右边缘，见类顶注释）
@@ -219,21 +219,21 @@ bool shouldPrefetchSource({
 // 累加改写」，表现为手指动一点点就跳 0 / 100。
 // -------------------------------------------------------------------------
 
-/// 手势提示浮层的类型（也即竖屏半屏判定可产生的目标）。
+/// 手势提示浮层的类型（也即半屏判定可产生的目标）。
 enum PlayerSlideKind {
   /// 横屏 seek（浮层显示 当前进度 / 总时长）。
   seek,
 
-  /// 亮度（竖屏左半屏纵向滑动）。
+  /// 亮度（左半屏纵向滑动）。
   brightness,
 
-  /// 音量（竖屏右半屏纵向滑动）。
+  /// 音量（右半屏纵向滑动）。
   volume,
 }
 
 /// 滑动手势的主导方向（判定锁定后本次手势不再切换，防中途抖动）。
 enum PanSlideMode {
-  /// 水平主导 → seek（仅全屏横屏激活；竖屏忽略）。
+  /// 水平主导 → seek（仅全屏横屏激活；非全屏忽略）。
   horizontal,
 
   /// 垂直主导 → 起点左半屏亮度 / 右半屏音量。
@@ -484,20 +484,27 @@ final Map<String, String> _viewDescCache = {};
 ///   B 站式快捷手势（v2.16.7+）：双击播放/暂停（单击显隐延迟 ~300ms 防误触）、
 ///   滑动按**主导方向**归类（v2.16.9+）：水平主导 → 全屏横屏 seek（时间浮层 +
 ///   松手 seekTo）；垂直主导 → 按起点左/右半屏调亮度/音量（原生通道
-///   bili_whitelist/media，仅当前 Activity 内生效）。竖屏只保留亮度/音量
-///   （水平主导忽略，无 seek 防误触）。v2.16.14+/v2.16.17+：触摸按下点落在
-///   手势区（竖屏 = 视频区黑盒，见下；全屏 = 整屏）底部/顶部/左右豁免带
-///   （[isExcludedGestureStart]，四边，按下点判定见 [_onPanDown]）→ 本次 Pan
-///   整体忽略（不 seek / 不调亮度音量）——横屏全屏从**物理底部**滑动（旋转后
-///   = 逻辑左/右边缘，左右带加宽）唤醒系统导航不再误触发 seek
-/// - 竖屏布局（v2.17.0+ 重构）：非全屏 = 视频区顶部置顶（按宽高比的黑盒，
-///   超高视频封顶屏高 60%）+ 下方视频信息行（标题/时长 + UP 主入口——
-///   阶段 C 加：圆形头像+名字可点进 UP 主页，番剧弱化为剧集标签）+
+///   bili_whitelist/media，仅当前 Activity 内生效）。非全屏（竖屏 / 横屏
+///   置顶）只保留亮度/音量（水平主导忽略，无 seek 防误触）。v2.16.14+/v2.16.17+：
+///   触摸按下点落在手势区（非全屏 = 视频区黑盒，见下；全屏 = 整屏）底部/顶部/
+///   左右豁免带（[isExcludedGestureStart]，四边，按下点判定见 [_onPanDown]）→
+///   本次 Pan 整体忽略（不 seek / 不调亮度音量）——横屏全屏从**物理底部**滑动
+///   （旋转后 = 逻辑左/右边缘，左右带加宽）唤醒系统导航不再误触发 seek
+/// - 非全屏布局（v2.17.0+ 重构；v2.17.17 横屏置顶模式）：
+///   非全屏 = 视频区顶部置顶（按宽高比的黑盒，竖屏超高视频封顶屏高 60%、
+///   横屏 16:9 封顶屏高 55%）+ 下方视频信息行（标题/时长 + UP 主入口——
+///   阶段 C 加：圆形头像+名字可点进 UP 主页，番剧弱化为剧集标签；横屏自动
+///   紧凑：标题 1 行/简介少行）+
 ///   **内嵌评论区**（[CommentListView]，与独立 [CommentPage]
 ///   共用同一实现，视频切换按 bvid+分P 重建刷新）。画面/弹幕/字幕/手势/
-///   控制层全部绑定在视频区矩形内（不再整屏黑底、不覆盖下方评论区）；
-///   控制层「评论」按钮：竖屏 = 滚动定位到评论区，横屏全屏 = 打开独立
-///   评论页（原行为）。全屏（横屏）保持整屏播放布局（无下方内容区）。
+///   控制层全部绑定在视频区矩形内（不再整屏黑底、不覆盖下方评论区）。
+///   设备竖放为竖屏布局；设备横放（v2.17.17）= 横屏「置顶+评论」形态——
+///   退出全屏不再强制转竖屏（设备当前横放即停在该形态，旋转设备可在两态
+///   间自由切换，见 [_toggleFullscreen]/[_PlayerPageState.build]）；离开播放
+///   页恢复系统方向。
+///   控制层「评论」按钮：非全屏（竖屏/横屏置顶）= 滚动定位到评论区，
+///   横屏全屏 = 打开独立评论页（原行为）。全屏（横屏）保持整屏播放布局
+///   （无下方内容区）。
 /// - 播放错误自动续播（v2.17.14+，onUrlExpired）：原生把**可自动恢复**的数据源错误
 ///   （流 URL 过期 403/404/410/429/5xx + 瞬时网络错误：超时/断连/解析失败，含
 ///   2001 timeout）统一归为 onUrlExpired → Dart 重取 playurl → 记位置 →
@@ -521,6 +528,27 @@ final Map<String, String> _viewDescCache = {};
 ///
 /// 听视频模式：只隐藏/显示画面（Offstage），不调 pause/play，音频持续播放；
 /// 不做系统后台服务，App 退后台时 Flutter 进程存活即可继续出声。
+
+/// 非全屏视频区高度占屏高上限（v2.17.17 横屏置顶模式）：
+/// 竖屏 60%（v2.17.0 起，超高视频如 9:16 封顶留出信息行/评论区）；横屏
+/// （宽>高）屏高低、16:9 视频按屏宽换算的理想高度 ≈ 整屏高 → 封顶取略小
+/// 的 55%，把更多剩余高度让给信息行与评论区（详见
+/// [_PlayerPageState._embeddedVideoHeight]）。
+const double kPortraitVideoHeightRatio = 0.6;
+const double kLandscapeVideoHeightRatio = 0.55;
+
+/// 播放页**非全屏**状态允许的方向（v2.17.17）：
+/// 「竖屏 + 双向横屏」三向——退出全屏时不再强制回竖屏：设备横放停在横屏
+/// 「顶部置顶+下方评论区」（横屏置顶模式），设备竖放仍竖屏置顶布局
+/// （兼容 v2.17.0），之后旋转设备可在两态间自由切换。不含 portraitDown
+/// （避免倒持误入）；离开播放页（dispose）仍恢复系统竖屏基准
+/// （[_PlayerPageState._restoreSystemUi]）。
+const List<DeviceOrientation> kPlayerPageFreeOrientations = [
+  DeviceOrientation.portraitUp,
+  DeviceOrientation.landscapeLeft,
+  DeviceOrientation.landscapeRight,
+];
+
 class PlayerPage extends StatefulWidget {
   final WhitelistVideo video;
 
@@ -582,13 +610,13 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
   bool _fullscreen = false;
   bool _dragging = false;
 
-  // 竖屏内嵌评论区（v2.17.0+ 布局重构）：
+  // 非全屏内嵌评论区（v2.17.0+ 布局重构；v2.17.17 横屏置顶模式共用）：
   // ---------------------------------------------------------------------
-  // 竖屏（非全屏）时视频下方内嵌 [CommentListView]（与独立 [CommentPage]
-  // 共用同一组件）。_commentScroll 为列表的外部滚动控制器（竖屏点控制层
-  // 「评论」按钮时定位用；独立页/全屏时该列表不在树中，控制器仍持有多余
-  // 无妨）；_commentCountHeaderKey 挂在列表顶部「评论 N」区头上，供
-  // Scrollable.ensureVisible 锚定滚动到评论区。
+  // 非全屏（竖屏置顶 / 横屏置顶）时视频下方内嵌 [CommentListView]（与独立
+  // [CommentPage] 共用同一组件）。_commentScroll 为列表的外部滚动控制器
+  // （点控制层「评论」按钮时定位用；独立页/全屏时该列表不在树中，控制器
+  // 仍持有多余无妨）；_commentCountHeaderKey 挂在列表顶部「评论 N」区头
+  // 上，供 Scrollable.ensureVisible 锚定滚动到评论区。
   final ScrollController _commentScroll = ScrollController();
   final GlobalKey _commentCountHeaderKey = GlobalKey();
 
@@ -1931,23 +1959,31 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     return kSideGestureExclusionPxPortrait;
   }
 
-  /// 竖屏（非全屏）视频区黑盒高度：按视频宽高比铺满可用宽（顶部置顶），
-  /// 超高视频（如 9:16）按比例会顶掉下方内容区 → 封顶屏高 60%，留出信息行
-  /// 与评论区（画面在盒内按 AspectRatio 居中 + 黑边补齐）。
-  double _portraitVideoHeight(Size screen) {
+  /// 非全屏视频区黑盒高度（竖屏置顶 v2.17.0 / 横屏置顶模式 v2.17.17 共用）：
+  /// 按视频宽高比铺满可用宽（顶部置顶），再按方向封顶留出信息行与评论区：
+  /// 竖屏超高视频（如 9:16）按比例会顶掉下方内容区 → 封顶屏高
+  /// [kPortraitVideoHeightRatio]（60%）；横屏（宽>高）16:9 视频按屏宽换算的
+  /// 理想高度 ≈ 整屏高 → 封顶 [kLandscapeVideoHeightRatio]（55%，略低于竖屏
+  /// 档位，多让空间给下方评论区）。盒内画面统一按 AspectRatio 居中 + 黑边
+  /// 补齐。
+  double _embeddedVideoHeight(Size screen) {
     final aspect = _aspectRatio > 0 ? _aspectRatio : 16 / 9;
     final ideal = screen.width / aspect;
-    final maxH = screen.height * 0.6;
+    final capRatio = screen.width > screen.height
+        ? kLandscapeVideoHeightRatio
+        : kPortraitVideoHeightRatio;
+    final maxH = screen.height * capRatio;
     return ideal > maxH ? maxH : ideal;
   }
 
-  /// 手势层所在矩形的逻辑尺寸：全屏 = 屏幕；竖屏 = 视频区黑盒（宽 = 屏宽、
-  /// 高 = [_portraitVideoHeight]）。亮度/音量纵向换算、半屏分界与豁免带判定
-  /// 均以手势层自身为准——竖屏时手势只发生在视频区内（不再覆盖下方内容区）。
+  /// 手势层所在矩形的逻辑尺寸：全屏 = 屏幕；非全屏 = 视频区黑盒（宽 = 屏宽、
+  /// 高 = [_embeddedVideoHeight]）。亮度/音量纵向换算、半屏分界与豁免带判定
+  /// 均以手势层自身为准——非全屏（竖屏/横屏置顶）时手势只发生在视频区内
+  /// （不覆盖下方评论区）。
   Size _gestureAreaSize() {
     final s = MediaQuery.sizeOf(context);
     if (_fullscreen) return s;
-    return Size(s.width, _portraitVideoHeight(s));
+    return Size(s.width, _embeddedVideoHeight(s));
   }
 
   /// 按下即判豁免（v2.16.17+，用**触摸按下点**而非 panStart 的竞技场胜出点）：
@@ -2353,17 +2389,18 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     setState(() => _listenMode = !_listenMode);
   }
 
-  /// 评论按钮行为（v2.17.0+ 竖屏布局重构 / v2.17.1+ 链接跳转语义）：
+  /// 评论按钮行为（v2.17.0+ 竖屏布局重构 / v2.17.17 横屏置顶共用 /
+  /// v2.17.1+ 链接跳转语义）：
   ///
   /// - **横屏全屏（_fullscreen=true）**：push 独立 [CommentPage]（全屏下无
   ///   内嵌评论区；本页在 C 下面照常出声 = 边看边评）。C 内点视频链接 →
   ///   C 先 pop 自己回本页，再由本页 [openVideoInNewPlayer] push 新播放页
   ///   （push 前显式暂停本页防双音轨）；返回本页 → [didPopNext] 恢复续播。
-  /// - **竖屏非全屏**：评论区已内嵌在视频下方内容区，点按即「滚动定位到
-  ///   评论区」——用 [Scrollable.ensureVisible] 平滑滚动使列表顶「评论 N」
-  ///   区头贴到内容区顶（锚点 [_commentCountHeaderKey]）；列表尚未加载出
-  ///   区头（首屏加载/暂无评论等）时兜底把列表滚回顶部（内容区即从评论区
-  ///   起，回到顶部等价于定位到评论区）。
+  /// - **非全屏（竖屏置顶 / 横屏置顶）**：评论区已内嵌在视频下方内容区，
+  ///   点按即「滚动定位到评论区」——用 [Scrollable.ensureVisible] 平滑滚动
+  ///   使列表顶「评论 N」区头贴到内容区顶（锚点 [_commentCountHeaderKey]）；
+  ///   列表尚未加载出区头（首屏加载/暂无评论等）时兜底把列表滚回顶部
+  ///   （内容区即从评论区起，回到顶部等价于定位到评论区）。
   void _onCommentsButtonTap() {
     if (!mounted) return;
     debugPrint('[player_page] 评论按钮 _fullscreen=$_fullscreen '
@@ -3842,14 +3879,19 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     final full = !_fullscreen;
     setState(() => _fullscreen = full);
     if (full) {
+      // 进全屏：锁横屏（原行为）——整屏沉浸横屏播放（无下方内容区）。
       await SystemChrome.setPreferredOrientations([
         DeviceOrientation.landscapeLeft,
         DeviceOrientation.landscapeRight,
       ]);
       await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     } else {
-      await SystemChrome.setPreferredOrientations(
-          [DeviceOrientation.portraitUp]);
+      // v2.17.17 退出全屏：**不再强制转竖屏**——放开「竖屏 + 双向横屏」
+      // （[kPlayerPageFreeOrientations]）：设备当前横放 → 停在横屏「顶部
+      // 置顶 + 下方评论区」（横屏置顶模式，布局按方向自适应见 build）；
+      // 设备竖放 → 仍竖屏置顶+评论（兼容 v2.17.0 行为）；之后旋转设备
+      // 可在横/竖两态间自由切换。离开播放页才恢复系统方向（dispose）。
+      await SystemChrome.setPreferredOrientations(kPlayerPageFreeOrientations);
       await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     }
   }
@@ -3857,6 +3899,18 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
   void _restoreSystemUi() {
     SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
     SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
+  }
+
+  /// 返回（顶栏箭头 / 系统返回键共用语义，v2.17.17）：
+  /// - 全屏中：**先退出全屏**回到当前方向的「置顶 + 评论」布局（设备横放 →
+  ///   横屏置顶+评论）——与全屏退出按钮一致，不再直接整页离开；
+  /// - 非全屏：离开播放页（dispose 恢复系统方向）。
+  void _handleBack() {
+    if (_fullscreen) {
+      _toggleFullscreen();
+      return;
+    }
+    Navigator.of(context).pop();
   }
 
   void _retry() {
@@ -3959,61 +4013,80 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
 
   @override
   Widget build(BuildContext context) {
-    // v2.17.0+ 竖屏布局重构：
-    // - 竖屏（非全屏）= 常规观看页：视频区顶部置顶（按宽高比的黑盒）+
-    //   下方视频信息行 + 内嵌评论区（滚动）；
+    // v2.17.0+ 非全屏布局重构（v2.17.17 起竖屏 / 横屏两态自适应）：
+    // - 非全屏 = 常规观看页：视频区顶部置顶（按宽高比的黑盒）+
+    //   下方视频信息行 + 内嵌评论区（滚动）——设备竖放为竖屏布局；设备
+    //   横放（v2.17.17 横屏置顶模式）= 同一 Column 的横屏形态：视频区高度
+    //   封顶比例略低（屏高 55%，见 _embeddedVideoHeight）、信息行紧凑（标题
+    //   1 行/简介少行，见 _buildVideoInfoBar/_descMaxExpandedHeight），剩余
+    //   高度全给评论区（哪怕矮也可滚）；
     // - 全屏（横屏）= 视频占满整屏（原全屏布局，无下方内容区）。
     // 两态共用 _buildVideoLayers：画面/听视频占位/弹幕/字幕/手势/控制层/
-    // 浮层全部绑定在视频区矩形内（竖屏不再覆盖下方评论区）；切换全屏只是
-    // 换视频区高度与是否渲染下方内容，布局随 _fullscreen 联动。
+    // 浮层全部绑定在视频区矩形内（非全屏不覆盖下方评论区）；切换全屏只是
+    // 换视频区高度与是否渲染下方内容，布局随 _fullscreen 联动。退出全屏
+    // 不再强制转竖屏（方向见 _toggleFullscreen）——当前横放即停在此横屏
+    // 置顶+评论形态。
     final screen = MediaQuery.sizeOf(context);
     final videoAreaHeight =
-        _fullscreen ? screen.height : _portraitVideoHeight(screen);
-    return Scaffold(
-      backgroundColor: _fullscreen
-          ? Colors.black
-          : Theme.of(context).colorScheme.surface,
-      body: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          // 1. 视频区（黑底）：竖屏 = 顶部置顶、按宽高比的黑盒（超高视频
-          //    封顶屏高 60%，盒内画面按 AspectRatio 居中 + 黑边补齐）；
-          //    全屏 = 占满整屏。
-          SizedBox(
-            key: const ValueKey('player-video-area'),
-            height: videoAreaHeight,
-            child: ColoredBox(color: Colors.black, child: _buildVideoLayers()),
-          ),
-          // 2/3. 竖屏内容区：视频信息行（标题/时长 + UP 主入口：阶段 C 已从
-          //      UP 主名文本占位升级为头像+名字可点进 UP 主页）+ 内嵌评论区
-          //      （评论区底部避开系统手势导航条）。
-          //      全屏不渲染（下方内容区不占位）。
-          if (!_fullscreen) ...[
-            Container(
-              key: const ValueKey('player-info-bar'),
-              decoration: BoxDecoration(
-                color: Theme.of(context).colorScheme.surface,
-                border: Border(
-                  bottom: BorderSide(
-                    color:
-                        Theme.of(context).dividerColor.withValues(alpha: 0.5),
+        _fullscreen ? screen.height : _embeddedVideoHeight(screen);
+    return PopScope(
+      // 系统返回键：全屏中拦截为「先退出全屏」（canPop=false 拦截后由
+      // onPopInvokedWithResult 兜底退全屏，回到当前方向的置顶+评论）；
+      // 非全屏放行直接离开页面（dispose 恢复系统方向）。
+      canPop: !_fullscreen,
+      onPopInvokedWithResult: (didPop, _) {
+        if (!didPop && _fullscreen) _toggleFullscreen();
+      },
+      child: Scaffold(
+        backgroundColor: _fullscreen
+            ? Colors.black
+            : Theme.of(context).colorScheme.surface,
+        body: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            // 1. 视频区（黑底）：非全屏 = 顶部置顶、按宽高比封顶的黑盒
+            //    （竖屏超高视频封顶屏高 60%；横屏 16:9 理想高度≈整屏高 →
+            //    封顶屏高 55%——盒内画面均按 AspectRatio 居中 + 黑边补齐）；
+            //    全屏 = 占满整屏。
+            SizedBox(
+              key: const ValueKey('player-video-area'),
+              height: videoAreaHeight,
+              child:
+                  ColoredBox(color: Colors.black, child: _buildVideoLayers()),
+            ),
+            // 2/3. 非全屏内容区（竖屏 / 横屏置顶共用）：视频信息行（标题/
+            //      时长 + UP 主入口：阶段 C 已从 UP 主名文本占位升级为头像
+            //      +名字可点进 UP 主页；横屏自动紧凑）+ 内嵌评论区（评论区
+            //      底部避开系统手势导航条）。
+            //      全屏不渲染（下方内容区不占位）。
+            if (!_fullscreen) ...[
+              Container(
+                key: const ValueKey('player-info-bar'),
+                decoration: BoxDecoration(
+                  color: Theme.of(context).colorScheme.surface,
+                  border: Border(
+                    bottom: BorderSide(
+                      color: Theme.of(context)
+                          .dividerColor
+                          .withValues(alpha: 0.5),
+                    ),
                   ),
                 ),
+                padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
+                child: _buildVideoInfoBar(context),
               ),
-              padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
-              child: _buildVideoInfoBar(context),
-            ),
-            Expanded(
-              key: const ValueKey('player-comments'),
-              child: SafeArea(top: false, child: _buildEmbeddedComments()),
-            ),
+              Expanded(
+                key: const ValueKey('player-comments'),
+                child: SafeArea(top: false, child: _buildEmbeddedComments()),
+              ),
+            ],
           ],
-        ],
+        ),
       ),
     );
   }
 
-  /// 视频区各图层（与所在矩形自适应：竖屏视频黑盒 / 全屏整屏）。
+  /// 视频区各图层（与所在矩形自适应：非全屏视频黑盒 / 全屏整屏）。
   ///
   /// Positioned.fill 的层（弹幕/手势/缓冲/听视频占位等）填满矩形；
   /// 字幕与控制层按矩形底部定位（字幕悬浮在控制行上方）——所有播放相关
@@ -4057,7 +4130,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
           // 主字幕大号在上，副字幕小号在其下（见 _SubtitleOverlay）。
           // v2.17.0+：字幕相对**视频区矩形**底部定位（不再相对整屏）——
           // 全屏横屏按控制层显隐取值（显示 → 抬升到控制行上方 110；
-          // 隐藏沉浸观影 → 贴画面底部 24，历史取值防跑偏）；竖屏视频区
+          // 隐藏沉浸观影 → 贴画面底部 24，历史取值防跑偏）；非全屏视频区
           // 较短，控制层显示时贴其上方（92），隐藏时贴视频区底（16）。
           if (!_listenMode &&
               _subtitleEnabled &&
@@ -4146,21 +4219,27 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
   }
 
   Widget _buildControls() {
-    // 竖屏视频区较短（如超宽视频黑盒 < 230px）时中央播放/快进快退簇与底部
-    // 控制行重叠 → 收起中央簇（双击播放/暂停仍可用，见手势层）。
+    // 非全屏视频区较短（如超宽视频黑盒 / 横屏置顶模式屏高矮 < 230px）时
+    // 中央播放/快进快退簇与底部控制行重叠 → 收起中央簇（双击播放/暂停仍
+    // 可用，见手势层）。
     final screen = MediaQuery.sizeOf(context);
-    final compactPortrait =
-        !_fullscreen && _portraitVideoHeight(screen) < 230;
+    final compactEmbedded =
+        !_fullscreen && _embeddedVideoHeight(screen) < 230;
     return Stack(
       children: [
         _buildTopBar(),
-        if (!compactPortrait) Center(child: _buildCenterControls()),
+        if (!compactEmbedded) Center(child: _buildCenterControls()),
         Align(alignment: Alignment.bottomCenter, child: _buildBottomBar()),
       ],
     );
   }
 
-  /// 竖屏（非全屏）视频信息行：标题（含分 P）+ UP 主入口 + 时长 + 简介。
+  /// 非全屏（竖屏置顶 / v2.17.17 横屏置顶）视频信息行：标题（含分 P）+
+  /// UP 主入口 + 时长 + 简介。
+  ///
+  /// v2.17.17+ 横屏自适应：横屏屏高低 → 标题收成 1 行（竖屏 2 行）、简介
+  /// 折叠少行（竖屏 3 行 → 横屏 2 行）——压低信息行固有高度，把剩余空间
+  /// 留给评论区（视频区封顶比例也随方向变档，见 [_embeddedVideoHeight]）。
   ///
   /// 阶段 C：UP 主区从 v2.17.0 的「person 图标 + up_name 文本占位」升级为
   /// [UpownerBadge]（圆形头像 + 名字，可点进 [UpownerPage]）；番剧/电影
@@ -4174,6 +4253,10 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
   Widget _buildVideoInfoBar(BuildContext context) {
     final theme = Theme.of(context);
     final subStyle = TextStyle(fontSize: 12.5, color: Colors.grey.shade600);
+    // 横屏（v2.17.17 横屏置顶模式）屏高低 → 信息行紧凑（标题 1 行 / 简介
+    // 少行），多留高度给评论区。
+    final landscape =
+        MediaQuery.sizeOf(context).width > MediaQuery.sizeOf(context).height;
     final titleText = _video.isMultiPage
         ? (_currentPartTitle.isEmpty
             ? _video.title
@@ -4198,7 +4281,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
       children: [
         Text(
           titleText,
-          maxLines: 2,
+          maxLines: landscape ? 1 : 2,
           overflow: TextOverflow.ellipsis,
           style: theme.textTheme.titleMedium?.copyWith(
             fontSize: 16,
@@ -4248,7 +4331,8 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
             child: ExpandableText(
               text: desc,
               style: subStyle.copyWith(height: 1.45),
-              foldLines: 3,
+              // 折叠行数按方向：竖屏 3 行；横屏（屏高低）2 行更省高度
+              foldLines: landscape ? 2 : 3,
               // 简介无链接、展开后整段都在滚动区内 → 无需长按复制兜底；
               // selectable=false：完整态用 Text（不引入选择手势与滚动打架）
               selectable: false,
@@ -4260,13 +4344,20 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     );
   }
 
-  /// 简介展开态封顶高度：竖屏下方剩余高度（屏幕 − 视频区）扣掉信息行标题
-  /// /UP 行/边距等固有高度后的安全余量，夹在 [80, 220] 之间——防超长简介
-  /// 把固定信息行撑高到把评论区挤没、整列溢出（短视频/高视频时余量小，
-  /// 展开区也相应矮，超高部分内部滚动）。
+  /// 简介展开态封顶高度：非全屏下方剩余高度（屏幕 − 视频区）扣掉信息行
+  /// 标题/UP 行/边距等固有高度后的安全余量——防超长简介把固定信息行撑高
+  /// 到把评论区挤没、整列溢出（余量小时展开区相应矮、超高部分内部滚动）。
+  /// 竖屏夹在 [80, 220]；横屏（v2.17.17 横屏置顶模式，屏高低、标题 1 行）
+  /// 收紧到 [48, 80]——展开后整行信息区仍给评论区留可见高度。
   double _descMaxExpandedHeight(BuildContext context) {
     final screen = MediaQuery.sizeOf(context);
-    final belowVideo = screen.height - _portraitVideoHeight(screen);
+    final landscape =
+        screen.width > screen.height; // 与 _buildVideoInfoBar 紧凑判定一致
+    final belowVideo = screen.height - _embeddedVideoHeight(screen);
+    if (landscape) {
+      const reservedForCompactInfoBar = 100.0; // 标题(1行)+UP 行+内边距+简介顶距
+      return (belowVideo - reservedForCompactInfoBar).clamp(48.0, 80.0);
+    }
     const reservedForInfoBar = 120.0; // 标题(≤2行) + UP 行 + 内边距 + 简介顶距
     return (belowVideo - reservedForInfoBar).clamp(80.0, 220.0);
   }
@@ -4345,8 +4436,9 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     );
   }
 
-  /// 竖屏（非全屏）内嵌评论区：数据/列表/楼中楼/图片/链接全部复用
-  /// [CommentListView]（与独立 [CommentPage] 同一份实现，避免双份）。
+  /// 非全屏（竖屏置顶 / v2.17.17 横屏置顶）内嵌评论区：数据/列表/楼中楼/
+  /// 图片/链接全部复用 [CommentListView]（与独立 [CommentPage] 同一份实现，
+  /// 避免双份）。
   ///
   /// 按「bvid + 当前分 P」换 key：换集/换源时自动重建重拉——评论归属随
   /// aid 变化（换源必变；同 aid 分 P 只是多一次请求，换取语义简单可靠），
@@ -4414,7 +4506,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
   }
 
   /// 听视频占位界面：封面 + 标题 + 提示。点按恢复画面；长按同样支持 2x。
-  /// v2.17.0+：占位层绑定在视频区矩形内（竖屏黑盒可能较矮），内容压缩
+  /// v2.17.0+：占位层绑定在视频区矩形内（非全屏黑盒可能较矮），内容压缩
   /// + 可滚动，防小盒溢出。
   Widget _buildListenPlaceholder() {
     return Positioned.fill(
@@ -4544,13 +4636,13 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
           children: [
             IconButton(
               icon: const Icon(Icons.arrow_back, color: Colors.white),
-              onPressed: () {
-                debugPrint('[player_page] back tapped');
-                Navigator.of(context).pop();
-              },
+              // v2.17.17：全屏中返回 = 先退出全屏（回当前方向置顶+评论），
+              // 非全屏 = 离开播放页（见 _handleBack）
+              onPressed: _handleBack,
             ),
-            // v2.17.0+：标题只在全屏顶栏显示——竖屏（非全屏）标题在视频
-            // 下方信息行（_buildVideoInfoBar），避免同一标题在屏上出现两次。
+            // v2.17.0+：标题只在全屏顶栏显示——非全屏（竖屏置顶 / 横屏
+            // 置顶）标题在视频下方信息行（_buildVideoInfoBar），避免同一
+            // 标题在屏上出现两次。
             if (_fullscreen)
               Expanded(
                 child: Text(
@@ -4582,9 +4674,10 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
       // （_RenderSlider 布局取 constraints.maxHeight），不固定会盖满全屏
       // 并吞掉中心播放/暂停与返回按钮的点击，且进度条漂到屏幕中部。
       // 两行结构：进度条行 + 按钮行（倍速/听视频/字幕/弹幕/评论/下载/全屏）。
-      // v2.17.0+：底部 SafeArea 只在全屏吃系统底 inset——竖屏时本行位于
-      // 视频区底部（屏幕中部），系统导航条在屏幕最下方，不需也**不能**
-      // 再垫底（否则按钮行上方悬空留黑）。
+      // v2.17.0+：底部 SafeArea 只在全屏吃系统底 inset——非全屏（竖屏 /
+      // 横屏置顶）时本行位于视频区黑盒底部（屏幕中部，不在屏底），系统
+      // 导航条在屏幕最下方（横屏在侧边），不需也**不能**再垫底（否则按钮
+      // 行上方悬空留黑）。
       child: SafeArea(
         top: false,
         bottom: _fullscreen,
@@ -4770,7 +4863,8 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
                       ),
                     ),
                   ),
-                  // 评论按钮（v2.17.0+）：竖屏 = 滚动定位到下方内嵌评论区；
+                  // 评论按钮（v2.17.0+；v2.17.17 横屏置顶共用）：非全屏
+                  // （竖屏/横屏置顶）= 滚动定位到下方内嵌评论区；
                   // 横屏全屏 = 打开原独立评论页（见 _onCommentsButtonTap）
                   Expanded(
                     child: InkWell(

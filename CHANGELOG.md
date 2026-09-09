@@ -8,6 +8,17 @@
 
 ---
 
+## v2.17.17 (2026-09-09)
+
+**横屏置顶模式：退出全屏不再强制转竖屏——设备横放停在横屏「顶部置顶视频 + 下方评论区」；布局横竖屏自适应**
+
+- **方向策略（`app/lib/pages/player_page.dart` `_toggleFullscreen` / PopScope）**：全屏（横屏）播放中点「退出全屏」或返回（顶栏箭头 / 系统返回键）→ **不再强制转竖屏**——方向放开为「竖屏 + 双向横屏」三向（`kPlayerPageFreeOrientations`：portraitUp + landscapeLeft/Right，不含 portraitDown 防倒持误入）：设备当前横放即**停在横屏「置顶+评论」模式**，设备竖放仍竖屏置顶+评论（兼容 v2.17.0 行为），之后旋转设备可在横/竖两态自由切换。**全屏中返回 = 先退出全屏**（回当前方向置顶+评论，页面不离开，再返回才离开播放页，`_handleBack` + `PopScope(canPop: !_fullscreen)`）；离开播放页 dispose 仍恢复系统竖屏 + edgeToEdge（`_restoreSystemUi` 现状保留）
+- **非全屏布局横竖屏自适应（同一 Column 两分支）**：竖屏封顶比例不变（屏高 60%）；**横屏**（宽>高，屏高低）→ 视频区高度封顶改为屏高 **55%**（`kLandscapeVideoHeightRatio`，16:9 视频按屏宽换算理想高度≈整屏高，必须封顶留出下方内容；盒内画面仍按 AspectRatio 居中 + 黑边补齐），视频信息行**横屏自动紧凑**（标题 1 行 / 简介折叠少行，`_buildVideoInfoBar` 按方向取 maxLines/foldLines），简介「展开」封顶高度横屏收紧（48–80，`_descMaxExpandedHeight`），剩余高度全部留给**内嵌评论区**（Expanded 哪怕矮也可滚）；手势层/字幕/听视频占位/控制层仍只绑定视频区矩形（横屏非全屏同样生效，`_gestureAreaSize`/字幕 bottom/中央簇紧凑判定改为复用同一方向感知的视频区高度 `_embeddedVideoHeight`）
+- 测试：新增 `test/player_landscape_pin_test.dart` widget 测试（platform 通道捕获 `SystemChrome.setPreferredOrientations` 实参：进全屏=[landscapeL/R] 锁横屏、退出/返回退全屏=放开三向、dispose=[portraitUp] 恢复——**方向策略核心证据**；另断言竖屏 400x800 与横屏 800x400 两态视频区封顶高度/信息行紧贴/评论区可见不越屏/全屏无下方内容区）；新增 `integration_test/landscape_pin_flow_test.dart` 真机验收（真实播放器 + 宿主机 adb 旋转打点：竖屏置顶→进全屏→横屏退出**停留横屏置顶+评论**（几何/评论区可滚/开弹幕不崩）→转竖屏回归→返回先退全屏）；`flutter analyze` 0 issue、全量 `flutter test` 通过（866 例）
+- 验证：debug APK 装机模拟器（Android 15 API35，真实白名单视频匿名播放「Yazi 文件管理器」BV1yRkCYVEUT，onPrepared 852x480 + 进度保存/观看计时日志确认真实播放）——**集成测试 `integration_test/landscape_pin_flow_test.dart` 全流程取证（[集成] 几何数值）**：① 竖屏进入播放 屏=411x914，视频区 **411x231@顶 0**（宽高比封顶）、信息行顶=231、评论区 411x480 底 890≤914（竖屏置顶+评论）；② 进全屏 → 屏 914x411、视频区 **914x411 占满整屏**、信息行/评论区=0（全屏无下方内容区）；③ **横屏退出全屏 → 停留横屏置顶+评论（核心验收）**：屏仍 914x411（未强制转竖屏），视频区 **914x226@顶0 = 屏高 55% 封顶**、信息行顶=226、评论区 862x22 可见不越屏且 **上拉滚动 300px 生效（评论区可滚）**、全程 0 RenderFlex 溢出异常；④ 转回竖屏 → 回归 视频区 411x231@顶0 + 评论区 480（竖放兼容 v2.17.0）；⑤ 全屏点返回箭头 = 先退出全屏（页面不离开），再返回才离开播放页（dispose 恢复方向）。弹幕冒烟：横屏/竖屏置顶下开弹幕真实拉取 **121 条**、游标对齐/布局正常、开关关闭不崩；观看计时 +10s 累计正常。方向策略 API 侧证据在 widget 测试（platform 通道捕获 setPreferredOrientations 实参）
+
+---
+
 ## v2.17.16 (2026-09-09)
 
 **搜索页「搜索历史记录」+ 观看热力图配色改「相对制」（不再固定时间分档）**
