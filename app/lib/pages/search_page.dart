@@ -8,6 +8,13 @@
 /// 防风控：输入防抖 600ms 自动搜 + 手动搜索按钮；搜索失败分类提示
 /// （-412 风控 / -352 限流 / -1200 降级 / 网络失败），返回空数组时显示「无结果」。
 ///
+/// 搜索历史（v2.17.16+）：本地关键词列表（[SearchHistoryStore]，去重置顶 /
+/// 上限 20 / 单删 / 清空）——输入框为空且在「全部 B 站 / 搜索 UP 主」Tab 时
+/// 显示「搜索历史」面板：每条可点 = 直接填入并搜索，行尾 X 或长按单删，
+/// 标题行「清空」一键清空。键盘搜索键 / 点搜索按钮 / 点历史词会记录
+/// （防抖自动搜索、切范围/排序自动重查不记录，避免中间词污染历史）。
+/// 切 Tab / 切类型不影响历史（三个 Tab 共用一份）。
+///
 /// 翻页与排序（v2.12.1 / v2.16.5）：
 /// - 搜索范围 chip 行：视频 / 番剧 / 电影 / 电视剧；切换取消防抖、重置分页
 ///   状态并重新执行 page=1 搜索（media 范围时隐藏排序行——media 接口不支持排序）
@@ -25,6 +32,7 @@ library;
 import 'dart:async';
 
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 
 import '../api/bilibili_api.dart';
@@ -33,9 +41,11 @@ import '../models/media_search_result.dart';
 import '../models/search_result.dart';
 import '../models/upowner.dart';
 import '../models/whitelist_video.dart';
+import '../services/search_history_store.dart';
 import '../services/service_locator.dart';
 import '../services/upowner_writer.dart';
 import '../services/whitelist_writer.dart';
+import '../sync/whitelist_source.dart';
 import '../widgets/cover_image.dart';
 import '../widgets/pgc_import_dialog.dart';
 import '../widgets/upowner_tile.dart';
@@ -108,7 +118,23 @@ String _fmtPubDate(int unixSec) {
 class SearchPage extends StatefulWidget {
   final int initialTab;
 
-  const SearchPage({super.key, this.initialTab = 0});
+  /// 搜索历史存储（v2.17.16+）：默认全局 [SearchHistoryStore.instance]；
+  /// 测试注入独立实例。搜索页三个 Tab 共用同一份历史（切 Tab/类型不影响）。
+  final SearchHistoryStore? historyStore;
+
+  /// 白名单同步服务（测试注入假实现，避免触发真实 Gist/LAN 网络）。
+  final WhitelistSyncService? syncService;
+
+  /// B 站接口（测试注入假实现，避免 widget 测试发起真实搜索请求）。
+  final BiliApi? api;
+
+  const SearchPage({
+    super.key,
+    this.initialTab = 0,
+    this.historyStore,
+    this.syncService,
+    this.api,
+  });
 
   @override
   State<SearchPage> createState() => _SearchPageState();
@@ -117,9 +143,17 @@ class SearchPage extends StatefulWidget {
 class _SearchPageState extends State<SearchPage>
     with SingleTickerProviderStateMixin {
   final TextEditingController _keywordCtrl = TextEditingController();
-  final BiliApi _api = BiliApi();
+  late final BiliApi _api = widget.api ?? BiliApi();
   final WhitelistWriter _writer = WhitelistWriter();
   final UpownerWriter _upwriter = UpownerWriter();
+
+  late final SearchHistoryStore _historyStore =
+      widget.historyStore ?? SearchHistoryStore.instance;
+
+  /// 搜索历史（v2.17.16+）：内存态与 store 同步，展示「搜索历史」面板用；
+  /// 空列表 = 面板不显示。
+  List<String> _history = const [];
+  bool _historyLoaded = false;
 
   /// Tab 控制器：区分「全部 B 站」(0) / 「我的白名单」(1) / 「搜索 UP 主」(2)，
   /// 防抖自动搜索只在「全部 B 站」和「搜索 UP 主」Tab 触发
@@ -195,6 +229,7 @@ class _SearchPageState extends State<SearchPage>
     _tabCtrl.addListener(_onTabChanged);
     _scrollCtrl.addListener(_onScroll);
     _loadWhitelist();
+    _loadHistory();
   }
 
   /// Tab 切换：切到「我的白名单」时 scroll 监听暂停（不影响功能，但能避免
@@ -227,13 +262,26 @@ class _SearchPageState extends State<SearchPage>
   }
 
   /// 加载白名单快照（与首页同一套同步逻辑：Gist → LAN → 本地文件 → 缓存）。
+  /// 测试可注入替身 [widget.syncService]，不触发真实网络。
   Future<void> _loadWhitelist() async {
     try {
-      final result = await ServiceLocator.syncService.sync();
+      final service = widget.syncService ?? ServiceLocator.syncService;
+      final result = await service.sync();
       if (mounted) setState(() => _whitelist = result.data);
     } catch (_) {
       // 白名单加载失败不阻塞搜索；「我的白名单」Tab 显示错误提示
       if (mounted) setState(() => _whitelist = null);
+    }
+  }
+
+  /// 加载本地搜索历史（进入搜索页即读；异步完成再展示面板）。
+  Future<void> _loadHistory() async {
+    final list = await _historyStore.getAll();
+    if (mounted) {
+      setState(() {
+        _history = list;
+        _historyLoaded = true;
+      });
     }
   }
 
@@ -298,7 +346,12 @@ class _SearchPageState extends State<SearchPage>
   }
 
   /// 手动搜索（按钮 / 键盘搜索键）：根据当前 Tab + 搜索范围分发。
-  Future<void> _doSearch() async {
+  ///
+  /// [record]（v2.17.16+）：是否把关键词记入搜索历史。只有**明确的搜索
+  /// 行为**才记录——键盘搜索键 / 点搜索按钮 / 点历史词（[record: true]）；
+  /// 防抖自动搜索、切范围/排序后的自动重查（[record: false] 默认）不进
+  /// 历史，避免把「边打字边联想」的中间词刷进历史。
+  Future<void> _doSearch({bool record = false}) async {
     final keyword = _keywordCtrl.text.trim();
     _debounce?.cancel();
     if (keyword.isEmpty) {
@@ -324,6 +377,7 @@ class _SearchPageState extends State<SearchPage>
       });
       return;
     }
+    if (record) await _recordHistory(keyword);
     if (_tabCtrl.index == 2) {
       await _doUpownerSearch();
     } else if (_scope.isMedia) {
@@ -331,6 +385,50 @@ class _SearchPageState extends State<SearchPage>
     } else {
       await _doVideoSearch();
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // 搜索历史（v2.17.16+）
+  // ---------------------------------------------------------------------------
+
+  /// 是否显示「搜索历史」面板：历史已加载且非空 + 输入框为空 +
+  /// 不在「我的白名单」Tab（该 Tab 是本地列表浏览，历史词面板会挡住
+  /// 白名单列表；切回全部 B 站 / UP 主 Tab 后恢复显示）。
+  bool get _showHistoryPanel =>
+      _historyLoaded &&
+      _history.isNotEmpty &&
+      _keywordCtrl.text.trim().isEmpty &&
+      _tabCtrl.index != 1;
+
+  /// 把关键词记入本地历史（去重置顶、超限裁最旧），并同步内存态。
+  /// store 损坏/写入失败静默（store 内部容错），不影响搜索主流程。
+  Future<void> _recordHistory(String keyword) async {
+    final next = await _historyStore.add(keyword);
+    if (!mounted) return;
+    if (!listEquals(next, _history)) setState(() => _history = next);
+  }
+
+  /// 点历史词：填入输入框并立即搜索（该词重新置顶），关闭历史面板。
+  void _searchFromHistory(String keyword) {
+    _keywordCtrl.text = keyword;
+    if (mounted) setState(() {}); // keyword 非空 → 面板隐藏，展示结果区
+    _doSearch(record: true);
+  }
+
+  /// 删除单条历史（点行尾 X 或长按行）。
+  Future<void> _removeHistoryAt(int index) async {
+    if (index < 0 || index >= _history.length) return;
+    await _historyStore.removeAt(index);
+    if (!mounted) return;
+    setState(() => _history = [..._history]..removeAt(index));
+    _showSnack('已删除该条搜索历史');
+  }
+
+  /// 清空全部搜索历史。
+  Future<void> _clearHistory() async {
+    await _historyStore.clear();
+    if (mounted) setState(() => _history = const []);
+    _showSnack('已清空搜索历史');
   }
 
   /// 切换搜索范围 chip：取消防抖、清当前范围结果，从 page=1 重查。
@@ -737,7 +835,7 @@ class _SearchPageState extends State<SearchPage>
                 autofocus: true,
                 textInputAction: TextInputAction.search,
                 onChanged: _onKeywordChanged,
-                onSubmitted: (_) => _doSearch(),
+                onSubmitted: (_) => _doSearch(record: true),
                 decoration: InputDecoration(
                   hintText: _tabCtrl.index == 2
                       ? '搜索 B 站 UP 主（昵称 / 认证名）'
@@ -752,7 +850,7 @@ class _SearchPageState extends State<SearchPage>
             IconButton(
               tooltip: '搜索',
               icon: const Icon(Icons.search),
-              onPressed: _doSearch,
+              onPressed: () => _doSearch(record: true),
             ),
           ],
         ),
@@ -765,10 +863,85 @@ class _SearchPageState extends State<SearchPage>
           ],
         ),
       ),
-      body: TabBarView(
-        controller: _tabCtrl,
-        children: [_buildGlobalTab(), _buildWhitelistTab(), _buildUpownerTab()],
-      ),
+      // 搜索历史面板：输入框为空且 Tab=0/2 时覆盖结果区（v2.17.16+）
+      body: _showHistoryPanel ? _buildHistoryPanel() : _buildTabArea(),
+    );
+  }
+
+  /// 三个 Tab 的内容区（与历史面板互斥展示）。
+  Widget _buildTabArea() {
+    return TabBarView(
+      controller: _tabCtrl,
+      children: [_buildGlobalTab(), _buildWhitelistTab(), _buildUpownerTab()],
+    );
+  }
+
+  /// 「搜索历史」面板（v2.17.16+）：标题行（含清空入口）+ 历史词列表。
+  ///
+  /// - 每条可点 = 直接填入输入框并搜索；行尾 X 或长按 = 删除单条
+  /// - 顶部「清空」一键清空全部；历史为空时不渲染本面板（由调用方保证）
+  Widget _buildHistoryPanel() {
+    final theme = Theme.of(context);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 8, 4, 0),
+          child: Row(
+            children: [
+              Icon(Icons.history,
+                  size: 18, color: theme.colorScheme.onSurfaceVariant),
+              const SizedBox(width: 8),
+              Text('搜索历史', style: theme.textTheme.titleSmall),
+              const Spacer(),
+              TextButton.icon(
+                key: const ValueKey('search-history-clear'),
+                onPressed: _clearHistory,
+                style: TextButton.styleFrom(
+                  foregroundColor: theme.colorScheme.onSurfaceVariant,
+                  visualDensity: VisualDensity.compact,
+                ),
+                icon: const Icon(Icons.delete_outline, size: 18),
+                label: const Text('清空'),
+              ),
+            ],
+          ),
+        ),
+        const Divider(height: 1),
+        Expanded(
+          child: ListView.separated(
+            itemCount: _history.length,
+            separatorBuilder: (_, __) => const Divider(
+              height: 1,
+              indent: 52,
+            ),
+            itemBuilder: (context, i) {
+              final kw = _history[i];
+              return ListTile(
+                key: ValueKey('search-history-$kw'),
+                dense: true,
+                leading: Icon(Icons.search,
+                    size: 18, color: theme.colorScheme.outline),
+                title: Text(
+                  kw,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(fontSize: 14),
+                ),
+                trailing: IconButton(
+                  key: ValueKey('search-history-remove-$kw'),
+                  tooltip: '删除该条搜索历史',
+                  icon: Icon(Icons.close,
+                      size: 18, color: theme.colorScheme.outline),
+                  onPressed: () => _removeHistoryAt(i),
+                ),
+                onTap: () => _searchFromHistory(kw),
+                onLongPress: () => _removeHistoryAt(i),
+              );
+            },
+          ),
+        ),
+      ],
     );
   }
 

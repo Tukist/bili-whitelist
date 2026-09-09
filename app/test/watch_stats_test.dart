@@ -1,7 +1,7 @@
 // WatchStats（每日观看时长记录）单元测试。
 // - shared_preferences.setMockInitialValues 注入内存存储，不碰原生插件
 // - 记录累加 / 跨日（clock 注入）/ streak / 400 天裁剪 / 损坏容错 /
-//   纯函数（delta 累计排除跳变、watchLevel 分级）
+//   纯函数（delta 累计排除跳变、relativeIntensity 相对强度）
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -40,24 +40,31 @@ void main() {
     });
   });
 
-  group('纯函数 watchLevel（蓝阶分级）', () {
-    test('0 秒 = 0（无观看）；>0 按分钟分 5 档', () {
-      expect(WatchStats.watchLevel(0), 0);
-      // <5 分钟 → 1
-      expect(WatchStats.watchLevel(1), 1);
-      expect(WatchStats.watchLevel(299), 1);
-      // 5-15 分钟 → 2
-      expect(WatchStats.watchLevel(300), 2);
-      expect(WatchStats.watchLevel(899), 2);
-      // 15-30 分钟 → 3
-      expect(WatchStats.watchLevel(900), 3);
-      expect(WatchStats.watchLevel(1799), 3);
-      // 30-60 分钟 → 4
-      expect(WatchStats.watchLevel(1800), 4);
-      expect(WatchStats.watchLevel(3599), 4);
-      // ≥60 分钟 → 5
-      expect(WatchStats.watchLevel(3600), 5);
-      expect(WatchStats.watchLevel(99999), 5);
+  group('纯函数 relativeIntensity（v2.17.16 相对配色强度）', () {
+    test('0 观看 / 无基准（max<=0）→ 0', () {
+      expect(WatchStats.relativeIntensity(0, 3600), 0);
+      expect(WatchStats.relativeIntensity(3600, 0), 0);
+      expect(WatchStats.relativeIntensity(0, 0), 0);
+      expect(WatchStats.relativeIntensity(100, -1), 0);
+    });
+
+    test('当天 = 最长 → 1（最深克莱因蓝）', () {
+      expect(WatchStats.relativeIntensity(3600, 3600), 1);
+    });
+
+    test('比例 = 当天秒 / 最长秒（半量 0.5、四分之一 0.25）', () {
+      expect(WatchStats.relativeIntensity(1800, 3600), 0.5);
+      expect(WatchStats.relativeIntensity(900, 3600), 0.25);
+      expect(WatchStats.relativeIntensity(1, 10000), 0.0001);
+    });
+
+    test('超过最长（脏数据/时钟边界）→ 截断为 1', () {
+      expect(WatchStats.relativeIntensity(7200, 3600), 1);
+    });
+
+    test('任一单日 < 最长 → 强度 < 1 但 > 0（数据集中一天也能最深）', () {
+      // 只有一天 5 分钟 → 该日 = 窗口内最长 → 强度 1（不再是固定分档的浅档）
+      expect(WatchStats.relativeIntensity(300, 300), 1);
     });
   });
 

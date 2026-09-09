@@ -8,6 +8,17 @@
 
 ---
 
+## v2.17.16 (2026-09-09)
+
+**搜索页「搜索历史记录」+ 观看热力图配色改「相对制」（不再固定时间分档）**
+
+- **搜索历史（本地，`app/lib/services/search_history_store.dart` + `search_page.dart`）**：三个搜索 Tab 共用一份本地关键词历史（shared_preferences 单 key JSON 数组，不入 Gist 不跨设备）——**去重置顶**（新搜置顶、重复关键词剔除旧位置移到顶部）、**上限 20 条**自动裁剪最旧、支持单删与一键清空；存储损坏（解析失败 / 非列表 / 脏元素）一律容错为干净数据，不崩溃不影响搜索（含损坏后 add 自愈，见单测）。**搜索页 UI**：进入搜索页输入框为空时（「全部 B 站 / 搜索 UP 主」Tab）显示「搜索历史」面板——标题行（历史图标 + 清空入口）+ 历史词列表（每行点 = **直接填入输入框并立即搜索**、行尾 X 或长按 = 删除单条）；切到「我的白名单」Tab 面板自动隐藏不挡本地列表（空历史也不显示）。**记录时机**：键盘搜索键 / 点搜索按钮 / 点历史词 → 记入历史（防抖自动搜索、切范围/排序自动重查**不记录**，避免把打字联想中间词刷进历史）；切 Tab / 切类型不影响历史。测试：store 单测（去重置顶 / 重复上移 / 上限裁剪 / 空词忽略 / removeAt / clear / 持久化模拟重启 / 损坏容错自愈 / dedupeFront 纯函数）+ 搜索页 widget 冒烟（空历史隐藏 / 历史词渲染 / 输入时隐藏清空恢复 / 点历史填入并搜索 / 键盘提交记录 / 单删 / 清空 / 白名单 Tab 不挡）
+- **观看热力图配色改「相对制」（`watch_stats.dart` + `watch_stats_page.dart`）**：删除固定分钟分档（原 `watchLevel` 0..5 / `kHeatLevelColors` / `heatColorForLevel` 及其单测），改为窗口（近 53 周）内**最长单日观看秒为基准**的连续渐变——纯函数 `WatchStats.relativeIntensity(daySec, maxSec)` = `clamp(daySec/maxSec, 0, 1)`（max<=0 或无观看防除零返回 0；超长截断 1）+ `heatColorForIntensity(intensity)`（≤0 = 无观看浅近白底 #EBEEF5；≥1 = 最长那天**克莱因蓝 #002FA7**；0<强度<1 = 浅蓝起点 #D5E5FF → 克莱因蓝连续插值）；`HeatCell` 不再固化 level（渲染时按 `maxDaySecondsOfGrid(grid)` 实时算强度）——**数据只集中一天也能最深**（不再像固定分档那样日均 5 分钟永远浅色），任一天观看都能在窗口内找到相对深浅；图例改「无观看灰格 + 浅蓝→克莱因蓝渐变条」，说明文案点明「相对色阶：最深=近53周内单日最长观看，其余按当天/最长比例变浅」（原「档位：<5 分/…」固定文案移除）。测试：`relativeIntensity`（0/半量/1/超长截断/max≤0 防御/单日即最长=1）+ `heatColorForIntensity`（两端 + 0.5 连续插值 + 单调）+ `maxDaySecondsOfGrid`（取窗口最长 / 全 0 防御）
+- 测试：新增 `search_history_store_test.dart`、`search_history_page_test.dart`（假同步服务 + 假 B 站 API 注入，不发真实网络），更新 `watch_stats_test.dart` / `watch_stats_page_test.dart` 配色与网格用例；`flutter analyze` 0 issue、全量 `flutter test` 通过（865 例）
+- 验证：debug APK 装机模拟器——**① 搜索历史**：搜索页输入搜一次 → 清空输入框 → 「搜索历史」面板出现该词（uiautomator dump 见「搜索历史 / 关键词」文本）→ 点历史词触发搜索（输入框自动填入、日志出现搜索请求）→ 单删（行尾 X）/ 清空可用；**② 热力相对配色**：颜色为逐格渲染语义无法截屏取证——由「相对强度/配色纯函数单测 + 网格布局 dump（最长日格子 Semantics 文案）+ 最长日=最深语义」覆盖验证边界
+
+---
+
 ## v2.17.15 (2026-09-09)
 
 **根治播放中「间歇 2001/Source error」的必现路径——流 URL deadline 实测 2h + 主动预取到期前平滑换源**

@@ -4,7 +4,7 @@ import '../services/watch_stats.dart';
 import 'daily_history_page.dart';
 
 /// 观看统计页（v2.17.10+ 重做：GitHub 官方样式克莱因蓝热力 + 总览下移
-/// + 点日进历史 + 底部内联设置区）。
+/// + 点日进历史 + 底部内联设置区；v2.17.16 热力改**相对制**配色）。
 ///
 /// 作为主页 PageView 的一页（与主页共享 AppBar，**不带自己的 Scaffold**）：
 /// 主页右滑两页到这里（index3）。数据源 [WatchStats]（shared_preferences，
@@ -15,7 +15,12 @@ import 'daily_history_page.dart';
 /// - **1）GitHub 官方 contribution 样式的单张大热力图卡**：近 53 周连续
 ///   （今天在最右列），行 = 周一..周日，**圆角小方块**格子（格间距 2-3px）；
 ///   主色 **克莱因蓝 #002FA7 + 白**：无观看 = 浅近白底 #EBEEF5，有观看按
-///   分钟数 5 档蓝阶（<5 分浅蓝 .. ≥60 分克莱因蓝，见 [kHeatLevelColors]）；
+///   **相对制**连续渐变（v2.17.16，不再固定时间分档）——取窗口内**最长单日
+///   观看秒 [maxDaySecondsOfGrid] 为基准**，最长那天用最深克莱因蓝 #002FA7，
+///   其余按 `当天秒/最长秒` 的强度（[WatchStats.relativeIntensity]）从浅蓝
+///   #D5E5FF 到克莱因蓝插值（[heatColorForIntensity]）；窗口内没有观看的日
+///   子单独用浅底 #EBEEF5。**任何一天 > 0 观看都能在窗口内找到相对深浅**，
+///   不像固定分档那样数据集中一天也只会是浅色
 ///   列上方月份标签 + 少→多图例；窄屏横向滑动看更早的周（初始停在最近，
 ///   今天可见），宽屏整图放下不滚动；**点某日格子 → push [DailyHistoryPage]
 ///   看那一天的历史记录（当天观看视频列表，可续播）**
@@ -35,22 +40,18 @@ const Color kKleinBlue = Color(0xFF002FA7);
 /// 无观看格底色（浅近白，GitHub contribution 灰格风格）。
 const Color kHeatNoWatchColor = Color(0xFFEBEEF5);
 
-/// 热力图蓝阶（1..5 由浅蓝到克莱因蓝深；0 = 无观看用 [kHeatNoWatchColor]）。
-/// 档位按 [WatchStats.watchLevel] 的 0..5 查表：
-/// 1 = <5 分钟；2 = 5-15；3 = 15-30；4 = 30-60；5 = ≥60 分钟。
-const List<Color> kHeatLevelColors = [
-  Color(0xFFC7D8FF), // 1：<5 分钟（最浅蓝）
-  Color(0xFF7FA6FF), // 2：5-15 分钟
-  Color(0xFF3D6EFF), // 3：15-30 分钟
-  Color(0xFF1546C8), // 4：30-60 分钟
-  kKleinBlue,        // 5：≥60 分钟（克莱因蓝）
-];
+/// 有观看格渐变的最浅起点色（v2.17.16 相对制；0 观看单独用
+/// [kHeatNoWatchColor]，不参与渐变）。
+const Color kHeatLowColor = Color(0xFFD5E5FF);
 
-/// level → 格子颜色（纯函数，渲染/单测共用）：0 = 无观看浅底，1..5 蓝阶。
-Color heatColorForLevel(int level) {
-  if (level <= 0) return kHeatNoWatchColor;
-  if (level > kHeatLevelColors.length) return kKleinBlue;
-  return kHeatLevelColors[level - 1];
+/// 相对强度 → 格子颜色（纯函数，渲染/单测共用；v2.17.16 相对制）：
+/// - 强度 ≤ 0（无观看）→ 浅底 [kHeatNoWatchColor]
+/// - 强度 ≥ 1（窗口内单日最长）→ 克莱因蓝 [kKleinBlue]
+/// - 0 < 强度 < 1 → 浅蓝起点 [kHeatLowColor] → 克莱因蓝连续插值
+Color heatColorForIntensity(double intensity) {
+  if (intensity <= 0) return kHeatNoWatchColor;
+  if (intensity >= 1) return kKleinBlue;
+  return Color.lerp(kHeatLowColor, kKleinBlue, intensity)!;
 }
 
 /// 热力格占位边长（格 13 + 右/下间距 2），月份标签按此定列位。
@@ -60,15 +61,16 @@ const double _kSlot = 15.0;
 const double _kCellRadius = 3;
 
 /// 热力网格单格数据（纯数据，供渲染与单测）。
+/// [seconds] 为该日观看秒数；颜色由渲染侧按**相对制**实时算
+/// （[WatchStats.relativeIntensity] + [heatColorForIntensity]），不在格子里
+/// 固化分档，便于窗口内最长基准变化后无需改数据。
 class HeatCell {
   final DateTime date;
   final int seconds;
-  final int level;
 
   const HeatCell({
     required this.date,
     required this.seconds,
-    required this.level,
   });
 }
 
@@ -96,7 +98,8 @@ DateTime heatGridStart(DateTime today, {int weeks = 53}) {
 /// 构建 53 周热力网格（纯函数，便于单测）：
 /// 返回 `weeks × 7` 的二维表，`grid[col][row]`（row 0..6 = 周一..周日）；
 /// 列 0 的周一 = [heatGridStart]，今天位于最右列；
-/// 超过今天的未来格子返回 null（占位不画）；无记录的天返回 level 0 的格子。
+/// 超过今天的未来格子返回 null（占位不画）；无记录的天返回 0 秒格子
+/// （渲染按相对制，用 [maxDaySecondsOfGrid] 取窗口基准再逐个算色）。
 List<List<HeatCell?>> buildHeatmapGrid(
   Map<String, int> days,
   DateTime today, {
@@ -114,15 +117,25 @@ List<List<HeatCell?>> buildHeatmapGrid(
       }
       final key = WatchStats.dateKey(date);
       final seconds = days[key] ?? 0;
-      col.add(HeatCell(
-        date: date,
-        seconds: seconds,
-        level: WatchStats.watchLevel(seconds),
-      ));
+      col.add(HeatCell(date: date, seconds: seconds));
     }
     out.add(col);
   }
   return out;
+}
+
+/// 窗口内**最长单日观看秒**（相对配色基准，纯函数）：遍历 [grid] 全部格子
+/// 取最大 [HeatCell.seconds]；无任何观看（全 0 / 空）返回 0
+/// （调用方应保证有数据才画热力，见 [_heatCard] 的空态分支）。
+int maxDaySecondsOfGrid(List<List<HeatCell?>> grid) {
+  var max = 0;
+  for (final col in grid) {
+    for (final cell in col) {
+      final s = cell?.seconds ?? 0;
+      if (s > max) max = s;
+    }
+  }
+  return max;
 }
 
 /// 计算网格上方的月份标签（纯函数）：从 [gridStart] 的当月到 [today] 当月，
@@ -323,7 +336,7 @@ class WatchStatsPageState extends State<WatchStatsPage> {
                 label: '本周观看',
                 value: week.$1,
                 unit: week.$2,
-                accent: kHeatLevelColors[3],
+                accent: kKleinBlue,
               ),
             ),
           ],
@@ -337,7 +350,7 @@ class WatchStatsPageState extends State<WatchStatsPage> {
                 label: '累计观看',
                 value: total.$1,
                 unit: total.$2,
-                accent: kHeatLevelColors[2],
+                accent: kKleinBlue,
               ),
             ),
             const SizedBox(width: 8),
@@ -360,6 +373,8 @@ class WatchStatsPageState extends State<WatchStatsPage> {
     final now = DateTime.now();
     final grid = buildHeatmapGrid(_stats.days, now);
     final labels = buildHeatMonthLabels(heatGridStart(now), now);
+    // 相对配色基准：窗口（53 周）内最长单日观看秒 —— 该日格子最深的克莱因蓝
+    final maxSeconds = maxDaySecondsOfGrid(grid);
     return Container(
       padding: const EdgeInsets.fromLTRB(12, 12, 12, 10),
       decoration: BoxDecoration(
@@ -390,7 +405,7 @@ class WatchStatsPageState extends State<WatchStatsPage> {
           else ...[
             _heatLegend(theme),
             const SizedBox(height: 8),
-            _heatMap(theme, grid, labels, now),
+            _heatMap(theme, grid, labels, now, maxSeconds),
             const SizedBox(height: 4),
             Center(
               child: Text(
@@ -431,30 +446,43 @@ class WatchStatsPageState extends State<WatchStatsPage> {
     );
   }
 
-  /// 少 → 多 图例：5 个蓝阶色块 + 「少/多」说明。
+  /// 少 → 多 图例（v2.17.16 相对制）：灰格（无观看）+ 浅蓝→克莱因蓝连续
+  /// 渐变条；说明文案点明「最深 = 窗口内单日观看最长」。
   Widget _heatLegend(ThemeData theme) {
     return Row(
       children: [
+        // 灰格 = 无观看
+        Container(
+          width: 12,
+          height: 12,
+          decoration: BoxDecoration(
+            color: kHeatNoWatchColor,
+            borderRadius: BorderRadius.circular(3),
+          ),
+        ),
+        const SizedBox(width: 4),
+        Text('无', style: theme.textTheme.labelSmall),
+        const SizedBox(width: 8),
         Text('少', style: theme.textTheme.labelSmall),
-        const SizedBox(width: 6),
-        for (var i = 0; i < kHeatLevelColors.length; i++) ...[
-          if (i > 0) const SizedBox(width: 3),
-          Container(
-            width: 12,
-            height: 12,
-            decoration: BoxDecoration(
-              color: kHeatLevelColors[i],
-              borderRadius: BorderRadius.circular(3),
+        const SizedBox(width: 4),
+        // 连续渐变条：浅蓝起点 → 克莱因蓝（最深 = 窗口内最长单日）
+        Container(
+          width: 72,
+          height: 12,
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(3),
+            gradient: LinearGradient(
+              colors: const [kHeatLowColor, kKleinBlue],
             ),
           ),
-        ],
-        const SizedBox(width: 6),
+        ),
+        const SizedBox(width: 4),
         Text('多', style: theme.textTheme.labelSmall),
         const SizedBox(width: 8),
         Expanded(
           child: Text(
-            '档位：<5 分 / 5-15 / 15-30 / 30-60 / ≥60 分 · 灰=无观看',
-            maxLines: 1,
+            '相对色阶：最深=近53周内单日最长观看，其余按当天/最长比例变浅',
+            maxLines: 2,
             overflow: TextOverflow.ellipsis,
             style: theme.textTheme.labelSmall?.copyWith(
               color: theme.colorScheme.onSurfaceVariant,
@@ -467,14 +495,16 @@ class WatchStatsPageState extends State<WatchStatsPage> {
 
   /// 53 周单张大热力：左侧固定周几栏（不随横向滚动）+ 右侧月份标签与
   /// 网格一起横向滚动（内容约 53×15 ≈ 795px，手机宽度不够时右滑看更早的
-  /// 周；平板等宽屏直接整图放下）。v2.17.10：色块改克莱因蓝阶、圆角
-  /// 小方块、**点格子直接进当天观看历史**；首次渲染自动滚动到最近端
+  /// 周；平板等宽屏直接整图放下）。v2.17.10：色块克莱因蓝阶、圆角小方块、
+  /// 点格子直接进当天观看历史；v2.17.16：颜色改**相对制**（[maxSeconds] =
+  /// 窗口内最长单日秒，传进每格实时算相对强度）；首次渲染自动滚动到最近端
   /// （今天在最右列可见，GitHub 打开默认看最近）。
   Widget _heatMap(
     ThemeData theme,
     List<List<HeatCell?>> grid,
     List<HeatMonthLabel> labels,
     DateTime today,
+    int maxSeconds,
   ) {
     const gutter = 22.0; // 左侧周几栏宽
     final weekdays = const ['一', '二', '三', '四', '五', '六', '日'];
@@ -514,7 +544,7 @@ class WatchStatsPageState extends State<WatchStatsPage> {
               Column(
                 children: [
                   for (var r = 0; r < 7; r++)
-                    _heatCell(theme, grid[w][r], today),
+                    _heatCell(theme, grid[w][r], today, maxSeconds),
                 ],
               ),
           ],
@@ -590,7 +620,15 @@ class WatchStatsPageState extends State<WatchStatsPage> {
 
   /// 单格：圆角小方块 + 无障碍标签；点任意非未来格 → 当天历史页。
   /// 未来（null）= 不画占位（保留格子间距）。
-  Widget _heatCell(ThemeData theme, HeatCell? cell, DateTime today) {
+  /// 颜色 = 相对制（v2.17.16）：无观看（0 秒）浅底 [kHeatNoWatchColor]；
+  /// 有观看按 `秒 / [maxSeconds]` 强度连续渐变，强度 1（最长那天）=
+  /// 克莱因蓝。
+  Widget _heatCell(
+    ThemeData theme,
+    HeatCell? cell,
+    DateTime today,
+    int maxSeconds,
+  ) {
     if (cell == null) {
       return Container(
         width: 13,
@@ -603,6 +641,7 @@ class WatchStatsPageState extends State<WatchStatsPage> {
     final desc = cell.seconds > 0
         ? '$dateKey 观看 ${formatWatchDuration(cell.seconds)}'
         : '$dateKey 无观看记录';
+    final intensity = WatchStats.relativeIntensity(cell.seconds, maxSeconds);
     return Semantics(
       button: true,
       label: desc,
@@ -615,7 +654,7 @@ class WatchStatsPageState extends State<WatchStatsPage> {
           height: 13,
           margin: const EdgeInsets.only(right: 2, bottom: 2),
           decoration: BoxDecoration(
-            color: heatColorForLevel(cell.level),
+            color: heatColorForIntensity(intensity),
             borderRadius: BorderRadius.circular(_kCellRadius),
             border: isToday
                 ? Border.all(color: kKleinBlue.withValues(alpha: .9), width: 1.2)

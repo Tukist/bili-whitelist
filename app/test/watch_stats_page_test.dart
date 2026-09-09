@@ -1,5 +1,6 @@
 // 观看统计页（WatchStatsPage）单测：53 周热力网格构建 / 月份标签 /
-// 时长文案 / 克莱因蓝阶配色（v2.17.10）/ 总览在热力下方 / 设置区内联 /
+// 时长文案 / 克莱因蓝**相对制**配色（v2.17.16：最长日→最深，其余按比例
+// 连续渐变，无固定分档）/ 总览在热力下方 / 设置区内联 /
 // 点日期格进入该日历史页；另有页面冒烟（空态 / 有数据热力卡出现）。
 // - 网格函数不碰插件，直接断言数据结构
 // - 页面冒烟用 shared_preferences mock + 注入 stats 实例
@@ -75,19 +76,17 @@ void main() {
       expect(rightCol[6], isNull);
     });
 
-    test('秒数正确落格 & level 与 watchLevel 一致', () {
+    test('秒数正确落格（level 概念已移除，v2.17.16 相对制渲染时算强度）', () {
       const days = {
         '2026-09-08': 60, // 今天 1 分钟
         '2026-09-07': 300, // 本周一 5 分钟
-        '2025-09-08': 7200, // 一年前某天 ≥60 分钟（克莱因蓝）
+        '2025-09-08': 7200, // 一年前某天 2 小时
       };
       final grid = buildHeatmapGrid(days, today);
       final todayCell = grid.last[1]!;
       expect(todayCell.seconds, 60);
-      expect(todayCell.level, WatchStats.watchLevel(60)); // 1
       final mondayCell = grid.last[0]!;
       expect(mondayCell.seconds, 300);
-      expect(mondayCell.level, 2);
 
       HeatCell? found;
       for (final col in grid) {
@@ -96,14 +95,33 @@ void main() {
         }
       }
       expect(found, isNotNull);
-      expect(found!.level, 5);
+      expect(found!.seconds, 7200);
     });
 
-    test('无记录的天 = level 0 灰格（仍有日期）', () {
+    test('无记录的天 = 0 秒格子（渲染侧给浅底；仍有日期）', () {
       final grid = buildHeatmapGrid(const {}, today);
       final yesterday = grid.last[0]!; // 本周一无记录
-      expect(yesterday.level, 0);
       expect(yesterday.seconds, 0);
+    });
+
+    test('maxDaySecondsOfGrid：窗口内最长单日秒（相对配色基准）', () {
+      final grid = buildHeatmapGrid(const {
+        '2026-09-08': 60,
+        '2026-09-07': 7200, // 最长
+        '2025-09-08': 300,
+      }, today);
+      expect(maxDaySecondsOfGrid(grid), 7200);
+    });
+
+    test('maxDaySecondsOfGrid：全 0 / 空 → 0（防御，页面空态分支已挡）', () {
+      expect(maxDaySecondsOfGrid(buildHeatmapGrid(const {}, today)), 0);
+      final allZero = buildHeatmapGrid(const {}, today);
+      for (final col in allZero) {
+        for (var r = 0; r < col.length; r++) {
+          col[r] = HeatCell(date: today, seconds: 0);
+        }
+      }
+      expect(maxDaySecondsOfGrid(allZero), 0);
     });
   });
 
@@ -132,26 +150,41 @@ void main() {
     });
   });
 
-  group('克莱因蓝阶配色（v2.17.10 重做）', () {
-    test('主色 #002FA7 + 白；无观看浅近白底 #EBEEF5', () {
+  group('相对配色（v2.17.16：克莱因蓝连续渐变，无固定分档）', () {
+    test('主色 #002FA7 + 无观看浅近白底 #EBEEF5 + 渐变起点浅蓝 #D5E5FF', () {
       expect(kKleinBlue, const Color(0xFF002FA7));
       expect(kHeatNoWatchColor, const Color(0xFFEBEEF5));
-      expect(kHeatLevelColors, const [
-        Color(0xFFC7D8FF), // <5 分
-        Color(0xFF7FA6FF), // 5-15
-        Color(0xFF3D6EFF), // 15-30
-        Color(0xFF1546C8), // 30-60
-        Color(0xFF002FA7), // ≥60（克莱因蓝）
-      ]);
+      expect(kHeatLowColor, const Color(0xFFD5E5FF));
     });
 
-    test('heatColorForLevel：0=浅底、1..5 蓝阶、越界兜底克莱因蓝', () {
-      expect(heatColorForLevel(0), kHeatNoWatchColor);
-      for (var i = 1; i <= 5; i++) {
-        expect(heatColorForLevel(i), kHeatLevelColors[i - 1]);
-      }
-      expect(heatColorForLevel(9), kKleinBlue);
-      expect(heatColorForLevel(-1), kHeatNoWatchColor);
+    test('heatColorForIntensity：≤0=浅底、≥1=克莱因蓝、中间连续插值', () {
+      expect(heatColorForIntensity(0), kHeatNoWatchColor);
+      expect(heatColorForIntensity(-1), kHeatNoWatchColor);
+      expect(heatColorForIntensity(1), kKleinBlue);
+      expect(heatColorForIntensity(5), kKleinBlue);
+      // 0.5 应等于 Color.lerp(起点浅蓝, 克莱因蓝, 0.5) 的插值结果
+      // （Flutter 新版 lerp 走更精确的宽色域插值，不等于逐通道均值，直接对比实现）
+      final mid = Color.lerp(kHeatLowColor, kKleinBlue, 0.5)!;
+      expect(heatColorForIntensity(0.5), mid);
+      // 中间色在两端之间、且不是任一端（确有渐变）
+      expect(mid, isNot(kHeatLowColor));
+      expect(mid, isNot(kKleinBlue));
+      // 单调：三个通道都介于起点与克莱因蓝之间（0 <= 红 <= 213 等）
+      expect(mid.r, inInclusiveRange(kKleinBlue.r, kHeatLowColor.r));
+      expect(mid.g, inInclusiveRange(kKleinBlue.g, kHeatLowColor.g));
+      expect(mid.b, inInclusiveRange(kKleinBlue.b, kHeatLowColor.b));
+      // 强度 0.75 明显比 0.5 深（红通道降、蓝通道升方向相反，用红通道比较）
+      final q3 = heatColorForIntensity(0.75);
+      expect(q3.r, lessThan(mid.r));
+    });
+
+    test('两端贴合：1% 几乎=起点浅蓝，99% 几乎=克莱因蓝（连续无跳档断层）', () {
+      final nearLow = heatColorForIntensity(0.01);
+      final nearHigh = heatColorForIntensity(0.99);
+      // 低强度贴近起点浅蓝（红通道高 ≈0.83），高强度贴近克莱因蓝（红通道近 0）
+      expect(nearLow.r, closeTo(kHeatLowColor.r, 0.05));
+      expect(nearHigh.r, closeTo(kKleinBlue.r, 0.05));
+      expect(nearLow.r - nearHigh.r, greaterThan(0.7));
     });
   });
 
@@ -182,7 +215,9 @@ void main() {
       await tester.pumpAndSettle();
       expect(find.text('观看热力 · 最近 53 周'), findsOneWidget);
       expect(find.textContaining('天有观看记录'), findsOneWidget);
-      expect(find.textContaining('档位：'), findsOneWidget);
+      // v2.17.16 相对制图例说明（不再有固定档位文案）
+      expect(find.textContaining('相对色阶'), findsOneWidget);
+      expect(find.textContaining('档位：'), findsNothing);
       expect(find.text('开始观看后这里会生成你的观看热力'), findsNothing);
     });
   });

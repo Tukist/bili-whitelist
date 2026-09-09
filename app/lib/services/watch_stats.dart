@@ -19,7 +19,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 /// [longestStreakDays]（最长连续有观看的天数）。
 ///
 /// 便于单测：日期用可注入的 [clock]（模拟跨日），纯函数独立成静态方法
-/// （[dateKey]/[watchLevel]/[accumulateWatchMs]/[countStreak]）。
+/// （[dateKey]/[relativeIntensity]/[accumulateWatchMs]/[countStreak]）。
 class WatchStats extends ChangeNotifier {
   WatchStats();
 
@@ -79,16 +79,14 @@ class WatchStats extends ChangeNotifier {
     return dt;
   }
 
-  /// 观看秒 → 热力等级 0..5（纯函数，供热力图着色/图例共用）：
-  /// 0 = 无观看；1 = <5 分钟；2 = 5-15；3 = 15-30；4 = 30-60；5 = ≥60 分钟。
-  static int watchLevel(int seconds) {
-    if (seconds <= 0) return 0;
-    final minutes = seconds ~/ 60;
-    if (minutes >= 60) return 5;
-    if (minutes >= 30) return 4;
-    if (minutes >= 15) return 3;
-    if (minutes >= 5) return 2;
-    return 1;
+  /// 相对强度（纯函数，v2.17.16 相对配色用）：某日观看秒 / 窗口内最长单日
+  /// 秒，截断到 [0,1]——0 = 无观看（或窗口内没有任何观看，[maxSeconds]<=0
+  /// 视为 0，避免除零）；1 = 当天就是窗口内最长的一天。热力格按此连续
+  /// 渐变着色（不再固定时间分档），图例/单测共用。
+  static double relativeIntensity(int daySeconds, int maxSeconds) {
+    if (maxSeconds <= 0 || daySeconds <= 0) return 0;
+    final v = daySeconds / maxSeconds;
+    return v > 1 ? 1 : v;
   }
 
   /// 累计观看毫秒的纯函数：输入每次 tick 的位置增量（ms），只累计
