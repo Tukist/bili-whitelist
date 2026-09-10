@@ -10,10 +10,11 @@ library;
 import 'package:flutter/material.dart';
 
 import '../models/danmaku_settings.dart';
+import '../theme/app_tokens.dart';
 
-/// 设置面板行内小标题样式。
+/// 设置面板行内小标题样式（暗底上次级文字 = 白 54%）。
 const TextStyle _kSectionTitleStyle =
-    TextStyle(color: Colors.white54, fontSize: 12);
+    TextStyle(color: kPlayerOnDim, fontSize: 12);
 
 class DanmakuSettingsSheet extends StatefulWidget {
   /// 当前设置（父层持有的值，作为编辑起点）。
@@ -76,9 +77,7 @@ class _DanmakuSettingsSheetState extends State<DanmakuSettingsSheet> {
           children: [
             Center(
               child: Text('弹幕设置',
-                  style: TextStyle(
-                      color: Colors.white.withValues(alpha: 0.85),
-                      fontSize: 14)),
+                  style: TextStyle(color: kPlayerOn, fontSize: 14)),
             ),
             const SizedBox(height: 6),
             const Divider(height: 1),
@@ -87,33 +86,33 @@ class _DanmakuSettingsSheetState extends State<DanmakuSettingsSheet> {
             SwitchListTile(
               dense: true,
               contentPadding: EdgeInsets.zero,
-              activeTrackColor: Colors.pinkAccent,
+              activeTrackColor: kPlayerOn,
               title: const Text('滚动弹幕',
-                  style: TextStyle(color: Colors.white, fontSize: 15)),
+                  style: TextStyle(color: kPlayerOn, fontSize: 15)),
               subtitle: const Text('从右向左飞过（默认开启）',
-                  style: TextStyle(color: Colors.white38, fontSize: 12)),
+                  style: TextStyle(color: kPlayerOff, fontSize: 12)),
               value: !_s.blockScroll,
               onChanged: (v) => _set(_s.copyWith(blockScroll: !v)),
             ),
             SwitchListTile(
               dense: true,
               contentPadding: EdgeInsets.zero,
-              activeTrackColor: Colors.pinkAccent,
+              activeTrackColor: kPlayerOn,
               title: const Text('顶部弹幕',
-                  style: TextStyle(color: Colors.white, fontSize: 15)),
+                  style: TextStyle(color: kPlayerOn, fontSize: 15)),
               subtitle: const Text('固定在顶部居中停留（默认开启）',
-                  style: TextStyle(color: Colors.white38, fontSize: 12)),
+                  style: TextStyle(color: kPlayerOff, fontSize: 12)),
               value: !_s.blockTop,
               onChanged: (v) => _set(_s.copyWith(blockTop: !v)),
             ),
             SwitchListTile(
               dense: true,
               contentPadding: EdgeInsets.zero,
-              activeTrackColor: Colors.pinkAccent,
+              activeTrackColor: kPlayerOn,
               title: const Text('底部弹幕',
-                  style: TextStyle(color: Colors.white, fontSize: 15)),
+                  style: TextStyle(color: kPlayerOn, fontSize: 15)),
               subtitle: const Text('固定在底部居中停留（默认开启）',
-                  style: TextStyle(color: Colors.white38, fontSize: 12)),
+                  style: TextStyle(color: kPlayerOff, fontSize: 12)),
               value: !_s.blockBottom,
               onChanged: (v) => _set(_s.copyWith(blockBottom: !v)),
             ),
@@ -122,13 +121,13 @@ class _DanmakuSettingsSheetState extends State<DanmakuSettingsSheet> {
             const Text('屏蔽关键词', style: _kSectionTitleStyle),
             const SizedBox(height: 2),
             const Text('弹幕文本包含任一关键词即不显示（空词自动忽略）',
-                style: TextStyle(color: Colors.white30, fontSize: 11)),
+                style: TextStyle(color: kPlayerOff, fontSize: 11)),
             const SizedBox(height: 8),
             if (_s.blockWords.isEmpty)
               const Padding(
                 padding: EdgeInsets.symmetric(vertical: 4),
                 child: Text('未添加屏蔽词',
-                    style: TextStyle(color: Colors.white24, fontSize: 12)),
+                    style: TextStyle(color: kPlayerRule, fontSize: 12)),
               )
             else
               Wrap(
@@ -139,9 +138,9 @@ class _DanmakuSettingsSheetState extends State<DanmakuSettingsSheet> {
                     InputChip(
                       label: Text(w,
                           style: const TextStyle(
-                              color: Colors.white, fontSize: 13)),
+                              color: kPlayerOn, fontSize: 13)),
                       backgroundColor: const Color(0xFF3A3A3F),
-                      deleteIconColor: Colors.white54,
+                      deleteIconColor: kPlayerOnDim,
                       side: BorderSide.none,
                       visualDensity: VisualDensity.compact,
                       onDeleted: () => _removeWord(w),
@@ -151,12 +150,12 @@ class _DanmakuSettingsSheetState extends State<DanmakuSettingsSheet> {
             const SizedBox(height: 8),
             TextField(
               controller: _wordCtrl,
-              style: const TextStyle(color: Colors.white, fontSize: 14),
-              cursorColor: Colors.pinkAccent,
+              style: const TextStyle(color: kPlayerOn, fontSize: 14),
+              cursorColor: kPlayerOn,
               decoration: InputDecoration(
                 hintText: '输入要屏蔽的词，回车添加',
                 hintStyle:
-                    const TextStyle(color: Colors.white30, fontSize: 13),
+                    const TextStyle(color: kPlayerOff, fontSize: 13),
                 isDense: true,
                 filled: true,
                 fillColor: const Color(0xFF2A2A2E),
@@ -178,7 +177,7 @@ class _DanmakuSettingsSheetState extends State<DanmakuSettingsSheet> {
                 const Spacer(),
                 Text('${_s.displayAreaPercent}%',
                     style: const TextStyle(
-                        color: Colors.white70,
+                        color: kPlayerOnDim,
                         fontSize: 13,
                         fontWeight: FontWeight.w600)),
               ],
@@ -189,8 +188,8 @@ class _DanmakuSettingsSheetState extends State<DanmakuSettingsSheet> {
               max: kDanmakuDisplayAreaMax.toDouble(),
               divisions: (kDanmakuDisplayAreaMax - kDanmakuDisplayAreaMin) ~/
                   kDanmakuDisplayAreaStep,
-              activeColor: Colors.pinkAccent,
-              inactiveColor: Colors.white24,
+              activeColor: kPlayerOn,
+              inactiveColor: kPlayerRule,
               label: '${_s.displayAreaPercent}%',
               onChanged: (v) =>
                   _set(_s.copyWith(displayAreaPercent: v.round())),
@@ -198,7 +197,7 @@ class _DanmakuSettingsSheetState extends State<DanmakuSettingsSheet> {
             const SizedBox(height: 2),
             const Text('弹幕只在屏幕上方 N% 高度内滚动，防飘到画面中下部妨碍观感'
                 '（100% = 默认全屏带），设置自动保存',
-                style: TextStyle(color: Colors.white24, fontSize: 11)),
+                style: TextStyle(color: kPlayerRule, fontSize: 11)),
             const Divider(height: 20),
             // ---- 透明度 ----
             Row(
@@ -207,7 +206,7 @@ class _DanmakuSettingsSheetState extends State<DanmakuSettingsSheet> {
                 const Spacer(),
                 Text('${(_s.opacity * 100).round()}%',
                     style: const TextStyle(
-                        color: Colors.white70,
+                        color: kPlayerOnDim,
                         fontSize: 13,
                         fontWeight: FontWeight.w600)),
               ],
@@ -217,8 +216,8 @@ class _DanmakuSettingsSheetState extends State<DanmakuSettingsSheet> {
               min: kDanmakuOpacityMin,
               max: kDanmakuOpacityMax,
               divisions: 16,
-              activeColor: Colors.pinkAccent,
-              inactiveColor: Colors.white24,
+              activeColor: kPlayerOn,
+              inactiveColor: kPlayerRule,
               label: '${(_s.opacity * 100).round()}%',
               onChanged: (v) => _set(_s.copyWith(opacity: v)),
             ),
@@ -237,7 +236,7 @@ class _DanmakuSettingsSheetState extends State<DanmakuSettingsSheet> {
                   ),
                   child: const Text('示例弹幕：这就是 100% 的样子',
                       style: TextStyle(
-                          color: Colors.white,
+                          color: kPlayerOn,
                           fontSize: 15,
                           fontWeight: FontWeight.w600)),
                 ),
@@ -245,7 +244,7 @@ class _DanmakuSettingsSheetState extends State<DanmakuSettingsSheet> {
             ),
             const SizedBox(height: 2),
             const Text('透明度对全部弹幕生效（20%~100%），设置自动保存',
-                style: TextStyle(color: Colors.white24, fontSize: 11)),
+                style: TextStyle(color: kPlayerRule, fontSize: 11)),
           ],
         ),
       ),

@@ -17,6 +17,7 @@ import 'package:flutter/material.dart';
 
 import '../config.dart';
 import '../services/gallery_saver.dart';
+import '../theme/app_tokens.dart';
 
 /// 图片/头像请求兜底头：与评论页一致（i*.hdslb.com 一般无需 Referer，
 /// 带上浏览器头更稳）。
@@ -153,9 +154,9 @@ class _ImageViewerPageState extends State<ImageViewerPage> {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          Icon(Icons.broken_image_outlined, size: 56, color: Colors.grey.shade600),
+          Icon(Icons.broken_image_outlined, size: 56, color: kPlayerOff),
           const SizedBox(height: 10),
-          Text('没有可查看的图片', style: TextStyle(color: Colors.grey.shade500)),
+          Text('没有可查看的图片', style: TextStyle(color: kPlayerOnDim)),
         ],
       ),
     );
@@ -179,7 +180,7 @@ class _ImageViewerPageState extends State<ImageViewerPage> {
               if (progress == null) return child;
               return const Center(
                 child: CircularProgressIndicator(
-                  color: Colors.white54,
+                  color: kPlayerOnDim,
                   strokeWidth: 2.5,
                 ),
               );
@@ -191,11 +192,11 @@ class _ImageViewerPageState extends State<ImageViewerPage> {
                   mainAxisSize: MainAxisSize.min,
                   children: [
                     Icon(Icons.broken_image_outlined,
-                        size: 56, color: Colors.grey.shade600),
+                        size: 56, color: kPlayerOff),
                     const SizedBox(height: 10),
                     Text(
                       '图片加载失败',
-                      style: TextStyle(color: Colors.grey.shade500, fontSize: 13),
+                      style: TextStyle(color: kPlayerOnDim, fontSize: 13),
                     ),
                   ],
                 ),
@@ -209,13 +210,13 @@ class _ImageViewerPageState extends State<ImageViewerPage> {
 
   /// 顶部：关闭（左）+ 页码（中）。
   Widget _topBar(int count) {
-    final iconColor = Colors.white;
+    final iconColor = kPlayerOn;
     return Positioned(
       top: 0,
       left: 0,
       right: 0,
       child: Container(
-        color: Colors.black.withValues(alpha: 0.2),
+        color: kInkBlack.withValues(alpha: 0.2),
         padding: const EdgeInsets.symmetric(vertical: 4),
         child: SafeArea(
           bottom: false,
@@ -232,7 +233,7 @@ class _ImageViewerPageState extends State<ImageViewerPage> {
               Text(
                 '${_index + 1}/$count',
                 style: const TextStyle(
-                  color: Colors.white,
+                  color: kPlayerOn,
                   fontSize: 14.5,
                   fontWeight: FontWeight.w500,
                 ),
@@ -253,7 +254,7 @@ class _ImageViewerPageState extends State<ImageViewerPage> {
       right: 0,
       bottom: 0,
       child: Container(
-        color: Colors.black.withValues(alpha: 0.2),
+        color: kInkBlack.withValues(alpha: 0.2),
         padding: const EdgeInsets.only(top: 6, bottom: 8),
         child: SafeArea(
           top: false,
@@ -265,7 +266,7 @@ class _ImageViewerPageState extends State<ImageViewerPage> {
                       width: 18,
                       height: 18,
                       child: CircularProgressIndicator(
-                        color: Colors.white70,
+                        color: kPlayerOnDim,
                         strokeWidth: 2,
                       ),
                     ),
@@ -275,10 +276,10 @@ class _ImageViewerPageState extends State<ImageViewerPage> {
                     icon: const Icon(Icons.download_outlined, size: 18),
                     label: const Text('保存到相册'),
                     style: FilledButton.styleFrom(
-                      backgroundColor: Colors.white.withValues(alpha: 0.18),
-                      foregroundColor: Colors.white,
+                      backgroundColor: kPlayerRule,
+                      foregroundColor: kPlayerOn,
                       disabledBackgroundColor:
-                          Colors.white.withValues(alpha: 0.08),
+                          kInkBlack.withValues(alpha: 0.2),
                     ),
                   ),
           ),
@@ -298,7 +299,7 @@ class _ImageViewerPageState extends State<ImageViewerPage> {
       onPressed: onTap,
       icon: Icon(icon, color: color, size: 26),
       style: IconButton.styleFrom(
-        backgroundColor: Colors.black.withValues(alpha: 0.35),
+        backgroundColor: kInkBlack.withValues(alpha: 0.35),
       ),
     );
   }

@@ -22,6 +22,30 @@ whitelist.json
 probe_out*.json
 probe_1080p_out.json
 
+# ---------- 一次性调试探针（排查残留，不入库） ----------
+# 注意：已跟踪的项目文件 probe.py / probe_1080p.py / whitelist.py 必须继续跟踪，
+# 故下面一律按具体名字列举，不用会误伤它们的通配符
+comment_probe*.py
+comment_probe_out*.json
+deadline_probe.py
+deadline_probe_out.json
+find_subtitle_probe.py
+find_subtitle_out.json
+investigator_probe.py
+invest_*.py
+invest_state.json
+pgc_probe.py
+pgc_probe_out.json
+subtitle_probe*.py
+subtitle_probe*_out.json
+tmp_drive.py
+
+# ---------- 录屏抽帧中间产物（可由 docs/screenshots 下的 mp4 重新生成） ----------
+docs/screenshots/**/_frames_*/
+
+# ---------- 调试期截图（Gist ID 未打码，不入库；README 用的是 v2.18.0/） ----------
+docs/screenshots/v2.18.0-r2/
+
 # ---------- Python ----------
 __pycache__/
 *.pyc

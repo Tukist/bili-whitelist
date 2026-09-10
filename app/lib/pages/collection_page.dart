@@ -17,6 +17,8 @@ import 'package:flutter/material.dart';
 import '../cache/download_manager.dart';
 import '../models/whitelist_video.dart';
 import '../services/whitelist_writer.dart';
+import '../theme/app_tokens.dart';
+import '../widgets/app_state_view.dart';
 import '../widgets/video_tile.dart';
 import 'player_page.dart';
 
@@ -218,7 +220,7 @@ class _CollectionPageState extends State<CollectionPage> {
           ),
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx, true),
-            child: const Text('删除', style: TextStyle(color: Colors.red)),
+            child: const Text('删除', style: TextStyle(color: kError)),
           ),
         ],
       ),
@@ -374,7 +376,7 @@ class _CollectionPageState extends State<CollectionPage> {
           ),
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx, true),
-            child: const Text('删除', style: TextStyle(color: Colors.red)),
+            child: const Text('删除', style: TextStyle(color: kError)),
           ),
         ],
       ),
@@ -473,7 +475,14 @@ class _CollectionPageState extends State<CollectionPage> {
                 );
               },
             )
-          : _EmptyView(label: _label),
+          : AppStateView(
+              kind: AppStateKind.empty,
+              // 合集名是动态的（「未分类」/ 用户自建名）→ 直给文案，无 copyId
+              title: '「$_label」暂无视频',
+              illustrationSeed: 'collection',
+              // 旧空态是 ListView(AlwaysScrollableScrollPhysics) → 保持同一结构
+              scrollable: true,
+            ),
       // 多选模式：底部批量操作栏（移动到合集 / 删除）
       bottomNavigationBar: _selectMode
           ? SafeArea(
@@ -515,30 +524,6 @@ class _CollectionPageState extends State<CollectionPage> {
               ),
             )
           : null,
-    );
-  }
-}
-
-/// 空态视图：本合集暂无视频（可下拉刷新，由主页同步兜底）。
-class _EmptyView extends StatelessWidget {
-  final String label;
-
-  const _EmptyView({required this.label});
-
-  @override
-  Widget build(BuildContext context) {
-    return ListView(
-      physics: const AlwaysScrollableScrollPhysics(),
-      children: [
-        const SizedBox(height: 120),
-        Icon(
-          Icons.video_library_outlined,
-          size: 56,
-          color: Theme.of(context).colorScheme.outline,
-        ),
-        const SizedBox(height: 12),
-        Center(child: Text('「$label」暂无视频')),
-      ],
     );
   }
 }

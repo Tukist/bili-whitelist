@@ -1,20 +1,30 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import 'pages/playlist_page.dart';
+import 'services/theme_store.dart';
+import 'theme/app_theme.dart';
 
 /// 全局路由观察者（v2.17.1+）：播放页 [RouteAware] 订阅它，感知「自己上面
 /// 又叠了一个新的播放页」→ 暂停当前播放（防双音轨）并记进度，返回时恢复
 /// 续播（见 player_page.dart 的 didPushNext / didPopNext）。判定依据是
 /// push PlayerPage 的路由统一带 [RouteSettings.name] = 'player'
-/// （[kPlayerRouteName]，见 player_page.dart）。
+/// （[kPlayerRouteName]，常量定义在 `lib/theme/route_names.dart`；
+/// player_page.dart 只做 export 转发）。
 final RouteObserver<ModalRoute<void>> routeObserver =
     RouteObserver<ModalRoute<void>>();
 
 void main() {
+  // 读已保存的配色配方（P1.5）：必须在 runApp 前确保 binding 就绪
+  // （SharedPreferences 走平台通道）。读到非默认配方时会 notifyListeners，
+  // 首帧即用用户选的墨色，不闪默认色。
+  WidgetsFlutterBinding.ensureInitialized();
+  unawaited(ThemeStore.instance.ensureLoaded());
   runApp(const BiliWhitelistApp());
 }
 
-/// B 站白名单点播 App。
+/// amoTV —— B 站白名单点播 App。
 ///
 /// 防短视频成瘾设计：首页只有白名单视频列表，无任何增删白名单入口；
 /// 播放页 M3 实现。
@@ -29,15 +39,20 @@ class BiliWhitelistApp extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: '白名单点播',
-      debugShowCheckedModeBanner: false,
-      navigatorObservers: [routeObserver],
-      theme: ThemeData(
-        colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF00A1D6)),
-        useMaterial3: true,
+    // 监听配色 store（P1.5）：换配方 → 重建 MaterialApp → AnimatedTheme
+    // 按 AppPalette.lerp 平滑过渡，全 App 换墨。
+    return ListenableBuilder(
+      listenable: ThemeStore.instance,
+      builder: (context, _) => MaterialApp(
+        title: 'amoTV',
+        debugShowCheckedModeBanner: false,
+        navigatorObservers: [routeObserver],
+        // 全局主题（P1 视觉地基 + P1.5 配方）：单墨/双墨编辑印刷，见 lib/theme/。
+        theme: buildAppTheme(ThemeStore.instance.recipe),
+        // 只做浅色纸面，不跟随系统深色（暗底只存在于播放视口内）。
+        themeMode: ThemeMode.light,
+        home: const PlaylistPage(),
       ),
-      home: const PlaylistPage(),
     );
   }
 }

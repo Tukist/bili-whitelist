@@ -23,6 +23,15 @@
 /// 显示不重复请求；粉丝数走 relation/stat（acc/info 实测不含 fans 字段）；
 /// 信息/视频列表失败均自动重试（短退避），吸收 B 站 space wbi 接口对匿名/
 /// 高频请求的间歇风控（-352/-412，实测等待后重试即恢复）。
+///
+/// 块化与动效（批次 4）：
+/// - 两套列表（「全部视频」/「合集·列表」视频）各挂一个 [StaggeredListScope]：
+///   代次 = `upowner.videos#<加载代际>`（复用已有的 `_listGen`）
+///   与 `upowner.seasons#<合集代次>`（换合集自增，用来重演入场）；
+///   每条视频包 [StaggeredEntrance]（entryKey = bvid），首屏逐条推入、
+///   翻页追加用更短节奏；
+/// - 整页等待（首屏拉视频）= [AppLoadingHero]，列表底部翻页 = 小剪影 + 闲话；
+///   顶部「关注」按钮的 14px 内联转圈**保持不变**（那是操作反馈）。
 library;
 
 import 'dart:async';
@@ -35,9 +44,16 @@ import '../api/github_api.dart';
 import '../models/upowner.dart';
 import '../models/whitelist_video.dart';
 import '../services/followings_auto_sync.dart';
+import '../services/loading_copy.dart';
 import '../services/upowner_writer.dart';
 import '../services/whitelist_writer.dart';
+import '../theme/app_motion.dart';
+import '../theme/app_tokens.dart';
+import '../widgets/animated_copy_line.dart';
+import '../widgets/app_state_view.dart';
 import '../widgets/cover_image.dart';
+import '../widgets/smoke_silhouette.dart';
+import '../widgets/staggered_entrance.dart';
 import 'player_page.dart';
 
 /// UP 主视频列表排序选项（与 BiliApi.fetchUpownerVideos order 参数对应）。
@@ -187,6 +203,22 @@ class _UpownerPageState extends State<UpownerPage> {
 
   /// 本页会话内是否改过关注状态：pop 返回 true 让上层刷新白名单列表。
   bool _changed = false;
+
+  // ---- 交错入场（批次 4）---------------------------------------------------
+
+  /// 两套列表各一本「已入场」账本（活在列表项之外，回收再出现不重播）。
+  final EntranceLedger _videoLedger = EntranceLedger();
+  final EntranceLedger _colLedger = EntranceLedger();
+
+  /// 合集/列表视图的数据代次：换合集（[._selectCollection]）自增 ——
+  /// 配合清空的账本，让同一批视频在换合集后能重演一次。
+  /// 「全部视频」列表直接用已有的 [_listGen]（每次全新加载 +1）。
+  int _colToken = 0;
+
+  /// 本批次起点（翻页追加时置为「追加前的条数」）：新增项按
+  /// `i - batchStart` 从 0 排队；0 = 首屏，直接用 i。
+  int _videoBatchStart = 0;
+  int _colBatchStart = 0;
 
   @override
   void initState() {
@@ -371,6 +403,9 @@ class _UpownerPageState extends State<UpownerPage> {
   /// 重试）看到代际不一致即放弃，防止过期结果串入新列表。
   Future<void> _loadFirstPage() async {
     final gen = ++_listGen;
+    // 全新加载 = 换了一批数据：清空账本（允许同一 bvid 再演一次）+ 批次起点归零
+    _videoLedger.clear();
+    _videoBatchStart = 0;
     setState(() {
       _videos.clear();
       _page = 1;
@@ -435,6 +470,8 @@ class _UpownerPageState extends State<UpownerPage> {
         _hasMore = result.hasMore;
         _loadingMore = false;
         _error = null;
+        // 本批新增项的入场序号从 0 起算（旧项已记账不会重播）
+        _videoBatchStart = existing.length;
         final curInfo = _info;
         if (listAuthor.isNotEmpty &&
             (curInfo == null || curInfo.name.isEmpty)) {
@@ -536,6 +573,10 @@ class _UpownerPageState extends State<UpownerPage> {
       _colHasMore = true;
       _colLoadingMore = false;
       _colError = null;
+      // 换合集 = 换数据源：代次 +1 + 清空账本（同一批视频可再演一次）
+      _colToken++;
+      _colLedger.clear();
+      _colBatchStart = 0;
     });
     // 切视图时滚动回顶部（主/合集两个列表共用一个 controller）
     if (_scrollCtrl.hasClients) _scrollCtrl.jumpTo(0);
@@ -570,6 +611,8 @@ class _UpownerPageState extends State<UpownerPage> {
         _colHasMore = result.hasMore;
         _colLoadingMore = false;
         _colError = null;
+        // 本批新增项的入场序号从 0 起算（旧项已记账不会重播）
+        _colBatchStart = existing.length;
       });
     } on BiliApiException catch (e) {
       if (!mounted || !_sameCollection(_activeCollection, c)) return;
@@ -663,7 +706,7 @@ class _UpownerPageState extends State<UpownerPage> {
       final full = WhitelistWriter.videoFromMeta(meta, fallbackBvid: v.bvid);
       final writer = WhitelistWriter();
       if (!await writer.hasConfig()) {
-        _showSnack('请先到首页「管理」入口配置 GitHub token 与 Gist ID');
+        _showSnack('请先到底部导航「个人」页配置 GitHub token 与 Gist ID');
         return;
       }
       final result = await writer.addVideo(full);
@@ -959,76 +1002,120 @@ class _UpownerPageState extends State<UpownerPage> {
   /// 视频列表。
   Widget _buildVideoList() {
     if (_loadingMore && _videos.isEmpty) {
-      return const Center(child: CircularProgressIndicator());
+      // 首屏整页等待（不是转圈）：抽烟剪影 + 加载闲话
+      return const AppLoadingHero(seed: 'upowner.videos');
     }
     if (_error != null && _videos.isEmpty) {
-      return _ErrorView(message: _error!, onRetry: _loadFirstPage);
+      return AppErrorView(
+        message: _error!,
+        onRetry: _loadFirstPage,
+        illustrationSeed: 'upowner.videos',
+      );
     }
     if (_videos.isEmpty) {
-      return const Center(
-        child: Text('暂无视频', style: TextStyle(color: Colors.grey)),
+      return const AppStateView(
+        kind: AppStateKind.empty,
+        copyId: 'empty.upowner_videos',
+        illustrationSeed: 'upowner.videos',
       );
     }
     final extraSlots = (_loadingMore || !_hasMore) ? 1 : 0;
-    return ListView.separated(
-      controller: _scrollCtrl,
-      itemCount: _videos.length + extraSlots,
-      separatorBuilder: (_, __) => const Divider(height: 1, indent: 88),
-      itemBuilder: (context, i) {
-        if (i >= _videos.length) {
-          return _buildListFooter(_loadingMore);
-        }
-        return _buildVideoTile(_videos[i]);
-      },
+    final appendBatch = _videoBatchStart > 0;
+    // 交错入场：代次用已有的 [_listGen]（每次全新加载 +1）
+    return StaggeredListScope(
+      generation: 'upowner.videos#$_listGen',
+      ledger: _videoLedger,
+      child: ListView.separated(
+        controller: _scrollCtrl,
+        itemCount: _videos.length + extraSlots,
+        separatorBuilder: (_, __) => const Divider(height: 1, indent: 88),
+        itemBuilder: (context, i) {
+          if (i >= _videos.length) {
+            return _buildListFooter(_loadingMore, seed: 'upowner.videos');
+          }
+          final v = _videos[i];
+          final int rawIndex = i - _videoBatchStart;
+          return StaggeredEntrance(
+            entryKey: 'bvid:${v.bvid}',
+            index: rawIndex < 0 ? 0 : rawIndex,
+            step: appendBatch ? kStaggerStepAppend : kStaggerStep,
+            duration: appendBatch ? kDurEntranceAppend : kDurEntrance,
+            maxIndex: appendBatch ? kStaggerMaxIndexAppend : kStaggerMaxIndex,
+            child: _buildVideoTile(v),
+          );
+        },
+      ),
     );
   }
 
   /// 合集/列表视频视图（选中某合集后取代主列表）。
   Widget _buildCollectionVideoList() {
     if (_colLoadingMore && _colVideos.isEmpty) {
-      return const Center(child: CircularProgressIndicator());
+      // 与「全部视频」首屏同一套整页等待（seed 不同 → 文案不同）
+      return const AppLoadingHero(seed: 'upowner.seasons');
     }
     if (_colError != null && _colVideos.isEmpty) {
-      return _ErrorView(
+      return AppErrorView(
         message: _colError!,
         onRetry: () => _loadCollectionPage(1),
+        illustrationSeed: 'upowner.seasons',
       );
     }
     if (_colVideos.isEmpty) {
-      return Center(
-        child: Text(
-          _activeCollection?.kind == UpownerCollectionKind.season
-              ? '该合集暂无视频'
-              : '该列表暂无视频',
-          style: const TextStyle(color: Colors.grey),
-        ),
+      // 合集（season）与列表（series）用不同 copyId / 插画种子
+      final isSeason = _activeCollection?.kind == UpownerCollectionKind.season;
+      return AppStateView(
+        kind: AppStateKind.empty,
+        copyId: isSeason ? 'empty.upowner.season' : 'empty.upowner.list',
+        illustrationSeed: isSeason ? 'upowner.season' : 'upowner.list',
       );
     }
     final extraSlots = (_colLoadingMore || !_colHasMore) ? 1 : 0;
-    return ListView.separated(
-      controller: _scrollCtrl,
-      itemCount: _colVideos.length + extraSlots,
-      separatorBuilder: (_, __) => const Divider(height: 1, indent: 88),
-      itemBuilder: (context, i) {
-        if (i >= _colVideos.length) {
-          return _buildListFooter(_colLoadingMore);
-        }
-        return _buildVideoTile(_colVideos[i]);
-      },
+    final appendBatch = _colBatchStart > 0;
+    // 交错入场：代次 = 当前合集（换合集自增）
+    return StaggeredListScope(
+      generation: 'upowner.seasons#$_colToken',
+      ledger: _colLedger,
+      child: ListView.separated(
+        controller: _scrollCtrl,
+        itemCount: _colVideos.length + extraSlots,
+        separatorBuilder: (_, __) => const Divider(height: 1, indent: 88),
+        itemBuilder: (context, i) {
+          if (i >= _colVideos.length) {
+            return _buildListFooter(_colLoadingMore, seed: 'upowner.seasons');
+          }
+          final v = _colVideos[i];
+          final int rawIndex = i - _colBatchStart;
+          return StaggeredEntrance(
+            entryKey: 'bvid:${v.bvid}',
+            index: rawIndex < 0 ? 0 : rawIndex,
+            step: appendBatch ? kStaggerStepAppend : kStaggerStep,
+            duration: appendBatch ? kDurEntranceAppend : kDurEntrance,
+            maxIndex: appendBatch ? kStaggerMaxIndexAppend : kStaggerMaxIndex,
+            child: _buildVideoTile(v),
+          );
+        },
+      ),
     );
   }
 
-  /// 列表底部占位：加载中转圈 / 「没有更多了」。主视频列表与合集列表共用。
-  Widget _buildListFooter(bool loading) {
+  /// 列表底部占位：加载中小剪影 + 闲话 / 「没有更多了」。
+  /// 主视频列表与合集列表共用（[seed] 决定挑哪句闲话，[seed] 不同文案不同）。
+  Widget _buildListFooter(bool loading, {required String seed}) {
     if (loading) {
-      return const Padding(
-        padding: EdgeInsets.symmetric(vertical: 16),
-        child: Center(
-          child: SizedBox(
-            width: 18,
-            height: 18,
-            child: CircularProgressIndicator(strokeWidth: 2),
-          ),
+      // 高度锁 78（原 18px 转圈 + 上下各 16 = 50）：只涨在列表尾部
+      return SizedBox(
+        height: 78,
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const SmokeSilhouette(size: 56),
+            const SizedBox(height: kSpace4),
+            AnimatedCopyLine(
+              text: loadingCopyFor(pool: kLoadingPoolFooter, seed: seed),
+              style: kTypeBodyS.copyWith(color: kInkGray70),
+            ),
+          ],
         ),
       );
     }
@@ -1119,7 +1206,7 @@ class _UpownerPageState extends State<UpownerPage> {
           ),
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx, true),
-            child: const Text('取消关注', style: TextStyle(color: Colors.red)),
+            child: const Text('取消关注', style: TextStyle(color: kError)),
           ),
         ],
       ),
@@ -1147,27 +1234,5 @@ class _UpownerPageState extends State<UpownerPage> {
       setState(() => _followBusy = false);
       _showSnack('取消失败：${e.message}');
     }
-  }
-}
-
-class _ErrorView extends StatelessWidget {
-  final String message;
-  final VoidCallback onRetry;
-  const _ErrorView({required this.message, required this.onRetry});
-
-  @override
-  Widget build(BuildContext context) {
-    return Center(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          const Icon(Icons.error_outline, size: 48, color: Colors.grey),
-          const SizedBox(height: 12),
-          Text(message),
-          const SizedBox(height: 16),
-          FilledButton.tonal(onPressed: onRetry, child: const Text('重试')),
-        ],
-      ),
-    );
   }
 }

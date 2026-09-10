@@ -3,7 +3,10 @@ import 'package:flutter/material.dart';
 import '../models/whitelist_video.dart';
 import '../services/history_store.dart';
 import '../services/watch_stats.dart';
+import '../theme/app_tokens.dart';
+import '../widgets/app_state_view.dart';
 import '../widgets/history_tile.dart';
+import '../widgets/staggered_entrance.dart';
 import 'player_page.dart';
 
 /// 该日历史页（v2.17.10+）：观看统计热力图**点某日格子进入**的独立页——
@@ -46,6 +49,12 @@ class DailyHistoryPageState extends State<DailyHistoryPage> {
   List<HistoryEntry> _entries = const [];
   bool _loading = true;
 
+  /// 入场记账本：**由 State 持有**（活在列表项之外），列表项被回收再建时不重播。
+  final EntranceLedger _entranceLedger = EntranceLedger();
+
+  /// 重新加载代际号（作 [StaggeredListScope.generation]）：换数据 → 允许重播。
+  int _reloadToken = 0;
+
   DateTime get _day => widget.date;
 
   @override
@@ -61,6 +70,9 @@ class DailyHistoryPageState extends State<DailyHistoryPage> {
     setState(() {
       _entries = historyEntriesOnDay(all, _day);
       _loading = false;
+      // 数据换新 → 记账作废，列表项重建时可再演一次交错入场
+      _reloadToken++;
+      _entranceLedger.clear();
     });
   }
 
@@ -88,46 +100,49 @@ class DailyHistoryPageState extends State<DailyHistoryPage> {
 
   @override
   Widget build(BuildContext context) {
-    final theme = Theme.of(context);
     final day = _day;
     return Scaffold(
       appBar: AppBar(
         title: Text('${day.month}月${day.day}日 观看历史'),
       ),
       body: _loading
-          ? const Center(child: CircularProgressIndicator())
+          // 整页加载态：风衣男剪影 + 文案。本页是独立路由（自带 Scaffold），
+          // **不在 RefreshIndicator 宿主内** → 保持居中（无需 scrollable）
+          ? const AppLoadingHero(seed: 'daily_history')
           : _entries.isEmpty
-              ? _emptyView(theme)
-              : ListView.separated(
-                  padding: const EdgeInsets.all(12),
-                  itemCount: _entries.length,
-                  separatorBuilder: (_, __) => const SizedBox(height: 8),
-                  itemBuilder: (context, i) => HistoryTile(
-                    entry: _entries[i],
-                    onOpen: () => _openEntry(_entries[i]),
+              // 空态：细线插画 + 文案（主文案走 UiCopyStore；副文案是当天日期，
+              // 动态值 → 直给）
+              ? AppStateView(
+                  kind: AppStateKind.empty,
+                  copyId: 'empty.daily_history',
+                  subtitle: WatchStats.dateKey(_day),
+                  illustrationSeed: 'daily_history',
+                  // 旧空态是 ListView(AlwaysScrollableScrollPhysics) → 保持同结构
+                  scrollable: true,
+                )
+              : StaggeredListScope(
+                  generation: 'daily_history#$_reloadToken',
+                  ledger: _entranceLedger,
+                  child: ListView.separated(
+                    padding: const EdgeInsets.all(12),
+                    itemCount: _entries.length,
+                    // 历史卡自带 1px 强描边，间距用 kListGap 才不显挤
+                    separatorBuilder: (_, __) =>
+                        const SizedBox(height: kListGap),
+                    itemBuilder: (context, i) {
+                      final e = _entries[i];
+                      return StaggeredEntrance(
+                        // 稳定标识：同一 bvid 的不同分 P 是两条记录
+                        entryKey: '${e.bvid}#${e.pageIndex}',
+                        index: i,
+                        child: HistoryTile(
+                          entry: e,
+                          onOpen: () => _openEntry(e),
+                        ),
+                      );
+                    },
                   ),
                 ),
-    );
-  }
-
-  Widget _emptyView(ThemeData theme) {
-    return ListView(
-      physics: const AlwaysScrollableScrollPhysics(),
-      children: [
-        const SizedBox(height: 120),
-        Icon(Icons.event_busy, size: 56, color: theme.colorScheme.outline),
-        const SizedBox(height: 12),
-        const Center(child: Text('该日无观看记录')),
-        const SizedBox(height: 8),
-        Center(
-          child: Text(
-            WatchStats.dateKey(_day),
-            style: theme.textTheme.bodySmall?.copyWith(
-              color: theme.colorScheme.onSurfaceVariant,
-            ),
-          ),
-        ),
-      ],
     );
   }
 }

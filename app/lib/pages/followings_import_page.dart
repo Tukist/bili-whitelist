@@ -12,6 +12,13 @@
 ///
 /// 关注 = 加入白名单 UP 主（App 内没有 B 站账号数据的反向同步，见 README
 /// 「关注体系」章节的取舍说明）。
+///
+/// 块化与动效（批次 4）：
+/// - 勾选列表挂 [StaggeredListScope]（代次 = `followings#<重载计数>`），
+///   每行包 [StaggeredEntrance]（entryKey = mid）：首屏逐条推入、
+///   「加载更多」追加用更短节奏；
+/// - 首屏整页等待 = [AppLoadingHero]，列表底部翻页 = 小剪影 + 闲话；
+///   底部「加入白名单（n）」按钮的 16px 内联转圈**保持不变**（操作反馈）。
 library;
 
 import 'package:dio/dio.dart';
@@ -20,7 +27,15 @@ import 'package:flutter/material.dart';
 import '../api/bilibili_api.dart';
 import '../api/github_api.dart';
 import '../models/upowner.dart';
+import '../services/loading_copy.dart';
 import '../services/upowner_writer.dart';
+import '../theme/app_motion.dart';
+import '../theme/app_tokens.dart';
+import '../widgets/add_success_button.dart';
+import '../widgets/animated_copy_line.dart';
+import '../widgets/app_state_view.dart';
+import '../widgets/smoke_silhouette.dart';
+import '../widgets/staggered_entrance.dart';
 
 /// 单页条数（与 B 站接口 ps 默认值一致，够展示）。
 const int kFollowingsPageSize = 20;
@@ -121,6 +136,18 @@ class _FollowingsImportPageState extends State<FollowingsImportPage> {
   /// 页面上数据是否被修改过（加入过 UP 主），pop 时返回 true 让首页刷新。
   bool _changed = false;
 
+  // ---- 交错入场（批次 4）---------------------------------------------------
+
+  /// 「已入场」账本：活在列表项之外（State 持有），回收再出现不重播。
+  final EntranceLedger _entranceLedger = EntranceLedger();
+
+  /// 数据代次：首屏（重新）加载自增 —— 配合清空的账本重演一次入场。
+  int _reloadToken = 0;
+
+  /// 本批次起点（「加载更多」追加时置为「追加前的条数」）：新增行按
+  /// `i - batchStart` 从 0 排队；0 = 首屏，直接用 i。
+  int _batchStart = 0;
+
   @override
   void initState() {
     super.initState();
@@ -150,6 +177,9 @@ class _FollowingsImportPageState extends State<FollowingsImportPage> {
   Future<void> _fetchNextPage() async {
     if (_busy || !_hasMore) return;
     if (_items.length >= kFollowingsImportCap) return;
+    // 本次是首屏（列表还空）还是「加载更多」：决定入场批次语义
+    final int before = _items.length;
+    final bool firstPage = before == 0;
     setState(() {
       _busy = true;
       _loading = _items.isEmpty;
@@ -167,6 +197,15 @@ class _FollowingsImportPageState extends State<FollowingsImportPage> {
         _items.addAll(
           page.upowners.where((u) => !known.contains(u.mid)), // 去重追加
         );
+        // 首屏（重新加载）→ 代次 +1 + 清空账本（允许同一 mid 再演一次）；
+        // 「加载更多」→ 本批新增行序号从追加前长度起算
+        if (firstPage) {
+          _reloadToken++;
+          _entranceLedger.clear();
+          _batchStart = 0;
+        } else {
+          _batchStart = before;
+        }
         _total = page.totalCount > 0 ? page.totalCount : _total;
         // 防呆：返回空页也视为无更多（避免服务端 total 虚高时无限翻页）
         _hasMore = page.upowners.isNotEmpty &&
@@ -234,8 +273,11 @@ class _FollowingsImportPageState extends State<FollowingsImportPage> {
         _selected.clear();
       });
       if (result.added > 0) {
-        _snack('已添加 ${result.added} 个'
-            '${result.skipped > 0 ? '，跳过 ${result.skipped}（已在白名单）' : ''}');
+        _snack(
+          '已添加 ${result.added} 个'
+          '${result.skipped > 0 ? '，跳过 ${result.skipped}（已在白名单）' : ''}',
+          ok: true,
+        );
       } else {
         _snack(result.message);
       }
@@ -250,11 +292,18 @@ class _FollowingsImportPageState extends State<FollowingsImportPage> {
     }
   }
 
-  void _snack(String message) {
+  /// 底部提示条。[ok] = true（批量加入成功）时首行加一个小号勾
+  /// （与「加入」成功动效同一个勾的形状）；**文案字符串本身不变**。
+  void _snack(String message, {bool ok = false}) {
     if (!mounted) return;
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(message)));
+      ..showSnackBar(
+        SnackBar(
+          content:
+              ok ? AddSuccessSnackContent(message: message) : Text(message),
+        ),
+      );
   }
 
   /// 返回页（系统返回/AppBar 返回）：期间有成功加入 → pop(true) 让首页刷新。
@@ -322,79 +371,89 @@ class _FollowingsImportPageState extends State<FollowingsImportPage> {
   }
 
   Widget _buildBody(ThemeData theme) {
-    // 首屏加载中
+    // 首屏加载中：整页等待（抽烟剪影 + 加载闲话）
     if (_loading && _items.isEmpty) {
-      return const Center(child: CircularProgressIndicator());
+      return const AppLoadingHero(seed: 'followings');
     }
     // 首屏失败（整页错误 + 重试）
     if (_error != null && _items.isEmpty) {
-      return Center(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(Icons.error_outline, size: 40, color: theme.colorScheme.outline),
-            const SizedBox(height: 12),
-            Text(_error!, textAlign: TextAlign.center),
-            const SizedBox(height: 16),
-            FilledButton.tonal(
-              onPressed: () {
-                setState(() => _error = null);
-                _fetchNextPage();
-              },
-              child: const Text('重试'),
-            ),
-          ],
-        ),
+      return AppErrorView(
+        message: _error!,
+        onRetry: () {
+          setState(() => _error = null);
+          _fetchNextPage();
+        },
+        illustrationSeed: 'followings',
       );
     }
     // 关注为空
     if (_items.isEmpty && _loadedOnce) {
-      return const Center(
-        child: Text(
-          '这个账号还没有关注任何 UP 主\n（或关注列表未公开）',
-          textAlign: TextAlign.center,
-          style: TextStyle(color: Colors.grey),
-        ),
+      return const AppStateView(
+        kind: AppStateKind.empty,
+        copyId: 'empty.followings',
+        illustrationSeed: 'followings',
       );
     }
     final showLoadingMore = _busy && _items.isNotEmpty;
-    return ListView.builder(
-      padding: const EdgeInsets.symmetric(vertical: 4),
-      itemCount: _items.length + 1, // 末尾 = 加载更多/状态行
-      itemBuilder: (context, i) {
-        if (i >= _items.length) {
-          return _buildFooter(theme, showLoadingMore);
-        }
-        final up = _items[i];
-        return _FollowingsRow(
-          up: up,
-          followed: !_selectable(up),
-          checked: _selected.contains(up.mid),
-          onChanged: _selectable(up)
-              ? (sel) => setState(() {
-                    if (sel ?? false) {
-                      _selected.add(up.mid);
-                    } else {
-                      _selected.remove(up.mid);
-                    }
-                  })
-              : null,
-        );
-      },
+    final appendBatch = _batchStart > 0;
+    // 交错入场：scope 只提供「代次 + 账本」，列表仍由 ListView 懒加载
+    return StaggeredListScope(
+      generation: 'followings#$_reloadToken',
+      ledger: _entranceLedger,
+      child: ListView.builder(
+        padding: const EdgeInsets.symmetric(vertical: 4),
+        itemCount: _items.length + 1, // 末尾 = 加载更多/状态行
+        itemBuilder: (context, i) {
+          if (i >= _items.length) {
+            return _buildFooter(theme, showLoadingMore);
+          }
+          final up = _items[i];
+          final int rawIndex = i - _batchStart;
+          return StaggeredEntrance(
+            entryKey: 'mid:${up.mid}',
+            index: rawIndex < 0 ? 0 : rawIndex,
+            step: appendBatch ? kStaggerStepAppend : kStaggerStep,
+            duration: appendBatch ? kDurEntranceAppend : kDurEntrance,
+            maxIndex: appendBatch ? kStaggerMaxIndexAppend : kStaggerMaxIndex,
+            child: _FollowingsRow(
+              up: up,
+              followed: !_selectable(up),
+              checked: _selected.contains(up.mid),
+              onChanged: _selectable(up)
+                  ? (sel) => setState(() {
+                        if (sel ?? false) {
+                          _selected.add(up.mid);
+                        } else {
+                          _selected.remove(up.mid);
+                        }
+                      })
+                  : null,
+            ),
+          );
+        },
+      ),
     );
   }
 
-  /// 列表末尾：加载中 / 加载更多按钮 / 已达上限提示 / 无更多。
+  /// 列表末尾：加载中（小剪影 + 闲话） / 加载更多按钮 / 已达上限提示 / 无更多。
   Widget _buildFooter(ThemeData theme, bool loadingMore) {
     if (loadingMore) {
-      return const Padding(
-        padding: EdgeInsets.symmetric(vertical: 16),
-        child: Center(
-          child: SizedBox(
-            width: 18,
-            height: 18,
-            child: CircularProgressIndicator(strokeWidth: 2),
-          ),
+      // 高度锁 78（原 18px 转圈 + 上下各 16 = 50）：只涨在列表尾部
+      return SizedBox(
+        height: 78,
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const SmokeSilhouette(size: 56),
+            const SizedBox(height: kSpace4),
+            AnimatedCopyLine(
+              text: loadingCopyFor(
+                pool: kLoadingPoolFooter,
+                seed: 'followings',
+              ),
+              style: kTypeBodyS.copyWith(color: kInkGray70),
+            ),
+          ],
         ),
       );
     }
@@ -509,7 +568,7 @@ class _FollowingsRow extends StatelessWidget {
         ),
       ),
       trailing: followed
-          ? const Icon(Icons.check_circle, size: 18, color: Colors.grey)
+          ? const Icon(Icons.check_circle, size: 18, color: kInkGray50)
           : null,
     );
   }

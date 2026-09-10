@@ -17,6 +17,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:bili_whitelist_app/api/bilibili_api.dart';
 import 'package:bili_whitelist_app/config.dart';
 import 'package:bili_whitelist_app/pages/upowner_page.dart';
+import 'package:bili_whitelist_app/widgets/app_state_view.dart';
+import 'package:bili_whitelist_app/widgets/dot_illustration.dart';
 
 final Map<String, String> _store = {};
 
@@ -366,5 +368,54 @@ void main() {
     await tester.pumpAndSettle();
     expect(find.text('加入白名单视频'), findsNothing);
     expect(find.text('合集视频一号'), findsOneWidget);
+  });
+
+  testWidgets('合集无视频 → AppStateView(empty.upowner.season)；'
+      '自建列表无视频 → AppStateView(empty.upowner.list)', (tester) async {
+    final api = _fakeApi({
+      ..._baseHandlers(),
+      '/x/polymer/web-space/seasons_series_list': _collectionsBody,
+      // 合集与列表都返回空 archives
+      '/x/polymer/web-space/seasons_archives_list': () => {
+            'code': 0,
+            'message': 'OK',
+            'data': {
+              'archives': <Map<String, dynamic>>[],
+              'page': {'page_num': 1, 'page_size': 20, 'total': 0},
+            },
+          },
+      '/x/series/archives': () => {
+            'code': 0,
+            'message': 'OK',
+            'data': {
+              'archives': <Map<String, dynamic>>[],
+              'page': {'num': 1, 'size': 20, 'total': 0},
+            },
+          },
+    });
+    await _pumpPage(tester, api);
+
+    // 合集（season）：copyId = empty.upowner.season，插画 seed = upowner.season
+    await tester.tap(find.text('合集·经典领读'));
+    await tester.pumpAndSettle();
+    expect(find.text('该合集暂无视频'), findsOneWidget);
+    var state = tester.widget<AppStateView>(find.byType(AppStateView));
+    expect(state.kind, AppStateKind.empty);
+    expect(state.copyId, 'empty.upowner.season');
+    expect(
+      tester.widget<DotIllustration>(find.byType(DotIllustration)).seed,
+      'upowner.season',
+    );
+
+    // 自建列表（series）：copyId = empty.upowner.list，插画 seed = upowner.list
+    await tester.tap(find.text('自建列表 · 列表'));
+    await tester.pumpAndSettle();
+    expect(find.text('该列表暂无视频'), findsOneWidget);
+    state = tester.widget<AppStateView>(find.byType(AppStateView));
+    expect(state.copyId, 'empty.upowner.list');
+    expect(
+      tester.widget<DotIllustration>(find.byType(DotIllustration)).seed,
+      'upowner.list',
+    );
   });
 }

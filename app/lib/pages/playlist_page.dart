@@ -12,13 +12,20 @@ import '../models/update_info.dart';
 import '../models/upowner.dart';
 import '../models/whitelist_video.dart';
 import '../services/apk_installer.dart';
+import '../services/collection_stats.dart';
 import '../services/followings_auto_sync.dart';
 import '../services/service_locator.dart';
 import '../services/update_service.dart';
 import '../services/update_storage.dart';
 import '../services/upowner_writer.dart';
 import '../services/whitelist_writer.dart';
+import '../theme/app_palette.dart';
+import '../theme/app_tokens.dart';
 import '../utils/import_parser.dart';
+import '../utils/relative_time.dart';
+import '../widgets/add_success_button.dart';
+import '../widgets/app_block.dart';
+import '../widgets/app_state_view.dart';
 import '../widgets/favorites_import_dialog.dart';
 import '../widgets/manage_panel.dart';
 import '../widgets/pgc_import_dialog.dart';
@@ -36,13 +43,20 @@ import 'watch_stats_page.dart';
 /// 唯一首页：合集卡片视图（两级导航第一级）。
 ///
 /// - 每张卡片 = 一个合集（合集名 + 视频数 + 代表视觉）；「未分类」固定一张卡片
+/// - **合集卡 = 首页视觉主角（P3）**：底板走 [AppBlock] 的 collectionCard 块化
+///   规格；名称行尾挂「N 天前更新 / N 天前加入」角标（时间取自本地播放历史与
+///   视频 [WhitelistVideo.pubdate]，口径见 [collectionBadgeText]）；卡片下沿
+///   一条 3px 观看进度条 + 副信息行「已看 X/Y」（统计见
+///   `services/collection_stats.dart`，异步加载、失败静默降级）
 /// - 点卡片 → [CollectionPage] 合集视频列表页（两级导航第二级）；
 ///   长按/多选/移动/删除等管理操作迁移到合集页
 /// - 卡片封面带防盗链头（Referer + 浏览器 UA，与 [CoverImage] 同约定）
 /// - 下拉刷新触发重新同步；AppBar 下方显示缓存数据时间
 /// - **新增白名单的入口**：导入（解析 B 站分享链接/文本，与电脑端油猴脚本
 ///   等价）+ 搜索页「加入」（搜 B 站全网后一键加入，M7）
-/// - 管理功能仅限：新建/重命名/删除合集、移动/删除视频（防沉迷原则不变）
+/// - 管理功能仅限：新建/重命名/删除合集、移动/删除视频（防沉迷原则不变）；
+///   **新建合集**入口常驻合集页顶部（v2.19.0 起从设置区移入合集页，
+///   空态另有醒目行动按钮）
 /// - **固定「收藏夹」卡（v2.17.7+）**：合集区顶部常驻入口（点开 = 我的 B 站
 ///   收藏夹，三级浏览：首页收藏夹卡 → 收藏夹列表 → 夹内视频直接点播，
 ///   白名单外可播模式，见 [FavoritesPage]/[FavoriteVideosPage]）；收藏夹属
@@ -50,7 +64,8 @@ import 'watch_stats_page.dart';
 /// - 右上角搜索入口：B 站全网搜索 + 白名单内过滤两个 Tab
 /// - 右上角导入入口：粘贴分享链接/文本（视频 BV/b23.tv 短链/完整链接；
 ///   番剧/电影 ep|ss 链接与 b23 番剧短码 → 整季逐集加入白名单，v2.16.2）
-/// - 右上角管理入口：GitHub token/gist_id 配置 + 新建合集 + 合集管理
+/// - 管理入口（v2.18.0 起不再是右上角图标）：底部导航「个人」页内的
+///   **设置**区（[ManagePanel]）——GitHub token/gist_id 配置 + 合集管理
 ///   + 缓存管理 + 翻译服务配置 + **B 站账号**（登录/重新登录，v2.16.18）
 /// - **启动自动登录（v2.16.18 起，取代原右上角常驻登录按钮）**：
 ///   SESSDATA 有效 → 静默恢复（不弹界面）；距过期 < 续期阈值（有
@@ -59,13 +74,17 @@ import 'watch_stats_page.dart';
 ///   登录成功自动保存，之后每次进入静默恢复（登录一次长期保持）。
 ///   登录页可关闭：关闭 = 匿名，首页/播放页给明确「未登录仅 720P，
 ///   去登录解锁 1080P」提示入口（v2.16.21，不默认静默降级）
-/// - **主页 PageView 四页**（初始停在主页合集页，左右滑动切换）：
-///   右滑 → 历史记录页（播放历史，点击续播；顶部历史图标可直达）；
-///   左滑 → 白名单 UP 主管理页 → 再左滑 → **观看统计页**（v2.17.9+ 每日真实
-///   观看时长；v2.17.10+ 克莱因蓝 GitHub 式热力单张大图 + 总览在热力下方 +
-///   点日期格看当天历史 + 底部内联设置区——设置区与齿轮弹层共用 ManagePanel，
-///   见 watch_stats_page.dart / widgets/manage_panel.dart）；
-///   顶部「观看统计」图标可直达（animateToPage 到第 4 页）
+/// - **底部导航 4 个目的地**（v2.19.0 起把原「统计」+「设置」合并为
+///   **「个人」**；取代更早的 AppBar 历史/统计/管理三个图标；同时保留
+///   PageView 左右滑动）：
+///   合集(0) → UP 主管理(1) → **历史记录**(2，播放历史，点击续播) →
+///   **个人**(3)：**观看统计在上**（v2.17.9+ 每日真实观看时长；v2.17.10+
+///   克莱因蓝 GitHub 式热力单张大图 + 总览在热力下方 + 点日期格看当天历史）、
+///   **设置在下**（与旧齿轮弹层共用 [ManagePanel]，内联嵌入不 pop 路由，
+///   见 watch_stats_page.dart / widgets/manage_panel.dart）。
+///   切换目的地 = animateToPage(kDurBase) + 显式幂等刷新目标页数据
+///   （见 [_goToPage]/[_reloadTab]）；图标 + 文字标签常显（Material 3
+///   [NavigationBar]，触摸目标 ≥ 48dp）
 class PlaylistPage extends StatefulWidget {
   /// 测试注入：Gist 写操作替身（默认用真实实现）。
   /// 拖动排序/导入等写操作统一走 [GithubApi.saveToGist]。
@@ -122,36 +141,41 @@ class _PlaylistPageState extends State<PlaylistPage> {
 
   bool get _hasData => _data.videos.isNotEmpty;
 
-  /// 主页 PageView（四页：历史记录 / 合集主页 / UP 主管理 / 观看统计），
-  /// 初始停在主页。
-  final PageController _pageController = PageController(initialPage: 1);
+  /// 主页 PageView（4 页：合集主页 / UP 主管理 / 历史记录 / 个人，
+  /// 见 [_buildPersonalPage]），初始停在合集主页（index 0，与底部导航首项一致）。
+  final PageController _pageController = PageController(initialPage: 0);
+
+  /// 当前选中的底部导航目的地（= PageView 当前页；点导航与滑动都会同步它，
+  /// 供 [NavigationBar.selectedIndex] 高亮）。
+  int _tab = 0;
 
   /// 历史页 State 的全局 key：切到历史页时刷新数据（PageView 相邻页存活，
   /// 用户可能刚从别处播放回来，需要重新读表）。
   final GlobalKey<HistoryPageState> _historyKey = GlobalKey<HistoryPageState>();
 
-  /// 观看统计页 State 的全局 key：切到统计页时刷新（播放返回/跨日后
-  /// 数据可能已变；PageView 页存活时也以切页为准重读，约定同历史页）。
+  /// 「个人」页（内含观看统计）State 的全局 key：切到该页时刷新（播放返回/
+  /// 跨日后数据可能已变；PageView 页存活时也以切页为准重读，约定同历史页）。
   final GlobalKey<WatchStatsPageState> _statsKey =
       GlobalKey<WatchStatsPageState>();
 
-  /// 顶部历史图标入口：动画切到历史页（第 0 页）。
-  void _goToHistory() {
-    _pageController.animateToPage(
-      0,
-      duration: const Duration(milliseconds: 250),
-      curve: Curves.easeOut,
-    );
+  /// 底部导航切页（幂等）：同步 [_tab] + 动画切到第 [i] 页 + 显式刷新目标页。
+  ///
+  /// 显式刷新必须保留：[onPageChanged] 只在滚动落页时触发，用户快速连点导航
+  /// 时上一次 [animateToPage] 可能被下一次打断、回调不触发——那样历史/个人页
+  /// 就会拿旧数据。刷新本身幂等（重读本地表），与回调重复调用无害。
+  void _goToPage(int i) {
+    if (i != _tab) setState(() => _tab = i);
+    if (!_pageController.hasClients) return;
+    _pageController.animateToPage(i, duration: kDurBase, curve: kCurveOut);
+    _reloadTab(i);
   }
 
-  /// 顶部「观看统计」图标入口：动画切到观看统计页（第 4 页，index3；
-  /// 主页左滑两页可达，图标直达更方便）。
-  void _goToWatchStats() {
-    _pageController.animateToPage(
-      3,
-      duration: const Duration(milliseconds: 250),
-      curve: Curves.easeOut,
-    );
+  /// 目标页数据刷新（幂等）：历史(2) / 个人(3，观看统计) 页重读本地表；
+  /// 首页(0) 重算合集统计（切回来时把「已看 X/Y」对齐刚看完的那几集）。
+  void _reloadTab(int i) {
+    if (i == 0) unawaited(_refreshCollectionStats());
+    if (i == 2) _historyKey.currentState?.reload();
+    if (i == 3) _statsKey.currentState?.reload();
   }
 
   /// 首页是否需要「未登录仅 720P」提示条（去登录入口，v2.16.21）：
@@ -462,6 +486,9 @@ class _PlaylistPageState extends State<PlaylistPage> {
           _sourceName = result.sourceName;
           _error = null;
         });
+        // 数据换了 → 合集卡的「已看 X/Y + N 天前更新」跟着重算。
+        // 不 await：统计是本地读表，慢一点也不该拖住列表刷新。
+        unawaited(_refreshCollectionStats());
       }
     } catch (e) {
       if (mounted) {
@@ -475,22 +502,65 @@ class _PlaylistPageState extends State<PlaylistPage> {
   }
 
   // ---------------------------------------------------------------------------
+  // 合集统计（首页合集卡的「已看 X/Y」+「N 天前更新」角标）：
+  // 数据源 = 本地播放历史 [HistoryStore]，纯本地读表，不触网。
+  // ---------------------------------------------------------------------------
+
+  /// 合集名 → 统计；空 = 还没加载完（或加载失败）→ 卡片不显示角标与进度条。
+  Map<String, CollectionStat> _stats = const {};
+
+  /// 统计是否正在加载：幂等守卫。
+  ///
+  /// 启动 4s 后的关注自动同步、下拉刷新、UP 详情页返回都会调 [_load]，
+  /// 彼此可能重叠；统计是同一份本地数据的纯计算，重复跑只会白读一次表，
+  /// 这里直接跳过（结果由在跑的那次写回，数字不会闪）。
+  bool _statsLoading = false;
+
+  /// 异步刷新合集统计（失败静默降级）。
+  ///
+  /// 失败/异常一律吞掉：卡片退回「无角标、无进度条」的素态，绝不弹错、
+  /// 绝不中断列表渲染（统计是锦上添花，不是页面可用性的前提）。
+  Future<void> _refreshCollectionStats() async {
+    if (_statsLoading) return;
+    _statsLoading = true;
+    try {
+      final next = await loadCollectionStats(_data);
+      if (!mounted) return;
+      setState(() => _stats = next);
+    } catch (e) {
+      debugPrint('[collection-stats] 统计加载失败，静默降级: $e');
+    } finally {
+      _statsLoading = false;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
   // 管理写操作：内存副本 → saveToGist 成功 → 写本地缓存 → 刷新 UI；
   // 失败只提示、不动内存与本地缓存。防沉迷：新增视频入口只有「导入」（与电脑端等价）。
   // ---------------------------------------------------------------------------
 
-  void _showSnack(String message) {
+  /// 底部提示条。
+  ///
+  /// [ok] = true（导入成功）时首行加一个小号勾（[AddSuccessSnackContent]，
+  /// 与「加入」成功动效同一个勾的形状）。**文案字符串本身不变**。
+  void _showSnack(String message, {bool ok = false}) {
     if (!mounted) return;
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(message)));
+      ..showSnackBar(
+        SnackBar(
+          content: ok
+              ? AddSuccessSnackContent(message: message)
+              : Text(message),
+        ),
+      );
   }
 
   /// 统一落库：先校验配置，再写 Gist，成功后写本地缓存并刷新。
   Future<void> _saveAndRefresh(WhitelistData next) async {
     try {
       if (!await _github.hasConfig()) {
-        _showSnack('请先到右上角管理入口配置 GitHub token 与 Gist ID');
+        _showSnack('请先在底部导航「个人」配置 GitHub token 与 Gist ID');
         return;
       }
       final ok = await _github.saveToGist(next);
@@ -503,6 +573,9 @@ class _PlaylistPageState extends State<PlaylistPage> {
         setState(() {
           _data = next;
         });
+        // 增删改（移动视频 / 新建合集 / 删除合集）会改变各合集的
+        // 「总集数 → 已看 X/Y + 最近更新」→ 统计跟着重算。
+        unawaited(_refreshCollectionStats());
       }
       _showSnack('已保存');
     } on GithubApiException catch (e) {
@@ -585,7 +658,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
     await runFavoritesImportFlow(
       context: context,
       writer: _writer,
-      configHint: '请先到右上角管理入口配置 GitHub token 与 Gist ID',
+      configHint: '请先在底部导航「个人」配置 GitHub token 与 Gist ID',
       openLogin: () async {
         // 引导登录（复用「B 站账号」入口同一登录页；测试注入替身）
         await _openLogin(context);
@@ -603,7 +676,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
     await runFollowingsImportFlow(
       context: context,
       writer: _upwriter,
-      configHint: '请先到右上角管理入口配置 GitHub token 与 Gist ID',
+      configHint: '请先在底部导航「个人」配置 GitHub token 与 Gist ID',
       openLogin: () async {
         // 引导登录（复用「B 站账号」入口同一登录页；测试注入替身）
         await _openLogin(context);
@@ -642,7 +715,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
     await runPgcSeasonImport(
       context: context,
       writer: _writer,
-      configHint: '请先到右上角管理入口配置 GitHub token 与 Gist ID',
+      configHint: '请先在底部导航「个人」配置 GitHub token 与 Gist ID',
       epId: ref.kind == PgcKind.ep ? ref.id : null,
       seasonId: ref.kind == PgcKind.ss ? ref.id : null,
       onDone: (_) async => _load(),
@@ -663,7 +736,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
 
     // 2) 配置门禁：未配置 token/gist_id 时提前引导，避免浪费 B 站接口调用
     if (!await _github.hasConfig()) {
-      _showSnack('请先到右上角管理入口配置 GitHub token 与 Gist ID');
+      _showSnack('请先在底部导航「个人」配置 GitHub token 与 Gist ID');
       return;
     }
 
@@ -695,7 +768,10 @@ class _PlaylistPageState extends State<PlaylistPage> {
       });
     }
     final multi = countLinkTokens(input) > 1;
-    _showSnack('已导入：$displayTitle${multi ? '（检测到多个链接，仅导入第一个）' : ''}');
+    _showSnack(
+      '已导入：$displayTitle${multi ? '（检测到多个链接，仅导入第一个）' : ''}',
+      ok: true,
+    );
   }
 
   /// 打开搜索页（B 站全网搜索 + 白名单内过滤两个 Tab）。
@@ -710,56 +786,70 @@ class _PlaylistPageState extends State<PlaylistPage> {
     if (mounted) _load();
   }
 
-  /// 打开管理面板（GitHub 配置 + B 站账号 + 新建合集 + 合集管理 + 缓存管理
-  /// + 翻译服务 + 检查更新）。v2.17.10+ 内容组件抽为 [ManagePanel]
-  /// （widgets/manage_panel.dart），首页齿轮弹层与观看统计页底部内联
-  /// **共用同一组件**：这里只负责弹层外壳（滚动 + 键盘避让）与回调注入，
-  /// 面板内点「登录 / 检查更新」会先 pop 自身再执行（closeBeforeNavigate）。
-  void _openManage() {
-    showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      useSafeArea: true,
-      builder: (sheetCtx) => Padding(
-        // 键盘弹起时把内容顶上去（isScrollControlled + viewInsets）
-        padding: EdgeInsets.only(
-          bottom: MediaQuery.of(sheetCtx).viewInsets.bottom,
-        ),
-        child: SingleChildScrollView(
-          padding: const EdgeInsets.fromLTRB(16, 20, 16, 24),
-          child: ManagePanel(
-            github: _github,
-            closeBeforeNavigate: true,
-            onCollectionCreated: _createCollection,
-            onManageCollections: _openCollectionManage,
-            onCheckUpdate: _manualCheckUpdate,
-            // 次级「登录 / 重新登录」入口：面板内按钮先 pop 自身，再推登录页
-            onLogin: () {
-              if (mounted) _openLogin(context);
-            },
-          ),
-        ),
-      ),
-    );
-  }
-
-  /// 观看统计页底部内联的设置区（v2.17.10+）：与首页齿轮弹层同一
-  /// [ManagePanel]（内联模式不 pop，见 manage_panel.dart 注释）。
-  ManagePanel _statsManagePanel() {
+  /// 管理面板装配（v2.18.0+；v2.19.0 起内联在底部导航「个人」页）：
+  /// 与（将来的）弹层宿主共用同一 [ManagePanel]（widgets/manage_panel.dart）
+  /// ——这里只负责注入宿主回调（管理合集 / 检查更新 / 登录导航）。
+  ///
+  /// [closeBeforeNavigate]：true = 面板内点「登录 / 检查更新」先 pop 自身
+  /// （弹层宿主需要干净上下文）；「个人」页是 PageView 的一页、**不是路由**，
+  /// 必须传 false，否则点「登录」会把整个首页 pop 掉。
+  ///
+  /// 注：新建合集已移到合集页（见 [_showCreateCollectionDialog]），面板不再管。
+  ManagePanel _managePanel({
+    required bool closeBeforeNavigate,
+    required String headingTitle,
+    required String headingSubtitle,
+  }) {
     return ManagePanel(
       github: _github,
-      closeBeforeNavigate: false,
-      headingTitle: '设置',
-      headingSubtitle:
-          'GitHub 配置 / 合集管理 / 缓存 / 翻译服务 / B 站账号 集中设置区'
-          '（与首页齿轮为同一组件）',
-      onCollectionCreated: _createCollection,
+      closeBeforeNavigate: closeBeforeNavigate,
+      headingTitle: headingTitle,
+      headingSubtitle: headingSubtitle,
       onManageCollections: _openCollectionManage,
       onCheckUpdate: _manualCheckUpdate,
+      // 次级「登录 / 重新登录」入口：推登录页（测试可注入替身）
       onLogin: () {
         if (mounted) _openLogin(context);
       },
     );
+  }
+
+  /// 「新建合集」入口（合集页顶部常驻 + 空态行动按钮，v2.19.0 从设置区移入）：
+  /// 弹输入框收名字，再交给 [_createCollection] 走原来的创建流程
+  /// （去重 → 写 Gist → 写本地缓存 → 刷新列表，逻辑与设置页时代完全一致）。
+  ///
+  /// 校验失败（空名 / 重名 / 保留名）仍由 [_createCollection] 弹提示；
+  /// 此时对话框已关闭，用户重新点入口填一次即可（与重命名对话框同风格）。
+  Future<void> _showCreateCollectionDialog() async {
+    final ctrl = TextEditingController();
+    final name = await showDialog<String>(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        title: const Text('新建合集'),
+        content: TextField(
+          controller: ctrl,
+          autofocus: true,
+          decoration: const InputDecoration(
+            labelText: '合集名称',
+            border: OutlineInputBorder(),
+            isDense: true,
+          ),
+          onSubmitted: (v) => Navigator.pop(dialogCtx, v),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogCtx),
+            child: const Text('取消'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(dialogCtx, ctrl.text),
+            child: const Text('创建'),
+          ),
+        ],
+      ),
+    );
+    if (name == null) return;
+    await _createCollection(name);
   }
 
   /// 打开合集管理面板（列出合集 + 重命名/删除）。
@@ -813,23 +903,27 @@ class _PlaylistPageState extends State<PlaylistPage> {
   // ---------------------------------------------------------------------------
 
   /// 卡片数据（构造时一次性生成，卡片本身是静态展示）。
-  List<({String name, int count, String cover})> _cards() {
-    final cards = <({String name, int count, String cover})>[];
-    for (final c in _data.collections) {
-      final vids = _data.sortedVideos(c.name);
+  ///
+  /// 统计（[_CollectionCardData.stat]）按合集名从 [_stats] 取；未分类卡的
+  /// key 用空串 `''`，与 [WhitelistData.sortedVideos] / [CollectionPage]
+  /// 的口径一致（统计表里也是空串）。统计还没加载完时取到 null →
+  /// 卡片只少一个「N 天前更新」角标和一条进度条，不影响列表渲染。
+  List<_CollectionCardData> _cards() {
+    final cards = <_CollectionCardData>[];
+    void addCard(String name, List<WhitelistVideo> vids) {
       cards.add((
-        name: c.name,
+        name: name,
         count: vids.length,
         cover: vids.isNotEmpty ? vids.first.cover : '',
+        stat: _stats[name == kUncategorizedLabel ? '' : name],
       ));
     }
+
+    for (final c in _data.collections) {
+      addCard(c.name, _data.sortedVideos(c.name));
+    }
     // 「未分类」固定卡片：始终显示（含 0 个），让用户知道新导入视频的默认归处
-    final uncategorized = _data.sortedVideos('');
-    cards.add((
-      name: kUncategorizedLabel,
-      count: uncategorized.length,
-      cover: uncategorized.isNotEmpty ? uncategorized.first.cover : '',
-    ));
+    addCard(kUncategorizedLabel, _data.sortedVideos(''));
     return cards;
   }
 
@@ -871,7 +965,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
           ),
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx, true),
-            child: const Text('移除', style: TextStyle(color: Colors.red)),
+            child: const Text('移除', style: TextStyle(color: kError)),
           ),
         ],
       ),
@@ -911,24 +1005,17 @@ class _PlaylistPageState extends State<PlaylistPage> {
     final theme = Theme.of(context);
     final cards = _hasData
         ? _cards()
-        : const <({String name, int count, String cover})>[];
+        : const <_CollectionCardData>[];
     return Scaffold(
       appBar: AppBar(
-        title: const Text('白名单点播'),
+        title: const Text('amoTV'),
         actions: [
-          // 历史记录入口：右滑可到历史页，图标直达
-          IconButton(
-            tooltip: '历史记录',
-            icon: const Icon(Icons.history),
-            onPressed: _goToHistory,
-          ),
-          // 观看统计入口（v2.17.9+）：主页左滑两页可到统计页，图标直达
-          IconButton(
-            tooltip: '观看统计',
-            icon: const Icon(Icons.insights_outlined),
-            onPressed: _goToWatchStats,
-          ),
-          // 信箱入口：未读 > 0 时图标右上角显示小红点
+          // 信箱入口：未读 > 0 时图标右上角显示计数点。
+          // 底色用点缀墨实心档 accentFill（= 「时间与新鲜度」语义，见
+          // ink_recipes.dart 的语义约定：未读数/未读点归 accent），文字用
+          // onAccent：两档都过对比度护栏，10 套配方下都跟随配色且可读。
+          // 旧实现取 colorScheme.error（固定 kError），换配方时红点不变色，
+          // 且把「错误」语义色当装饰色用。
           Stack(
             clipBehavior: Clip.none,
             children: [
@@ -951,14 +1038,14 @@ class _PlaylistPageState extends State<PlaylistPage> {
                       minHeight: 16,
                     ),
                     decoration: BoxDecoration(
-                      color: Theme.of(context).colorScheme.error,
+                      color: context.palette.accentFill,
                       borderRadius: BorderRadius.circular(8),
                     ),
                     alignment: Alignment.center,
                     child: Text(
                       _inboxUnseen > 99 ? '99+' : '$_inboxUnseen',
-                      style: const TextStyle(
-                        color: Colors.white,
+                      style: TextStyle(
+                        color: context.palette.onAccent,
                         fontSize: 10,
                         fontWeight: FontWeight.bold,
                       ),
@@ -977,24 +1064,23 @@ class _PlaylistPageState extends State<PlaylistPage> {
             icon: const Icon(Icons.add_link),
             onPressed: _openImport,
           ),
-          IconButton(
-            tooltip: '管理（GitHub 配置 / 合集 / B 站账号）',
-            icon: const Icon(Icons.settings_outlined),
-            onPressed: _openManage,
-          ),
         ],
       ),
       body: PageView(
         controller: _pageController,
         onPageChanged: (index) {
-          // 切到历史页/统计页时重新读取（播放返回/时间推移后数据可能已变化）
-          if (index == 0) _historyKey.currentState?.reload();
-          if (index == 3) _statsKey.currentState?.reload();
+          // 滑动落页：同步导航高亮 + 重读目标页数据（点导航切页时
+          // [_goToPage] 也会显式刷新一次，两处重复调用是幂等的）
+          if (index != _tab) setState(() => _tab = index);
+          _reloadTab(index);
         },
         children: [
-          HistoryPage(key: _historyKey),
+          // 每页给稳定 key：启动 4s 后的静默同步 setState 会重建 PageView，
+          // 无 key 时只能按 index 匹配 Element，State 可能错配/被重置
+          // （「个人」页的 ManagePanel 持有输入框与账号状态）。
           _buildCollectionHome(theme, cards),
           _UpownerManagePage(
+            key: const ValueKey('upowner'),
             upowners: _data.upowners,
             syncing: _syncing,
             onRefresh: _load,
@@ -1003,7 +1089,66 @@ class _PlaylistPageState extends State<PlaylistPage> {
             onRemove: _removeUpowner,
             onImportFollowings: _importFollowings,
           ),
-          WatchStatsPage(key: _statsKey, settingsSection: _statsManagePanel()),
+          HistoryPage(key: _historyKey),
+          // 「个人」（index 3，v2.19.0 把原「统计」+「设置」合并）：观看统计
+          // 在上、设置在下的同一滚动流——设置区以 [WatchStatsPage.settingsSection]
+          // 交给统计页内联渲染在统计内容之后（[ManagePanel] 无滚动/无内边距，
+          // 由统计页的 ListView 提供滚动与留白）。统计页 State 的全局 key
+          // [_statsKey] 保留在它自己身上（切到本页时刷新统计）。
+          WatchStatsPage(
+            key: _statsKey,
+            settingsSection: _managePanel(
+              closeBeforeNavigate: false,
+              headingTitle: '设置',
+              headingSubtitle:
+                  'GitHub 配置 / 合集管理 / 缓存 / 翻译服务 / B 站账号 集中设置区',
+            ),
+          ),
+        ],
+      ),
+      // 底部导航（v2.18.0+，v2.19.0 起 4 个目的地，Material 3）：
+      // 图标 + 文字标签常显（触摸目标 ≥ 48dp 由 NavigationBar +
+      // materialTapTargetSize 保证）。
+      // 选中态墨色与指示器底由 app_theme 的 navigationBarTheme 统一配置，
+      // 页面不写死颜色；顶部 1px 描边代替阴影（层级靠细线，不靠投影）。
+      // tooltip：历史记录逐字沿用旧 AppBar 图标文案（测试锚点）；
+      // 「个人」= 观看统计 + 设置（v2.19.0 合并后的新语义）。
+      //
+      // 描边必须用**独立**的 Divider 占位绘制：`NavigationBar` 自带不透明的
+      // `backgroundColor: kPaper`（见 app_theme），若像旧实现那样把描边画在
+      // `DecoratedBox.decoration` 里，线画在 child **之下**会被整条盖住
+      // （实测截图像素扫描找不到该线）。Divider 是兄弟节点、自己占 1px。
+      bottomNavigationBar: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Divider(height: 1, thickness: 1, color: kRule),
+          NavigationBar(
+            selectedIndex: _tab,
+            onDestinationSelected: _goToPage,
+            destinations: const [
+              NavigationDestination(
+                icon: Icon(Icons.video_library_outlined),
+                label: '合集',
+                tooltip: '合集（白名单视频）',
+              ),
+              NavigationDestination(
+                icon: Icon(Icons.person_outline),
+                label: 'UP 主',
+                tooltip: '白名单 UP 主',
+              ),
+              NavigationDestination(
+                icon: Icon(Icons.history),
+                label: '历史',
+                tooltip: '历史记录',
+              ),
+              // 图标不用 person_outline（已被「UP 主」占用，避免两项混淆）
+              NavigationDestination(
+                icon: Icon(Icons.account_circle_outlined),
+                label: '个人',
+                tooltip: '个人（观看统计 / 设置）',
+              ),
+            ],
+          ),
         ],
       ),
     );
@@ -1011,9 +1156,11 @@ class _PlaylistPageState extends State<PlaylistPage> {
 
   Widget _buildCollectionHome(
     ThemeData theme,
-    List<({String name, int count, String cover})> cards,
+    List<_CollectionCardData> cards,
   ) {
     return Column(
+      // 稳定 key：静默同步 setState 重建 PageView 时保住本页 Element/State
+      key: const ValueKey('home'),
       children: [
         // 未登录提示条（v2.16.21）：登录页被关闭/从未登录时给明确匿名提示 +
         // 去登录入口，不默认静默降级；点击直达登录页（带自动保存说明 banner）
@@ -1055,6 +1202,24 @@ class _PlaylistPageState extends State<PlaylistPage> {
           padding: const EdgeInsets.fromLTRB(12, 4, 12, 0),
           child: _FavoritesCard(onTap: _openFavorites),
         ),
+        // 「新建合集」（v2.19.0 从设置区移到合集页）：合集非空时用顶部常驻按钮
+        // ——不随列表滚走，随时可点；且**不进** ReorderableListView（排序索引
+        // 与长按拖拽逻辑保持不变）。描边 / 圆角 / 墨色走主题的
+        // outlinedButtonTheme（1px kRule + kRadiusMd + 主墨 inkText，无阴影），
+        // materialTapTargetSize.padded 保证触摸目标 ≥ 48dp。
+        // 空名单时改由空态里的醒目行动按钮承担（见 _EmptyView）。
+        if (_hasData)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(kSpace12, kSpace8, kSpace12, 0),
+            child: SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: _showCreateCollectionDialog,
+                icon: const Icon(Icons.create_new_folder_outlined, size: 18),
+                label: const Text('新建合集'),
+              ),
+            ),
+          ),
         Expanded(
           child: RefreshIndicator(
             onRefresh: _load,
@@ -1076,19 +1241,23 @@ class _PlaylistPageState extends State<PlaylistPage> {
                           name: card.name,
                           count: card.count,
                           cover: card.cover,
+                          stat: card.stat,
                           draggable: !isUncategorized,
                           onTap: () => _openCollection(card.name),
                         ),
                       );
                     },
                   )
-                : _EmptyView(syncing: _syncing),
+                : _EmptyView(
+                    syncing: _syncing,
+                    onCreateCollection: _showCreateCollectionDialog,
+                  ),
           ),
         ),
         Padding(
           padding: const EdgeInsets.symmetric(vertical: 4),
           child: Text(
-            'v$_version · 左右滑动：历史 / 合集 / UP 主 / 统计',
+            'v$_version · 底部导航切换：合集 / UP 主 / 历史 / 个人',
             style: theme.textTheme.labelSmall?.copyWith(
               color: theme.colorScheme.outline,
             ),
@@ -1135,7 +1304,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
   }
 }
 
-/// 首页右滑第二页：白名单 UP 主管理。
+/// 底部导航「UP 主」页（index 1）：白名单 UP 主管理。
 class _UpownerManagePage extends StatelessWidget {
   final List<Upowner> upowners;
   final bool syncing;
@@ -1148,6 +1317,7 @@ class _UpownerManagePage extends StatelessWidget {
   final void Function(Upowner upowner) onRemove;
 
   const _UpownerManagePage({
+    super.key,
     required this.upowners,
     required this.syncing,
     required this.onRefresh,
@@ -1174,7 +1344,7 @@ class _UpownerManagePage extends StatelessWidget {
               Text('白名单 UP 主', style: theme.textTheme.titleSmall),
               const SizedBox(height: 2),
               Text(
-                '关注 UP 主 = 加入白名单；右滑到这里管理，可移除或从 B 站关注列表批量导入',
+                '关注 UP 主 = 加入白名单；底部导航「UP 主」可管理，可移除或从 B 站关注列表批量导入',
                 style: theme.textTheme.bodySmall?.copyWith(
                   color: theme.colorScheme.onSurfaceVariant,
                 ),
@@ -1211,7 +1381,7 @@ class _UpownerManagePage extends StatelessWidget {
                     physics: const AlwaysScrollableScrollPhysics(),
                     padding: const EdgeInsets.all(12),
                     itemCount: upowners.length,
-                    separatorBuilder: (_, __) => const SizedBox(height: 8),
+                    separatorBuilder: (_, __) => const SizedBox(height: kListGap),
                     itemBuilder: (context, i) {
                       final up = upowners[i];
                       return _UpownerManageTile(
@@ -1367,8 +1537,58 @@ String _fmtUpownerMeta(Upowner upowner) {
 String _trimNumber(double v) =>
     v == v.roundToDouble() ? v.toInt().toString() : v.toStringAsFixed(1);
 
-/// 合集卡片（行式）：左侧代表视觉（封面 / 渐变底 + 图标），
-/// 右侧合集名 + 视频数，尾部拖动手柄提示（未分类不可拖不显示）。
+/// 首页合集卡的数据（[_PlaylistPageState._cards] 构造，卡片本身是静态展示）。
+///
+/// 前三项是卡片原有内容；[stat] 是 P3 新增的观看统计（已看集数 / 总集数 /
+/// 最近更新时间）。统计没加载完（或加载失败）时是 null → 卡片只少一个
+/// 更新时间角标和一条观看进度条，其余照常渲染。
+typedef _CollectionCardData = ({
+  String name,
+  int count,
+  String cover,
+  CollectionStat? stat,
+});
+
+/// 合集卡底部观看进度条的高度（3px 细条：只表达「推进到哪儿了」）。
+const double _kCollectionProgressH = 3;
+
+/// 合集卡底部观看进度条的 key（测试锚点：`total == 0` 时整条不存在）。
+///
+/// 多张卡片共用同一个 key 值不会冲突（它们各自是不同 [Stack] 的孩子）。
+const Key kCollectionProgressBarKey = ValueKey('collection-progress-bar');
+
+/// 合集卡右上角「更新时间角标」的文案；取不到时间 → null（不显示角标，
+/// 绝不出现「null 更新」这种）。
+///
+/// - `fromPubdate == true` → 「3 天前更新」（B 站真实发布时间，最可信）；
+/// - `fromPubdate == false` → 「3 天前加入」（只有加入白名单的时间可兜底，
+///   文案改说「加入」，不谎称「更新」）；
+/// - 一年以上 → [fmtRelativeTime] 给绝对日期「2024-03-15更新」。
+///
+/// [now] 仅供测试注入固定的「现在」。
+String? collectionBadgeText(CollectionStat? stat, {DateTime? now}) {
+  final updatedAt = stat?.updatedAt;
+  if (updatedAt == null) return null;
+  final rel = fmtRelativeTime(updatedAt, now: now);
+  return '$rel${stat!.fromPubdate ? '更新' : '加入'}';
+}
+
+/// 合集卡片（行式）：左侧代表视觉（封面 / 渐变底 + 图标），右侧合集名 +
+/// 更新时间角标 + 视频数 / 观看进度，尾部拖动手柄提示（未分类不可拖不显示）。
+///
+/// 块化（P3「合集卡成为视觉主角」）：
+/// - 底板交给 [AppBlock] 的 [AppBlockVariant.collectionCard] 规格
+///   （kPaperCool 冷底 + kRuleStrong 1px 描边 + kRadiusMd 圆角 + all(10)
+///   内边距），与原来的 Material 版外观等价，只是外形收敛到统一规格表；
+/// - **既有文案原样保留**：`'$count 个视频'` 仍是独立的 [Text]（页面测试
+///   `find.text('0 个视频')` 逐字命中），新加的「已看 X/Y」是**另一个**
+///   [Text] 挂在它旁边（不拼接、不改写既有字符串）；
+/// - 更新时间角标放在**名称行尾（卡片右上角）**而不是封面右上角：日期文案
+///   最长会是「2024-03-15更新」这种十来字符，压在 64×64 的封面角上会盖住
+///   封面、溢出到名称上；挂在名称行尾由 [Expanded] 自然让位，既不重叠
+///   也不碰尾部拖拽把手；
+/// - 观看进度 = 底部 3px 细条（贴卡片下沿，一眼看出推进度）+ 副信息行的
+///   「已看 X/Y」文字（承载精确数字），两者都不与拖拽把手抢位置。
 class _CollectionCard extends StatelessWidget {
   final String name;
   final int count;
@@ -1376,84 +1596,167 @@ class _CollectionCard extends StatelessWidget {
   final bool draggable; // 是否可拖动（未分类固定最后，不可拖）
   final VoidCallback onTap;
 
+  /// 该合集的观看统计；null = 统计未加载完（或加载失败）→ 素态显示。
+  final CollectionStat? stat;
+
   const _CollectionCard({
     required this.name,
     required this.count,
     required this.cover,
     required this.draggable,
     required this.onTap,
+    this.stat,
   });
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final isUncategorized = name == kUncategorizedLabel;
-    return Material(
-      color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: .5),
-      borderRadius: BorderRadius.circular(12),
-      clipBehavior: Clip.antiAlias,
-      child: InkWell(
-        onTap: onTap,
-        child: Padding(
-          padding: const EdgeInsets.all(10),
-          child: Row(
-            children: [
-              // 代表视觉：未分类用固定渐变+图标；合集优先展示首个视频封面
-              ClipRRect(
-                borderRadius: BorderRadius.circular(8),
-                child: SizedBox(
-                  width: 64,
-                  height: 64,
-                  child: cover.isNotEmpty && !isUncategorized
-                      ? Image.network(
-                          cover,
-                          fit: BoxFit.cover,
-                          // 与 CoverImage 一致：必须带防盗链头，否则 B 站图床 403
-                          headers: {
-                            'User-Agent': kBrowserUA,
-                            'Referer': kBiliReferer,
-                          },
-                          errorBuilder: (_, __, ___) =>
-                              _coverPlaceholder(context),
-                          loadingBuilder: (context, child, progress) {
-                            if (progress == null) return child;
-                            return _coverPlaceholder(context);
-                          },
-                        )
-                      : _coverPlaceholder(context),
-                ),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
+    final stat = this.stat;
+    final total = stat?.total ?? 0;
+    // 已看集数夹在 [0, total]：统计端已保证 watched <= total，这里只防脏数据
+    // 把进度条比例画错（负数和 >total 都算不出合法宽度）。
+    var watched = stat?.watched ?? 0;
+    if (watched < 0) watched = 0;
+    if (watched > total) watched = total;
+    final badge = collectionBadgeText(stat);
+    final showProgress = total > 0; // 0 集不画进度条（除法也没意义）
+
+    return ClipRRect(
+      // 圆角裁剪：底部进度条是贴卡片下沿的通栏矩形，不裁就会从卡片圆角处
+      // 露出直角（[AppBlock] 只在带左竖条时才自己裁）。
+      borderRadius: BorderRadius.circular(kRadiusMd),
+      child: Stack(
+        children: [
+          AppBlock(
+            variant: AppBlockVariant.collectionCard,
+            child: Material(
+              // 透明 Material = 只提供 ink 图层。放在 [AppBlock] **内部**是
+              // 关键：块的冷底是不透明 Container，Material 若在外层，水波
+              // 会被压到底色之下（完全看不见）。水波范围 = 内容区（内边距
+              // 之内），整卡的拖动不受影响（拖拽监听在卡片外层）。
+              type: MaterialType.transparency,
+              child: InkWell(
+                onTap: onTap,
+                child: Row(
                   children: [
-                    Text(
-                      name,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: theme.textTheme.titleSmall,
-                    ),
-                    const SizedBox(height: 4),
-                    Text(
-                      '$count 个视频',
-                      style: theme.textTheme.bodySmall?.copyWith(
-                        color: theme.colorScheme.onSurfaceVariant,
+                    // 代表视觉：未分类用固定渐变+图标；合集优先展示首个视频封面
+                    ClipRRect(
+                      borderRadius: BorderRadius.circular(8),
+                      child: SizedBox(
+                        width: 64,
+                        height: 64,
+                        child: cover.isNotEmpty && !isUncategorized
+                            ? Image.network(
+                                cover,
+                                fit: BoxFit.cover,
+                                // 与 CoverImage 一致：必须带防盗链头，否则
+                                // B 站图床 403
+                                headers: {
+                                  'User-Agent': kBrowserUA,
+                                  'Referer': kBiliReferer,
+                                },
+                                errorBuilder: (_, __, ___) =>
+                                    _coverPlaceholder(context),
+                                loadingBuilder: (context, child, progress) {
+                                  if (progress == null) return child;
+                                  return _coverPlaceholder(context);
+                                },
+                              )
+                            : _coverPlaceholder(context),
                       ),
                     ),
+                    const SizedBox(width: 12),
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          // 名称行：合集名（超长省略号）+ 右上角更新时间角标
+                          Row(
+                            children: [
+                              Expanded(
+                                child: Text(
+                                  name,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: theme.textTheme.titleSmall,
+                                ),
+                              ),
+                              if (badge != null) ...[
+                                const SizedBox(width: kSpace8),
+                                _UpdateBadge(text: badge),
+                              ],
+                            ],
+                          ),
+                          const SizedBox(height: 4),
+                          // 副信息行：既有「N 个视频」+ 新增「已看 X/Y」
+                          Row(
+                            children: [
+                              Text(
+                                '$count 个视频',
+                                style: theme.textTheme.bodySmall?.copyWith(
+                                  color: theme.colorScheme.onSurfaceVariant,
+                                ),
+                              ),
+                              if (showProgress) ...[
+                                const SizedBox(width: kSpace8),
+                                Flexible(
+                                  child: Text(
+                                    '已看 $watched/$total',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: kTypeNum.copyWith(
+                                      color:
+                                          theme.colorScheme.onSurfaceVariant,
+                                    ),
+                                  ),
+                                ),
+                              ],
+                            ],
+                          ),
+                        ],
+                      ),
+                    ),
+                    // 拖动手柄提示（可拖动的合集才显示；未分类不可拖）
+                    if (draggable)
+                      Icon(
+                        Icons.drag_indicator,
+                        size: 20,
+                        color:
+                            theme.colorScheme.outline.withValues(alpha: .55),
+                      ),
                   ],
                 ),
               ),
-              // 拖动手柄提示（可拖动的合集才显示；未分类不可拖）
-              if (draggable)
-                Icon(
-                  Icons.drag_indicator,
-                  size: 20,
-                  color: theme.colorScheme.outline.withValues(alpha: .55),
-                ),
-            ],
+            ),
           ),
-        ),
+          // 底部 3px 细进度条：已看段用图形墨 [AppPalette.inkDeco]（数据编码
+          // 专用档，浅墨配方下会自动压深，保证在 kPaperCool 冷底上看得见），
+          // 未看段用 kRule（比冷底深一档，能看出「还剩多少」）。
+          // 宽度按 flex 比例分（watched : total - watched），不用先算浮点数。
+          if (showProgress)
+            Positioned(
+              key: kCollectionProgressBarKey,
+              left: 0,
+              right: 0,
+              bottom: 0,
+              height: _kCollectionProgressH,
+              child: Row(
+                children: [
+                  if (watched > 0)
+                    Expanded(
+                      flex: watched,
+                      child: ColoredBox(color: context.palette.inkDeco),
+                    ),
+                  if (total - watched > 0)
+                    Expanded(
+                      flex: total - watched,
+                      child: const ColoredBox(color: kRule),
+                    ),
+                ],
+              ),
+            ),
+        ],
       ),
     );
   }
@@ -1484,9 +1787,40 @@ class _CollectionCard extends StatelessWidget {
   }
 }
 
-/// 首页固定「收藏夹」入口卡（v2.17.7+）：样式同合集卡（行式 + 圆角 + 64 视觉
-/// 位），但用 folder_special 图标 + 独立渐变与副标「我的 B 站收藏」作视觉
-/// 区分；不参与拖拽排序（合集区顶部常驻，未登录/空名单也显示）。
+/// 合集卡的更新时间角标（「3 天前更新」/「3 天前加入」）。
+///
+/// 底色取点缀墨稀释档 [AppPalette.accentWash]、文字取 [AppPalette.accentDeep]：
+/// 点缀墨（赤陶）的固定职责就是「时间与新鲜度」（角标 / 未读点，见
+/// app_tokens.dart 的语义约定），这里是它最正当的用法，换配色时自动跟随。
+class _UpdateBadge extends StatelessWidget {
+  final String text;
+
+  const _UpdateBadge({required this.text});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+      decoration: BoxDecoration(
+        color: context.palette.accentWash,
+        borderRadius: BorderRadius.circular(kRadiusXs),
+      ),
+      child: Text(
+        text,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: kTypeLabel.copyWith(color: context.palette.accentDeep),
+      ),
+    );
+  }
+}
+
+/// 首页固定「收藏夹」入口卡（v2.17.7+）：样式同合集卡（行式 + 64 视觉位，
+/// 底板走 [AppBlock] 的 [AppBlockVariant.collectionCard] 规格：冷底 +
+/// 1px kRuleStrong 描边 + kRadiusMd 圆角 + all(10) 内边距），但用
+/// folder_special 图标 + 独立渐变与副标「我的 B 站收藏」作视觉区分；
+/// 不参与拖拽排序（合集区顶部常驻，未登录/空名单也显示），也没有观看统计
+/// （收藏夹是 B 站账号数据，不属于白名单）。
 class _FavoritesCard extends StatelessWidget {
   final VoidCallback onTap;
 
@@ -1495,14 +1829,14 @@ class _FavoritesCard extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return Material(
-      color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: .5),
-      borderRadius: BorderRadius.circular(12),
-      clipBehavior: Clip.antiAlias,
-      child: InkWell(
-        onTap: onTap,
-        child: Padding(
-          padding: const EdgeInsets.all(10),
+    return AppBlock(
+      variant: AppBlockVariant.collectionCard,
+      child: Material(
+        // 透明 Material = 仅提供 ink 图层（同合集卡：块的冷底不透明，
+        // Material 必须在块内部水波才可见）
+        type: MaterialType.transparency,
+        child: InkWell(
+          onTap: onTap,
           child: Row(
             children: [
               // 代表视觉：收藏夹专属渐变 + folder_special 图标（区别于合集封面）
@@ -1719,25 +2053,57 @@ class _CacheBar extends StatelessWidget {
 }
 
 /// 空态视图（首次启动且无缓存/同步失败）。
+///
+/// 两种情况画面语言不同（本轮统一）：
+/// - [syncing] == true：**冷启动同步中**，整页走 [AppLoadingHero]（风衣男剪影
+///   + 加载闲话），与本版本其它整页加载态同一气质；主文案「正在同步白名单…」
+///   逐字保留（测试锚点），只换画面不换文案。此态**不显示「新建合集」**——
+///   白名单还没同步回来，此时建合集是误导。
+/// - [syncing] == false：白名单确实为空，给醒目行动按钮「新建合集」（新建合集
+///   入口从设置区移到了合集页；合集非空时该入口在列表上方常驻，不重复出现在
+///   这里）。主文案「白名单为空\n下拉刷新重新同步」逐字保留（widget 测试锚点）。
 class _EmptyView extends StatelessWidget {
   final bool syncing;
 
-  const _EmptyView({required this.syncing});
+  /// 「新建合集」回调（页面弹输入框 → 复用页面的 `_createCollection`）。
+  final VoidCallback onCreateCollection;
+
+  const _EmptyView({
+    required this.syncing,
+    required this.onCreateCollection,
+  });
 
   @override
   Widget build(BuildContext context) {
-    final message = syncing ? '正在同步白名单…' : '白名单为空\n下拉刷新重新同步';
+    if (syncing) {
+      // 宿主是 RefreshIndicator → 必须 scrollable: true 才能下拉刷新。
+      return const AppLoadingHero(
+        title: '正在同步白名单…',
+        seed: 'playlist.sync',
+        scrollable: true,
+      );
+    }
     return ListView(
       physics: const AlwaysScrollableScrollPhysics(),
       children: [
         const SizedBox(height: 120),
         Icon(
-          syncing ? Icons.sync : Icons.inbox_outlined,
+          Icons.inbox_outlined,
           size: 56,
           color: Theme.of(context).colorScheme.outline,
         ),
         const SizedBox(height: 12),
-        Center(child: Text(message)),
+        const Center(child: Text('白名单为空\n下拉刷新重新同步')),
+        // 行动按钮：主按钮（FilledButton = 主墨实心底，同「搜索并加入 UP 主」
+        // 空态动作），触摸目标 ≥ 48dp 由 materialTapTargetSize.padded 保证
+        const SizedBox(height: kSpace16),
+        Center(
+          child: FilledButton.icon(
+            onPressed: onCreateCollection,
+            icon: const Icon(Icons.create_new_folder_outlined, size: 18),
+            label: const Text('新建合集'),
+          ),
+        ),
       ],
     );
   }
@@ -1819,7 +2185,7 @@ class _CollectionManageSheetState extends State<_CollectionManageSheet> {
           ),
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx, true),
-            child: const Text('删除', style: TextStyle(color: Colors.red)),
+            child: const Text('删除', style: TextStyle(color: kError)),
           ),
         ],
       ),

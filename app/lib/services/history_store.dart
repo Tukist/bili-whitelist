@@ -83,7 +83,12 @@ class HistoryEntry {
 /// - 读/写失败静默降级（返回空列表 / 跳过写入），不影响播放主流程
 class HistoryStore {
   /// 历史记录条数上限（超出裁剪最早）。
-  static const int maxEntries = 200;
+  ///
+  /// 1000 而不是 200：首页合集卡的「已看 X/Y」直接数这张表里的
+  /// (bvid, pageIndex)，上限太低会把老记录裁掉、让「已看集数」偏少
+  /// （重度用户追一部 300+ 集的番就会撞上 200）。整表一条 JSON 存
+  /// shared_preferences，1000 条的量级（约几百 KB）读写仍在毫秒级。
+  static const int maxEntries = 1000;
 
   static const String _key = 'history_store:entries';
 

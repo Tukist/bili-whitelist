@@ -1,13 +1,15 @@
 // v2.17.17「横屏置顶模式」真机/模拟器集成验收（真实网络 + 真实播放器）：
 //   flutter test integration_test/landscape_pin_flow_test.dart -d emulator-5554
 //
-// 本测试需要宿主机在测试打点处执行 adb 旋转（模拟「用户横放/竖放设备」）：
-//   - 看到日志标记 `[集成] M1_PORTRAIT_EMBED` 后：adb shell settings put
-//     system accelerometer_rotation 0 && adb shell settings put system
-//     user_rotation 1（设备转横屏，模拟用户横放）
-//   - 看到 `[集成] M2_FULLSCREEN_LANDSCAPE` 后：无需动作（保持横屏）
-//   - 看到 `[集成] M3_LANDSCAPE_PIN` 后：adb shell settings put system
-//     user_rotation 0（设备转回竖屏，模拟用户竖放）
+// 方向前置（v2.17.18 起自足，不再依赖宿主机手工介入）：
+//   - 测试在需要横屏/竖屏处**自己发方向请求**（SystemChrome → Activity
+//     requestedOrientation，等价于用户横放/竖放设备；应用进程无
+//     WRITE_SETTINGS，写不了 `settings put system user_rotation`）；
+//   - 每个方向点仍先给宿主机留 20s 观察窗（保留历史的人工 adb 介入方式：
+//     adb shell settings put system accelerometer_rotation 0 &&
+//     adb shell settings put system user_rotation 1 / 0），宿主没动就自转；
+//   - 两者都失败（如设备被系统锁死竖屏、Activity 请求也被忽略）→
+//     markTestSkipped 明确跳过并复位竖屏，**不留红色失败**。
 //
 // 覆盖（取证 = 测试内 debugPrint `[集成]` 几何数值 + 页面自身 debugPrint）：
 //   1. 竖屏进入播放 = 竖屏「顶部置顶视频 + 信息行 + 内嵌评论区」
@@ -20,6 +22,7 @@
 // 注意：真实网络/播放器环境，播放可能缓冲/失败（不影响布局断言）；旋转等待
 // 均显式 pump（pumpAndSettle 会被缓冲转圈/进度 tick 卡死）。
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:integration_test/integration_test.dart';
 
@@ -70,6 +73,30 @@ Future<bool> _waitOrientation(WidgetTester tester, bool Function() pred,
     if (pred()) return true;
   }
   return false;
+}
+
+/// 测试自行请求方向并等窗口转到位（模拟用户横放/竖放设备），返回是否成功。
+///
+/// 为什么能用 SystemChrome 代替 adb：集成测试跑在 App 进程内，平台通道打到
+/// **真实** Activity，`setPreferredOrientations` 会落到
+/// `Activity.setRequestedOrientation` → 显示器真的旋转（窗口尺寸随之变横/变
+/// 竖），与用户把设备横放同效。反过来说，应用进程没有 WRITE_SETTINGS 权限，
+/// 写不了 `settings put system user_rotation`（宿主 adb 才行），故只能走这条。
+Future<bool> _requestOrientation(WidgetTester tester,
+    List<DeviceOrientation> orientations, bool Function() pred) async {
+  await SystemChrome.setPreferredOrientations(orientations);
+  return _waitOrientation(tester, pred, const Duration(seconds: 15));
+}
+
+/// 横屏前置：先给宿主机 20s 观察窗（人工 adb 旋转的历史流程），宿主没动就
+/// 由测试自己请求横屏。返回 (是否横屏到位, 是否由本测试自转)。
+Future<(bool, bool)> _ensureLandscape(WidgetTester tester) async {
+  final host = await _waitOrientation(
+      tester, () => _isLandscape(tester), const Duration(seconds: 20));
+  if (host) return (true, false);
+  final self = await _requestOrientation(
+      tester, [DeviceOrientation.landscapeLeft], () => _isLandscape(tester));
+  return (self, self);
 }
 
 Rect _rectOf(WidgetTester tester, Finder f) => tester.getRect(f.first);
@@ -134,11 +161,21 @@ void main() {
           reason: '整页不溢出');
     }
 
-    // 宿主机此刻应执行：settings accelerometer_rotation 0 + user_rotation 1
-    // （转横屏 = 模拟用户横放设备）。等旋转生效（最多 35s）。
-    final rotatedLandscape = await _waitOrientation(
-        tester, () => _isLandscape(tester), const Duration(seconds: 35));
-    expect(rotatedLandscape, isTrue, reason: '宿主机未按时转横屏（user_rotation 1）？');
+    // 方向前置（② 之前）：设备必须横放（= 横屏窗口）。
+    //    v2.17.18：不再要求宿主机必须手工 adb 旋转——宿主 20s 内没转就由本
+    //    测试自行请求横屏（见 [_ensureLandscape]）；两者都不成 → 明确 skip
+    //    （复位竖屏后跳过，不留红）。
+    final (rotatedLandscape, selfRotated) = await _ensureLandscape(tester);
+    if (!rotatedLandscape) {
+      await SystemChrome.setPreferredOrientations(
+          [DeviceOrientation.portraitUp]);
+      markTestSkipped('设备转不了横屏：宿主机未执行 adb 旋转，且应用内方向请求'
+          '（SystemChrome → Activity.requestedOrientation）未生效。'
+          '请在真机横放设备，或宿主机执行 settings put system '
+          'accelerometer_rotation 0 && settings put system user_rotation 1 后复跑。');
+    }
+    debugPrint('[集成] M1b_ROTATED_LANDSCAPE 横屏到位='
+        '$rotatedLandscape 自转=$selfRotated');
 
     // ② 横屏下进全屏 = 整屏视频（无信息行/评论区）
     await tester.tap(find.byIcon(Icons.fullscreen));
@@ -162,6 +199,17 @@ void main() {
     await tester.tap(find.byIcon(Icons.fullscreen_exit));
     await _pumpFor(tester, const Duration(seconds: 2));
     expect(find.byIcon(Icons.fullscreen), findsOneWidget, reason: '已退出全屏');
+    if (selfRotated) {
+      // 自转场景补一次横屏请求：退出全屏时页面把方向放开为「竖屏 + 双向横屏」
+      // （kPlayerPageFreeOrientations），而模拟器锁竖屏（accelerometer_rotation=0
+      // + user_rotation=0）会立刻回落到竖屏；真机横放时不会（传感器就是横的）。
+      // 重新请求横屏以维持「设备横放」前提，下面的几何断言依旧是横屏置顶布局。
+      // （「退出全屏不强制竖屏」的方向策略本身由 widget 测试
+      // test/player_landscape_pin_test.dart 断言平台通道收到的三向列表。）
+      final reLandscape = await _requestOrientation(tester,
+          [DeviceOrientation.landscapeLeft], () => _isLandscape(tester));
+      debugPrint('[集成] M2b_SELF_RELANDSCAPE ok=$reLandscape');
+    }
     {
       final s = _screenSize(tester);
       expect(s.width > s.height, isTrue,
@@ -213,10 +261,19 @@ void main() {
       }
     }
 
-    // 宿主机此刻应执行：settings put system user_rotation 0（转回竖屏）
-    final backPortrait = await _waitOrientation(
-        tester, () => !_isLandscape(tester), const Duration(seconds: 35));
-    expect(backPortrait, isTrue, reason: '宿主机未按时转竖屏（user_rotation 0）？');
+    // 方向前置（④ 之前）：转回竖屏。宿主 20s 内没动（人工 adb 流程），就由
+    // 测试自己请求竖屏；两者都不成 → 明确 skip（不留红）。
+    var backPortrait = await _waitOrientation(
+        tester, () => !_isLandscape(tester), const Duration(seconds: 20));
+    if (!backPortrait) {
+      backPortrait = await _requestOrientation(
+          tester, [DeviceOrientation.portraitUp], () => !_isLandscape(tester));
+      debugPrint('[集成] M3b_SELF_PORTRAIT ok=$backPortrait');
+    }
+    if (!backPortrait) {
+      markTestSkipped('设备转不回竖屏：宿主机未执行 user_rotation 0，且应用内'
+          '方向请求未生效。');
+    }
 
     // ④ 转回竖屏 → 竖屏置顶+评论回归（设备竖放兼容 v2.17.0 布局）
     {

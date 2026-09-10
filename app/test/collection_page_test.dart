@@ -21,9 +21,12 @@ import 'package:bili_whitelist_app/api/github_api.dart';
 import 'package:bili_whitelist_app/main.dart';
 import 'package:bili_whitelist_app/models/upowner.dart';
 import 'package:bili_whitelist_app/models/whitelist_video.dart';
+import 'package:bili_whitelist_app/pages/collection_page.dart';
 import 'package:bili_whitelist_app/pages/playlist_page.dart';
 import 'package:bili_whitelist_app/services/service_locator.dart';
 import 'package:bili_whitelist_app/sync/whitelist_source.dart';
+import 'package:bili_whitelist_app/widgets/app_state_view.dart';
+import 'package:bili_whitelist_app/widgets/dot_illustration.dart';
 import 'package:bili_whitelist_app/widgets/video_tile.dart';
 
 /// 假同步服务：返回固定数据，不触发任何原生插件/网络。
@@ -487,20 +490,139 @@ void main() {
     });
   });
 
-  group('观看统计入口（v2.17.9+；v2.17.10 副标题更新）', () {
-    testWidgets('顶栏「观看统计」图标存在，点击直达统计页（PageView 第 4 页）',
+  group('「个人」入口（v2.19.0：原「统计」+「设置」合并为底部导航第 4 项）', () {
+    testWidgets('底部导航 4 项；点「个人」→ 统计在上、设置在下（同一页滚动流）',
         (tester) async {
       SharedPreferences.setMockInitialValues({});
       await _pumpHomeWithGithub(tester, WhitelistData.empty());
-      expect(find.byTooltip('观看统计'), findsOneWidget);
-      expect(find.byTooltip('历史记录'), findsOneWidget);
 
-      // 点图标 → 动画切到统计页：页内自含标题 + 空态（无数据时不渲染图例）
-      await tester.tap(find.byTooltip('观看统计'));
+      // 目的地 = 合集 / UP 主 / 历史 / 个人（原「统计」「设置」两项已合并）
+      final nav = tester.widget<NavigationBar>(find.byType(NavigationBar));
+      final labels = [
+        for (final d in nav.destinations) (d as NavigationDestination).label,
+      ];
+      expect(labels, ['合集', 'UP 主', '历史', '个人']);
+      // 4 个标签都实际渲染（单行不截断；M3 NavigationBar + 11sp label +
+      // 4 等分宽度下最长的「UP 主」也只有 ~30dp，不会挤爆）
+      for (final label in labels) {
+        expect(find.text(label), findsOneWidget, reason: '标签 $label 未渲染');
+      }
+      expect(find.byTooltip('个人（观看统计 / 设置）'), findsOneWidget);
+      expect(find.byTooltip('历史记录'), findsOneWidget); // 历史 tooltip 逐字保留
+      // 旧的两个目的地不再存在
+      expect(find.byTooltip('观看统计'), findsNothing);
+      expect(find.byTooltip('管理（GitHub 配置 / 合集 / B 站账号）'), findsNothing);
+
+      // 点图标 → 动画切到「个人」页：统计在上（页内自含标题 + 空态）
+      await tester.tap(find.byTooltip('个人（观看统计 / 设置）'));
       await tester.pumpAndSettle();
-      expect(find.text('左滑到这里 · 点日期格看当天观看历史'), findsOneWidget);
+      expect(
+        find.text('底部导航「个人」· 点日期格看当天观看历史，设置在本页下方'),
+        findsOneWidget,
+      );
       expect(find.text('开始观看后这里会生成你的观看热力'), findsOneWidget);
       expect(find.textContaining('档位：'), findsNothing); // 空态不渲染图例/网格
+
+      // 设置在同一页的下方（同一个 ListView）：滚到底可见原设置面板内容
+      for (var i = 0;
+          i < 8 && find.text('B 站账号').evaluate().isEmpty;
+          i++) {
+        await tester.drag(find.byType(ListView).first, const Offset(0, -400));
+        await tester.pumpAndSettle();
+      }
+      expect(find.text('B 站账号'), findsOneWidget);
+      expect(find.text('合集管理'), findsOneWidget);
+      // 设置面板里不再有「新建合集」（已移到合集页）
+      expect(find.text('新建合集'), findsNothing);
+    });
+  });
+
+  group('合集页「新建合集」入口（v2.19.0 从设置页移入）', () {
+    testWidgets('合集非空：顶部常驻按钮 → 输入名字 → 走原创建流程写 Gist 并刷新',
+        (tester) async {
+      final ctx = await _pumpHomeWithGithub(
+        tester,
+        _dataWith(
+          [_video('BV1', '视频A', collection: '动画')],
+          collectionNames: ['动画'],
+        ),
+      );
+
+      // 顶部常驻按钮（不在 ReorderableListView 内 → 排序索引/拖拽逻辑不变）
+      // ⚠ `OutlinedButton.icon` 返回的是私有子类，`find.byType` 的精确类型
+      // 匹配找不到 → 按「文本的按钮祖先」+ `is` 判定
+      final button = find.ancestor(
+        of: find.text('新建合集'),
+        matching: find.byWidgetPredicate((w) => w is OutlinedButton),
+      );
+      expect(button, findsOneWidget);
+      // Android 无障碍：触摸目标 ≥ 48dp（materialTapTargetSize.padded）
+      expect(tester.getSize(button).height, greaterThanOrEqualTo(48));
+
+      await tester.tap(button);
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField).last, '新合辑');
+      await tester.tap(find.text('创建'));
+      await tester.pumpAndSettle();
+
+      // 复用页面既有创建流程（去重 → PATCH Gist → 刷新列表）
+      expect(ctx.adapter.requests, isNotEmpty);
+      expect(ctx.adapter.requests.last.method, 'PATCH');
+      expect(_savedCollectionNames(ctx.adapter), ['动画', '新合辑']);
+      expect(find.text('新合辑'), findsOneWidget); // 列表已刷新出新卡片
+    });
+
+    testWidgets('白名单为空：空态给出醒目「新建合集」行动按钮，同样可创建',
+        (tester) async {
+      final ctx = await _pumpHomeWithGithub(tester, WhitelistData.empty());
+
+      expect(find.textContaining('白名单为空'), findsOneWidget);
+      final button = find.ancestor(
+        of: find.text('新建合集'),
+        matching: find.byWidgetPredicate((w) => w is FilledButton),
+      );
+      expect(button, findsOneWidget);
+      expect(tester.getSize(button).height, greaterThanOrEqualTo(48));
+
+      await tester.tap(button);
+      await tester.pumpAndSettle();
+      await tester.enterText(find.byType(TextField).last, '空态建集');
+      await tester.tap(find.text('创建'));
+      await tester.pumpAndSettle();
+
+      expect(ctx.adapter.requests.last.method, 'PATCH');
+      expect(_savedCollectionNames(ctx.adapter), ['空态建集']);
+    });
+  });
+
+  group('合集页空态（P4b：统一到 AppStateView）', () {
+    testWidgets('合集内没有视频 → 细线插画 + 「「空集」暂无视频」+ 可滚动承载',
+        (tester) async {
+      _mockSecureStorage();
+      await tester.pumpWidget(MaterialApp(
+        home: CollectionPage(
+          collectionName: '空集',
+          data: _dataWith(const []),
+          saveAndRefresh: (_) async {},
+        ),
+      ));
+      await tester.pumpAndSettle();
+
+      // 文案逐字不变（合集名是动态的 → title 直给，不走 copyId）
+      expect(find.text('「空集」暂无视频'), findsOneWidget);
+      final state = tester.widget<AppStateView>(find.byType(AppStateView));
+      expect(state.kind, AppStateKind.empty);
+      expect(state.title, '「空集」暂无视频');
+      expect(state.scrollable, isTrue,
+          reason: '旧空态是 ListView(AlwaysScrollableScrollPhysics) → 保持同结构');
+      expect(
+        tester.widget<DotIllustration>(find.byType(DotIllustration)).seed,
+        'collection',
+      );
+      expect(
+        tester.widget<ListView>(find.byType(ListView)).physics,
+        isA<AlwaysScrollableScrollPhysics>(),
+      );
     });
   });
 }

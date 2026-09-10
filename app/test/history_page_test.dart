@@ -10,6 +10,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:bili_whitelist_app/pages/history_page.dart';
 import 'package:bili_whitelist_app/pages/player_page.dart';
 import 'package:bili_whitelist_app/services/history_store.dart';
+import 'package:bili_whitelist_app/widgets/app_state_view.dart';
+import 'package:bili_whitelist_app/widgets/dot_illustration.dart';
 
 HistoryEntry _entry(
   String bvid,
@@ -49,6 +51,22 @@ void main() {
     expect(find.text('暂无历史记录'), findsOneWidget);
     // 无记录时不显示「清空」按钮
     expect(find.text('清空'), findsNothing);
+
+    // 空态已统一到 AppStateView：细线插画（seed = history）+ 副文案 +
+    // 可滚动承载（旧空态是 ListView(AlwaysScrollableScrollPhysics)，保持同结构）
+    final state = tester.widget<AppStateView>(find.byType(AppStateView));
+    expect(state.kind, AppStateKind.empty);
+    expect(state.copyId, 'empty.history');
+    expect(state.scrollable, isTrue);
+    expect(
+      tester.widget<DotIllustration>(find.byType(DotIllustration)).seed,
+      'history',
+    );
+    expect(find.text('看过的视频会出现在这里，点击可续播'), findsOneWidget);
+    expect(
+      tester.widget<ListView>(find.byType(ListView)).physics,
+      isA<AlwaysScrollableScrollPhysics>(),
+    );
   });
 
   testWidgets('有历史时按倒序展示标题/上次位置/相对时间，并显示「清空」', (tester) async {

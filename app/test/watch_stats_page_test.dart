@@ -1,7 +1,8 @@
 // 观看统计页（WatchStatsPage）单测：53 周热力网格构建 / 月份标签 /
-// 时长文案 / 克莱因蓝**相对制**配色（v2.17.16：最长日→最深，其余按比例
-// 连续渐变，无固定分档）/ 总览在热力下方 / 设置区内联 /
-// 点日期格进入该日历史页；另有页面冒烟（空态 / 有数据热力卡出现）。
+// 时长文案 / 数据编码墨**相对制**配色（v2.17.16：最长日→最深，其余按比例
+// 连续渐变，无固定分档；P1.5：墨色跟随配色配方；S6：最深档改用
+// AppPalette.inkDeco，保证与纸底 ≥ 3:1 的图形对比度）/ 总览在热力下方 /
+// 设置区内联 / 点日期格进入该日历史页；另有页面冒烟（空态 / 有数据热力卡出现）。
 // - 网格函数不碰插件，直接断言数据结构
 // - 页面冒烟用 shared_preferences mock + 注入 stats 实例
 // - 点日进历史需要 HistoryStore 预置该日条目（SharedPreferences mock）
@@ -15,6 +16,10 @@ import 'package:bili_whitelist_app/pages/daily_history_page.dart';
 import 'package:bili_whitelist_app/pages/watch_stats_page.dart';
 import 'package:bili_whitelist_app/services/history_store.dart';
 import 'package:bili_whitelist_app/services/watch_stats.dart';
+import 'package:bili_whitelist_app/theme/app_palette.dart';
+import 'package:bili_whitelist_app/theme/app_theme.dart';
+import 'package:bili_whitelist_app/theme/app_tokens.dart';
+import 'package:bili_whitelist_app/theme/ink_recipes.dart';
 import 'package:bili_whitelist_app/widgets/manage_panel.dart';
 
 /// 构造一条历史（cover 置空 → CoverImage 占位不触网络）。
@@ -150,41 +155,90 @@ void main() {
     });
   });
 
-  group('相对配色（v2.17.16：克莱因蓝连续渐变，无固定分档）', () {
-    test('主色 #002FA7 + 无观看浅近白底 #EBEEF5 + 渐变起点浅蓝 #D5E5FF', () {
-      expect(kKleinBlue, const Color(0xFF002FA7));
-      expect(kHeatNoWatchColor, const Color(0xFFEBEEF5));
-      expect(kHeatLowColor, const Color(0xFFD5E5FF));
+  group('相对配色（v2.17.16 相对制 + P1.5 跟随配色配方）', () {
+    test('默认配方主墨 #002FA7 + 无观看极浅墨底 + 渐变起点主墨稀释底', () {
+      final p = AppPalette.fallback; // = 真机默认配方 klein_clay
+      expect(p.ink, const Color(0xFF002FA7));
+      expect(p.accent, const Color(0xFFC65F38));
+      // 无观看格：主墨 6% 融进纸底（P1 手写 #EBEEF5 → 现值 #EBEEF2，仅个位数差）
+      // 注：alphaBlend/lerp 结果是浮点通道，比色用 toARGB32() 取整后比
+      expect(heatNoWatchColorOf(p).toARGB32(), 0xFFEBEEF2);
+      // 渐变起点 = 主墨 12% 稀释底（P1 手写 #D5E5FF → 现值 #DCE2ED）
+      expect(p.inkWash.toARGB32(), 0xFFDCE2ED);
     });
 
-    test('heatColorForIntensity：≤0=浅底、≥1=克莱因蓝、中间连续插值', () {
-      expect(heatColorForIntensity(0), kHeatNoWatchColor);
-      expect(heatColorForIntensity(-1), kHeatNoWatchColor);
-      expect(heatColorForIntensity(1), kKleinBlue);
-      expect(heatColorForIntensity(5), kKleinBlue);
-      // 0.5 应等于 Color.lerp(起点浅蓝, 克莱因蓝, 0.5) 的插值结果
+    test('heatColorForIntensity：≤0=极浅底、≥1=最深档 inkDeco、中间连续插值', () {
+      final p = AppPalette.fallback;
+      final none = heatNoWatchColorOf(p);
+      final low = p.inkWash; // 渐变起点（主墨浅档）
+      final high = p.inkDeco; // 最强 = 数据编码最深档（默认配方 = 原墨）
+      expect(heatColorForIntensity(0, p), none);
+      expect(heatColorForIntensity(-1, p), none);
+      expect(heatColorForIntensity(1, p), high);
+      expect(heatColorForIntensity(5, p), high);
+      // 0.5 应等于 Color.lerp(起点浅档, 最深档 inkDeco, 0.5) 的插值结果
       // （Flutter 新版 lerp 走更精确的宽色域插值，不等于逐通道均值，直接对比实现）
-      final mid = Color.lerp(kHeatLowColor, kKleinBlue, 0.5)!;
-      expect(heatColorForIntensity(0.5), mid);
+      final mid = Color.lerp(low, high, 0.5)!;
+      expect(heatColorForIntensity(0.5, p), mid);
       // 中间色在两端之间、且不是任一端（确有渐变）
-      expect(mid, isNot(kHeatLowColor));
-      expect(mid, isNot(kKleinBlue));
-      // 单调：三个通道都介于起点与克莱因蓝之间（0 <= 红 <= 213 等）
-      expect(mid.r, inInclusiveRange(kKleinBlue.r, kHeatLowColor.r));
-      expect(mid.g, inInclusiveRange(kKleinBlue.g, kHeatLowColor.g));
-      expect(mid.b, inInclusiveRange(kKleinBlue.b, kHeatLowColor.b));
+      expect(mid, isNot(low));
+      expect(mid, isNot(high));
+      // 单调：三个通道都介于起点与主墨之间
+      expect(mid.r, inInclusiveRange(high.r, low.r));
+      expect(mid.g, inInclusiveRange(high.g, low.g));
+      expect(mid.b, inInclusiveRange(high.b, low.b));
       // 强度 0.75 明显比 0.5 深（红通道降、蓝通道升方向相反，用红通道比较）
-      final q3 = heatColorForIntensity(0.75);
+      final q3 = heatColorForIntensity(0.75, p);
       expect(q3.r, lessThan(mid.r));
     });
 
-    test('两端贴合：1% 几乎=起点浅蓝，99% 几乎=克莱因蓝（连续无跳档断层）', () {
-      final nearLow = heatColorForIntensity(0.01);
-      final nearHigh = heatColorForIntensity(0.99);
-      // 低强度贴近起点浅蓝（红通道高 ≈0.83），高强度贴近克莱因蓝（红通道近 0）
-      expect(nearLow.r, closeTo(kHeatLowColor.r, 0.05));
-      expect(nearHigh.r, closeTo(kKleinBlue.r, 0.05));
+    test('两端贴合：1% 几乎=起点浅档，99% 几乎=最深档（连续无跳档断层）', () {
+      final p = AppPalette.fallback;
+      final nearLow = heatColorForIntensity(0.01, p);
+      final nearHigh = heatColorForIntensity(0.99, p);
+      // 低强度贴近起点浅档（红通道高 ≈0.86），高强度贴近最深档（红通道近 0）
+      expect(nearLow.r, closeTo(p.inkWash.r, 0.05));
+      expect(nearHigh.r, closeTo(p.inkDeco.r, 0.05));
       expect(nearLow.r - nearHigh.r, greaterThan(0.7));
+    });
+
+    test('换配方：最深档 = 该配方 inkDeco（原墨达标则同值）、极浅底随主墨'
+        '（不是写死克莱因蓝）', () {
+      final cobalt =
+          AppPalette.fromRecipe(inkRecipeById('cobalt_terracotta')!);
+      expect(cobalt.ink, const Color(0xFF2148B8));
+      // 钴蓝原墨 vs 纸底本就 ≥ 3:1 → inkDeco 零漂移，最深档 = 原墨
+      expect(cobalt.inkDeco, cobalt.ink);
+      expect(heatColorForIntensity(1, cobalt), cobalt.inkDeco);
+      expect(heatColorForIntensity(0, cobalt), heatNoWatchColorOf(cobalt));
+      expect(
+        heatNoWatchColorOf(cobalt),
+        isNot(heatNoWatchColorOf(AppPalette.fallback)),
+      );
+    });
+
+    test('浅墨配方（粉蓝）：最深档不再用原墨而是压深的 inkDeco，'
+        '与纸底 ≥ 3:1 的图形对比度（S6）', () {
+      final powder =
+          AppPalette.fromRecipe(inkRecipeById('powder_blue_signal_red')!);
+      // 原墨 #9EB8D3 直接当最深档只有 ≈1.96:1，深浅读不出来
+      expect(contrastRatio(powder.ink, kPaper), lessThan(kMinContrastGraphic));
+      expect(powder.inkDeco, isNot(powder.ink));
+      expect(
+        contrastRatio(powder.inkDeco, kPaper),
+        greaterThanOrEqualTo(kMinContrastGraphic),
+      );
+      // 最深档确实更深（亮度更低）→ 「颜色越深观看越久」的刻度成立
+      expect(
+        relativeLuminance(powder.inkDeco),
+        lessThan(relativeLuminance(powder.ink)),
+      );
+      expect(heatColorForIntensity(1, powder), powder.inkDeco);
+      // 相对色阶仍单调：中间档介于浅档与最深档之间
+      final mid = heatColorForIntensity(0.5, powder);
+      expect(mid, Color.lerp(powder.inkWash, powder.inkDeco, 0.5));
+      expect(mid, isNot(powder.inkWash));
+      expect(mid, isNot(powder.inkDeco));
     });
   });
 
@@ -222,7 +276,32 @@ void main() {
     });
   });
 
-  group('总览在热力下方 + 点日进历史 + 设置区内联（v2.17.10）', () {
+  group('总览在热力下方 + 点日进历史 + 设置区内联（v2.17.10；v2.19.0「个人」页）',
+      () {
+    testWidgets('设置区追加在统计内容之后（统计在上、设置在下，同一滚动流）',
+        (tester) async {
+      SharedPreferences.setMockInitialValues({});
+      await tester.pumpWidget(MaterialApp(
+        home: Scaffold(
+          body: WatchStatsPage(
+            stats: WatchStats(),
+            settingsSection: const Text('设置区标记'),
+          ),
+        ),
+      ));
+      await tester.pumpAndSettle();
+
+      // 页面固定标题条「观看统计」在最上（不在滚动流里）
+      expect(find.text('观看统计'), findsOneWidget);
+      // 同一 ListView 里：总览（统计内容）在设置区之前
+      expect(find.text('观看总览'), findsOneWidget);
+      expect(find.text('设置区标记'), findsOneWidget);
+      expect(
+        tester.getTopLeft(find.text('观看总览')).dy,
+        lessThan(tester.getTopLeft(find.text('设置区标记')).dy),
+      );
+    });
+
     testWidgets('总览统计（观看总览）渲染在热力卡下方', (tester) async {
       SharedPreferences.setMockInitialValues({});
       final stats = WatchStats();
@@ -327,8 +406,7 @@ void main() {
         github: GithubApi(),
         closeBeforeNavigate: false,
         headingTitle: '设置',
-        headingSubtitle: '集中设置区（与首页齿轮为同一组件）',
-        onCollectionCreated: (_) async {},
+        headingSubtitle: '集中设置区（「个人」页底部内联组件）',
         onManageCollections: () {},
         onCheckUpdate: () {},
         onLogin: () {},
@@ -345,6 +423,75 @@ void main() {
       expect(find.text('保存配置'), findsOneWidget);
       await _scrollTo(tester, find.text('版本更新'));
       expect(find.text('检查更新'), findsOneWidget);
+    });
+  });
+
+  group('P1.5 热力色跟随配色配方（主题真的传到格子上）', () {
+    testWidgets('换配方（钴蓝 · 陶土）后：最强格 = 该配方 inkDeco，今天格描边同色',
+        (tester) async {
+      SharedPreferences.setMockInitialValues({});
+      final stats = WatchStats();
+      final now = DateTime.now();
+      await stats.record(3600, at: now); // 今天 = 窗口内最长 → 最强格
+      final recipe = inkRecipeById('cobalt_terracotta')!;
+      final palette = AppPalette.fromRecipe(recipe);
+
+      await tester.pumpWidget(MaterialApp(
+        theme: buildAppTheme(recipe),
+        home: Scaffold(body: WatchStatsPage(stats: stats)),
+      ));
+      await tester.pumpAndSettle();
+
+      final todayKey = WatchStats.dateKey(now);
+      final cell = tester.widget<Container>(
+        find.descendant(
+          of: find.byKey(ValueKey('heatcell-$todayKey')),
+          matching: find.byType(Container),
+        ),
+      );
+      final deco = cell.decoration as BoxDecoration;
+      // 钴蓝原墨本就达标 → inkDeco = 原墨 #2148B8（零漂移）
+      expect(
+        deco.color,
+        palette.inkDeco,
+        reason: '最强格 = 该配方 inkDeco（钴蓝下 = 原墨）',
+      );
+      expect(
+        (deco.border as Border).top.color,
+        palette.inkDeco.withValues(alpha: .9),
+        reason: '今天格描边 = inkDeco',
+      );
+    });
+
+    testWidgets('浅墨配方（粉蓝 · 信号红）下最强格明显比原墨深（3:1 可读）',
+        (tester) async {
+      SharedPreferences.setMockInitialValues({});
+      final stats = WatchStats();
+      final now = DateTime.now();
+      await stats.record(3600, at: now);
+      final recipe = inkRecipeById('powder_blue_signal_red')!;
+      final palette = AppPalette.fromRecipe(recipe);
+
+      await tester.pumpWidget(MaterialApp(
+        theme: buildAppTheme(recipe),
+        home: Scaffold(body: WatchStatsPage(stats: stats)),
+      ));
+      await tester.pumpAndSettle();
+
+      final todayKey = WatchStats.dateKey(now);
+      final cell = tester.widget<Container>(
+        find.descendant(
+          of: find.byKey(ValueKey('heatcell-$todayKey')),
+          matching: find.byType(Container),
+        ),
+      );
+      final deco = cell.decoration as BoxDecoration;
+      expect(deco.color, palette.inkDeco);
+      expect(deco.color, isNot(palette.ink)); // 不再是那个读不出来的浅墨
+      expect(
+        contrastRatio(deco.color!, kPaper),
+        greaterThanOrEqualTo(kMinContrastGraphic),
+      );
     });
   });
 }

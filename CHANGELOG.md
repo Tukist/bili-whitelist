@@ -8,6 +8,22 @@
 
 ---
 
+## v2.18.0 (2026-09-10)
+
+**视觉体系级重构 + 动效系统建设：token 化设计地基（克莱因蓝 + 暖白底材、全面去阴影改描边）、块化设计语言（AppBlock 6 变体）、交错入场 + 封面飞入、风衣男剪影加载动画；首页改 Material 3 底部导航四页签，App 与项目更名 amoTV**
+
+- **视觉地基与配色系统（新 `app/lib/theme/app_tokens.dart`、`app/lib/theme/app_theme.dart`）**：新建 token 体系（颜色 / 字阶 / 间距 / 圆角 / 动效）与主题工厂 `buildAppTheme`，**全库 197 处硬编码颜色统一收敛到 token**（不再散落魔法色值）；主色由 B 站蓝 `#00A1D6` 换成**克莱因蓝 `#002FA7`**，底材改**暖白 `#FAFAF7`**，**取消一切阴影**——层级改由 **1px 描边 + 底材差**表达；新增 `app/lib/theme/ink_recipes.dart`（**10 套双墨配色**，取自 mono-color-skill 的双色表）+ `app/lib/theme/app_palette.dart`（`AppPalette extends ThemeExtension`，内置 **WCAG 对比度护栏**：`inkFill` / `inkText` / `inkDeco` 分档，浅墨配方自动压深到 4.5:1 / 3:1）+ `app/lib/services/theme_store.dart`（本地持久化）；**设置面板新增「配色主题」选择器**（10 套，点击即生效、杀 App 重进保持）
+- **品牌与导航结构（`app/lib/pages/playlist_page.dart` 等）**：App 与项目更名为 **amoTV**（Android 显示名、AppBar 标题、README、油猴脚本 `@name`；`applicationId` 与 Dart 包名按工程判断**未改**，以免用户数据丢失）；首页导航从「AppBar 图标 + PageView 横滑」改为 **Material 3 底部导航 4 项**——合集 / UP 主 / 历史 / **个人**（原「统计」+「设置」合并为「个人」，统计在上、设置在下）；「新建合集」从设置区移到合集页（顶部常驻按钮 + 空态行动按钮）；修复导航栏 1px 顶线被 `NavigationBar` 不透明背景盖掉，AppBar 与卡片补描边
+- **块化设计语言（新 `app/lib/widgets/app_block.dart`）**：`AppBlock` 提供 6 个变体（`videoInfo` / `comment` / `reply` / `videoCard` / `collectionCard` / `setting`），靠「底材差 + 描边重量 + 左侧竖条 + 圆角」四轴表达层级；评论块 / 回复块（缩进 + 左侧竖条 + 下沉底色）/ 视频卡 / 历史卡 / 播放页信息块 / 合集卡全部块化；播放页信息块带左侧短竖条（主墨图形档）
+- **动效系统（新 `app/lib/theme/app_motion.dart`、`app/lib/theme/motion_control.dart`、`app/lib/widgets/staggered_entrance.dart`）**：入场节奏 token 化；全局动效开关 **在测试环境自动关闭**（避免无限动画卡住 `pumpAndSettle`）；**交错入场**——首屏 36ms/条、240ms 单条、最长 528ms 封顶，翻页追加 20ms / 180ms / 300ms，配 `EntranceLedger` 记账（滚出滚回不重播），应用于评论、历史、收藏夹、夹内视频、搜索结果（视频 / 番剧 / UP 主）、信箱、UP 主页、关注导入；**页面转场升级为三段式**（淡入 + 3% 上滑 + 下层压暗），**播放页走快速淡入无位移**（配合封面飞入）；新增 `app/lib/widgets/cover_hero.dart` + 播放页封面占位层——**点卡片时封面飞入播放页**（原生纹理无法 Hero，故为「封面 → 占位 → 淡出露画面」的假转场，含 1200ms 兜底超时）；播放页信息块**延迟补场**（120ms 后 320ms 内淡入 + 96%→100% 微放大），与封面飞行时间重叠
+- **加载动画与加载文案（新 `app/lib/widgets/smoke_silhouette.dart`、`app/lib/widgets/animated_copy_line.dart`）**：**通用风衣男抽烟剪影**（不指向任何具体角色，规避版权），剪影用主墨图形档、烟用点缀墨，3 条非等分相位烟缕为确定性动画（3200ms 周期）；`AnimatedCopyLine` 逐字淡入 + 上浮 4px；新增 `AppLoadingHero`（剪影 + 主文案 + 逐字副文案），各页整页加载与分页 footer 换用；新增 **15 条可编辑加载文案**（`loading.line.*` / `footer.loading.*` / `loading.empty.*`），走既有 `UiCopyStore` 机制，用户可在设置里改写
+- **其它视觉与交互收口**：空态 / 错误态统一到 `AppStateView` / `AppErrorView` + `DotIllustration` 细线插画（每页不同 seed），删掉 5 个重复的私有状态组件；合集卡成为视觉主角——**「N 天前更新 / 加入」角标**（点缀墨）+ **底部 3px 观看进度条** + 「已看 X/Y」；新增 `app/lib/widgets/add_success_button.dart`（「加入白名单」三态按钮 + **波纹扩散 + 描边生长对勾**确认动效）；播放页进度条从系统 `Slider` 改为自绘细轨（2px + 暗垫，亮 / 暗画面双向可见），底部按钮开启态加「纸白短线」（颜色不是唯一信息载体）；`HistoryStore.maxEntries` **200 → 1000**
+- 修复 6 处模拟器实测发现的缺陷：导航描边不渲染、播放页标签截断、进度条亮底不可见、未读角标不随配色、返回键与横幅重叠、浅墨下热力图对比度不足；修复 2 个集成测试既有失败（comment_flow 日志白名单漏 `[comment_list]` 前缀；landscape_pin 依赖宿主机手工旋转 → 改为测试自触发）
+- 测试：`flutter analyze` **0 issue**；全量 `flutter test` **1149 例全绿**（本轮由 866 例增至 1149 例，新增覆盖 token / 双墨配色与 WCAG 护栏、块组件 6 变体、交错入场与 `EntranceLedger` 记账、动效开关的测试环境自动关闭、加载文案可编辑等）；集成测试 **11 例全绿**（含横屏置顶模式流程）
+- 验证：debug APK 装机模拟器（AVD `bili_test` / Android 15）实测取证——底部导航四页签切换与描边渲染、10 套配色切换即时生效且杀进程重进保持、块化观感（底材差 / 描边 / 左侧竖条层级可辨）、列表交错入场逐条浮现、剪影加载动画 + 逐字文案、点卡片封面飞入播放页（占位淡出露画面）、「加入白名单」确认动效（波纹扩散 + 对勾生长）
+
+---
+
 ## v2.17.17 (2026-09-09)
 
 **横屏置顶模式：退出全屏不再强制转竖屏——设备横放停在横屏「顶部置顶视频 + 下方评论区」；布局横竖屏自适应**

@@ -2,11 +2,17 @@
 // - 新数据（pubdate 非空）→ 副信息行含 `· yyyy-MM-dd`
 // - 旧数据（pubdate null / 0）→ 副信息行与旧版逐字符一致（不含日期段），
 //   不崩、不破坏布局（标题/时长照常渲染）
+// - 块化（P0 批次 B）：外形给 ListTile 自己（圆角 + 强描边 + 纸底），
+//   **容器类型不变**（`find.byType(VideoTile)` 照旧命中）；封面外层包
+//   CoverHero（空 bvid → 零 Hero 节点），多选模式整块关掉 Hero。
 // 纯 widget 测试，无网络（cover 空串 → CoverImage 走本地占位）。
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:bili_whitelist_app/models/whitelist_video.dart';
+import 'package:bili_whitelist_app/theme/app_tokens.dart';
+import 'package:bili_whitelist_app/widgets/cover_hero.dart';
+import 'package:bili_whitelist_app/widgets/cover_image.dart';
 import 'package:bili_whitelist_app/widgets/video_tile.dart';
 
 /// 与模型 formatPubdate 同语义的本地日期推导（跨时区机器测试稳定）。
@@ -17,8 +23,8 @@ String _dateText(int sec) {
   return '${dt.year}-$m-$d';
 }
 
-WhitelistVideo _video({int? pubdate}) => WhitelistVideo(
-      bvid: 'BV1',
+WhitelistVideo _video({int? pubdate, String bvid = 'BV1'}) => WhitelistVideo(
+      bvid: bvid,
       cid: 1,
       title: '测试视频标题',
       cover: '',
@@ -56,5 +62,57 @@ void main() {
     await tester.pumpWidget(_wrap(VideoTile(video: _video(pubdate: 0))));
     expect(find.text('1:30 · UP主'), findsOneWidget);
     expect(find.textContaining(RegExp(r'· \d{4}-\d{2}-\d{2}')), findsNothing);
+  });
+
+  testWidgets('块化：容器类型不变，外形落在 ListTile 自己身上', (tester) async {
+    await tester.pumpWidget(_wrap(VideoTile(video: _video())));
+
+    // 容器类型不变（页面测试按类型抓取 VideoTile / ListTile）
+    expect(find.byType(VideoTile), findsOneWidget);
+    expect(find.byType(ListTile), findsOneWidget);
+
+    final tile = tester.widget<ListTile>(find.byType(ListTile));
+    final shape = tile.shape! as RoundedRectangleBorder;
+    expect(shape.side.color, kRuleStrong, reason: '1px 强描边');
+    expect(shape.side.width, 1);
+    expect(shape.borderRadius, BorderRadius.circular(kRadiusMd));
+    expect(tile.tileColor, kPaper, reason: '纸底');
+    expect(tile.contentPadding,
+        const EdgeInsets.fromLTRB(kSpace8, kSpace4, kSpace8, kSpace4));
+    // 触摸目标：两行 tile 高度 ≥ 48dp
+    expect(tester.getSize(find.byType(ListTile)).height,
+        greaterThanOrEqualTo(48.0));
+    // 空 cover 走本地占位，不触网、不崩
+    expect(find.byType(CoverImage), findsOneWidget);
+    expect(find.text('测试视频标题'), findsOneWidget);
+  });
+
+  testWidgets('封面 Hero：bvid 非空包 Hero；bvid 空 → 零 Hero 节点', (tester) async {
+    await tester.pumpWidget(_wrap(VideoTile(video: _video(bvid: 'BV1HERO0001'))));
+    expect(find.byType(Hero), findsOneWidget);
+    expect(
+      find.descendant(
+        of: find.byType(CoverHero),
+        matching: find.byType(CoverImage),
+      ),
+      findsOneWidget,
+    );
+
+    // bvid 为空 → coverHeroTag 返回 null → CoverHero 直接给 child（无 Hero）
+    await tester.pumpWidget(_wrap(VideoTile(video: _video(bvid: ''))));
+    expect(find.byType(CoverHero), findsOneWidget);
+    expect(find.byType(Hero), findsNothing);
+  });
+
+  testWidgets('多选模式：整块 HeroMode 关掉（不飞残影封面）', (tester) async {
+    await tester.pumpWidget(_wrap(VideoTile(
+      video: _video(),
+      selectMode: true,
+      selected: false,
+    )));
+    expect(tester.widget<HeroMode>(find.byType(HeroMode)).enabled, isFalse);
+    // 多选态结构照旧：勾选框在
+    expect(find.byType(Checkbox), findsOneWidget);
+    expect(find.byType(ListTile), findsOneWidget);
   });
 }

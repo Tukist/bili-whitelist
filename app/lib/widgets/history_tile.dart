@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 
 import '../services/history_store.dart';
+import '../theme/app_tokens.dart';
 import 'cover_image.dart';
 
 /// 历史记录条目（v2.17.10+ 自 HistoryPage 抽取为公共组件）：
@@ -49,15 +50,21 @@ class HistoryTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    // 块化（P0 批次 B）：与视频卡同一套外形 —— 纸底 + 1px 强描边 + kRadiusMd，
+    // 不用阴影；**保留 ListTile**（页面测试按 `find.byType(ListTile)` 计数）。
     return Material(
-      color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: .45),
-      borderRadius: BorderRadius.circular(12),
+      color: kPaper,
+      elevation: 0,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(kRadiusMd),
+        side: const BorderSide(color: kRuleStrong),
+      ),
       clipBehavior: Clip.antiAlias,
       child: ListTile(
         onTap: onOpen,
         onLongPress: onRemove,
         leading: ClipRRect(
-          borderRadius: BorderRadius.circular(4),
+          borderRadius: BorderRadius.circular(kRadiusSm),
           child: CoverImage(cover: entry.cover, width: 112, height: 63),
         ),
         title: Text(

@@ -39,14 +39,22 @@ const List<(String, int)> _candidatePgc = [
   ('BV1Pa41197Hm', 634284), // 神奇动物：邓布利多之谜 中文版
 ];
 
-/// 捕获 App 内 debugPrint 关键行（[comment_page]/[bili_api]…），作行为证据。
+/// 捕获 App 内 debugPrint 关键行（[comment_list]/[comment_page]/[bili_api]…），
+/// 作行为证据。
+///
+/// 注意：评论列表自身的业务日志前缀是 `[comment_list]`（见
+/// `lib/widgets/comment_list.dart`：主评论页 aid=… / 展开楼中楼 root=… 都在
+/// 这里），`[comment_page]` 只是**评论页外壳**（标题/链接跳转）的日志——旧版
+/// 白名单漏了 `[comment_list]`，于是「主评论页 aid=」「展开楼中楼 root=」两条
+/// 断言永远取不到证据（评论其实已加载成功，见运行日志），v2.17.18 已补上。
 List<String> _logs = [];
 void _captureDebugPrint() {
   _logs = [];
   final original = debugPrint;
   debugPrint = (String? message, {int? wrapWidth}) {
     if (message != null &&
-        (message.contains('[comment_page]') ||
+        (message.contains('[comment_list]') ||
+            message.contains('[comment_page]') ||
             message.contains('fetchVideoComments') ||
             message.contains('fetchReplyChildren') ||
             message.contains('图片加载失败') ||

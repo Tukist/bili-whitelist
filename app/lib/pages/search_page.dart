@@ -27,6 +27,19 @@
 ///
 /// UP 主 Tab：复用同一套防抖逻辑（不分页排序 chip，因为 search_type=bili_user
 /// 接口只支持默认排序），结果列表用 [UpownerTile] 展示，点整行跳 [UpownerPage]。
+///
+/// 块化与动效（批次 4）：
+/// - 三套结果列表（视频 / 番剧媒体 / UP 主）各自挂在 [StaggeredListScope] 下，
+///   每条结果包 [StaggeredEntrance]：首屏逐条推入，翻页追加用更短更密的节奏；
+///   代次串为 `search.<kind>#<代次>`，每次「重新搜索」自增（换关键词 / 重搜 /
+///   切范围 / 切排序都会重演一次）；
+/// - 整页等待（搜索中）= [AppLoadingHero]（抽烟剪影 + 加载闲话），
+///   列表底部翻页 = 小剪影 + 一句 footer 闲话；
+/// - 按钮内联转圈（「加入」14px）**保持** `CircularProgressIndicator`：
+///   那是操作反馈，不是等待画面；
+/// - 视频结果的「加入」按钮 = [AddSuccessButton]（P7）：三态（加入 / 转圈 /
+///   已加入）+ 加入成功时叠加一次波纹扩散 + 描边生长的勾（文案与提交逻辑
+///   都不变，只是呈现层换了）。
 library;
 
 import 'dart:async';
@@ -41,13 +54,21 @@ import '../models/media_search_result.dart';
 import '../models/search_result.dart';
 import '../models/upowner.dart';
 import '../models/whitelist_video.dart';
+import '../services/loading_copy.dart';
 import '../services/search_history_store.dart';
 import '../services/service_locator.dart';
 import '../services/upowner_writer.dart';
 import '../services/whitelist_writer.dart';
 import '../sync/whitelist_source.dart';
+import '../theme/app_motion.dart';
+import '../theme/app_tokens.dart';
+import '../widgets/add_success_button.dart';
+import '../widgets/animated_copy_line.dart';
+import '../widgets/app_state_view.dart';
 import '../widgets/cover_image.dart';
 import '../widgets/pgc_import_dialog.dart';
+import '../widgets/smoke_silhouette.dart';
+import '../widgets/staggered_entrance.dart';
 import '../widgets/upowner_tile.dart';
 import 'player_page.dart';
 import 'upowner_page.dart';
@@ -212,6 +233,31 @@ class _SearchPageState extends State<SearchPage>
   /// 正在「加入」的 bvid / mid 集合（防止连点重复提交）。
   final Set<String> _joining = {};
   final Set<int> _joiningUpowners = {};
+
+  // ---- 交错入场（批次 4）---------------------------------------------------
+
+  /// 三套结果列表各一本「已入场」账本：活在列表项之外（State 持有），
+  /// ListView 回收元素再出现时不重播。
+  final EntranceLedger _videoLedger = EntranceLedger();
+  final EntranceLedger _mediaLedger = EntranceLedger();
+  final EntranceLedger _upownerLedger = EntranceLedger();
+
+  /// 数据代次：每次「重新搜索」（换关键词 / 手动重搜 / 切范围 / 切排序）
+  /// 自增 —— 三套列表的代次串里都带上它，配合清空的账本重演一次。
+  int _reloadToken = 0;
+
+  /// 本批次起点（翻页追加时置为「追加前的条数」）：新增项按
+  /// `i - batchStart` 从 0 排队；0 = 首屏，直接用 i。
+  int _videoBatchStart = 0;
+  int _mediaBatchStart = 0;
+  int _upownerBatchStart = 0;
+
+  /// 重新搜索 = 换了一批数据：代次 +1（generation 变）+ 清空账本
+  /// （同一个 bvid / seasonId / mid 允许再演一次）。
+  void _restartEntrance(EntranceLedger ledger) {
+    _reloadToken++;
+    ledger.clear();
+  }
 
   /// 输入防抖 Timer（搜索接口风控严格，不高频连续搜索）。
   Timer? _debounce;
@@ -461,6 +507,9 @@ class _SearchPageState extends State<SearchPage>
   /// 视频搜索（Tab=0）。
   Future<void> _doVideoSearch() async {
     final keyword = _keywordCtrl.text.trim();
+    // 新一批数据（含重搜同一关键词）→ 重演入场
+    _restartEntrance(_videoLedger);
+    _videoBatchStart = 0;
     setState(() {
       _searching = true;
       _searchError = null;
@@ -496,6 +545,8 @@ class _SearchPageState extends State<SearchPage>
   /// media（番剧/电影/电视剧）搜索（Tab=0 + 范围非视频）。
   Future<void> _doMediaSearch() async {
     final keyword = _keywordCtrl.text.trim();
+    _restartEntrance(_mediaLedger);
+    _mediaBatchStart = 0;
     setState(() {
       _mediaSearching = true;
       _mediaError = null;
@@ -534,6 +585,8 @@ class _SearchPageState extends State<SearchPage>
   /// UP 主搜索（Tab=2）：search_type=bili_user，不带排序 chip。
   Future<void> _doUpownerSearch() async {
     final keyword = _keywordCtrl.text.trim();
+    _restartEntrance(_upownerLedger);
+    _upownerBatchStart = 0;
     setState(() {
       _upownerSearching = true;
       _upownerError = null;
@@ -619,6 +672,8 @@ class _SearchPageState extends State<SearchPage>
         _mediaPage = nextPage;
         _mediaHasMore = page.hasMore;
         _mediaLoadingMore = false;
+        // 本批新增项的入场序号从 0 起算（旧项已记账不会重播）
+        _mediaBatchStart = base.length;
       });
     } on BiliApiException catch (e) {
       if (!mounted) return;
@@ -661,6 +716,8 @@ class _SearchPageState extends State<SearchPage>
         _page = nextPage;
         _hasMore = page.hasMore;
         _loadingMore = false;
+        // 本批新增项的入场序号从 0 起算（旧项已记账不会重播）
+        _videoBatchStart = base.length;
       });
     } on BiliApiException catch (e) {
       if (!mounted) return;
@@ -696,6 +753,8 @@ class _SearchPageState extends State<SearchPage>
         _upownerPage = nextPage;
         _upownerHasMore = result.hasMore;
         _upownerLoadingMore = false;
+        // 本批新增项的入场序号从 0 起算（旧项已记账不会重播）
+        _upownerBatchStart = base.length;
       });
     } on BiliApiException catch (e) {
       if (!mounted) return;
@@ -717,7 +776,7 @@ class _SearchPageState extends State<SearchPage>
     setState(() => _joining.add(r.bvid));
     try {
       if (!await _writer.hasConfig()) {
-        _showSnack('请先在首页右上角「管理」入口配置 GitHub token 与 Gist ID');
+        _showSnack('请先到底部导航「个人」页配置 GitHub token 与 Gist ID');
         return;
       }
       final result = await _writer.addByBvid(r.bvid);
@@ -750,7 +809,7 @@ class _SearchPageState extends State<SearchPage>
       await runPgcSeasonImport(
         context: context,
         writer: _writer,
-        configHint: '请先在首页右上角「管理」入口配置 GitHub token 与 Gist ID',
+        configHint: '请先到底部导航「个人」页配置 GitHub token 与 Gist ID',
         seasonId: m.seasonId,
         onDone: (_) async {
           await _loadWhitelist();
@@ -1014,29 +1073,29 @@ class _SearchPageState extends State<SearchPage>
 
   Widget _buildGlobalResults() {
     if (_searching) {
-      return const Center(child: CircularProgressIndicator());
+      // 整页等待：抽烟剪影 + 加载闲话（同 seed 恒同一条文案）
+      return const AppLoadingHero(seed: 'search.video');
     }
     if (_searchError != null) {
-      return _MessageView(
-        icon: Icons.error_outline,
+      return AppErrorView(
         message: _searchError!,
-        actionLabel: '重试',
-        onAction: _doSearch,
+        onRetry: _doSearch,
+        illustrationSeed: 'search.video',
       );
     }
     final results = _results;
     if (results == null) {
-      return const _MessageView(
-        icon: Icons.search,
-        message:
-            '输入关键词，搜索 B 站全网视频\n'
-            '结果可一键加入白名单（加入前会查重）',
+      return const AppStateView(
+        kind: AppStateKind.empty,
+        copyId: 'empty.search',
+        illustrationSeed: 'search.video',
       );
     }
     if (results.isEmpty) {
-      return const _MessageView(
-        icon: Icons.search_off,
-        message: '没有找到相关视频，换个关键词试试',
+      return const AppStateView(
+        kind: AppStateKind.empty,
+        copyId: 'empty.search.result',
+        illustrationSeed: 'search.video.result',
       );
     }
     final theme = Theme.of(context);
@@ -1044,30 +1103,62 @@ class _SearchPageState extends State<SearchPage>
     final showNoMore = !_hasMore && !showLoadingMore;
     // 列表项 + 底部状态（加载中 / 没有更多了）
     final extraSlots = (showLoadingMore || showNoMore) ? 1 : 0;
-    return ListView.separated(
-      controller: _scrollCtrl,
-      itemCount: results.length + extraSlots,
-      separatorBuilder: (_, __) => const Divider(height: 1, indent: 112),
-      itemBuilder: (context, i) {
-        if (i >= results.length) {
-          return _buildBottomStatus(showLoadingMore, showNoMore);
-        }
-        return _buildResultTile(theme, results[i]);
-      },
+    final appendBatch = _videoBatchStart > 0;
+    // 交错入场：scope 只提供「代次 + 账本」，列表仍由 ListView 懒加载
+    // （每项自己决定演不演，不预建整表）。
+    return StaggeredListScope(
+      generation: 'search.video#$_reloadToken',
+      ledger: _videoLedger,
+      child: ListView.separated(
+        controller: _scrollCtrl,
+        itemCount: results.length + extraSlots,
+        separatorBuilder: (_, __) => const Divider(height: 1, indent: 112),
+        itemBuilder: (context, i) {
+          if (i >= results.length) {
+            return _buildBottomStatus(
+              showLoadingMore,
+              showNoMore,
+              seed: 'search.video',
+            );
+          }
+          final r = results[i];
+          // 翻页追加：序号相对本批起点从 0 起算（旧项已记账不会重播，
+          // 负数夹到 0 —— Interval 拿到负起点会 assert）
+          final int rawIndex = i - _videoBatchStart;
+          return StaggeredEntrance(
+            entryKey: 'bvid:${r.bvid}',
+            index: rawIndex < 0 ? 0 : rawIndex,
+            step: appendBatch ? kStaggerStepAppend : kStaggerStep,
+            duration: appendBatch ? kDurEntranceAppend : kDurEntrance,
+            maxIndex: appendBatch ? kStaggerMaxIndexAppend : kStaggerMaxIndex,
+            child: _buildResultTile(theme, r),
+          );
+        },
+      ),
     );
   }
 
   /// 列表底部状态：加载中 / 没有更多了。
-  Widget _buildBottomStatus(bool showLoadingMore, bool showNoMore) {
+  Widget _buildBottomStatus(
+    bool showLoadingMore,
+    bool showNoMore, {
+    required String seed,
+  }) {
     if (showLoadingMore) {
-      return const Padding(
-        padding: EdgeInsets.symmetric(vertical: 16),
-        child: Center(
-          child: SizedBox(
-            width: 18,
-            height: 18,
-            child: CircularProgressIndicator(strokeWidth: 2),
-          ),
+      // 翻页加载：小剪影 + 一句 footer 闲话（同 seed 恒同一条）。
+      // 高度锁在 78（原 18px 转圈 + 上下各 16 = 50）——只涨在列表尾部。
+      return SizedBox(
+        height: 78,
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const SmokeSilhouette(size: 56),
+            const SizedBox(height: kSpace4),
+            AnimatedCopyLine(
+              text: loadingCopyFor(pool: kLoadingPoolFooter, seed: seed),
+              style: kTypeBodyS.copyWith(color: kInkGray70),
+            ),
+          ],
         ),
       );
     }
@@ -1121,18 +1212,14 @@ class _SearchPageState extends State<SearchPage>
           ),
         ],
       ),
-      trailing: added
-          ? const FilledButton.tonal(onPressed: null, child: Text('已加入'))
-          : FilledButton(
-              onPressed: joining ? null : () => _join(r),
-              child: joining
-                  ? const SizedBox(
-                      width: 14,
-                      height: 14,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : const Text('加入'),
-            ),
+      // 三态 + 加入成功的确认动效（波纹 + 打勾，v2.18.x P7）；
+      // 「加入」/「已加入」文案不变（既有测试锚点），提交逻辑仍在 _join。
+      trailing: AddSuccessButton(
+        state: added
+            ? AddState.added
+            : (joining ? AddState.loading : AddState.idle),
+        onPressed: () => _join(r),
+      ),
     );
   }
 
@@ -1142,44 +1229,65 @@ class _SearchPageState extends State<SearchPage>
   /// 底部「加载中/没有更多了」复用 [_buildBottomStatus]。
   Widget _buildMediaResults() {
     if (_mediaSearching) {
-      return const Center(child: CircularProgressIndicator());
+      return const AppLoadingHero(seed: 'search.media');
     }
     if (_mediaError != null) {
-      return _MessageView(
-        icon: Icons.error_outline,
+      return AppErrorView(
         message: _mediaError!,
-        actionLabel: '重试',
-        onAction: _doSearch,
+        onRetry: _doSearch,
+        illustrationSeed: 'search.media',
       );
     }
     final results = _mediaResults;
     if (results == null) {
-      return _MessageView(
-        icon: Icons.movie_filter_outlined,
-        message: '输入关键词，搜索 B 站${_scope.label}\n'
+      return AppStateView(
+        kind: AppStateKind.empty,
+        // 范围名（番剧/电影/电视剧）是动态的 → 直给文案
+        title: '输入关键词，搜索 B 站${_scope.label}\n'
             '结果可一键整季导入白名单（加入前逐集查重）',
+        illustrationSeed: 'search.media',
       );
     }
     if (results.isEmpty) {
-      return _MessageView(
-        icon: Icons.search_off,
-        message: '没有找到相关${_scope.emptyMessage}，换个关键词试试',
+      return AppStateView(
+        kind: AppStateKind.empty,
+        title: '没有找到相关${_scope.emptyMessage}，换个关键词试试',
+        illustrationSeed: 'search.media.result',
       );
     }
     final theme = Theme.of(context);
     final showLoadingMore = _mediaLoadingMore;
     final showNoMore = !_mediaHasMore && !showLoadingMore;
     final extraSlots = (showLoadingMore || showNoMore) ? 1 : 0;
-    return ListView.separated(
-      controller: _scrollCtrl,
-      itemCount: results.length + extraSlots,
-      separatorBuilder: (_, __) => const Divider(height: 1, indent: 112),
-      itemBuilder: (context, i) {
-        if (i >= results.length) {
-          return _buildBottomStatus(showLoadingMore, showNoMore);
-        }
-        return _buildMediaTile(theme, results[i]);
-      },
+    final appendBatch = _mediaBatchStart > 0;
+    // 交错入场：整个 media 结果列表挂 scope（番剧按 seasonId 记账）
+    return StaggeredListScope(
+      generation: 'search.media#$_reloadToken',
+      ledger: _mediaLedger,
+      child: ListView.separated(
+        controller: _scrollCtrl,
+        itemCount: results.length + extraSlots,
+        separatorBuilder: (_, __) => const Divider(height: 1, indent: 112),
+        itemBuilder: (context, i) {
+          if (i >= results.length) {
+            return _buildBottomStatus(
+              showLoadingMore,
+              showNoMore,
+              seed: 'search.media',
+            );
+          }
+          final m = results[i];
+          final int rawIndex = i - _mediaBatchStart;
+          return StaggeredEntrance(
+            entryKey: 'season:${m.seasonId}',
+            index: rawIndex < 0 ? 0 : rawIndex,
+            step: appendBatch ? kStaggerStepAppend : kStaggerStep,
+            duration: appendBatch ? kDurEntranceAppend : kDurEntrance,
+            maxIndex: appendBatch ? kStaggerMaxIndexAppend : kStaggerMaxIndex,
+            child: _buildMediaTile(theme, m),
+          );
+        },
+      ),
     );
   }
 
@@ -1234,12 +1342,15 @@ class _SearchPageState extends State<SearchPage>
           color: theme.colorScheme.outline,
         ),
       ),
-      trailing: imported
-          ? const FilledButton.tonal(onPressed: null, child: Text('已导入'))
-          : FilledButton(
-              onPressed: importing ? null : () => _importMedia(m),
-              child: const Text('导入'),
-            ),
+      // 整季导入按钮：同样换 [AddSuccessButton]（P7）。这里**不用 loading 态**——
+      // 现存观感就是「禁用但文案不变」（进度由 runPgcSeasonImport 的进度对话框
+      // 负责），多一个内联转圈会和对话框打架，故 importing 映射成 idle + 禁用。
+      trailing: AddSuccessButton(
+        state: imported ? AddState.added : AddState.idle,
+        idleLabel: '导入',
+        addedLabel: '已导入',
+        onPressed: importing ? null : () => _importMedia(m),
+      ),
     );
   }
 
@@ -1247,16 +1358,18 @@ class _SearchPageState extends State<SearchPage>
 
   Widget _buildWhitelistTab() {
     if (_whitelist == null) {
-      return const _MessageView(
-        icon: Icons.cloud_off_outlined,
-        message: '白名单加载失败或暂无数据\n请确认网络后重新进入搜索页',
+      return const AppStateView(
+        kind: AppStateKind.empty,
+        copyId: 'empty.search.whitelist',
+        illustrationSeed: 'search.whitelist',
       );
     }
     final videos = _filteredWhitelist;
     if (videos.isEmpty) {
-      return const _MessageView(
-        icon: Icons.playlist_play,
-        message: '白名单里没有匹配的视频',
+      return const AppStateView(
+        kind: AppStateKind.empty,
+        copyId: 'empty.search.whitelist.filter',
+        illustrationSeed: 'search.whitelist.filter',
       );
     }
     final theme = Theme.of(context);
@@ -1303,81 +1416,106 @@ class _SearchPageState extends State<SearchPage>
 
   Widget _buildUpownerResults() {
     if (_upownerSearching) {
-      return const Center(child: CircularProgressIndicator());
+      return const AppLoadingHero(seed: 'search.upowner');
     }
     if (_upownerError != null) {
-      return _MessageView(
-        icon: Icons.error_outline,
+      return AppErrorView(
         message: _upownerError!,
-        actionLabel: '重试',
-        onAction: _doSearch,
+        onRetry: _doSearch,
+        illustrationSeed: 'search.upowner',
       );
     }
     final results = _upownerResults;
     if (results == null) {
-      return const _MessageView(
-        icon: Icons.person_search,
-        message:
-            '输入 UP 主昵称，搜索 B 站用户\n'
+      return const AppStateView(
+        kind: AppStateKind.empty,
+        title: '输入 UP 主昵称，搜索 B 站用户\n'
             '结果可一键关注（= 加入白名单 UP 主，加入前会查重）',
+        illustrationSeed: 'search.upowner',
       );
     }
     if (results.isEmpty) {
-      return const _MessageView(
-        icon: Icons.search_off,
-        message: '没有找到相关 UP 主，换个关键词试试',
+      return const AppStateView(
+        kind: AppStateKind.empty,
+        title: '没有找到相关 UP 主，换个关键词试试',
+        illustrationSeed: 'search.upowner.result',
       );
     }
     final showLoadingMore = _upownerLoadingMore;
     final showNoMore = !_upownerHasMore && !showLoadingMore;
     final extraSlots = (showLoadingMore || showNoMore) ? 1 : 0;
-    return ListView.separated(
-      controller: _scrollCtrl,
-      itemCount: results.length + extraSlots,
-      separatorBuilder: (_, __) => const Divider(height: 1, indent: 80),
-      itemBuilder: (context, i) {
-        if (i >= results.length) {
-          return _buildUpownerBottomStatus(showLoadingMore, showNoMore);
-        }
-        final up = results[i];
-        return UpownerTile(
-          upowner: up,
-          added: _isUpownerAdded(up.mid),
-          joining: _joiningUpowners.contains(up.mid),
-          onJoin: () => _joinUpowner(up),
-          onTap: () async {
-            // 跳 UP 主详情页（v2.13.0+）：展示 UP 主信息 + 视频列表
-            // v2.17.12+：详情页可「关注/取消关注」，返回 true（改过状态）
-            // 时刷新本页白名单快照（「关注」按钮状态与白名单 Tab 同步）
-            final changed = await Navigator.of(context).push<bool>(
-              MaterialPageRoute(
-                builder: (_) => UpownerPage(
-                  mid: up.mid,
-                  initial: up,
-                  isInWhitelist: _isUpownerAdded(up.mid),
-                ),
-              ),
+    final appendBatch = _upownerBatchStart > 0;
+    // 交错入场：UP 主结果按 mid 记账
+    return StaggeredListScope(
+      generation: 'search.upowner#$_reloadToken',
+      ledger: _upownerLedger,
+      child: ListView.separated(
+        controller: _scrollCtrl,
+        itemCount: results.length + extraSlots,
+        separatorBuilder: (_, __) => const Divider(height: 1, indent: 80),
+        itemBuilder: (context, i) {
+          if (i >= results.length) {
+            return _buildUpownerBottomStatus(
+              showLoadingMore,
+              showNoMore,
             );
-            if (changed == true && mounted) {
-              await _loadWhitelist();
-            }
-          },
-        );
-      },
+          }
+          final up = results[i];
+          final int rawIndex = i - _upownerBatchStart;
+          return StaggeredEntrance(
+            entryKey: 'mid:${up.mid}',
+            index: rawIndex < 0 ? 0 : rawIndex,
+            step: appendBatch ? kStaggerStepAppend : kStaggerStep,
+            duration: appendBatch ? kDurEntranceAppend : kDurEntrance,
+            maxIndex: appendBatch ? kStaggerMaxIndexAppend : kStaggerMaxIndex,
+            child: UpownerTile(
+              upowner: up,
+              added: _isUpownerAdded(up.mid),
+              joining: _joiningUpowners.contains(up.mid),
+              onJoin: () => _joinUpowner(up),
+              onTap: () async {
+                // 跳 UP 主详情页（v2.13.0+）：展示 UP 主信息 + 视频列表
+                // v2.17.12+：详情页可「关注/取消关注」，返回 true（改过状态）
+                // 时刷新本页白名单快照（「关注」按钮状态与白名单 Tab 同步）
+                final changed = await Navigator.of(context).push<bool>(
+                  MaterialPageRoute(
+                    builder: (_) => UpownerPage(
+                      mid: up.mid,
+                      initial: up,
+                      isInWhitelist: _isUpownerAdded(up.mid),
+                    ),
+                  ),
+                );
+                if (changed == true && mounted) {
+                  await _loadWhitelist();
+                }
+              },
+            ),
+          );
+        },
+      ),
     );
   }
 
   /// UP 主列表底部状态：加载中 / 没有更多了。
   Widget _buildUpownerBottomStatus(bool showLoadingMore, bool showNoMore) {
     if (showLoadingMore) {
-      return const Padding(
-        padding: EdgeInsets.symmetric(vertical: 16),
-        child: Center(
-          child: SizedBox(
-            width: 18,
-            height: 18,
-            child: CircularProgressIndicator(strokeWidth: 2),
-          ),
+      // 与视频/media 列表同款：小剪影 + 一句 footer 闲话，高度锁 78
+      return SizedBox(
+        height: 78,
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const SmokeSilhouette(size: 56),
+            const SizedBox(height: kSpace4),
+            AnimatedCopyLine(
+              text: loadingCopyFor(
+                pool: kLoadingPoolFooter,
+                seed: 'search.upowner',
+              ),
+              style: kTypeBodyS.copyWith(color: kInkGray70),
+            ),
+          ],
         ),
       );
     }
@@ -1395,48 +1533,5 @@ class _SearchPageState extends State<SearchPage>
       );
     }
     return const SizedBox.shrink();
-  }
-}
-
-/// 提示视图（搜索前提示 / 无结果 / 错误）。
-class _MessageView extends StatelessWidget {
-  final IconData icon;
-  final String message;
-  final String? actionLabel;
-  final VoidCallback? onAction;
-
-  const _MessageView({
-    required this.icon,
-    required this.message,
-    this.actionLabel,
-    this.onAction,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return Center(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icon, size: 56, color: theme.colorScheme.outline),
-          const SizedBox(height: 12),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 32),
-            child: Text(
-              message,
-              textAlign: TextAlign.center,
-              style: theme.textTheme.bodyMedium?.copyWith(
-                color: theme.colorScheme.onSurfaceVariant,
-              ),
-            ),
-          ),
-          if (actionLabel != null && onAction != null) ...[
-            const SizedBox(height: 16),
-            FilledButton.tonal(onPressed: onAction, child: Text(actionLabel!)),
-          ],
-        ],
-      ),
-    );
   }
 }

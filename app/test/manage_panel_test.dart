@@ -1,14 +1,19 @@
-// ManagePanel（v2.17.10 自首页 _ManageSheet 抽取，首页齿轮弹层与观看
-// 统计页底部内联共用）widget 测试：
-// - 内联模式（closeBeforeNavigate=false，统计页场景）：分区标题可用
+// ManagePanel（v2.17.10 自首页 _ManageSheet 抽取；v2.19.0 起由底部导航
+// 「个人」页底部内联承载）widget 测试：
+// - 内联模式（closeBeforeNavigate=false，「个人」页场景）：分区标题可用
 //   「设置」；各管理分区渲染；点「登录」调回调且不 pop（无路由可 pop）
 // - 保存 GitHub 配置走真实 GithubApi（secure storage channel mock）
 // - 已登录（模拟 SESSDATA 有效）显示「重新登录」文案
+// - 「新建合集」已移到合集页（v2.19.0）→ 面板内不再有该分区
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:bili_whitelist_app/api/github_api.dart';
+import 'package:bili_whitelist_app/services/theme_store.dart';
+import 'package:bili_whitelist_app/widgets/app_state_view.dart';
+import 'package:bili_whitelist_app/widgets/dot_illustration.dart';
 import 'package:bili_whitelist_app/widgets/manage_panel.dart';
 
 /// 内存版 secure storage（mock 原生 MethodChannel，同 auto_login_test）。
@@ -51,9 +56,6 @@ class _Spy {
   int loginCalls = 0;
   int checkUpdateCalls = 0;
   int manageCollectionsCalls = 0;
-  final created = <String>[];
-
-  Future<void> create(String name) async => created.add(name);
 }
 
 Future<void> _pumpPanel(
@@ -76,7 +78,6 @@ ManagePanel _panel(
     github: GithubApi(),
     closeBeforeNavigate: closeBeforeNavigate,
     headingTitle: heading,
-    onCollectionCreated: spy.create,
     onManageCollections: () => spy.manageCollectionsCalls++,
     onCheckUpdate: () => spy.checkUpdateCalls++,
     onLogin: () {
@@ -99,23 +100,25 @@ void main() {
         .setMockMethodCallHandler(_channel, null);
   });
 
-  group('ManagePanel 分区渲染（首页齿轮 / 统计页内联共用组件）', () {
-    testWidgets('内联模式：标题「设置」+ 各管理分区齐全', (tester) async {
+  group('ManagePanel 分区渲染（「个人」页底部内联共用组件）', () {
+    testWidgets('内联模式：标题「设置」+ 各管理分区齐全（无「新建合集」）', (tester) async {
       final spy = _Spy();
       await _pumpPanel(
         tester,
         _panel(spy, heading: '设置'),
       );
 
-      // 标题与全部管理分区（「新建合集」同时是分区标题与按钮文案 → findsWidgets）
+      // 标题与全部管理分区
       expect(find.text('设置'), findsOneWidget);
       expect(find.text('B 站账号'), findsOneWidget);
       expect(find.text('GitHub 配置'), findsOneWidget);
-      expect(find.text('新建合集'), findsWidgets);
       expect(find.text('合集管理'), findsOneWidget);
       expect(find.text('离线缓存'), findsOneWidget);
       expect(find.text('翻译服务'), findsOneWidget);
       expect(find.text('版本更新'), findsOneWidget);
+      // 「新建合集」已移到合集页（v2.19.0）：面板里不再有该分区/输入框
+      expect(find.text('新建合集'), findsNothing);
+      expect(find.byType(TextField), findsNWidgets(2)); // 只剩 token / gist
       // 未登录文案 + 登录按钮（无 SESSDATA → none）
       expect(find.textContaining('登录后可解锁 1080P'), findsOneWidget);
       expect(find.text('登录'), findsOneWidget);
@@ -148,7 +151,8 @@ void main() {
       expect(find.text('管理'), findsOneWidget);
       expect(find.textContaining('已登录：B 站账号已连接'), findsOneWidget);
       expect(find.text('重新登录'), findsOneWidget);
-      // 首页齿轮弹层的真实 pop+推登录链路由 auto_login_test（首页整页）覆盖
+      // 弹层宿主里点「登录」的真实 pop+推登录链路由 auto_login_test
+      //（首页整页）覆盖
       expect(spy.loginCalls, 0);
     });
 
@@ -168,16 +172,77 @@ void main() {
       expect(_store['gist_id'], 'gist_abc123');
     });
 
-    testWidgets('新建合集：把输入框名字交给回调', (tester) async {
+    testWidgets('点「管理合集」→ 调回调（分区仍在设置面板里）', (tester) async {
       final spy = _Spy();
       await _pumpPanel(tester, _panel(spy));
 
-      // 第 2 个输入框 = 新建合集名称；按钮文案与分区标题重名 → 取 .last（按钮）
-      await tester.enterText(find.byType(TextField).at(2), '我的新合集');
-      await tester.tap(find.text('新建合集').last);
+      final button = find.text('管理合集');
+      await tester.ensureVisible(button);
+      await tester.pumpAndSettle();
+      await tester.tap(button);
       await tester.pumpAndSettle();
 
-      expect(spy.created, ['我的新合集']);
+      expect(spy.manageCollectionsCalls, 1);
+    });
+
+    testWidgets('配色主题（P1.5）：按钮显示当前配方 → 弹层选一套 → 即时生效',
+        (tester) async {
+      SharedPreferences.setMockInitialValues({});
+      ThemeStore.instance.resetForTest();
+      addTearDown(ThemeStore.instance.resetForTest);
+      final spy = _Spy();
+      await _pumpPanel(tester, _panel(spy));
+
+      // 当前配方显示在按钮上（默认 = 克莱因蓝 · 陶土）
+      final button = find.text('配色：克莱因蓝 · 陶土');
+      expect(button, findsOneWidget);
+      await tester.ensureVisible(button);
+      await tester.pumpAndSettle();
+      await tester.tap(button);
+      await tester.pumpAndSettle();
+
+      // 弹层：中文名 + 英文原名（末尾几项在视口外，断言靠前的项）
+      // 「配色主题」既是面板分区标题也是弹层标题 → 命中 2 处
+      expect(find.text('配色主题'), findsNWidgets(2));
+      expect(find.text('钴蓝 · 陶土'), findsOneWidget);
+      expect(find.text('Cobalt · Terracotta'), findsOneWidget);
+
+      await tester.tap(find.text('钴蓝 · 陶土'));
+      await tester.pumpAndSettle();
+
+      // 点击即生效（store 已切）并关闭弹层；按钮文案同步刷新
+      expect(ThemeStore.instance.recipe.id, 'cobalt_terracotta');
+      expect(find.text('Cobalt · Terracotta'), findsNothing);
+      expect(find.text('配色：钴蓝 · 陶土'), findsOneWidget);
+    });
+
+    testWidgets('缓存管理弹层：无缓存 → 空态统一走 AppStateView（seed = cache）',
+        (tester) async {
+      final spy = _Spy();
+      await _pumpPanel(tester, _panel(spy));
+
+      final button = find.text('缓存管理');
+      await tester.ensureVisible(button);
+      await tester.pumpAndSettle();
+      await tester.tap(button);
+      await tester.pumpAndSettle();
+
+      // 弹层标题 + 页头说明（文案锚点不动）
+      expect(find.text('缓存管理'), findsNWidgets(2));
+      expect(
+        find.text('暂无缓存视频（在播放页点「下载」即可离线观看）'),
+        findsOneWidget,
+      );
+      // 列表区空态：AppStateView + 细线插画
+      expect(find.text('暂无缓存'), findsOneWidget);
+      final state = tester.widget<AppStateView>(find.byType(AppStateView));
+      expect(state.kind, AppStateKind.empty);
+      expect(state.copyId, 'empty.cache');
+      expect(state.scrollable, isFalse, reason: '弹层内已有界高度，无需自带滚动');
+      expect(
+        tester.widget<DotIllustration>(find.byType(DotIllustration)).seed,
+        'cache',
+      );
     });
   });
 }

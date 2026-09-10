@@ -9,6 +9,8 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:bili_whitelist_app/pages/daily_history_page.dart';
 import 'package:bili_whitelist_app/pages/player_page.dart';
 import 'package:bili_whitelist_app/services/history_store.dart';
+import 'package:bili_whitelist_app/widgets/app_state_view.dart';
+import 'package:bili_whitelist_app/widgets/dot_illustration.dart';
 
 HistoryEntry _entry(
   String bvid,
@@ -95,6 +97,16 @@ void main() {
 
       expect(find.text('该日无观看记录'), findsOneWidget);
       expect(find.text('2026-09-08'), findsOneWidget);
+
+      // 空态已统一到 AppStateView：细线插画（seed = daily_history）+ 日期副文案
+      final state = tester.widget<AppStateView>(find.byType(AppStateView));
+      expect(state.kind, AppStateKind.empty);
+      expect(state.copyId, 'empty.daily_history');
+      expect(state.scrollable, isTrue);
+      expect(
+        tester.widget<DotIllustration>(find.byType(DotIllustration)).seed,
+        'daily_history',
+      );
     });
 
     testWidgets('点击条目 → 跳播放页（构造视频 + initialPageIndex）',

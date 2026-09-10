@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
-# 白名单点播 App —— release 构建脚本（Git Bash 兼容，可重复执行）
+# amoTV —— release 构建脚本（Git Bash 兼容，可重复执行）
 #
 # 用法：
 #   bash build_release.sh                                  # 仅本地构建

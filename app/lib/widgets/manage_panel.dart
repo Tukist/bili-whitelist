@@ -4,28 +4,32 @@ import '../api/bilibili_api.dart';
 import '../api/github_api.dart';
 import '../api/translate_api.dart';
 import '../cache/download_manager.dart';
+import '../services/theme_store.dart';
+import '../theme/app_palette.dart';
+import '../theme/app_tokens.dart';
+import '../theme/ink_recipes.dart';
+import 'app_state_view.dart';
 
-/// 管理面板内容组件（v2.17.10+ 抽取自首页 _ManageSheet，供两处共用）：
+/// 管理面板内容组件（v2.17.10+ 抽取自首页 _ManageSheet；v2.19.0 起由
+/// 底部导航「个人」页内联承载）：
 ///
-/// - **首页齿轮弹层**（playlist_page `_openManage`）：BottomSheet 包一层
-///   [ManagePanel]，`closeBeforeNavigate: true`（点「登录 / 检查更新」先
-///   关面板再让页面动作，干净上下文，行为与旧 _ManageSheet 完全一致）
-/// - **观看统计页底部内联设置区**（watch_stats_page 最下方，分区标题
-///   「设置」）：直接嵌入页面滚动流，`closeBeforeNavigate: false`
+/// - **「个人」页的「设置」区**（watch_stats_page 的 settingsSection，页面
+///   最下方）：直接嵌入统计页滚动流，`closeBeforeNavigate: false`
 ///   （面板不是路由，不能 pop）
+/// - **（将来的）弹层宿主**：BottomSheet 包一层 [ManagePanel] 时传
+///   `closeBeforeNavigate: true`（点「登录 / 检查更新」先关面板再让页面
+///   动作，干净上下文）
 ///
-/// 内容分区：B 站账号（登录/重新登录）→ GitHub 配置（token/gist）→
-/// 新建合集 → 合集管理（重命名/删除）→ 离线缓存管理 → 翻译服务 →
-/// 版本更新（检查更新）。面板只含内容本身（无自己的滚动/内边距），
-/// 外层（弹层 or 页面滚动流）负责滚动与留白。
+/// 内容分区：B 站账号（登录/重新登录）→ 配色主题（P1.5 双墨配方切换）→
+/// GitHub 配置（token/gist）→ 合集管理（重命名/删除）→ 离线缓存管理 →
+/// 翻译服务 → 版本更新（检查更新）。面板只含内容本身（无自己的滚动/
+/// 内边距），外层（弹层 or 页面滚动流）负责滚动与留白。
+/// **新建合集已移到合集页**（v2.19.0），面板不再提供该分区。
 ///
-/// 各项操作以回调交给宿主页面（写 Gist、管理合集、检查更新、登录页
-/// 导航都依赖宿主状态），面板内部只持有配置表单与账号状态。
+/// 各项操作以回调交给宿主页面（管理合集、检查更新、登录页导航都依赖
+/// 宿主状态），面板内部只持有配置表单与账号状态。
 class ManagePanel extends StatefulWidget {
   final GithubApi github;
-
-  /// 新建合集：把输入框名字交给宿主写入（宿主提示成败）。
-  final Future<void> Function(String name) onCollectionCreated;
 
   /// 打开合集管理面板（重命名 / 删除；宿主维护合集数据）。
   final VoidCallback onManageCollections;
@@ -41,7 +45,7 @@ class ManagePanel extends StatefulWidget {
   /// 页面（不是路由，不 pop）。
   final bool closeBeforeNavigate;
 
-  /// 面板标题（弹层用「管理」；统计页内联用「设置」）。
+  /// 面板标题（弹层用「管理」；「个人」页内联用「设置」）。
   final String headingTitle;
 
   /// 标题下的说明文案。
@@ -50,14 +54,14 @@ class ManagePanel extends StatefulWidget {
   const ManagePanel({
     super.key,
     required this.github,
-    required this.onCollectionCreated,
     required this.onManageCollections,
     required this.onCheckUpdate,
     required this.onLogin,
     this.closeBeforeNavigate = false,
     this.headingTitle = '管理',
     this.headingSubtitle =
-        '管理功能只允许：新建 / 重命名 / 删除合集，移动 / 删除视频。'
+        '管理功能只允许：重命名 / 删除合集，移动 / 删除视频'
+        '（新建合集在合集页顶部）。'
         '新增白名单走右上角「导入」或「搜索」入口（加入前会查重）。',
   });
 
@@ -71,10 +75,8 @@ enum _AccountState { loading, loggedIn, expired, none }
 class _ManagePanelState extends State<ManagePanel> {
   final _tokenCtrl = TextEditingController();
   final _gistCtrl = TextEditingController();
-  final _nameCtrl = TextEditingController();
   bool _loadingConfig = true;
   bool _savingConfig = false;
-  bool _creating = false;
   bool _obscureToken = true;
 
   /// B 站账号状态（读取 secure storage 的 SESSDATA 剩余有效期判断）。
@@ -94,7 +96,6 @@ class _ManagePanelState extends State<ManagePanel> {
   void dispose() {
     _tokenCtrl.dispose();
     _gistCtrl.dispose();
-    _nameCtrl.dispose();
     super.dispose();
   }
 
@@ -171,19 +172,6 @@ class _ManagePanelState extends State<ManagePanel> {
     }
   }
 
-  Future<void> _createCollection() async {
-    setState(() => _creating = true);
-    try {
-      await widget.onCollectionCreated(_nameCtrl.text);
-      // 页面统一提示成败；创建成功后清空输入框
-      if (mounted && _nameCtrl.text.trim().isNotEmpty) {
-        _nameCtrl.clear();
-      }
-    } finally {
-      if (mounted) setState(() => _creating = false);
-    }
-  }
-
   void _showSnack(String message) {
     if (!mounted) return;
     ScaffoldMessenger.of(context)
@@ -237,6 +225,36 @@ class _ManagePanelState extends State<ManagePanel> {
               size: 18,
             ),
             label: Text(_accountActionLabel),
+          ),
+        ),
+        const SizedBox(height: 16),
+        const Divider(height: 1),
+        const SizedBox(height: 16),
+        // ---- 配色主题（P1.5 双墨配方切换，选中立即生效）----
+        Text('配色主题', style: theme.textTheme.titleMedium),
+        const SizedBox(height: 4),
+        Text(
+          '从双墨配方里挑一套：主墨管「观看」，点缀墨管「时间与新鲜度」。'
+          '选中立即生效，仅存本机。',
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+        const SizedBox(height: 8),
+        // 按钮上的配方名要跟着当前配色走 → 单独监听 ThemeStore
+        ListenableBuilder(
+          listenable: ThemeStore.instance,
+          builder: (context, _) => SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: () => _openThemePicker(context),
+              icon: const Icon(Icons.palette_outlined, size: 18),
+              label: Text(
+                '配色：${ThemeStore.instance.recipe.label}',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
           ),
         ),
         const SizedBox(height: 16),
@@ -302,37 +320,7 @@ class _ManagePanelState extends State<ManagePanel> {
         const SizedBox(height: 16),
         const Divider(height: 1),
         const SizedBox(height: 16),
-        // ---- 新建合集 ----
-        Text('新建合集', style: theme.textTheme.titleMedium),
-        const SizedBox(height: 8),
-        TextField(
-          controller: _nameCtrl,
-          decoration: const InputDecoration(
-            labelText: '合集名称',
-            border: OutlineInputBorder(),
-            isDense: true,
-          ),
-          onSubmitted: (_) => _createCollection(),
-        ),
-        const SizedBox(height: 8),
-        SizedBox(
-          width: double.infinity,
-          child: FilledButton.icon(
-            onPressed: _creating ? null : _createCollection,
-            icon: _creating
-                ? const SizedBox(
-                    width: 14,
-                    height: 14,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
-                : const Icon(Icons.create_new_folder_outlined, size: 18),
-            label: Text(_creating ? '创建中…' : '新建合集'),
-          ),
-        ),
-        const SizedBox(height: 16),
-        const Divider(height: 1),
-        const SizedBox(height: 16),
-        // ---- 合集管理（重命名 / 删除）----
+        // ---- 合集管理（重命名 / 删除）；新建合集在合集页（v2.19.0 移出）----
         Text('合集管理', style: theme.textTheme.titleMedium),
         const SizedBox(height: 4),
         Text(
@@ -420,6 +408,16 @@ class _ManagePanelState extends State<ManagePanel> {
           ),
         ),
       ],
+    );
+  }
+
+  /// 打开配色主题选择器（P1.5）：列出全部双墨配方，选中立即生效并关闭弹层。
+  void _openThemePicker(BuildContext context) {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      builder: (_) => const _InkRecipeSheet(),
     );
   }
 
@@ -526,7 +524,7 @@ class _TranslateConfigDialogState extends State<_TranslateConfigDialog> {
             const Text(
               'OpenAI 兼容翻译服务，用于字幕副字幕翻译；'
               'key 仅存本机，可留空=不启用翻译。',
-              style: TextStyle(fontSize: 12, color: Colors.black54),
+              style: TextStyle(fontSize: 12, color: kInkGray70),
             ),
             const SizedBox(height: 12),
             TextField(
@@ -640,7 +638,7 @@ class _CacheManageSheetState extends State<_CacheManageSheet> {
           ),
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx, true),
-            child: const Text('删除', style: TextStyle(color: Colors.red)),
+            child: const Text('删除', style: TextStyle(color: kError)),
           ),
         ],
       ),
@@ -669,7 +667,7 @@ class _CacheManageSheetState extends State<_CacheManageSheet> {
           ),
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx, true),
-            child: const Text('清空', style: TextStyle(color: Colors.red)),
+            child: const Text('清空', style: TextStyle(color: kError)),
           ),
         ],
       ),
@@ -717,11 +715,11 @@ class _CacheManageSheetState extends State<_CacheManageSheet> {
           const Divider(height: 1),
           Expanded(
             child: items.isEmpty
-                ? const Center(
-                    child: Padding(
-                      padding: EdgeInsets.all(24),
-                      child: Text('暂无缓存'),
-                    ),
+                // 空态：细线插画 + 文案（文案走 UiCopyStore，可在设置页改写）
+                ? const AppStateView(
+                    kind: AppStateKind.empty,
+                    copyId: 'empty.cache',
+                    illustrationSeed: 'cache',
                   )
                 : ListView(
                     controller: scrollCtrl,
@@ -731,7 +729,7 @@ class _CacheManageSheetState extends State<_CacheManageSheet> {
                         ListTile(
                           leading: const Icon(
                             Icons.check_circle_outline,
-                            color: Color(0xFF0A7A4A),
+                            color: kSuccess,
                           ),
                           title: Text(
                             c.title,
@@ -774,6 +772,134 @@ class _CacheManageSheetState extends State<_CacheManageSheet> {
               ),
             ),
         ],
+      ),
+    );
+  }
+}
+
+/// 配色主题选择弹层（P1.5）：列出全部双墨配方（首位 = 默认），
+/// 每项「两个墨块 + 中文名 + 英文原名」，当前选中打勾；点击即生效并关闭。
+///
+/// 选项来自 `theme/ink_recipes.dart`（mono-color-skill 双色配方表）；
+/// 点击调 [ThemeStore.select]（立即换墨 + 持久化），由 `main.dart` 的
+/// ListenableBuilder 重建 MaterialApp。
+class _InkRecipeSheet extends StatelessWidget {
+  const _InkRecipeSheet();
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return SafeArea(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 20, 20, 8),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('配色主题', style: theme.textTheme.titleLarge),
+                const SizedBox(height: 4),
+                Text(
+                  '双墨配方：主墨 = 观看（品牌 / 导航 / 进度 / 热力），'
+                  '点缀墨 = 时间与新鲜度（更新角标 / 未读点）。',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const Divider(height: 1),
+          // 选中项打勾要跟着当前配色走 → 单独监听 ThemeStore
+          Flexible(
+            child: ListenableBuilder(
+              listenable: ThemeStore.instance,
+              builder: (context, _) {
+                final currentId = ThemeStore.instance.recipe.id;
+                return ListView.builder(
+                  shrinkWrap: true,
+                  padding: const EdgeInsets.only(bottom: 12),
+                  itemCount: kInkRecipes.length,
+                  itemBuilder: (context, i) {
+                    final recipe = kInkRecipes[i];
+                    return _InkRecipeTile(
+                      recipe: recipe,
+                      selected: recipe.id == currentId,
+                      onTap: () {
+                        // 立即生效（全 App 换墨 + 持久化），再关掉弹层
+                        ThemeStore.instance.select(recipe.id);
+                        Navigator.of(context).pop();
+                      },
+                    );
+                  },
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 单个配色选项：主墨 + 点缀墨两个墨块（左 ink 右 accent）、中文名、
+/// 英文原名、当前选中打勾。
+class _InkRecipeTile extends StatelessWidget {
+  final InkRecipe recipe;
+  final bool selected;
+  final VoidCallback onTap;
+
+  const _InkRecipeTile({
+    required this.recipe,
+    required this.selected,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return ListTile(
+      onTap: onTap,
+      contentPadding: const EdgeInsets.symmetric(horizontal: 20, vertical: 2),
+      leading: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _InkSwatch(color: recipe.ink),
+          const SizedBox(width: 3),
+          _InkSwatch(color: recipe.accent),
+        ],
+      ),
+      title: Text(recipe.label, style: theme.textTheme.titleSmall),
+      subtitle: Text(
+        recipe.labelEn,
+        style: theme.textTheme.bodySmall?.copyWith(
+          color: theme.colorScheme.onSurfaceVariant,
+        ),
+      ),
+      trailing: selected
+          ? Icon(Icons.check, size: 20, color: context.palette.inkText)
+          : null,
+    );
+  }
+}
+
+/// 单个墨块（圆角小方块）：加一圈淡描边，浅色墨也能看清边界与大小。
+class _InkSwatch extends StatelessWidget {
+  final Color color;
+
+  const _InkSwatch({required this.color});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 16,
+      height: 16,
+      decoration: BoxDecoration(
+        color: color,
+        borderRadius: BorderRadius.circular(kRadiusSm),
+        border: Border.all(color: kRule.withValues(alpha: .6)),
       ),
     );
   }

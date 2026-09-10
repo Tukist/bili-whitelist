@@ -2,9 +2,11 @@
 // 1. planSessionStart 纯函数决策映射（无会话→autoLogin；续期阈值按
 //    refresh_token 有无分档——有→15 天提前续期、无→7 天：含边界与已过期）
 // 2. Widget：有会话（长期有效）冷启动 → 首页**无**登录按钮 tooltip、
-//    不请求登录（静默恢复）；管理面板显示「已连接 + 重新登录」次级入口
+//    不请求登录（静默恢复）；底部导航「个人」页的**设置区**显示
+//    「已连接 + 重新登录」次级入口（v2.19.0：「统计」+「设置」合并为
+//    「个人」，管理面板不再是独立页/弹层，而是内联在该页统计下方）
 // 3. Widget：无会话冷启动 → **自动请求登录**一次（带 kAutoLoginBanner 提示，
-//    测试注入导航替身，不真推含 WebView 的 LoginPage）；管理面板显示
+//    测试注入导航替身，不真推含 WebView 的 LoginPage）；设置区显示
 //    「未登录 + 登录」入口
 // 4. Widget：会话已过期（无 refresh 凭据）→ 续期失败 → 自动请求重登 +
 //    清除失效会话（v2.16.20 修复：残留过期 SESSDATA 不应再被播放取流
@@ -17,6 +19,7 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:bili_whitelist_app/api/bilibili_api.dart';
 import 'package:bili_whitelist_app/pages/login_page.dart';
@@ -75,6 +78,20 @@ Future<void> _pumpHome(WidgetTester tester, _LoginSpy spy) async {
   // 首帧后允许异步会话检查/同步任务完成（同 widget_test.dart 冒烟方式）
   await tester.pump();
   await tester.pump();
+}
+
+/// 进入底部导航「个人」页，并把设置区（管理面板内联在观看统计下方）
+/// 滚到可见——v2.19.0 起管理入口不再是右上角图标/独立页。
+Future<void> _openPersonalSettings(WidgetTester tester, Finder target) async {
+  await tester.tap(find.byTooltip('个人（观看统计 / 设置）'));
+  await tester.pumpAndSettle();
+  for (var i = 0; i < 8 && target.evaluate().isEmpty; i++) {
+    await tester.drag(find.byType(ListView).first, const Offset(0, -400));
+    await tester.pumpAndSettle();
+  }
+  expect(target, findsWidgets);
+  await tester.ensureVisible(target);
+  await tester.pumpAndSettle();
 }
 
 void main() {
@@ -136,6 +153,10 @@ void main() {
     setUp(() {
       _store = {};
       _mockSecureStorage();
+      // shared_preferences 也要 mock：下面两条用例会切到「个人」页，
+      // 该页的观看统计/历史读本地表——没有 mock 时插件缺失会让统计页
+      // 一直停在加载态（转圈动画 → pumpAndSettle 永不收敛）。
+      SharedPreferences.setMockInitialValues({});
     });
 
     testWidgets('无会话：冷启动自动请求登录一次（带自动引导 banner）',
@@ -245,16 +266,13 @@ void main() {
       expect(_store.containsKey('bili_jct'), isFalse);
     });
 
-    testWidgets('管理面板：已登录显示「已连接 + 重新登录」次级入口',
+    testWidgets('「个人」页设置区：已登录显示「已连接 + 重新登录」次级入口',
         (tester) async {
       _store['bili_sessdata'] = _fakeSessdata(const Duration(days: 30));
       final spy = _LoginSpy();
       await _pumpHome(tester, spy);
 
-      await tester.tap(
-        find.byTooltip('管理（GitHub 配置 / 合集 / B 站账号）'),
-      );
-      await tester.pumpAndSettle();
+      await _openPersonalSettings(tester, find.text('B 站账号'));
 
       expect(find.text('B 站账号'), findsOneWidget);
       expect(find.textContaining('已登录：B 站账号已连接'), findsOneWidget);
@@ -268,19 +286,16 @@ void main() {
       expect(spy.lastBanner, isNull);
     });
 
-    testWidgets('管理面板：未登录显示「登录」次级入口', (tester) async {
+    testWidgets('「个人」页设置区：未登录显示「登录」次级入口', (tester) async {
       final spy = _LoginSpy();
       await _pumpHome(tester, spy);
       await tester.pump();
       await tester.pump();
 
-      await tester.tap(
-        find.byTooltip('管理（GitHub 配置 / 合集 / B 站账号）'),
-      );
-      await tester.pumpAndSettle();
+      await _openPersonalSettings(tester, find.text('B 站账号'));
 
       expect(find.text('B 站账号'), findsOneWidget);
-      // 与首页「未登录仅 720P」提示条区分开：匹配管理面板账号行专有文案
+      // 与首页「未登录仅 720P」提示条区分开：匹配设置区账号行专有文案
       expect(find.textContaining('登录后可解锁 1080P'), findsOneWidget);
       expect(find.text('登录'), findsOneWidget);
     });

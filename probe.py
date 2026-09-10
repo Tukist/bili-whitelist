@@ -6,7 +6,7 @@ probe.py — B 站 API 技术侦察探针脚本（M0 阶段）
 
 用途
 ----
-为「B 站白名单点播安卓 App」做技术侦察，实测 B 站 API 的真实行为：
+为「amoTV」（白名单点播安卓 App）做技术侦察，实测 B 站 API 的真实行为：
   1. 视频信息接口 view：匿名能否拿到 cid/title/pic/duration/owner.name
   2. 播放流接口 playurl：匿名下 mp4(durl) 最高清晰度、DASH 结构、qn=127 实际给什么
   3. 防盗链：mp4 流 URL 对 Referer / User-Agent 的依赖

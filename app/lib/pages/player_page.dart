@@ -10,7 +10,6 @@ import '../api/sherpa_model.dart';
 import '../api/translate_api.dart';
 import '../cache/download_manager.dart';
 import '../cache/playback_progress.dart';
-import '../config.dart';
 import '../models/danmaku.dart';
 import '../models/danmaku_settings.dart';
 import '../models/subtitle.dart';
@@ -22,7 +21,14 @@ import '../services/device_media.dart';
 import '../services/history_store.dart';
 import '../services/realtime_transcriber.dart';
 import '../services/watch_stats.dart';
+import '../theme/app_motion.dart';
+import '../theme/app_tokens.dart';
+import '../theme/motion_control.dart';
+import '../theme/route_names.dart';
+import '../widgets/app_block.dart';
 import '../widgets/comment_list.dart';
+import '../widgets/cover_hero.dart';
+import '../widgets/cover_image.dart';
 import '../widgets/danmaku_overlay.dart';
 import '../widgets/danmaku_settings_sheet.dart';
 import '../widgets/expandable_text.dart';
@@ -31,6 +37,12 @@ import 'comment_page.dart';
 import 'login_page.dart';
 import 'upowner_page.dart';
 
+// 路由名常量已上移到 theme 层（避免 theme → pages 的跨层依赖）。
+// 这里 re-export：各入口页面与测试历来自 `player_page.dart` 取
+// [kPlayerRouteName]，re-export 让这些引用点零改动，也保证全 App
+// 只有一个定义（`route_names.dart`）。
+export '../theme/route_names.dart';
+
 /// 可选的播放倍速档位（默认 1.0，均落在原生支持区间 0.25~4.0 内）。
 const List<double> kPlaybackSpeeds = [
   0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0,
@@ -38,14 +50,6 @@ const List<double> kPlaybackSpeeds = [
 
 /// 长按视频画面时强制使用的倍速。
 const double kLongPressSpeed = 2.0;
-
-/// push 新 [PlayerPage] 的路由名（v2.17.1+，评论视频链接跳转 / 各入口统一）。
-///
-/// 播放页以 [RouteAware]（全局 [routeObserver]）订阅路由：[didPopNext]（本页
-/// 重新成为顶层）时恢复续播。暂停不是靠 didPushNext 判定（该版本
-/// didPushNext() 无参、无法按路由名过滤，见 player_page 内机制取舍注释），
-/// 而是由 push 新播放页的调用点在 [RouteAware] 之外显式执行。
-const String kPlayerRouteName = 'player';
 
 // -------------------------------------------------------------------------
 // 会员集播放回退决策（纯函数，便于单测）
@@ -574,7 +578,8 @@ class PlayerPage extends StatefulWidget {
   State<PlayerPage> createState() => _PlayerPageState();
 }
 
-class _PlayerPageState extends State<PlayerPage> with RouteAware {
+class _PlayerPageState extends State<PlayerPage>
+    with RouteAware, SingleTickerProviderStateMixin {
   /// 当前播放的视频（initState 初始化为 _video；内部换源（[playVideo]）后
   /// 更新为被换视频）。标题/取流/弹幕/下载/历史/评论等一律以 [_video] 为准
   /// ——换源后仍引用 _video 会把旧视频记进历史/进度、下载与评论串到旧视频
@@ -605,7 +610,50 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
   int _durationMs = 0;
   double _aspectRatio = 16 / 9;
 
-  // 控制层
+  // 信息块「补场」动画（块化与动效系统 · 批次 C）
+  // ---------------------------------------------------------------------
+  // 用户从卡片点进播放页时：卡片封面先由 Hero 飞进视频区落位（[kHeroFlightDur]
+  // 340ms），信息块延迟 [kInfoBlockDelay] 后再淡入 + 从 [kInfoBlockScaleFrom]
+  // 96% 微放大到位（[kInfoBlockDur] 320ms）——两段在时间轴上重叠，读起来像
+  // 「先落画面、文字跟上」的因果，而不是一个没有来处的整页闪现。
+  //
+  // 不做「卡片副标题 → 视频标题」的字面 morph：Hero 是**一对一**机制，而两端
+  // 的尺寸/结构差太远（卡片 tag 是一行小字，信息块是标题 + UP 行 + 简介的多行
+  // 块），插值中间态必然是一坨被拉扁的畸形文字；「整块补场」拿到了同样的因果
+  // 观感，代价只是两个 token，且不引入任何跨 route 的共享状态。
+  late final AnimationController _infoBlockCtl = AnimationController(
+    vsync: this,
+    duration: kInfoBlockDelay + kInfoBlockDur,
+  );
+
+  /// 补场动画已播完 → 信息块恢复成裸块（树里不留 FadeTransition/Transform）。
+  bool _infoBlockDone = false;
+
+  // 封面占位层（「封面放大变成播放界面」的假转场）
+  // ---------------------------------------------------------------------
+  // 播放页画面是原生纹理（BiliDashTexture），Hero 没法跨进 Texture 里，所以
+  // 转场做成：Hero 把封面从卡片飞进视频区、落在**同一个 AspectRatio 盒**里的
+  // 封面占位层上，等播放器就绪（或兜底超时）后这一层淡出，露出真实画面。
+  //
+  // 三态字段分工：[_coverOverlayVisible] = 这一层是否还留在树里；
+  // [_coverOverlayOpaque] = 不透明度目标值（淡出中/已透明）。
+  // 两个都只在本页首次出现时用——全屏/横竖屏切换、换源都不会重播（不进
+  // [playVideo] 的复位清单）。[_video].cover 为空时**整层不构建**（零开销、
+  // 零网络请求），兜底计时器也不排。
+  bool _coverOverlayVisible = true;
+  bool _coverOverlayOpaque = true;
+
+  /// 封面占位层的兜底淡出计时器（播放器/cid=0 等取流卡死时不至于让封面常驻）。
+  Timer? _coverFallbackTimer;
+
+  /// 淡出动画结束后把这一层移出树（[kCoverFadeOutDur] 之后）。
+  Timer? _coverTeardownTimer;
+
+  /// 封面占位层的兜底淡出时限：正常由 onPrepared / 错误态触发，这里是
+  /// 「播放器一个回调都没来」时的保底。
+  static const int kCoverOverlayFallbackMs = 1200;
+
+  /// 控制层
   bool _controlsVisible = true;
   bool _fullscreen = false;
   bool _dragging = false;
@@ -905,7 +953,41 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     // UP 主入口元数据（阶段 C）：拉 view 接口 owner 补齐 mid/face（异步，
     // 信息行先用 up_name 文本渲染，拉取成功后 setState 换头像+真名）
     _refreshUpownerMeta();
+    // 信息块「补场」：进页即起步（延迟 kInfoBlockDelay 由 Interval 表达，
+    // 见 [_withInfoBlockEntrance]）。控制器只在装饰开关打开时才被读取，
+    // 但**一律 forward**——否则「测试环境默认关闭动效」时它永远停在第 0 帧，
+    // 中途开启动效会从半个动画开始。
+    _infoBlockCtl.forward();
+    _infoBlockCtl.addStatusListener(_onInfoBlockCtlStatus);
+    // 封面占位层兜底：cover 为空时整层不构建，也就不必排计时器。
+    if (_video.cover.isNotEmpty) {
+      _coverFallbackTimer = Timer(
+        const Duration(milliseconds: kCoverOverlayFallbackMs),
+        _dismissCoverOverlay,
+      );
+    }
     _init();
+  }
+
+  /// 补场动画播完 → 卸掉包裹层（只置一次标志，幂等）。
+  void _onInfoBlockCtlStatus(AnimationStatus status) {
+    if (status != AnimationStatus.completed || _infoBlockDone) return;
+    if (!mounted) return;
+    setState(() => _infoBlockDone = true);
+  }
+
+  /// 封面占位层淡出：播放器就绪 / 取流出错 / 兜底超时（三者任一先到）。
+  ///
+  /// 幂等：第二次调用直接返回——[onPrepared] 每次换源都会来一遍，而这一层
+  /// 只该在本页首次出现时淡出一次（换源/全屏/横竖屏都不重播）。
+  void _dismissCoverOverlay() {
+    if (!mounted || !_coverOverlayVisible || !_coverOverlayOpaque) return;
+    setState(() => _coverOverlayOpaque = false);
+    _coverTeardownTimer?.cancel();
+    _coverTeardownTimer = Timer(kCoverFadeOutDur, () {
+      if (!mounted) return;
+      setState(() => _coverOverlayVisible = false);
+    });
   }
 
   @override
@@ -925,9 +1007,15 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     _flushWatchTime();
     _timer?.cancel();
     _hudTimer?.cancel();
+    _coverFallbackTimer?.cancel();
+    _coverTeardownTimer?.cancel();
     _eventSub?.cancel();
     _eventSub = null;
     _commentScroll.dispose();
+    // 补场控制器：必须在 super.dispose() 之前释放——SingleTickerProviderState
+    // 在状态销毁时断言「ticker 不能还在跑」，正是靠这里 stop。
+    _infoBlockCtl.removeStatusListener(_onInfoBlockCtlStatus);
+    _infoBlockCtl.dispose();
     _player?.dispose();
     _restoreSystemUi();
     super.dispose();
@@ -1299,6 +1387,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
           _error = '该集未返回可播放的流（可能需大会员/付费）';
           _canRetry = false;
         });
+        _dismissCoverOverlay();
         return;
       }
       await _playStream(r, positionMs: positionMs);
@@ -1316,6 +1405,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
       _canRetry = isRisk;
       _loginPrompt = !isRisk;
     });
+    _dismissCoverOverlay();
   }
 
   /// 取流失败分类处理。
@@ -1385,6 +1475,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
         _error = '登录已失效，请重新登录';
         _loginPrompt = true;
       });
+      _dismissCoverOverlay();
       return;
     }
     // -404：普通 playurl 对番剧会员/付费集返回 -404（v2.16.4+ 带 epId 的
@@ -1396,6 +1487,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
         _error = '该集可能为大会员/付费内容或已下架';
         _canRetry = false;
       });
+      _dismissCoverOverlay();
       return;
     }
     _showFatal(e);
@@ -1415,6 +1507,8 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
       _error = _errMsg(e);
       _canRetry = canRetry;
     });
+    // 取流失败：不会再有 onPrepared，封面占位层立刻淡出（露出错误视图）
+    _dismissCoverOverlay();
   }
 
   String _errMsg(Object e) {
@@ -1461,6 +1555,8 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     });
     // 首次进入 / 切集后恢复该集记忆进度（不打断自动播放）
     _maybeRestoreProgress(durationMs);
+    // 画面就绪 → 封面占位层淡出（换源时这一层早已卸载，调用是空操作）
+    _dismissCoverOverlay();
     // 新流开始：观看时长累计基线重建（旧流位置与此无关；若本流 onPrepared
     // 后还要 seek 恢复进度，_maybeRestoreProgress/seek 处会再次置 null）
     _resetWatchBaseline();
@@ -1487,6 +1583,8 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
       _error = '播放失败（$code）：$msg';
       _playing = false;
     });
+    // 原生报错：画面不会来了，封面占位层让位给错误视图
+    _dismissCoverOverlay();
   }
 
   /// 自动续播（流 URL 过期 / 瞬时网络错误，原生已统一归类为可恢复）：
@@ -2343,7 +2441,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
             const Padding(
               padding: EdgeInsets.only(top: 14, bottom: 6),
               child: Text('播放速度',
-                  style: TextStyle(color: Colors.white70, fontSize: 13)),
+                  style: TextStyle(color: kPlayerOnDim, fontSize: 13)),
             ),
             // Flexible + shrinkWrap：内容超过弹窗约束时在弹窗内滚动，
             // 与同文件 _showEpisodeSheet 的选集列表同一写法
@@ -2359,7 +2457,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
                       _fmtSpeed(s),
                       textAlign: TextAlign.center,
                       style: TextStyle(
-                        color: s == _speed ? Colors.pinkAccent : Colors.white,
+                        color: s == _speed ? kPlayerOn : kPlayerOff,
                         fontSize: 16,
                         fontWeight: s == _speed
                             ? FontWeight.bold
@@ -2368,7 +2466,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
                     ),
                     trailing: s == _speed
                         ? const Icon(Icons.check,
-                            color: Colors.pinkAccent, size: 20)
+                            color: kPlayerOn, size: 20)
                         : const SizedBox(width: 20),
                     onTap: () => Navigator.of(context).pop(s),
                   );
@@ -2743,12 +2841,12 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
               const Padding(
                 padding: EdgeInsets.only(top: 14, bottom: 6),
                 child: Text('字幕设置',
-                    style: TextStyle(color: Colors.white70, fontSize: 13)),
+                    style: TextStyle(color: kPlayerOnDim, fontSize: 13)),
               ),
               SwitchListTile(
                 dense: true,
                 title: const Text('显示字幕',
-                    style: TextStyle(color: Colors.white, fontSize: 15)),
+                    style: TextStyle(color: kPlayerOn, fontSize: 15)),
                 value: _subtitleEnabled,
                 onChanged: (v) {
                   _subtitleEnabled = v;
@@ -2780,7 +2878,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
         Padding(
           padding: EdgeInsets.all(24),
           child: Center(
-            child: CircularProgressIndicator(color: Colors.pinkAccent),
+            child: CircularProgressIndicator(color: kPlayerOn),
           ),
         ),
       ];
@@ -2796,12 +2894,12 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
                 Text(_subtitleError!,
                     textAlign: TextAlign.center,
                     style:
-                        const TextStyle(color: Colors.white70, fontSize: 13)),
+                        const TextStyle(color: kPlayerOnDim, fontSize: 13)),
                 const SizedBox(height: 12),
                 OutlinedButton(
                   onPressed: () => _loadSubtitleTracks(onChanged: refresh),
                   style:
-                      OutlinedButton.styleFrom(foregroundColor: Colors.white),
+                      OutlinedButton.styleFrom(foregroundColor: kPlayerOn),
                   child: const Text('重试'),
                 ),
               ],
@@ -2814,7 +2912,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
             padding: EdgeInsets.all(24),
             child: Center(
               child: Text('该视频无可用字幕（可尝试下方「实时转写」）',
-                  style: TextStyle(color: Colors.white54, fontSize: 14)),
+                  style: TextStyle(color: kPlayerOnDim, fontSize: 14)),
             ),
           ),
         ];
@@ -2849,12 +2947,12 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
                   width: 12,
                   height: 12,
                   child: CircularProgressIndicator(
-                      strokeWidth: 2, color: Colors.pinkAccent),
+                      strokeWidth: 2, color: kPlayerOn),
                 ),
                 const SizedBox(width: 8),
                 Text('翻译中 $_translationDone/$_translationTotal',
                     style:
-                        const TextStyle(color: Colors.white54, fontSize: 12)),
+                        const TextStyle(color: kPlayerOnDim, fontSize: 12)),
               ],
             ),
           )
@@ -2862,13 +2960,13 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 6, 16, 2),
             child: Text('已翻译 $_translationDone/$_translationTotal 条',
-                style: const TextStyle(color: Colors.white54, fontSize: 12)),
+                style: const TextStyle(color: kPlayerOnDim, fontSize: 12)),
           ),
         if (_translationError != null)
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 6, 16, 2),
             child: Text('翻译失败：$_translationError',
-                style: const TextStyle(color: Colors.redAccent, fontSize: 12)),
+                style: const TextStyle(color: kError, fontSize: 12)),
           ),
       ];
     }
@@ -2894,7 +2992,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 10, 16, 2),
           child: Text('🎙 实时转写（流式）',
-              style: const TextStyle(color: Colors.white70, fontSize: 12)),
+              style: const TextStyle(color: kPlayerOnDim, fontSize: 12)),
         ),
         ..._buildRealtimeStates(refresh),
         const SizedBox(height: 8),
@@ -2946,18 +3044,18 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
                     width: 12,
                     height: 12,
                     child: CircularProgressIndicator(
-                        strokeWidth: 2, color: Colors.pinkAccent),
+                        strokeWidth: 2, color: kPlayerOn),
                   ),
                   const SizedBox(width: 8),
                   const Expanded(
                     child: Text('转写中…',
                         style:
-                            TextStyle(color: Colors.white54, fontSize: 12)),
+                            TextStyle(color: kPlayerOnDim, fontSize: 12)),
                   ),
                   TextButton(
                     onPressed: _stopRealtime,
                     style: TextButton.styleFrom(
-                        foregroundColor: Colors.white70),
+                        foregroundColor: kPlayerOnDim),
                     child: const Text('停止'),
                   ),
                 ],
@@ -2972,7 +3070,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
                   t.trim().isEmpty ? '（识别中…）' : t.trim(),
                   maxLines: 2,
                   overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(color: Colors.white38, fontSize: 12),
+                  style: const TextStyle(color: kPlayerOff, fontSize: 12),
                 ),
               ),
             ),
@@ -2986,19 +3084,19 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
             child: Row(
               children: [
                 const Icon(Icons.check_circle,
-                    color: Colors.greenAccent, size: 16),
+                    color: kSuccess, size: 16),
                 const SizedBox(width: 6),
                 Expanded(
                   child: Text(
                     '✅ 实时转写完成（${list.length} 句）· 已作为字幕',
                     style: const TextStyle(
-                        color: Colors.greenAccent, fontSize: 13),
+                        color: kSuccess, fontSize: 13),
                   ),
                 ),
                 TextButton(
                   onPressed: _startRealtime,
                   style: TextButton.styleFrom(
-                      foregroundColor: Colors.white70),
+                      foregroundColor: kPlayerOnDim),
                   child: const Text('重新转写'),
                 ),
               ],
@@ -3015,7 +3113,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
                 padding: const EdgeInsets.fromLTRB(16, 4, 16, 0),
                 child: Text(
                   err ?? '实时转写失败',
-                  style: const TextStyle(color: Colors.redAccent, fontSize: 12),
+                  style: const TextStyle(color: kError, fontSize: 12),
                 ),
               ),
             ),
@@ -3024,7 +3122,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
               child: OutlinedButton(
                 onPressed: _startRealtime,
                 style:
-                    OutlinedButton.styleFrom(foregroundColor: Colors.white),
+                    OutlinedButton.styleFrom(foregroundColor: kPlayerOn),
                 child: const Text('重试'),
               ),
             ),
@@ -3039,8 +3137,8 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
               child: FilledButton(
                 onPressed: _startRealtime,
                 style: FilledButton.styleFrom(
-                  backgroundColor: Colors.pinkAccent,
-                  foregroundColor: Colors.black,
+                  backgroundColor: kPlayerOn,
+                  foregroundColor: kInkBlack,
                 ),
                 child: const Text('🎙 实时转写'),
               ),
@@ -3048,13 +3146,13 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
             const Padding(
               padding: EdgeInsets.only(top: 6),
               child: Text('流式识别，边播边出字幕（首次需下载模型 247MB）',
-                  style: TextStyle(color: Colors.white38, fontSize: 12)),
+                  style: TextStyle(color: kPlayerOff, fontSize: 12)),
             ),
             if (_realtimeModelDir.isNotEmpty)
               Padding(
                 padding: const EdgeInsets.only(top: 2),
                 child: Text('也可手动放置模型文件到：$_realtimeModelDir',
-                    style: const TextStyle(color: Colors.white24, fontSize: 11)),
+                    style: const TextStyle(color: kPlayerRule, fontSize: 11)),
               ),
           ],
         );
@@ -3069,14 +3167,14 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 6, 16, 0),
           child: Text('$label ${(v * 100).round()}%',
-              style: const TextStyle(color: Colors.white54, fontSize: 12)),
+              style: const TextStyle(color: kPlayerOnDim, fontSize: 12)),
         ),
         Padding(
           padding: const EdgeInsets.fromLTRB(16, 4, 16, 0),
           child: LinearProgressIndicator(
             value: v,
-            color: Colors.pinkAccent,
-            backgroundColor: Colors.white12,
+            color: kPlayerOn,
+            backgroundColor: kPlayerRule,
             minHeight: 3,
           ),
         ),
@@ -3093,7 +3191,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
         dir.isEmpty
             ? '下载可能较慢（GitHub 国内网络），也可手动放置模型文件后重试'
             : '下载可能较慢（GitHub 国内网络），也可手动放置模型文件到：$dir',
-        style: const TextStyle(color: Colors.white38, fontSize: 12),
+        style: const TextStyle(color: kPlayerOff, fontSize: 12),
       ),
     );
   }
@@ -3118,7 +3216,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     return Padding(
       padding: const EdgeInsets.fromLTRB(16, 10, 16, 2),
       child: Text(title,
-          style: const TextStyle(color: Colors.white70, fontSize: 12)),
+          style: const TextStyle(color: kPlayerOnDim, fontSize: 12)),
     );
   }
 
@@ -3140,16 +3238,16 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
         track == null ? '无' : (track.lanDoc.isEmpty ? track.lan : track.lanDoc),
         style: TextStyle(
           color: disabled
-              ? Colors.white24
+              ? kPlayerOff
               : isSelected
-                  ? Colors.pinkAccent
-                  : Colors.white,
+                  ? kPlayerOn
+                  : kPlayerOnDim,
           fontSize: 14,
           fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
         ),
       ),
       trailing: isSelected
-          ? const Icon(Icons.check, color: Colors.pinkAccent, size: 18)
+          ? const Icon(Icons.check, color: kPlayerOn, size: 18)
           : const SizedBox(width: 18),
       onTap: disabled
           ? null
@@ -3174,13 +3272,13 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
       title: Text(
         '🔤 翻译（中文）',
         style: TextStyle(
-          color: isSelected ? Colors.pinkAccent : Colors.white,
+          color: isSelected ? kPlayerOn : kPlayerOff,
           fontSize: 14,
           fontWeight: isSelected ? FontWeight.bold : FontWeight.normal,
         ),
       ),
       trailing: isSelected
-          ? const Icon(Icons.check, color: Colors.pinkAccent, size: 18)
+          ? const Icon(Icons.check, color: kPlayerOn, size: 18)
           : const SizedBox(width: 18),
       onTap: () {
         _selectTranslationMode();
@@ -3389,21 +3487,21 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
             ListTile(
               dense: true,
               title: Text(cached != null ? '缓存操作' : '离线下载',
-                  style: const TextStyle(color: Colors.white, fontSize: 15)),
+                  style: const TextStyle(color: kPlayerOn, fontSize: 15)),
               subtitle: Text(
                 partTitle,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
-                style: const TextStyle(color: Colors.white54, fontSize: 12),
+                style: const TextStyle(color: kPlayerOnDim, fontSize: 12),
               ),
             ),
             const Divider(height: 1),
             if (cached == null) ...[
               ListTile(
                 leading:
-                    const Icon(Icons.download_outlined, color: Colors.white),
+                    const Icon(Icons.download_outlined, color: kPlayerOn),
                 title: const Text('下载本集',
-                    style: TextStyle(color: Colors.white, fontSize: 15)),
+                    style: TextStyle(color: kPlayerOn, fontSize: 15)),
                 onTap: () {
                   Navigator.pop(sheetCtx);
                   _confirmDownloadPage(_currentPageIndex);
@@ -3412,10 +3510,10 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
               if (_video.isMultiPage)
                 ListTile(
                   leading: const Icon(Icons.download_done,
-                      color: Colors.white),
+                      color: kPlayerOn),
                   title: Text('下载全部集（${_video.pageCount} 集）',
                       style:
-                          const TextStyle(color: Colors.white, fontSize: 15)),
+                          const TextStyle(color: kPlayerOn, fontSize: 15)),
                   onTap: () {
                     Navigator.pop(sheetCtx);
                     _confirmDownloadAll();
@@ -3423,9 +3521,9 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
                 ),
             ] else ...[
               ListTile(
-                leading: const Icon(Icons.refresh, color: Colors.white),
+                leading: const Icon(Icons.refresh, color: kPlayerOn),
                 title: const Text('重新下载',
-                    style: TextStyle(color: Colors.white, fontSize: 15)),
+                    style: TextStyle(color: kPlayerOn, fontSize: 15)),
                 onTap: () {
                   Navigator.pop(sheetCtx);
                   _confirmDownloadPage(_currentPageIndex);
@@ -3541,7 +3639,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
           ),
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx, true),
-            child: const Text('删除', style: TextStyle(color: Colors.red)),
+            child: const Text('删除', style: TextStyle(color: kError)),
           ),
         ],
       ),
@@ -3595,44 +3693,33 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     final String label;
     final Color color;
     if (downloading) {
+      // 下载中：进度环本身就是非颜色的状态载体（环 + 百分比文字），不再加短线
       icon = SizedBox(
-        width: 18,
-        height: 18,
+        width: 20,
+        height: 20,
         child: CircularProgressIndicator(
           value: task.progress,
           strokeWidth: 2,
-          color: Colors.pinkAccent,
+          color: kPlayerOn,
         ),
       );
       label = task.progress == null ? '下载中' : '${task.percent}%';
-      color = Colors.pinkAccent;
+      color = kPlayerOn;
     } else if (cached != null) {
-      icon =
-          const Icon(Icons.check_circle_outline, color: Colors.pinkAccent, size: 18);
+      // 已缓存 = 持续生效的「开启态」→ 纸白 + 短线
+      icon = _barToggleIcon(Icons.check_circle_outline, on: true);
       label = '已缓存';
-      color = Colors.pinkAccent;
+      color = kPlayerOn;
     } else {
-      icon = const Icon(Icons.download_outlined, color: Colors.white, size: 18);
+      icon = _barToggleIcon(Icons.download_outlined, on: false);
       label = '下载';
-      color = Colors.white;
+      color = kPlayerOff;
     }
     return InkWell(
       onTap: downloading ? null : _onDownloadTap,
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          icon,
-          const SizedBox(width: 4),
-          Flexible(
-            child: Text(
-              label,
-              softWrap: false,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(color: color, fontSize: 14),
-            ),
-          ),
-        ],
-      ),
+      // 图标在上、标签在下（见 [_barIconLabel]）——与同级 7 个按钮同一竖排
+      // 语汇，「已缓存」「下载中」等 3 字标签不再被省略号截断
+      child: _barIconLabel(icon: icon, label: label, color: color),
     );
   }
 
@@ -3804,7 +3891,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
               padding: EdgeInsets.only(top: 14, bottom: 6),
               child: Text('选集',
                   textAlign: TextAlign.center,
-                  style: TextStyle(color: Colors.white70, fontSize: 13)),
+                  style: TextStyle(color: kPlayerOnDim, fontSize: 13)),
             ),
             // Flexible + shrinkWrap：分 P 较多时在弹窗约束内滚动
             Flexible(
@@ -3815,7 +3902,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
                   final p = pages[i];
                   final isCurrent = i == _currentPageIndex;
                   final TextStyle titleStyle = TextStyle(
-                    color: isCurrent ? Colors.pinkAccent : Colors.white,
+                    color: isCurrent ? kPlayerOn : kPlayerOff,
                     fontSize: 15,
                     fontWeight:
                         isCurrent ? FontWeight.bold : FontWeight.normal,
@@ -3834,11 +3921,11 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
                       children: [
                         Text(_fmtPageDuration(p.duration),
                             style: const TextStyle(
-                                color: Colors.white54, fontSize: 13)),
+                                color: kPlayerOnDim, fontSize: 13)),
                         const SizedBox(width: 8),
                         if (isCurrent)
                           const Icon(Icons.check,
-                              color: Colors.pinkAccent, size: 18)
+                              color: kPlayerOn, size: 18)
                         else
                           const SizedBox(width: 18),
                       ],
@@ -4054,27 +4141,13 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
               child:
                   ColoredBox(color: Colors.black, child: _buildVideoLayers()),
             ),
-            // 2/3. 非全屏内容区（竖屏 / 横屏置顶共用）：视频信息行（标题/
+            // 2/3. 非全屏内容区（竖屏 / 横屏置顶共用）：视频信息块（标题/
             //      时长 + UP 主入口：阶段 C 已从 UP 主名文本占位升级为头像
-            //      +名字可点进 UP 主页；横屏自动紧凑）+ 内嵌评论区（评论区
-            //      底部避开系统手势导航条）。
+            //      +名字可点进 UP 主页；横屏自动紧凑；块化见 [_buildInfoBlock]）
+            //      + 内嵌评论区（评论区底部避开系统手势导航条）。
             //      全屏不渲染（下方内容区不占位）。
             if (!_fullscreen) ...[
-              Container(
-                key: const ValueKey('player-info-bar'),
-                decoration: BoxDecoration(
-                  color: Theme.of(context).colorScheme.surface,
-                  border: Border(
-                    bottom: BorderSide(
-                      color: Theme.of(context)
-                          .dividerColor
-                          .withValues(alpha: 0.5),
-                    ),
-                  ),
-                ),
-                padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
-                child: _buildVideoInfoBar(context),
-              ),
+              _buildInfoBlock(context),
               Expanded(
                 key: const ValueKey('player-comments'),
                 child: SafeArea(top: false, child: _buildEmbeddedComments()),
@@ -4108,6 +4181,48 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
             ),
           // 2. 听视频占位界面（封面 + 标题 + 提示，点按恢复画面）
           if (_listenMode) _buildListenPlaceholder(),
+          // 2.1 封面占位层（「封面放大变成播放界面」的假转场）
+          //     ───────────────────────────────────────────────────────
+          //     为什么是「假」：播放画面是原生纹理（BiliDashTexture），Hero
+          //     飞不到 Texture 里去，所以让 Hero 把卡片封面飞进视频区、落在
+          //     这一层上，等播放器就绪后这层淡出，露出真实画面。
+          //
+          //     落点精度：包在**与纹理同一个 AspectRatio 盒**里（_aspectRatio
+          //     + Center），两端 box 一致 → 飞行终点与最终画面严格同位。
+          //     tag 用 coverHeroTag(_video.bvid)，与源端 VideoTile 同一工厂，
+          //     不会对不上；本页只渲染这一个封面层 → tag 唯一。
+          //
+          //     IgnorePointer 是硬要求（不是防御性写法）：本层在听视频占位层
+          //     **之上**，而 CoverImage/占位底色是 opaque 命中区，不忽略命中就
+          //     会截掉「点按恢复画面」；非听视频态也会挡住下面的显隐/手势层。
+          //
+          //     cover 为空则整层不构建（连 AnimatedOpacity 都没有），因此既不
+          //     产生占位图也绝不发图片请求（测试用的空 cover 视频即走这条路径）。
+          //     这一层与听视频模式无关：它按自己的节奏淡出，不被 _listenMode
+          //     分支收编（否则开着听视频进来封面会永远盖着）。
+          if (_coverOverlayVisible && _video.cover.isNotEmpty)
+            Positioned.fill(
+              child: IgnorePointer(
+                child: AnimatedOpacity(
+                  opacity: _coverOverlayOpaque ? 1.0 : 0.0,
+                  duration: kCoverFadeOutDur,
+                  curve: kCurveOut,
+                  child: Center(
+                    child: AspectRatio(
+                      aspectRatio: _aspectRatio,
+                      child: CoverHero(
+                        tag: coverHeroTag(_video.bvid),
+                        child: CoverImage(
+                          cover: _video.cover,
+                          width: double.infinity,
+                          height: double.infinity,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
           // 2.25 弹幕层：Texture 之上、字幕层之下（字幕可读优先）。
           // 仅「开关开 && 有数据 && 已加载」才构建——关闭时零开销；
           // 无弹幕（空数据）不构建，不产生任何绘制。
@@ -4126,12 +4241,15 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
               ),
             ),
           // 2.5 字幕层：Texture 之上、控制层之下（听视频模式隐藏）。
-          // 底部控制行约 80px（进度条行 36 + 按钮行 44），字幕悬浮在其上方。
-          // 主字幕大号在上，副字幕小号在其下（见 _SubtitleOverlay）。
+          // 底部控制行 88px（进度条行 44 + 按钮行 44，见 _buildBottomBar），
+          // 字幕悬浮在其上方。主字幕大号在上，副字幕小号在其下（见
+          // _SubtitleOverlay）。
           // v2.17.0+：字幕相对**视频区矩形**底部定位（不再相对整屏）——
-          // 全屏横屏按控制层显隐取值（显示 → 抬升到控制行上方 110；
+          // 全屏横屏按控制层显隐取值（显示 → 抬升到控制行上方 118；
           // 隐藏沉浸观影 → 贴画面底部 24，历史取值防跑偏）；非全屏视频区
-          // 较短，控制层显示时贴其上方（92），隐藏时贴视频区底（16）。
+          // 较短，控制层显示时贴其上方（100），隐藏时贴视频区底（16）。
+          // （P5：控制行 80 → 88，可见态两个基准同步 +8，保持与控制行顶部
+          // 原有的 22 / 12 px 间隙不变。）
           if (!_listenMode &&
               _subtitleEnabled &&
               (_mainSubtitleText.isNotEmpty ||
@@ -4140,18 +4258,25 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
               left: 24,
               right: 24,
               bottom: _fullscreen
-                  ? (_controlsVisible ? 110.0 : 24.0)
-                  : (_controlsVisible ? 92.0 : 16.0),
+                  ? (_controlsVisible ? 118.0 : 24.0)
+                  : (_controlsVisible ? 100.0 : 16.0),
               child: _SubtitleOverlay(
                 mainText: _mainSubtitleText,
                 secondaryText: _secondarySubtitleText,
               ),
             ),
           // 3. 登录过期横幅
+          //    v2.17.18：不再与返回键共享同一条带——横幅整条下压不合适（会落进
+          //    中央播放簇的命中带、抢走「点按去登录」），改为让横幅**从返回键
+          //    触摸区右缘起**（left = 48，与 [_buildTopBar] 里 IconButton 钉死的
+          //    minWidth 48 对齐）：箭头独占左上角 48×48 触摸区，不再压在横幅
+          //    左内边距上（旧版两者重叠 → 箭头看着像横幅的前置图标）。
+          //    横幅高度随文字自适应（Text 不设 maxLines），窄了会换行不截断。
           if (_loginExpiryText != null)
             Positioned(
               top: 0,
-              left: 0,
+              // 与顶栏返回键触摸区宽度一致（player_page 常量：48dp）
+              left: 48,
               right: 0,
               child: _LoginExpiryBanner(
                 text: _loginExpiryText!,
@@ -4211,7 +4336,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
           // 6. 缓冲指示
           if (_buffering)
             const Center(
-                child: CircularProgressIndicator(color: Colors.white)),
+                child: CircularProgressIndicator(color: kPlayerOn)),
           // 7. 错误视图
           if (_error != null) _buildErrorView(),
         ],
@@ -4234,6 +4359,65 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     );
   }
 
+  /// 信息块的补场起点（归一化到控制器 0..1 上的 [Interval]）：前
+  /// [kInfoBlockDelay] 是「等封面先落位」，与封面 Hero 的 [kHeroFlightDur]
+  /// 重叠，不是串行等待。
+  static final double _kInfoBlockFadeStart = kInfoBlockDelay.inMilliseconds /
+      (kInfoBlockDelay.inMilliseconds + kInfoBlockDur.inMilliseconds);
+
+  /// 信息块（块化 + 补场动效）。
+  ///
+  /// 外形交给 [AppBlock]（variant=videoInfo）：描边 + 左侧短竖条当「起笔」+
+  /// 圆角，底色沿用规格表的 [kPaper]（与原 `colorScheme.surface` 同值，所以
+  /// 原来的底色写法直接删掉，不做双层底）。原来那条 `border(bottom:)` 的
+  /// hairline 分隔线也一并删——现在由块的四周描边表达层级，再留一条横线就是
+  /// 两套语言打架。
+  ///
+  /// `ValueKey('player-info-bar')` 仍挂在这里（测试锚点：横屏/竖屏/集成三处
+  /// 几何断言都量它的 RenderObject ⊤ == 视频区底边）。注意**没有外边距**：
+  /// 块紧贴视频区下沿、通栏铺满，任何 margin 都会让「顶部 == 视频区底部」
+  /// 偏掉。
+  Widget _buildInfoBlock(BuildContext context) {
+    final block = AppBlock(
+      key: const ValueKey('player-info-bar'),
+      variant: AppBlockVariant.videoInfo,
+      child: _buildVideoInfoBar(context),
+    );
+    return _withInfoBlockEntrance(context, block);
+  }
+
+  /// 给信息块套「补场」动效：延迟 [kInfoBlockDelay] 后淡入 + 从 96%
+  /// ([kInfoBlockScaleFrom]) 微放大到位，总长 [kInfoBlockDur]。
+  ///
+  /// 卸载时机：[_infoBlockDone]（控制器 completed 时置位）之后本方法直接返回
+  /// 原块——树里不留 `FadeTransition`/`Transform`，信息块不动的那些帧不必
+  /// 多走一次 opacity + transform 的合成。
+  ///
+  /// 不加 `IgnorePointer`：这块里有 UP 主入口等可点元素，动画期间也必须可点
+  /// （`FadeTransition`/`Transform` 都不拦命中，保持默认即可）。
+  Widget _withInfoBlockEntrance(BuildContext context, Widget block) {
+    if (!MotionControl.of(context) || _infoBlockDone) return block;
+    // 用 drive 而不是 CurvedAnimation：CurvedAnimation 要在 state 里持有并
+    // dispose，而这里每次 build 都取一次动画视图，drive 出来的 Animatable
+    // 不挂监听、随 build 丢弃无副作用。
+    final t = _infoBlockCtl
+        .drive(CurveTween(curve: Interval(_kInfoBlockFadeStart, 1.0, curve: kCurveOut)));
+    return FadeTransition(
+      opacity: t,
+      // child 必须传：否则每帧重建整棵信息块子树（含 ExpandableText）
+      child: AnimatedBuilder(
+        animation: t,
+        child: block,
+        builder: (_, child) => Transform.scale(
+          scale: kInfoBlockScaleFrom + (1 - kInfoBlockScaleFrom) * t.value,
+          // 从左上角放大：信息块是「落位后长出来」，锚点跟着左上角才不倒冲
+          alignment: Alignment.topLeft,
+          child: child,
+        ),
+      ),
+    );
+  }
+
   /// 非全屏（竖屏置顶 / v2.17.17 横屏置顶）视频信息行：标题（含分 P）+
   /// UP 主入口 + 时长 + 简介。
   ///
@@ -4251,8 +4435,10 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
   /// 「展开」看全文、「收起」复原；展开态封顶高度内可滚动（防超长简介把
   /// 固定信息行撑爆布局，见 [_descMaxExpandedHeight]）。
   Widget _buildVideoInfoBar(BuildContext context) {
-    final theme = Theme.of(context);
-    final subStyle = TextStyle(fontSize: 12.5, color: Colors.grey.shade600);
+    // 中性墨分层（P5）：标题主墨（kInkBlack）→ UP 主/集数/简介次级
+    // （kInkGray70）→ 时长三级（kInkGray50，等宽数字）。标题/正文/元信息
+    // 分别走 kTypeTitleM / kTypeBodyS / kTypeNum 字阶。
+    final subStyle = kTypeBodyS.copyWith(color: kInkGray70);
     // 横屏（v2.17.17 横屏置顶模式）屏高低 → 信息行紧凑（标题 1 行 / 简介
     // 少行），多留高度给评论区。
     final landscape =
@@ -4283,11 +4469,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
           titleText,
           maxLines: landscape ? 1 : 2,
           overflow: TextOverflow.ellipsis,
-          style: theme.textTheme.titleMedium?.copyWith(
-            fontSize: 16,
-            fontWeight: FontWeight.w600,
-            height: 1.3,
-          ),
+          style: kTypeTitleM.copyWith(color: kInkBlack),
         ),
         const SizedBox(height: 4),
         Row(
@@ -4295,7 +4477,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
             // UP 主区（阶段 C）：普通视频 → 头像+名字可点；番剧 → 剧集标签
             if (_video.epId != null) ...[
               Icon(Icons.play_circle_outline,
-                  size: 15, color: Colors.grey.shade500),
+                  size: 15, color: kInkGray50),
               const SizedBox(width: 4),
               Flexible(
                 child: Text(
@@ -4321,7 +4503,9 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
                   style: subStyle),
             ],
             const Spacer(),
-            Text(_fmtMs(durMs), style: subStyle),
+            // 时长：三级墨 + 等宽数字（与进度条两端时间同一套数字语汇）
+            Text(_fmtMs(durMs),
+                style: kTypeNum.copyWith(color: kInkGray50)),
           ],
         ),
         // 简介区：desc 空（无简介/番剧/拉取失败）不占位，避免空行喧宾夺主
@@ -4482,21 +4666,17 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
           decoration: BoxDecoration(
-            color: Colors.black.withValues(alpha: 0.55),
+            color: kInkBlack.withValues(alpha: 0.55),
             borderRadius: BorderRadius.circular(8),
           ),
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(icon, color: Colors.white, size: 22),
+              Icon(icon, color: kPlayerOn, size: 22),
               const SizedBox(width: 8),
               Text(
                 text,
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontSize: 16,
-                  fontWeight: FontWeight.w600,
-                ),
+                style: kTypeTitleM.copyWith(color: kPlayerOn),
               ),
             ],
           ),
@@ -4525,33 +4705,24 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
+                    // 封面：与列表/占位层共用 [CoverImage]（防盗链头 + 加载/
+                    // 失败占位只此一份）。听视频占位层的封面尺寸固定 150x84，
+                    // 与 [CoverImage] 默认一致，只是这里显式写出来免歧义。
                     if (_video.cover.isNotEmpty)
                       ClipRRect(
                         borderRadius: BorderRadius.circular(8),
-                        child: Image.network(
-                          _video.cover,
+                        child: CoverImage(
+                          cover: _video.cover,
                           width: 150,
                           height: 84,
-                          fit: BoxFit.cover,
-                          headers: {
-                            'User-Agent': kBrowserUA,
-                            'Referer': kBiliReferer,
-                          },
-                          errorBuilder: (_, __, ___) => Container(
-                            width: 150,
-                            height: 84,
-                            color: Colors.white10,
-                            child: const Icon(Icons.broken_image_outlined,
-                                color: Colors.white54, size: 32),
-                          ),
                         ),
                       )
                     else
                       const Icon(Icons.headphones,
-                          color: Colors.white70, size: 40),
+                          color: kPlayerOnDim, size: 40),
                     const SizedBox(height: 12),
                     const Icon(Icons.headphones,
-                        color: Colors.white70, size: 24),
+                        color: kPlayerOnDim, size: 24),
                     const SizedBox(height: 6),
                     Padding(
                       padding: const EdgeInsets.symmetric(horizontal: 16),
@@ -4560,13 +4731,12 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
                         maxLines: 2,
                         overflow: TextOverflow.ellipsis,
                         textAlign: TextAlign.center,
-                        style: const TextStyle(
-                            color: Colors.white, fontSize: 14),
+                        style: kTypeTitleS.copyWith(color: kPlayerOn),
                       ),
                     ),
                     const SizedBox(height: 8),
-                    const Text('听视频中 · 点按恢复画面',
-                        style: TextStyle(color: Colors.white54, fontSize: 12)),
+                    Text('听视频中 · 点按恢复画面',
+                        style: kTypeBodyS.copyWith(color: kPlayerOnDim)),
                   ],
                 ),
               ),
@@ -4574,6 +4744,35 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
           ),
         ),
       ),
+    );
+  }
+
+  /// 中央播放/暂停键图形（P5 印刷语汇）：1.5px 纸白描边圆 + 8% 纸白半透明
+  /// 填充 + 实心三角/暂停双竖条——比原来实心 `play_circle_filled` 更克制、
+  /// 平面（不靠色块压画面）。
+  ///
+  /// 尺寸固定 72×72：与原 `iconSize: 72` 完全一致——中央簇尺寸属几何敏感区
+  /// （[_buildControls] 的 compactEmbedded 收起判定 + player_landscape_pin
+  /// 测试的矩形断言），**只换描边不换尺寸**。
+  Widget _buildPlayGlyph() {
+    return Stack(
+      alignment: Alignment.center,
+      children: [
+        Container(
+          width: 72,
+          height: 72,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: kPlayerPaper.withValues(alpha: 0.08),
+            border: Border.all(
+              color: kPlayerPaper.withValues(alpha: 0.8),
+              width: 1.5,
+            ),
+          ),
+        ),
+        Icon(_playing ? Icons.pause : Icons.play_arrow,
+            color: kPlayerOn, size: 34),
+      ],
     );
   }
 
@@ -4587,7 +4786,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
           const Padding(
             padding: EdgeInsets.only(bottom: 12),
             child: Text('播放完成',
-                style: TextStyle(color: Colors.white, fontSize: 16)),
+                style: TextStyle(color: kPlayerOn, fontSize: 16)),
           ),
         Row(
           mainAxisSize: MainAxisSize.min,
@@ -4596,22 +4795,21 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
             IconButton(
               tooltip: '快退 3 秒',
               iconSize: 40,
-              color: Colors.white,
+              color: kPlayerOn,
               icon: const Icon(Icons.replay),
               onPressed: _player == null ? null : _rewind3s,
             ),
             IconButton(
               iconSize: 72,
-              color: Colors.white,
-              icon: Icon(
-                  _playing ? Icons.pause_circle_filled : Icons.play_circle_filled),
+              color: kPlayerOn,
+              icon: _buildPlayGlyph(),
               onPressed: _player == null ? null : _togglePlay,
             ),
             // 快进 3 秒：Icons.forward_30 转圈箭头，与左侧快退对称
             IconButton(
               tooltip: '快进 3 秒',
               iconSize: 40,
-              color: Colors.white,
+              color: kPlayerOn,
               icon: const Icon(Icons.forward_30),
               onPressed: _player == null ? null : _forward3s,
             ),
@@ -4621,6 +4819,10 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     );
   }
 
+  /// 顶部控制栏（全屏 / 非全屏共用的返回行）。
+  ///
+  /// 遮罩：现在就是「贴内容高度」的渐变条（SafeArea + 48 高按钮行 ≈ 48 + 状态栏
+  /// inset），P5 保持不扩大——只有返回键与全屏标题两个元素，无需更高的 scrim。
   Widget _buildTopBar() {
     return Container(
       decoration: const BoxDecoration(
@@ -4635,7 +4837,12 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
         child: Row(
           children: [
             IconButton(
-              icon: const Icon(Icons.arrow_back, color: Colors.white),
+              icon: const Icon(Icons.arrow_back, color: kPlayerOn),
+              // 命中区 ≥48×48（Android 触摸规范）：M3 IconButton 的 padded
+              // tapTarget 已是 48，这里显式钉住 minSize，避免将来主题改
+              // visualDensity / tapTargetSize 时悄悄缩水
+              constraints:
+                  const BoxConstraints(minWidth: 48, minHeight: 48),
               // v2.17.17：全屏中返回 = 先退出全屏（回当前方向置顶+评论），
               // 非全屏 = 离开播放页（见 _handleBack）
               onPressed: _handleBack,
@@ -4651,7 +4858,7 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
                       : _video.title,
                   maxLines: 1,
                   overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(color: Colors.white, fontSize: 15),
+                  style: kTypeTitleM.copyWith(color: kPlayerOn),
                 ),
               ),
           ],
@@ -4660,8 +4867,72 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     );
   }
 
+  /// 底部按钮行的「开关图标 + 开启标记」：开启态 [kPlayerOn]（纸白）、
+  /// 关闭态 [kPlayerOff]（白 38%）；开启时图标下方加一条 2×10 纸白短线。
+  ///
+  /// 短线是**颜色之外的第二状态载体**（Android 无障碍规范：状态不得只用颜色
+  /// 表达）；关闭态同样占 2px 槽位（无子节点 = 不绘制），保证两态图标垂直
+  /// 位置不跳动。
+  Widget _barToggleIcon(IconData icon, {required bool on}) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(icon, color: on ? kPlayerOn : kPlayerOff, size: 20),
+        const SizedBox(height: 2),
+        SizedBox(
+          width: 10,
+          height: 2,
+          child: on ? const ColoredBox(color: kPlayerOn) : null,
+        ),
+      ],
+    );
+  }
+
+  /// 底部按钮行的单个按钮内容：**图标在上、标签在下**的竖排单元（v2.17.18）。
+  ///
+  /// 为什么改成竖排：8 等分格在 411dp 宽屏（Pixel 7 档）上每格仅 51.4dp，
+  /// 横排时「图标 20 + 间距 4」先吃掉 24dp，标签只剩 27.4dp——而 [kTypeLabel]
+  /// （11px + 字距 0.6 ≈ 11.6dp/字）下 2 个中文字要 23.2dp、3 个字要 34.8dp、
+  /// 4 个字要 46.4dp，**必然**被 `TextOverflow.ellipsis` 截断（实测「选集 1/N」
+  /// 显示成「选⋯」、「听视频」显示成「听⋯」，「听视频中」「字幕中」「已缓存」
+  /// 同理）。竖排后标签独占整格宽 51.4dp：3 字（34.8）与 4 字（46.4）都完整
+  /// 显示，不再有省略号。
+  ///
+  /// [FittedBox]（`scaleDown`，Flutter 内置组件，不引入新依赖）是最后一道
+  /// 保险：极端长度（如「选集 1/100」≈ 56dp 超出整格）整体等比缩到格宽以内
+  /// 而**不省略**；正常长度缩放比 = 1，字号仍是 [kTypeLabel]，字阶不乱。
+  /// 竖排单元高约 39.2（图标 20 + 短线槽 4 + 间距 2 + 单行文字 13.2）＜ 按钮行
+  /// 44，行高与整条控制行高度（88）不变；点击回调、按钮顺序全部照旧。
+  Widget _barIconLabel({
+    required Widget icon,
+    required String label,
+    required Color color,
+  }) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        icon,
+        const SizedBox(height: 2),
+        SizedBox(
+          // 撑满整格宽（Column 交叉轴对子级是松约束，infinity 会夹到格宽），
+          // 让 FittedBox 拿到确定的可用宽度
+          width: double.infinity,
+          child: FittedBox(
+            fit: BoxFit.scaleDown,
+            child: Text(
+              label,
+              // softWrap: false 且不设 maxLines：文本按自然宽度单行排版（不受
+              // 格宽约束 → 结构上不可能出现省略号），超宽交给 FittedBox 缩放
+              softWrap: false,
+              style: kTypeLabel.copyWith(color: color),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
   Widget _buildBottomBar() {
-    final sliderEnabled = _durationMs > 0;
     return Container(
       decoration: const BoxDecoration(
         gradient: LinearGradient(
@@ -4670,10 +4941,16 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
           colors: [Colors.black54, Colors.transparent],
         ),
       ),
-      // 固定高度：Slider 在「有界高度」约束下会撑满整个高度
-      // （_RenderSlider 布局取 constraints.maxHeight），不固定会盖满全屏
-      // 并吞掉中心播放/暂停与返回按钮的点击，且进度条漂到屏幕中部。
-      // 两行结构：进度条行 + 按钮行（倍速/听视频/字幕/弹幕/评论/下载/全屏）。
+      // 两行结构：进度条行（自绘 [_PlayerSeekBar]，固定 44 高）+
+      // 按钮行（44 高：选集/倍速/听视频/字幕/弹幕/评论/下载/全屏）。
+      //
+      // P5：进度条行不用原生 Slider——Slider 在「有界高度」约束下会撑满整个
+      // 高度（_RenderSlider 布局取 constraints.maxHeight）并吞掉中心播放/暂停
+      // 与返回按钮的点击，且两端内建 24px 边距让细轨几何不可控。改为自绘后
+      // 轨道位置 / 命中区 / 柄形状全部自定（见 [_PlayerSeekBar] 类注释）。
+      // 本行高度 36 → 44：满足拖动触摸目标 ≥44（Android 触摸规范），整条
+      // 控制行由 80 抬到 88（+8，未显著变高），字幕悬浮基准同步 +8（见
+      // [_buildVideoLayers] 字幕层的 bottom 取值）。
       // v2.17.0+：底部 SafeArea 只在全屏吃系统底 inset——非全屏（竖屏 /
       // 横屏置顶）时本行位于视频区黑盒底部（屏幕中部，不在屏底），系统
       // 导航条在屏幕最下方（横屏在侧边），不需也**不能**再垫底（否则按钮
@@ -4685,25 +4962,36 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
           mainAxisSize: MainAxisSize.min,
           children: [
             SizedBox(
-              height: 36,
+              height: _PlayerSeekBar.height,
               child: Row(
                 children: [
+                  // 已播时间：等宽数字（秒位跳动时不抖）
                   Text(_fmtMs(_positionMs),
-                      style: const TextStyle(color: Colors.white, fontSize: 12)),
+                      style: kTypeNum.copyWith(color: kPlayerOn)),
                   Expanded(
-                    child: Slider(
-                      value: sliderEnabled
-                          ? _positionMs.clamp(0, _durationMs).toDouble()
-                          : 0,
-                      max: sliderEnabled ? _durationMs.toDouble() : 1,
-                      activeColor: Colors.white,
-                      inactiveColor: Colors.white24,
-                      onChanged: sliderEnabled ? _onSeekStart : null,
-                      onChangeEnd: sliderEnabled ? _onSeekEnd : null,
+                    child: Padding(
+                      // 细轨与两端时间文本之间留白（原 Slider 内建 24px 边距，
+                      // 自绘后按印刷语汇收紧到 8）
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      child: _PlayerSeekBar(
+                        positionMs: _positionMs,
+                        durationMs: _durationMs,
+                        // 原生播放器未上报缓冲进度（BiliDashEvent 只有
+                        // prepared/completed/error/urlExpired 四类），因此
+                        // 不画缓冲段——不伪造数据；将来原生补 onBufferUpdate
+                        // 时在此传值即可点亮轨道中段的 kPlayerOnDim。
+                        bufferedMs: null,
+                        showHandle: _controlsVisible,
+                        // 回调完全沿用原 Slider：拖动中 = onChanged
+                        // （_onSeekStart 只更新 UI 位置），松手 = onChangeEnd
+                        // （_onSeekEnd 提交 seekTo）——播放行为零改动
+                        onDrag: _onSeekStart,
+                        onDragEnd: _onSeekEnd,
+                      ),
                     ),
                   ),
                   Text(_fmtMs(_durationMs),
-                      style: const TextStyle(color: Colors.white, fontSize: 12)),
+                      style: kTypeNum.copyWith(color: kPlayerOn)),
                 ],
               ),
             ),
@@ -4711,189 +4999,107 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
               height: 44,
               child: Row(
                 children: [
-                  // 选集按钮：仅多 P 显示（当前集 1/N），点按弹出选集列表
+                  // 选集按钮：仅多 P 显示（当前集 1/N），点按弹出选集列表。
+                  // 非开关（导航动作）→ 恒定纸白，无「开启标记」短线。
                   if (_video.isMultiPage)
                     Expanded(
                       child: InkWell(
                         onTap: _player == null ? null : _showEpisodeSheet,
-                        child: Row(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            const Icon(Icons.queue_music,
-                                color: Colors.white, size: 18),
-                            const SizedBox(width: 4),
-                            Flexible(
-                              child: Text(
-                                '选集 ${_currentPageIndex + 1}/${_video.pageCount}',
-                                softWrap: false,
-                                overflow: TextOverflow.ellipsis,
-                                style: const TextStyle(
-                                    color: Colors.white, fontSize: 14),
-                              ),
-                            ),
-                          ],
+                        child: _barIconLabel(
+                          icon: const Icon(Icons.queue_music,
+                              color: kPlayerOn, size: 20),
+                          label:
+                              '选集 ${_currentPageIndex + 1}/${_video.pageCount}',
+                          color: kPlayerOn,
                         ),
                       ),
                     ),
-                  // 倍速按钮：显示当前档位，点按弹出九档选择
+                  // 倍速按钮：显示当前档位，点按弹出九档选择。
+                  // 非开关（档位由文字自明）→ 恒定纸白，无短线。
                   Expanded(
                     child: InkWell(
                       onTap: _player == null ? null : _showSpeedSheet,
-                      child: Row(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          const Icon(Icons.speed,
-                              color: Colors.white, size: 18),
-                          const SizedBox(width: 4),
-                          Flexible(
-                            child: Text(
-                              _fmtSpeed(_speed),
-                              softWrap: false,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                  color: Colors.white, fontSize: 14),
-                            ),
-                          ),
-                        ],
+                      child: _barIconLabel(
+                        icon: const Icon(Icons.speed,
+                            color: kPlayerOn, size: 20),
+                        label: _fmtSpeed(_speed),
+                        color: kPlayerOn,
                       ),
                     ),
                   ),
-                  // 听视频按钮：图标 + 状态反馈（开启时高亮）
+                  // 听视频按钮：开关态「纸白 + 图标下方 2×10 纸白短线」
+                  // （短线 = 颜色之外的第二状态载体，Android 无障碍规范：
+                  // 不得只用颜色表达状态）
                   Expanded(
                     child: InkWell(
                       onTap: _player == null ? null : _toggleListenMode,
-                      child: Row(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          Icon(
-                            _listenMode
-                                ? Icons.headset
-                                : Icons.headset_off,
-                            color: _listenMode
-                                ? Colors.pinkAccent
-                                : Colors.white,
-                            size: 18,
-                          ),
-                          const SizedBox(width: 4),
-                          Flexible(
-                            child: Text(
-                              _listenMode ? '听视频中' : '听视频',
-                              softWrap: false,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                color: _listenMode
-                                    ? Colors.pinkAccent
-                                    : Colors.white,
-                                fontSize: 14,
-                              ),
-                            ),
-                          ),
-                        ],
+                      child: _barIconLabel(
+                        icon: _barToggleIcon(
+                          _listenMode ? Icons.headset : Icons.headset_off,
+                          on: _listenMode,
+                        ),
+                        label: _listenMode ? '听视频中' : '听视频',
+                        color: _listenMode ? kPlayerOn : kPlayerOff,
                       ),
                     ),
                   ),
-                  // 字幕按钮：图标 + 状态反馈（开启时高亮），点按弹出字幕设置
+                  // 字幕按钮：开关态同上；点按弹出字幕设置（_showSubtitleSheet）
                   Expanded(
                     child: InkWell(
                       onTap: _player == null ? null : _showSubtitleSheet,
-                      child: Row(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          Icon(
-                            _subtitleEnabled
-                                ? Icons.subtitles
-                                : Icons.subtitles_off,
-                            color: _subtitleEnabled
-                                ? Colors.pinkAccent
-                                : Colors.white,
-                            size: 18,
-                          ),
-                          const SizedBox(width: 4),
-                          Flexible(
-                            child: Text(
-                              _subtitleEnabled ? '字幕中' : '字幕',
-                              softWrap: false,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                color: _subtitleEnabled
-                                    ? Colors.pinkAccent
-                                    : Colors.white,
-                                fontSize: 14,
-                              ),
-                            ),
-                          ),
-                        ],
+                      child: _barIconLabel(
+                        icon: _barToggleIcon(
+                          _subtitleEnabled
+                              ? Icons.subtitles
+                              : Icons.subtitles_off,
+                          on: _subtitleEnabled,
+                        ),
+                        label: _subtitleEnabled ? '字幕中' : '字幕',
+                        color: _subtitleEnabled ? kPlayerOn : kPlayerOff,
                       ),
                     ),
                   ),
-                  // 弹幕按钮：图标 + 状态反馈（开启时高亮）。
+                  // 弹幕按钮：开关态同上。
                   // 点按 = 开关；长按 = 弹幕设置（屏蔽词/类型/透明度）。
                   Expanded(
                     child: InkWell(
                       onTap: _player == null ? null : _toggleDanmaku,
                       onLongPress:
                           _player == null ? null : _showDanmakuSettings,
-                      child: Row(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          Icon(
-                            _danmakuEnabled
-                                ? Icons.chat_bubble
-                                : Icons.chat_bubble_outline,
-                            color: _danmakuEnabled
-                                ? Colors.pinkAccent
-                                : Colors.white,
-                            size: 18,
-                          ),
-                          const SizedBox(width: 4),
-                          Flexible(
-                            child: Text(
-                              '弹幕',
-                              softWrap: false,
-                              overflow: TextOverflow.ellipsis,
-                              style: TextStyle(
-                                color: _danmakuEnabled
-                                    ? Colors.pinkAccent
-                                    : Colors.white,
-                                fontSize: 14,
-                              ),
-                            ),
-                          ),
-                        ],
+                      child: _barIconLabel(
+                        icon: _barToggleIcon(
+                          _danmakuEnabled
+                              ? Icons.chat_bubble
+                              : Icons.chat_bubble_outline,
+                          on: _danmakuEnabled,
+                        ),
+                        label: '弹幕',
+                        color: _danmakuEnabled ? kPlayerOn : kPlayerOff,
                       ),
                     ),
                   ),
                   // 评论按钮（v2.17.0+；v2.17.17 横屏置顶共用）：非全屏
                   // （竖屏/横屏置顶）= 滚动定位到下方内嵌评论区；
-                  // 横屏全屏 = 打开原独立评论页（见 _onCommentsButtonTap）
+                  // 横屏全屏 = 打开原独立评论页（见 _onCommentsButtonTap）。
+                  // 非开关 → 恒定纸白，无短线。
                   Expanded(
                     child: InkWell(
                       onTap: _player == null ? null : _onCommentsButtonTap,
-                      child: Row(
-                        mainAxisAlignment: MainAxisAlignment.center,
-                        children: [
-                          const Icon(Icons.comment_outlined,
-                              color: Colors.white, size: 18),
-                          const SizedBox(width: 4),
-                          Flexible(
-                            child: Text(
-                              '评论',
-                              softWrap: false,
-                              overflow: TextOverflow.ellipsis,
-                              style: const TextStyle(
-                                  color: Colors.white, fontSize: 14),
-                            ),
-                          ),
-                        ],
+                      child: _barIconLabel(
+                        icon: const Icon(Icons.comment_outlined,
+                            color: kPlayerOn, size: 20),
+                        label: '评论',
+                        color: kPlayerOn,
                       ),
                     ),
                   ),
                   // 下载按钮：未缓存「下载」/ 下载中进度环+百分比 / 已缓存「已缓存」
                   Expanded(child: _buildDownloadControl()),
-                  // 全屏按钮
+                  // 全屏按钮（非开关动作；图标 20 与同级按钮对齐）
                   Expanded(
                     child: IconButton(
-                      color: Colors.white,
+                      color: kPlayerOn,
+                      iconSize: 20,
                       icon: Icon(
                           _fullscreen ? Icons.fullscreen_exit : Icons.fullscreen),
                       onPressed: _toggleFullscreen,
@@ -4908,25 +5114,35 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
     );
   }
 
+  /// 播放失败 / 需登录面板：墨黑半透明底（保留画面透出感）+ 纸白系内容。
+  ///
+  /// 点缀墨 [kInkClay] **只用在唯一「需要行动」的强调点**——「去登录」是
+  /// 用户必须做点什么才能继续播放的动作；「重试」「返回」是可选/退路，保持
+  /// 纸白描边，不抢焦点（点缀色不得多点开花）。
   Widget _buildErrorView() {
     return ColoredBox(
-      color: Colors.black87,
+      // 覆盖在视频之上的错误面板：半透明墨黑底（保留画面透出感）
+      color: kInkBlack.withValues(alpha: 0.87),
       child: Center(
         child: Padding(
           padding: const EdgeInsets.symmetric(horizontal: 32),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              const Icon(Icons.error_outline, color: Colors.white70, size: 48),
+              const Icon(Icons.error_outline, color: kPlayerOnDim, size: 48),
               const SizedBox(height: 12),
               Text(
                 _error!,
                 textAlign: TextAlign.center,
-                style: const TextStyle(color: Colors.white, fontSize: 15),
+                style: kTypeTitleS.copyWith(color: kPlayerOn),
               ),
               const SizedBox(height: 20),
               if (_loginPrompt) ...[
                 FilledButton(
+                  style: FilledButton.styleFrom(
+                    backgroundColor: kInkClay,
+                    foregroundColor: kPaper,
+                  ),
                   onPressed: _goLogin,
                   child: const Text('去登录'),
                 ),
@@ -4939,7 +5155,9 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
                     OutlinedButton(
                       onPressed: _retry,
                       style: OutlinedButton.styleFrom(
-                          foregroundColor: Colors.white),
+                        foregroundColor: kPlayerOn,
+                        side: const BorderSide(color: kPlayerOnDim),
+                      ),
                       child: const Text('重试'),
                     ),
                     const SizedBox(width: 12),
@@ -4947,7 +5165,9 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
                   OutlinedButton(
                     onPressed: () => Navigator.of(context).pop(),
                     style: OutlinedButton.styleFrom(
-                        foregroundColor: Colors.white),
+                      foregroundColor: kPlayerOn,
+                      side: const BorderSide(color: kPlayerOnDim),
+                    ),
                     child: const Text('返回'),
                   ),
                 ],
@@ -4958,6 +5178,206 @@ class _PlayerPageState extends State<PlayerPage> with RouteAware {
       ),
     );
   }
+}
+
+/// 自绘播放进度条（P5）：2px 三段轨道 + 4×14 竖条拖动柄，替代原生
+/// Material `Slider`。
+///
+/// 为什么自绘：Slider 在「有界高度」约束下会撑满整个高度（`_RenderSlider`
+/// 布局取 `constraints.maxHeight`），两端还内建 24px 边距、柄为 20px 直径
+/// 圆，细轨几何不可控；播放页要的是印刷语汇的「细轨 + 方柄 + 无阴影」。
+///
+/// 视觉三态（左→右）：未播 [kPlayerRule]（白 24%）→ 已缓冲 [kPlayerOnDim]
+/// （白 54%）→ 已播 [kPlayerPaper]（纸白）；柄为 4×14 纸白竖条（「书签」
+/// 而非圆点），仅控制层可见时显示（[showHandle]）。
+///
+/// 亮/暗双向可见（v2.17.18）：三态墨里只有已播/已缓冲/柄是「白系」，它们在
+/// 浅色画面上靠底部黑色渐变（`_buildBottomBar` 的 black54 遮罩）压暗背景才
+/// 显出来；未播档的 kPlayerRule 只有白 24%，压在**浅米色画面**上与背景同色
+/// → 实测拖动后「柄右侧的未播轨道几乎消失」（看不出轨道走向）。修法：在整条
+/// 轨道下方先铺一条同厚度（仍是 [trackThickness]=2，不加粗）的 [kInkBlack]
+/// 70% 暗垫，再画三态——未播段变成「白 24% 压在暗垫上」的复合灰，浅色画面
+/// 上对比度 ≈3:1 可见，深色画面上暗垫融入背景、白 24% 照旧发亮；已播段与柄
+/// 是**不透明纸白**，压在暗垫上完全不受影响，层级仍是「已播 + 柄 ＞ 未播」。
+///
+/// 触摸目标：整条 [height]=44 高、整宽都是命中区（`HitTestBehavior.opaque`），
+/// 比原生 Slider 的 2px 细轨好按得多——Android 规范的目标是 ≥48，这里取
+/// 44（本行原为 36）：再抬高会让整条控制行显著变高，牵动视频区几何与
+/// 字幕悬浮基准，收益不抵代价（见 [_PlayerPageState._buildBottomBar]）。
+///
+/// 回调语义与 Slider 一一对应：[onDrag] = `onChanged`（拖动/点按过程持续
+/// 回调，播放页只更新 UI 位置）、[onDragEnd] = `onChangeEnd`（松手/抬手
+/// 提交 `seekTo`）。播放页传入 [_PlayerPageState._onSeekStart] /
+/// [_PlayerPageState._onSeekEnd]，**播放行为零改动**。
+class _PlayerSeekBar extends StatelessWidget {
+  /// 已播位置（ms）。
+  final int positionMs;
+
+  /// 总时长（ms）；<= 0 视为时长未知 → 不可拖（只画未播轨道）。
+  final int durationMs;
+
+  /// 已缓冲位置（ms）；null / <= 0 = 无缓冲信息 → 不画缓冲段。
+  ///
+  /// 现状：播放页传 null——原生层未上报缓冲进度（[BiliDashEvent] 只有
+  /// prepared / completed / error / urlExpired 四类事件，没有缓冲事件），
+  /// 不伪造数据、不假装有缓冲段。轨道中段这一档画法已就绪，原生侧将来
+  /// 补 `onBufferUpdate` 时在调用处传值即可点亮。
+  final int? bufferedMs;
+
+  /// 是否显示拖动柄（控制层可见时显示；隐藏时只留轨道）。
+  final bool showHandle;
+
+  /// 拖动/点按中回调（Slider.onChanged 语义）。
+  final ValueChanged<double>? onDrag;
+
+  /// 松手/抬手回调（Slider.onChangeEnd 语义）。
+  final ValueChanged<double>? onDragEnd;
+
+  const _PlayerSeekBar({
+    required this.positionMs,
+    required this.durationMs,
+    required this.showHandle,
+    this.bufferedMs,
+    this.onDrag,
+    this.onDragEnd,
+  });
+
+  /// 触摸目标高度（与 [_PlayerPageState._buildBottomBar] 的进度条行一致）。
+  static const double height = 44;
+
+  /// 轨道粗细（px）。
+  static const double trackThickness = 2;
+
+  /// 拖动柄宽 / 高（px）。
+  static const double handleWidth = 4;
+  static const double handleHeight = 14;
+
+  @override
+  Widget build(BuildContext context) {
+    final max = durationMs > 0 ? durationMs.toDouble() : 1.0;
+    final draggable = durationMs > 0 && onDrag != null && onDragEnd != null;
+    return SizedBox(
+      height: height,
+      child: LayoutBuilder(
+        builder: (context, c) {
+          final width = c.maxWidth;
+          // 命中点 dx → 目标时长：轨道左右各内缩半个柄宽（柄在任何位置都
+          // 完整落在画布内），故比例按 (width - handleWidth) 折算
+          double valueAt(double dx) {
+            final span = width - handleWidth;
+            if (span <= 0) return 0;
+            return ((dx - handleWidth / 2) / span).clamp(0.0, 1.0) * max;
+          }
+
+          return GestureDetector(
+            behavior: HitTestBehavior.opaque,
+            // 手势集刻意只有两种，且**不注册 onTapDown**：
+            // - 点按：抬手（onTapUp）一次性「定位并提交」，等价 Slider 的
+            //   tap-to-seek；
+            // - 拖动：start/update 持续回调（拇指跟手）、end 提交。
+            // 不注册 onTapDown 的原因：按下超过 100ms 时 Tap 识别器会先触发
+            // onTapDown，随后若横向位移超 slop 则由 HorizontalDrag 赢走竞技场
+            // （onTapUp 不再触发，只发 onTapCancel，而这里没有 onTapCancel
+            // 回调）——那会让播放页的 _dragging 停在 true、tick 循环永久
+            // 停摆。只在抬手/松手提交，就没有任何「开了收不住」的路径。
+            onTapUp: draggable
+                ? (d) => onDragEnd!(valueAt(d.localPosition.dx))
+                : null,
+            onHorizontalDragStart:
+                draggable ? (d) => onDrag!(valueAt(d.localPosition.dx)) : null,
+            onHorizontalDragUpdate:
+                draggable ? (d) => onDrag!(valueAt(d.localPosition.dx)) : null,
+            onHorizontalDragEnd: draggable
+                ? (d) => onDragEnd!(valueAt(d.localPosition.dx))
+                : null,
+            child: CustomPaint(
+              size: Size(width, height),
+              painter: _SeekBarPainter(
+                progress: durationMs > 0 ? positionMs / max : 0,
+                buffered: (bufferedMs == null || durationMs <= 0)
+                    ? 0
+                    : bufferedMs! / max,
+                showHandle: showHandle,
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+}
+
+/// [_PlayerSeekBar] 的画笔：三段细轨（未播 / 已缓冲 / 已播）+ 竖条柄。
+/// 只有矩形描边式色块，无阴影、无圆角装饰（印刷语汇）。
+class _SeekBarPainter extends CustomPainter {
+  /// 已播比例 0..1。
+  final double progress;
+
+  /// 已缓冲比例 0..1；<= 0 时不画（不伪造缓冲进度）。
+  final double buffered;
+
+  final bool showHandle;
+
+  const _SeekBarPainter({
+    required this.progress,
+    required this.buffered,
+    required this.showHandle,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final cy = size.height / 2;
+    final left = _PlayerSeekBar.handleWidth / 2;
+    final right = size.width - _PlayerSeekBar.handleWidth / 2;
+    final span = right - left;
+    if (span <= 0) return;
+
+    final ink = Paint()..style = PaintingStyle.fill;
+    final trackTop = cy - _PlayerSeekBar.trackThickness / 2;
+    final track = Rect.fromLTWH(
+        left, trackTop, span, _PlayerSeekBar.trackThickness);
+
+    // 暗垫（v2.17.18）：整条轨道先铺一层 kInkBlack 70% 的**同厚度**底——
+    // 只垫底不加粗（保持 2px 细轨印刷感），让未播档在浅色画面上也有对比。
+    canvas.drawRect(track, ink..color = kInkBlack.withValues(alpha: 0.7));
+
+    // 未播段（整条轨道底）
+    canvas.drawRect(track, ink..color = kPlayerRule);
+
+    // 已缓冲段（有缓冲信息才画；无信息时轨道中段不出现第三种墨）
+    if (buffered > 0) {
+      final w = span * buffered.clamp(0.0, 1.0);
+      canvas.drawRect(
+        Rect.fromLTWH(left, trackTop, w, _PlayerSeekBar.trackThickness),
+        ink..color = kPlayerOnDim,
+      );
+    }
+
+    // 已播段
+    final playedW = span * progress.clamp(0.0, 1.0);
+    canvas.drawRect(
+      Rect.fromLTWH(left, trackTop, playedW, _PlayerSeekBar.trackThickness),
+      ink..color = kPlayerPaper,
+    );
+
+    // 拖动柄：4×14 纸白竖条，仅在控制层可见时出现
+    if (showHandle) {
+      canvas.drawRect(
+        Rect.fromCenter(
+          center: Offset(left + playedW, cy),
+          width: _PlayerSeekBar.handleWidth,
+          height: _PlayerSeekBar.handleHeight,
+        ),
+        ink..color = kPlayerPaper,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(_SeekBarPainter old) =>
+      old.progress != progress ||
+      old.buffered != buffered ||
+      old.showHandle != showHandle;
 }
 
 /// 登录即将过期 / 未登录匿名横幅（点按跳登录页；未登录文案见播放页
@@ -4971,7 +5391,10 @@ class _LoginExpiryBanner extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Material(
-      color: const Color(0xFF7A5C00),
+      // 登录即将过期 / 未登录匿名横幅：点缀墨职责——「时效性提示」，用
+      // kInkClayWash 底 + kInkClay 字（浅底上的赤陶，对比度足够且不与视频
+      // 黑底混同；旧的「墨底纸字」在此场景看不见，横幅本就压在视频上）
+      color: kInkClayWash,
       child: InkWell(
         onTap: onTap,
         child: SafeArea(
@@ -4981,15 +5404,15 @@ class _LoginExpiryBanner extends StatelessWidget {
             child: Row(
               children: [
                 const Icon(Icons.warning_amber_rounded,
-                    color: Colors.white, size: 18),
+                    color: kInkClay, size: 18),
                 const SizedBox(width: 8),
                 Expanded(
                   child: Text(
                     text,
-                    style: const TextStyle(color: Colors.white, fontSize: 13),
+                    style: kTypeBodyS.copyWith(color: kInkClay),
                   ),
                 ),
-                const Icon(Icons.chevron_right, color: Colors.white70),
+                const Icon(Icons.chevron_right, color: kInkClay),
               ],
             ),
           ),
@@ -5034,14 +5457,15 @@ class _SubtitleLine extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
       decoration: BoxDecoration(
-        color: Colors.black45,
+        // 字幕小药丸：半透明墨黑底（画面透出）+ 纸白字
+        color: kInkBlack.withValues(alpha: 0.45),
         borderRadius: BorderRadius.circular(6),
       ),
       child: Text(
         text,
         textAlign: TextAlign.center,
         style: TextStyle(
-          color: Colors.white,
+          color: kPlayerOn,
           fontSize: fontSize,
           fontWeight: FontWeight.w600,
           // 黑色阴影描边：无底时也保证字幕可读

@@ -2,13 +2,17 @@ import 'package:flutter/material.dart';
 
 import '../models/whitelist_video.dart';
 import '../services/history_store.dart';
+import '../theme/app_tokens.dart';
+import '../widgets/app_state_view.dart';
 import '../widgets/history_tile.dart';
+import '../widgets/staggered_entrance.dart';
 import 'player_page.dart';
 
 /// 历史记录页（播放历史：记录看过的视频，点击续播）。
 ///
 /// 作为主页 PageView 的一页（与主页共享 AppBar，**不带自己的 Scaffold**）：
-/// 主页右滑进入；数据按 watchedAt 倒序；点击条目 → 构造 WhitelistVideo →
+/// 底部导航「历史」进入（index 2）；数据按 watchedAt 倒序；
+/// 点击条目 → 构造 WhitelistVideo →
 /// push [PlayerPage]（现有进度恢复逻辑自动续播到上次位置/分 P）；
 /// 长按或条目右侧删除按钮 → 删除单条；顶部「清空」→ 确认后清空全部；
 /// 无记录时显示空态「暂无历史记录」。
@@ -23,6 +27,13 @@ class HistoryPageState extends State<HistoryPage> {
   List<HistoryEntry> _entries = const [];
   bool _loading = true;
 
+  /// 入场记账本：**由 State 持有**（活在列表项之外），列表项被回收再建时不重播。
+  final EntranceLedger _entranceLedger = EntranceLedger();
+
+  /// 重新加载代际号：每次 reload 自增 → 作为 [StaggeredListScope.generation]，
+  /// 表达"换了一批数据"（配合 clear() 让同一批条目允许再演一次入场）。
+  int _reloadToken = 0;
+
   @override
   void initState() {
     super.initState();
@@ -36,6 +47,9 @@ class HistoryPageState extends State<HistoryPage> {
     setState(() {
       _entries = entries;
       _loading = false;
+      // 数据换新 → 记账作废，列表项重建时可再演一次交错入场
+      _reloadToken++;
+      _entranceLedger.clear();
     });
   }
 
@@ -74,7 +88,7 @@ class HistoryPageState extends State<HistoryPage> {
           ),
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx, true),
-            child: const Text('删除', style: TextStyle(color: Colors.red)),
+            child: const Text('删除', style: TextStyle(color: kError)),
           ),
         ],
       ),
@@ -98,7 +112,7 @@ class HistoryPageState extends State<HistoryPage> {
           ),
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx, true),
-            child: const Text('清空', style: TextStyle(color: Colors.red)),
+            child: const Text('清空', style: TextStyle(color: kError)),
           ),
         ],
       ),
@@ -127,7 +141,7 @@ class HistoryPageState extends State<HistoryPage> {
                     Text('历史记录', style: theme.textTheme.titleSmall),
                     const SizedBox(height: 2),
                     Text(
-                      '右滑到这里 · 点击条目续播',
+                      '底部导航「历史」· 点击条目续播',
                       style: theme.textTheme.bodySmall?.copyWith(
                         color: theme.colorScheme.onSurfaceVariant,
                       ),
@@ -146,44 +160,43 @@ class HistoryPageState extends State<HistoryPage> {
         ),
         Expanded(
           child: _loading
-              ? const Center(child: CircularProgressIndicator())
+              // 整页加载态：风衣男剪影 + 文案。本页是主页 PageView 内嵌页，
+              // **不在 RefreshIndicator 宿主内** → 保持居中（无需 scrollable）
+              ? const AppLoadingHero(seed: 'history')
               : _entries.isEmpty
-                  ? _emptyView(theme)
-                  : ListView.separated(
-                      padding: const EdgeInsets.all(12),
-                      itemCount: _entries.length,
-                      separatorBuilder: (_, __) => const SizedBox(height: 8),
-                      itemBuilder: (context, i) => HistoryTile(
-                        entry: _entries[i],
-                        onOpen: () => _openEntry(_entries[i]),
-                        onRemove: () => _confirmRemove(_entries[i]),
+                  // 空态：细线插画 + 文案（文案走 UiCopyStore，可在设置页改写）
+                  ? const AppStateView(
+                      kind: AppStateKind.empty,
+                      copyId: 'empty.history',
+                      subtitleCopyId: 'empty.history.sub',
+                      illustrationSeed: 'history',
+                      // 旧空态是 ListView(AlwaysScrollableScrollPhysics) → 保持同结构
+                      scrollable: true,
+                    )
+                  : StaggeredListScope(
+                      generation: 'history#$_reloadToken',
+                      ledger: _entranceLedger,
+                      child: ListView.separated(
+                        padding: const EdgeInsets.all(12),
+                        itemCount: _entries.length,
+                        // 历史卡自带 1px 强描边，间距用 kListGap 才不显挤
+                        separatorBuilder: (_, __) =>
+                            const SizedBox(height: kListGap),
+                        itemBuilder: (context, i) {
+                          final e = _entries[i];
+                          return StaggeredEntrance(
+                            // 稳定标识：同一 bvid 的不同分 P 是两条记录
+                            entryKey: '${e.bvid}#${e.pageIndex}',
+                            index: i,
+                            child: HistoryTile(
+                              entry: e,
+                              onOpen: () => _openEntry(e),
+                              onRemove: () => _confirmRemove(e),
+                            ),
+                          );
+                        },
                       ),
                     ),
-        ),
-      ],
-    );
-  }
-
-  Widget _emptyView(ThemeData theme) {
-    return ListView(
-      physics: const AlwaysScrollableScrollPhysics(),
-      children: [
-        const SizedBox(height: 120),
-        Icon(
-          Icons.history,
-          size: 56,
-          color: theme.colorScheme.outline,
-        ),
-        const SizedBox(height: 12),
-        const Center(child: Text('暂无历史记录')),
-        const SizedBox(height: 8),
-        Center(
-          child: Text(
-            '看过的视频会出现在这里，点击可续播',
-            style: theme.textTheme.bodySmall?.copyWith(
-              color: theme.colorScheme.onSurfaceVariant,
-            ),
-          ),
         ),
       ],
     );

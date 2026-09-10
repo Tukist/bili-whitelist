@@ -37,7 +37,7 @@ android {
         applicationId = "com.biliwhitelist.bili_whitelist_app"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
-        // M2：白名单点播 App 需要 Android 8.0+（Api 26）以获得稳定 MediaCodec/ExoPlayer 行为
+        // M2：amoTV 需要 Android 8.0+（Api 26）以获得稳定 MediaCodec/ExoPlayer 行为
         minSdk = 26
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode

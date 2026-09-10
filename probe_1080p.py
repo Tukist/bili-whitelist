@@ -6,7 +6,7 @@ probe_1080p.py — 登录态 1080P mp4 单流实测（M1 补充）
 
 背景
 ----
-为「B 站白名单点播安卓 App」判定播放器路线：
+为「amoTV」（白名单点播安卓 App）判定播放器路线：
   - 路线 C：登录后 playurl(fnval=0, qn=80) 能直接返回 1080P mp4(durl)
             → 可用 Flutter video_player 单流播放（最简）
   - 路线 A：1080P 只能走 DASH 双流 → 需要原生通道

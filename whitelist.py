@@ -4,7 +4,7 @@
 whitelist.py — B 站白名单管理 CLI（M1：PC 端标记脚本 + Gist 同步）
 ================================================================
 
-为「B 站白名单点播安卓 App」维护 whitelist.json：
+为「amoTV」（白名单点播安卓 App）维护 whitelist.json：
   - add    解析 BV 号 → 调 view 接口抓取信息 → 追加进 whitelist.json
   - remove 从白名单删除（带确认）
   - list   表格打印白名单

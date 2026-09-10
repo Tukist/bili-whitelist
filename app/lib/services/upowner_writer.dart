@@ -75,7 +75,7 @@ class UpownerWriter {
     if (!await github.hasConfig()) {
       return const UpownerWriteResult(
         ok: false,
-        message: '请先在首页右上角「管理」入口配置 GitHub token 与 Gist ID',
+        message: '请先到底部导航「个人」页配置 GitHub token 与 Gist ID',
       );
     }
     final current = await github.fetchFromGist();
@@ -133,7 +133,7 @@ class UpownerWriter {
     if (!await github.hasConfig()) {
       return const UpownerBatchResult(
         ok: false,
-        message: '请先在首页右上角「管理」入口配置 GitHub token 与 Gist ID',
+        message: '请先到底部导航「个人」页配置 GitHub token 与 Gist ID',
       );
     }
     final current = await github.fetchFromGist();
@@ -180,7 +180,7 @@ class UpownerWriter {
     if (!await github.hasConfig()) {
       return const UpownerWriteResult(
         ok: false,
-        message: '请先在首页右上角「管理」入口配置 GitHub token 与 Gist ID',
+        message: '请先到底部导航「个人」页配置 GitHub token 与 Gist ID',
       );
     }
     final current = await github.fetchFromGist();
@@ -224,7 +224,7 @@ class UpownerWriter {
     if (!await github.hasConfig()) {
       return const UpownerWriteResult(
         ok: false,
-        message: '请先在首页右上角「管理」入口配置 GitHub token 与 Gist ID',
+        message: '请先到底部导航「个人」页配置 GitHub token 与 Gist ID',
       );
     }
     final current = await github.fetchFromGist();

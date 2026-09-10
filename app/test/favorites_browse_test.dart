@@ -25,6 +25,8 @@ import 'package:bili_whitelist_app/pages/favorites_page.dart';
 import 'package:bili_whitelist_app/pages/playlist_page.dart';
 import 'package:bili_whitelist_app/services/service_locator.dart';
 import 'package:bili_whitelist_app/sync/whitelist_source.dart';
+import 'package:bili_whitelist_app/widgets/app_state_view.dart';
+import 'package:bili_whitelist_app/widgets/dot_illustration.dart';
 
 /// 内存版 secure storage。
 final Map<String, String> _store = {};
@@ -307,7 +309,7 @@ void main() {
       expect(find.text('去登录'), findsOneWidget);
     });
 
-    testWidgets('收藏夹为空 → 空态文案', (tester) async {
+    testWidgets('收藏夹为空 → 空态文案 + 细线插画 + 仍能下拉刷新', (tester) async {
       _seedValidSession();
       final adapter = _RoutingAdapter({
         '/x/web-interface/nav': (_) => _navBody(),
@@ -318,6 +320,75 @@ void main() {
       );
       await tester.pumpAndSettle();
       expect(find.textContaining('还没有收藏夹'), findsOneWidget);
+
+      // 空态已统一到 AppStateView：文案走 UiCopyStore（逐字不变）、
+      // 细线插画 seed = favorites、scrollable（宿主是 RefreshIndicator）
+      final state = tester.widget<AppStateView>(find.byType(AppStateView));
+      expect(state.kind, AppStateKind.empty);
+      expect(state.copyId, 'empty.favorites');
+      expect(state.actionLabel, isNull, reason: '空态不带动作按钮');
+      expect(state.scrollable, isTrue);
+      expect(
+        tester.widget<DotIllustration>(find.byType(DotIllustration)).seed,
+        'favorites',
+      );
+      expect(
+        tester.widget<ListView>(find.byType(ListView)).physics,
+        isA<AlwaysScrollableScrollPhysics>(),
+      );
+
+      // ★ 空态下仍能下拉刷新（scrollable: true 的意义）
+      int listAllCalls() => adapter.requests
+          .where((r) => r.path == '/x/v3/fav/folder/created/list-all')
+          .length;
+      final before = listAllCalls();
+      await tester.fling(find.byType(ListView), const Offset(0, 320), 1000);
+      await tester.pump();
+      await tester.pump(const Duration(seconds: 1));
+      await tester.pumpAndSettle();
+      expect(listAllCalls(), before + 1,
+          reason: '空态下拉必须触发 onRefresh → 重新请求收藏夹');
+    });
+
+    testWidgets('收藏夹接口失败（-412 风控）→ AppErrorView + 点重试重发请求',
+        (tester) async {
+      _seedValidSession();
+      final adapter = _RoutingAdapter({
+        '/x/web-interface/nav': (_) => _navBody(),
+        '/x/v3/fav/folder/created/list-all': (_) => {
+              'code': -412,
+              'message': '请求被风控拦截',
+            },
+      });
+      await tester.pumpWidget(
+        MaterialApp(
+          home: FavoritesPage(
+            api: _makeApi(adapter),
+            openLogin: (context, {banner}) async {},
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.byType(AppErrorView), findsOneWidget);
+      // 错误文案直给接口 message（-412 的具体文案由 API 层决定）→ 只断言非空
+      expect(
+        tester.widget<AppErrorView>(find.byType(AppErrorView)).message,
+        isNotEmpty,
+      );
+      expect(find.text('重试'), findsOneWidget);
+      expect(
+        tester.widget<DotIllustration>(find.byType(DotIllustration)).seed,
+        'favorites',
+      );
+
+      int listAllCalls() => adapter.requests
+          .where((r) => r.path == '/x/v3/fav/folder/created/list-all')
+          .length;
+      final before = listAllCalls();
+      await tester.tap(find.text('重试'));
+      await tester.pumpAndSettle();
+      expect(listAllCalls(), greaterThan(before), reason: '点「重试」必须重新请求');
     });
 
     testWidgets('点某收藏夹 → 夹内视频页；点视频 → view 补全 → 播放回调；'
@@ -450,6 +521,16 @@ void main() {
       );
       await tester.pumpAndSettle();
       expect(find.textContaining('这个收藏夹还没有视频'), findsOneWidget);
+
+      // 空态统一到 AppStateView：细线插画 seed = favorite_videos + 可滚动
+      final state = tester.widget<AppStateView>(find.byType(AppStateView));
+      expect(state.kind, AppStateKind.empty);
+      expect(state.copyId, 'empty.favorite_videos');
+      expect(state.scrollable, isTrue);
+      expect(
+        tester.widget<DotIllustration>(find.byType(DotIllustration)).seed,
+        'favorite_videos',
+      );
     });
   });
 }

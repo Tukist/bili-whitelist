@@ -28,7 +28,13 @@ import 'package:flutter/material.dart';
 
 import '../api/bilibili_api.dart';
 import '../models/whitelist_video.dart';
+import '../services/loading_copy.dart';
 import '../services/whitelist_writer.dart';
+import '../theme/app_motion.dart';
+import '../theme/app_tokens.dart';
+import '../widgets/app_state_view.dart';
+import '../widgets/smoke_silhouette.dart';
+import '../widgets/staggered_entrance.dart';
 import '../widgets/video_tile.dart';
 import 'login_page.dart';
 import 'player_page.dart';
@@ -94,6 +100,21 @@ class _FavoriteVideosPageState extends State<FavoriteVideosPage> {
   /// 首屏失败（列表仍空）时的整页错误 / 登录引导状态。
   String? _error;
   String? _needLogin;
+
+  // -------------------------------------------------------------------------
+  // 交错入场（块化与动效系统）
+  // -------------------------------------------------------------------------
+
+  /// 入场记账本：**由 State 持有**（活在列表项之外），列表项被回收再建时不重播。
+  final EntranceLedger _entranceLedger = EntranceLedger();
+
+  /// 加载代际号（作 [StaggeredListScope.generation]）：重拉第一页 → 自增。
+  int _reloadToken = 0;
+
+  /// 本批追加条目在列表中的**绝对起始下标**（追加成功时记为追加前的长度）。
+  /// 翻页追加用 `index = i - _appendBatchStart` 让新批重新从 0 起步；
+  /// 首屏 / 重新加载时归 0。
+  int _appendBatchStart = 0;
 
   /// 正在拉视频详情（防连点：同一时刻只允许一次「点视频 → 补 meta」）。
   bool _openingVideo = false;
@@ -170,6 +191,10 @@ class _FavoriteVideosPageState extends State<FavoriteVideosPage> {
       _loadingMore = false;
       _error = null;
       _needLogin = null;
+      // 交错入场：新一批数据 → 代际号自增 + 记账作废（可重演）+ 追加批从 0 起
+      _reloadToken++;
+      _appendBatchStart = 0;
+      _entranceLedger.clear();
       // 搜索缓存随「全新分页加载」作废（重新分页浏览即视为数据刷新）
       _searchGen++;
       _fullVideos.clear();
@@ -206,6 +231,8 @@ class _FavoriteVideosPageState extends State<FavoriteVideosPage> {
     try {
       final result = await _api.fetchFavoriteVideos(widget.mediaId, pn: pn);
       if (!mounted) return;
+      // 本批第一条在列表里的绝对下标（追加前长度）：翻页追加的入场序号从这里起算
+      final batchStart = _videos.length;
       // 去重（按 bvid；防接口重复条目）
       final existing = _videos.map((v) => v.bvid).toSet();
       final appended = [
@@ -217,6 +244,7 @@ class _FavoriteVideosPageState extends State<FavoriteVideosPage> {
         _videos
           ..clear()
           ..addAll(appended);
+        _appendBatchStart = batchStart;
         _page = pn;
         _hasMore = result.hasMore;
         _loadingMore = false;
@@ -317,6 +345,8 @@ class _FavoriteVideosPageState extends State<FavoriteVideosPage> {
           ..addAll(_fullVideos); // 全量缓存即夹内全部（服务端顺序）
         _hasMore = false; // 整夹已在手：翻页结束
         _loadingMore = false;
+        // 整夹一次性顶上来 = 换了一批数据：入场序号重新从首屏起算
+        _appendBatchStart = 0;
       }
     });
   }
@@ -447,40 +477,51 @@ class _FavoriteVideosPageState extends State<FavoriteVideosPage> {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: Text(_title)),
-      body: RefreshIndicator(onRefresh: _onRefresh, child: _buildBody()),
+      body: RefreshIndicator(
+        onRefresh: _onRefresh,
+        // 列表项交错入场的 scope（InheritedWidget，不参与布局）：
+        // 分页浏览列表与搜索结果列表共用同一本账（bvid 稳定标识）。
+        child: StaggeredListScope(
+          generation: 'favorite_videos#$_reloadToken',
+          ledger: _entranceLedger,
+          child: _buildBody(),
+        ),
+      ),
     );
   }
 
   Widget _buildBody() {
-    final theme = Theme.of(context);
     // 整页状态（列表仍空，此时搜索无意义 → 整页视图不显示搜索框）：
     if (_needLogin != null) {
-      return _StateView(
-        icon: Icons.lock_outline,
-        message: _needLogin!,
-        actionIcon: Icons.login,
+      // 登录门禁不是「错误」→ 走空态的克制配色，只给一个「去登录」动作
+      return AppStateView(
+        kind: AppStateKind.empty,
+        title: _needLogin!,
         actionLabel: '去登录',
         onAction: _goLogin,
+        illustrationSeed: 'favorite_videos',
+        scrollable: true,
       );
     }
     if (_loadingMore && _videos.isEmpty) {
-      // 首屏加载中
-      return const Center(child: CircularProgressIndicator());
+      // 首屏加载中：本页 body 在 RefreshIndicator 宿主内 →
+      // **必须 scrollable: true**，否则加载态下没有可滚动区域，下拉刷新失效
+      return const AppLoadingHero(seed: 'favorite_videos', scrollable: true);
     }
     if (_error != null) {
-      return _StateView(
-        icon: Icons.error_outline,
+      return AppErrorView(
         message: _error!,
-        actionIcon: Icons.refresh,
-        actionLabel: '重试',
-        onAction: _loadFirstPage,
+        onRetry: _loadFirstPage,
+        illustrationSeed: 'favorite_videos',
+        scrollable: true,
       );
     }
     if (_videos.isEmpty) {
-      return const _StateView(
-        icon: Icons.video_library_outlined,
-        message: '这个收藏夹还没有视频。\n'
-            '（收藏的合集 / 剧集等非视频内容，本版暂不展示）',
+      return const AppStateView(
+        kind: AppStateKind.empty,
+        copyId: 'empty.favorite_videos',
+        illustrationSeed: 'favorite_videos',
+        scrollable: true,
       );
     }
     // 内容区：AppBar 下搜索框 + 列表（分页浏览 / 拉全量进度 / 过滤结果）
@@ -488,7 +529,7 @@ class _FavoriteVideosPageState extends State<FavoriteVideosPage> {
       children: [
         _buildSearchBar(),
         const Divider(height: 1),
-        Expanded(child: _buildListArea(theme)),
+        Expanded(child: _buildListArea(Theme.of(context))),
       ],
     );
   }
@@ -528,11 +569,11 @@ class _FavoriteVideosPageState extends State<FavoriteVideosPage> {
   Widget _buildListArea(ThemeData theme) {
     if (_keyword.isNotEmpty) {
       if (_loadingFull) return _buildSearchProgress();
-      if (_fullLoaded) return _buildSearchResults(theme);
+      if (_fullLoaded) return _buildSearchResults();
       // 防抖等待窗口（关键词已输入、拉全量尚未开始）：暂沿用浏览列表，
       // 400ms 停滞后进入进度/结果视图
     }
-    // 分页浏览：列表 + 底部占位（加载中转圈 / 「没有更多了」）
+    // 分页浏览：列表 + 底部占位（小剪影 + 闲话 / 「没有更多了」）
     final extraSlots = (_loadingMore || !_hasMore) ? 1 : 0;
     return ListView.separated(
       controller: _scrollCtrl,
@@ -544,7 +585,20 @@ class _FavoriteVideosPageState extends State<FavoriteVideosPage> {
           return _buildFooter(theme);
         }
         final v = _videos[i];
-        return VideoTile(video: v, onTap: () => _openVideo(v));
+        // 首屏项与翻页追加项走两套节奏：首屏 36ms/240ms（一格格推入），
+        // 追加 20ms/180ms（用户已在看内容，节奏更密更快）；
+        // 追加批的序号从本批第一条起算（_appendBatchStart），且**不能为负**。
+        final bool isAppend = _appendBatchStart > 0 && i >= _appendBatchStart;
+        final int rel = i - _appendBatchStart;
+        return StaggeredEntrance(
+          // 稳定标识：bvid（刷新/去重后同一条始终给同一个 key）
+          entryKey: v.bvid,
+          index: isAppend ? (rel < 0 ? 0 : rel) : i,
+          step: isAppend ? kStaggerStepAppend : kStaggerStep,
+          duration: isAppend ? kDurEntranceAppend : kDurEntrance,
+          maxIndex: isAppend ? kStaggerMaxIndexAppend : kStaggerMaxIndex,
+          child: VideoTile(video: v, onTap: () => _openVideo(v)),
+        );
       },
     );
   }
@@ -575,17 +629,16 @@ class _FavoriteVideosPageState extends State<FavoriteVideosPage> {
 
   /// 搜索过滤结果：本地过滤（标题/UP 主包含关键词）后的匹配列表；
   /// 无匹配 → 「未找到匹配的视频」。点视频照常补 cid 播放。
-  Widget _buildSearchResults(ThemeData theme) {
+  Widget _buildSearchResults() {
     final matched = filterFavoriteVideosByKeyword(_fullVideos, _keyword);
     if (matched.isEmpty) {
-      return ListView(
-        physics: const AlwaysScrollableScrollPhysics(),
-        children: [
-          const SizedBox(height: 120),
-          Icon(Icons.search_off, size: 52, color: theme.colorScheme.outline),
-          const SizedBox(height: 14),
-          const Center(child: Text('未找到匹配的视频')),
-        ],
+      return const AppStateView(
+        kind: AppStateKind.empty,
+        copyId: 'empty.favorite_search',
+        subtitleCopyId: 'empty.favorite_search.sub',
+        illustrationSeed: 'favorite_videos.search',
+        // 旧空态是 ListView(AlwaysScrollableScrollPhysics) → 保持同结构
+        scrollable: true,
       );
     }
     return ListView.separated(
@@ -595,20 +648,38 @@ class _FavoriteVideosPageState extends State<FavoriteVideosPage> {
       separatorBuilder: (_, __) => const Divider(height: 1, indent: 88),
       itemBuilder: (context, i) {
         final v = matched[i];
-        return VideoTile(video: v, onTap: () => _openVideo(v));
+        // 搜索结果也走交错入场（同一本账：浏览时已演过的条目不重播）
+        return StaggeredEntrance(
+          entryKey: v.bvid,
+          index: i,
+          child: VideoTile(video: v, onTap: () => _openVideo(v)),
+        );
       },
     );
   }
 
   Widget _buildFooter(ThemeData theme) {
     if (_loadingMore) {
-      return const Padding(
-        padding: EdgeInsets.symmetric(vertical: 16),
+      // 「下一批正在路上」：小剪影 + 一句闲话。高度**写死**（原 footer 是
+      // 18px 转圈 + 上下 16 padding ≈ 50），避免翻页时列表高度跳动。
+      return SizedBox(
+        height: 80,
         child: Center(
-          child: SizedBox(
-            width: 18,
-            height: 18,
-            child: CircularProgressIndicator(strokeWidth: 2),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const SmokeSilhouette(size: 56),
+              const SizedBox(width: kSpace12),
+              Flexible(
+                child: Text(
+                  loadingCopyFor(
+                    pool: kLoadingPoolFooter,
+                    seed: 'favorite_videos',
+                  ),
+                  style: kTypeBodyS.copyWith(color: kInkGray70),
+                ),
+              ),
+            ],
           ),
         ),
       );
@@ -623,51 +694,6 @@ class _FavoriteVideosPageState extends State<FavoriteVideosPage> {
           ),
         ),
       ),
-    );
-  }
-}
-
-/// 夹内视频页的整页状态视图（登录引导 / 错误重试 / 空态），
-/// 样式与收藏夹总览页 [_StateView] 保持一致。
-class _StateView extends StatelessWidget {
-  final IconData icon;
-  final String message;
-  final IconData? actionIcon;
-  final String? actionLabel;
-  final VoidCallback? onAction;
-
-  const _StateView({
-    required this.icon,
-    required this.message,
-    this.actionIcon,
-    this.actionLabel,
-    this.onAction,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return ListView(
-      physics: const AlwaysScrollableScrollPhysics(),
-      children: [
-        const SizedBox(height: 140),
-        Icon(icon, size: 52, color: theme.colorScheme.outline),
-        const SizedBox(height: 14),
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 32),
-          child: Text(message, textAlign: TextAlign.center),
-        ),
-        if (actionLabel != null && onAction != null) ...[
-          const SizedBox(height: 18),
-          Center(
-            child: FilledButton.tonalIcon(
-              onPressed: onAction,
-              icon: Icon(actionIcon, size: 18),
-              label: Text(actionLabel!),
-            ),
-          ),
-        ],
-      ],
     );
   }
 }

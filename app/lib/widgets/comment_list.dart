@@ -24,6 +24,15 @@
 ///   拉完整楼中楼（`x/v2/reply/reply`，pn 递增分页，hasMore 继续加载）
 /// - 空态/错误态：暂无评论 / 评论区已关闭（12002）/ 网络与风控（可重试）
 ///
+/// 块化与动效（P0 批次 B）：
+/// - 每条根评论 = [AppBlock]（`comment` 规格：纸底 + hairline 描边），
+///   楼中楼预览/真回复 = [AppBlock]（`reply` 规格：冷底 + 左竖条）；
+///   条目间靠块自身 margin([kListGap]) 留呼吸（原尾部 Divider 已删除）；
+/// - 入场：整个列表挂在 [StaggeredListScope] 下（代次 = bvid+cid+重载计数），
+///   每条根评论包 [StaggeredEntrance]（翻页追加用更短更密的节奏）——
+///   楼中楼**不参与** stagger（嵌套延迟不可预测）；
+/// - 底部翻页加载态 = [SmokeSilhouette] + 一句 [kLoadingPoolFooter] 文案。
+///
 /// 只读：本组件不做任何点赞/发评论等写操作。aid 解析失败 / 首屏失败均给
 /// 重试入口。正文过长（v2.17.3+ 折叠）：超 5 行折叠省略 + 「展开」点击
 /// 看全文、「收起」复原（纯文本/链接混排都支持；无链接短评保持可直接
@@ -39,13 +48,22 @@ import '../api/bilibili_api.dart';
 import '../config.dart';
 import '../models/comment.dart';
 import '../models/whitelist_video.dart';
+import '../services/loading_copy.dart';
 import '../services/whitelist_writer.dart';
+import '../theme/app_motion.dart';
+import '../theme/app_palette.dart';
+import '../theme/app_tokens.dart';
 import '../utils/comment_links.dart';
 import '../utils/import_parser.dart';
 import '../pages/image_viewer_page.dart';
 import '../pages/player_page.dart';
 import '../pages/upowner_page.dart';
+import 'animated_copy_line.dart';
+import 'app_block.dart';
+import 'app_state_view.dart';
 import 'expandable_text.dart';
+import 'smoke_silhouette.dart';
+import 'staggered_entrance.dart';
 
 /// 图片/头像请求兜底头：B 站图床（i*.hdslb.com）一般无需 Referer，
 /// 带上浏览器头更稳（防个别域名/防盗链策略拦截）。
@@ -170,6 +188,25 @@ class _CommentListViewState extends State<CommentListView> {
   final Map<int, bool> _childrenLoading = {}; // 正在拉第一页
   final Map<int, String> _childrenError = {};
 
+  // --- 交错入场（P0 批次 B）-------------------------------------------------
+
+  /// 「已入场」记账本：**活在列表项之外**（State 持有），列表项被 ListView
+  /// 回收再出现时不重播。重新加载（[_init] / 首屏 reset）时 [clear] 清空
+  /// → 允许重播。
+  final EntranceLedger _entranceLedger = EntranceLedger();
+
+  /// 本批次（首屏 / 一次翻页追加）的起始下标：首屏 0；翻页成功时置为
+  /// 「追加前的根评论条数」，于是本批新增项按 `根下标 - _batchStart` 从 0 排队。
+  int _batchStart = 0;
+
+  /// 数据代次：每次 [_init]（换源/换集/重载）自增 —— [StaggeredListScope]
+  /// 的 generation 随之变化，配合清空的账本实现「换一批数据就重演一次」。
+  int _reloadToken = 0;
+
+  /// 当前入场代次（bvid + cid + 代次）：同一条评论换视频后算不同数据源。
+  String get _entranceGeneration =>
+      '${widget.video.bvid}#${widget.video.cid}#$_reloadToken';
+
   @override
   void initState() {
     super.initState();
@@ -224,6 +261,10 @@ class _CommentListViewState extends State<CommentListView> {
       _cursorNext = 0;
       _isEnd = false;
       _total = 0;
+      // 换数据源：代次 +1、批次归零、账本清空 → 新的 entryKey 重新排队入场
+      _reloadToken++;
+      _batchStart = 0;
+      _entranceLedger.clear();
     });
     var aid = widget.initialAid;
     aid ??= await _api.fetchVideoAid(widget.video);
@@ -277,6 +318,14 @@ class _CommentListViewState extends State<CommentListView> {
       );
       if (!mounted) return;
       setState(() {
+        // 交错入场批次：reset（首屏重载）→ 从 0 排队 + 账本清空；
+        // 翻页追加 → 本次新项从「追加前的条数」开始算序号。
+        if (reset) {
+          _batchStart = 0;
+          _entranceLedger.clear();
+        } else {
+          _batchStart = _roots.length;
+        }
         if (reset) {
           _pinned
             ..clear()
@@ -673,15 +722,27 @@ class _CommentListViewState extends State<CommentListView> {
     }
     final err = _error;
     if (err != null) {
-      return _fitState(
-          _ErrorView(message: err, onRetry: _errorRetry ? _retry : null));
+      // 评论区的错误/空态统一走 AppStateView（细线插画）；外层 _fitState
+      // 负责矮容器（横屏小窗）下仍可滚动、不溢出。
+      return _fitState(AppErrorView(
+        message: err,
+        onRetry: _errorRetry ? _retry : null,
+        illustrationSeed: 'comment',
+      ));
     }
     if (_pinned.isEmpty && _roots.isEmpty) {
-      return _fitState(const _EmptyView());
+      return _fitState(const AppStateView(
+        kind: AppStateKind.empty,
+        copyId: 'empty.comment',
+        subtitleCopyId: 'empty.comment.sub',
+        illustrationSeed: 'comment',
+      ));
     }
     final pinnedCount = _pinned.length;
     final rootCount = _roots.length;
     final headerCount = widget.showCountHeader ? 1 : 0;
+    // 翻页追加批次：本批条目用更短更密的入场节奏（见 app_motion.dart）
+    final appendBatch = _batchStart > 0;
     return NotificationListener<ScrollNotification>(
       onNotification: (notification) {
         // 上拉到底触发下一页（ScrollController 监听 + 此兜底双保险）
@@ -691,47 +752,72 @@ class _CommentListViewState extends State<CommentListView> {
         }
         return false;
       },
-      child: ListView.builder(
-        controller: _scrollCtrl,
-        padding: const EdgeInsets.only(bottom: 12),
-        itemCount: headerCount + pinnedCount + rootCount + 1, // +1 脚部
-        itemBuilder: (context, index) {
-          if (index == headerCount + pinnedCount + rootCount) {
-            return _buildFooter();
-          }
-          if (headerCount > 0 && index == 0) {
-            return _buildCountHeader();
-          }
-          final i = index - headerCount;
-          final bool pinned = i < pinnedCount;
-          final reply = pinned ? _pinned[i] : _roots[i - pinnedCount];
-          return _CommentRootTile(
-            reply: reply,
-            pinned: pinned,
-            expanded: _children.containsKey(reply.rpid),
-            childrenLoading: _childrenLoading[reply.rpid] == true,
-            childrenError: _childrenError[reply.rpid],
-            childState: _children[reply.rpid],
-            onToggle: () => _toggleReplies(reply),
-            onLoadMore: () => _loadMoreChildren(reply),
-            onLinkTap: _onCommentLinkTap,
-            onImageTap: _openImageGallery,
-          );
-        },
+      // 交错入场：scope 只提供「代次 + 账本」，列表仍由 ListView.builder
+      // 懒加载（每项自己决定演不演，不预建整表）。
+      child: StaggeredListScope(
+        generation: _entranceGeneration,
+        ledger: _entranceLedger,
+        child: ListView.builder(
+          controller: _scrollCtrl,
+          // 块与块之间的呼吸由页面内边距 + 每块的 margin(kListGap) 给
+          // （删除了原先条目尾部的 Divider）
+          padding: const EdgeInsets.fromLTRB(kPagePadH, 0, kPagePadH, kSpace12),
+          itemCount: headerCount + pinnedCount + rootCount + 1, // +1 脚部
+          itemBuilder: (context, index) {
+            if (index == headerCount + pinnedCount + rootCount) {
+              return _buildFooter();
+            }
+            if (headerCount > 0 && index == 0) {
+              return _buildCountHeader();
+            }
+            final i = index - headerCount;
+            final bool pinned = i < pinnedCount;
+            final reply = pinned ? _pinned[i] : _roots[i - pinnedCount];
+            // 入场序号：
+            // - 首屏（_batchStart == 0）：整个列表按位置 i 排队（置顶项一起排）；
+            // - 翻页追加（_batchStart > 0）：只有本批新增的根评论排队，序号
+            //   相对本批起点从 0 起算（置顶项/已有项都记过账不会重播，
+            //   负数一并夹到 0，防 Interval 拿到负起点）。
+            final int rawIndex =
+                appendBatch ? (i - pinnedCount) - _batchStart : i;
+            return StaggeredEntrance(
+              entryKey: 'rpid:${reply.rpid}',
+              index: rawIndex < 0 ? 0 : rawIndex,
+              step: appendBatch ? kStaggerStepAppend : kStaggerStep,
+              duration: appendBatch ? kDurEntranceAppend : kDurEntrance,
+              maxIndex: appendBatch ? kStaggerMaxIndexAppend : kStaggerMaxIndex,
+              child: _CommentRootTile(
+                reply: reply,
+                pinned: pinned,
+                expanded: _children.containsKey(reply.rpid),
+                childrenLoading: _childrenLoading[reply.rpid] == true,
+                childrenError: _childrenError[reply.rpid],
+                childState: _children[reply.rpid],
+                onToggle: () => _toggleReplies(reply),
+                onLoadMore: () => _loadMoreChildren(reply),
+                onLinkTap: _onCommentLinkTap,
+                onImageTap: _openImageGallery,
+              ),
+            );
+          },
+        ),
       ),
     );
   }
 
   /// 列表顶部「评论 N」区头（内嵌场景的评论区锚点 + 计数展示）。
+  ///
+  /// 横向内边距交给列表的 [kPagePadH]（本区头在列表内），文字与下方评论块
+  /// 左边线对齐；底色与页面底色相同（[ColorScheme.surface] = [kPaper]）。
   Widget _buildCountHeader() {
     return Container(
       key: widget.countHeaderKey,
       color: Theme.of(context).colorScheme.surface,
-      padding: const EdgeInsets.fromLTRB(12, 10, 12, 6),
+      padding: const EdgeInsets.fromLTRB(0, 10, 0, 6),
       child: Row(
         children: [
           Icon(Icons.forum_outlined,
-              size: 16, color: Colors.grey.shade600),
+              size: 16, color: kInkGray70),
           const SizedBox(width: 6),
           Text(
             '评论 $_total',
@@ -747,14 +833,23 @@ class _CommentListViewState extends State<CommentListView> {
 
   Widget _buildFooter() {
     if (_loadingMore) {
-      return const Padding(
-        padding: EdgeInsets.symmetric(vertical: 16),
-        child: Center(
-          child: SizedBox(
-            width: 22,
-            height: 22,
-            child: CircularProgressIndicator(strokeWidth: 2),
-          ),
+      // 翻页加载：抽烟剪影 + 一句加载闲话（文案池确定性挑一句，同 bvid 恒同）。
+      // 高度锁在 78（原转圈脚部 ~54）——只涨在列表尾部，不影响已滚过的内容。
+      return SizedBox(
+        height: 78,
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            const SmokeSilhouette(size: 56),
+            const SizedBox(height: kSpace4),
+            AnimatedCopyLine(
+              text: loadingCopyFor(
+                pool: kLoadingPoolFooter,
+                seed: '${widget.video.bvid}#footer',
+              ),
+              style: kTypeBodyS.copyWith(color: kInkGray70),
+            ),
+          ],
         ),
       );
     }
@@ -777,7 +872,7 @@ class _CommentListViewState extends State<CommentListView> {
           child: Text(
             folded ? '未登录仅展示热门评论，登录后可查看全部' : '没有更多了',
             textAlign: TextAlign.center,
-            style: TextStyle(color: Colors.grey, fontSize: folded ? 12.5 : 13),
+            style: TextStyle(color: kInkGray50, fontSize: folded ? 12.5 : 13),
           ),
         ),
       );
@@ -789,64 +884,6 @@ class _CommentListViewState extends State<CommentListView> {
 // ---------------------------------------------------------------------------
 // 展示用小组件
 // ---------------------------------------------------------------------------
-
-/// 错误/失败视图（带重试按钮）。
-class _ErrorView extends StatelessWidget {
-  final String message;
-  final VoidCallback? onRetry;
-
-  const _ErrorView({required this.message, this.onRetry});
-
-  @override
-  Widget build(BuildContext context) {
-    return Center(
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 32, vertical: 24),
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Icon(Icons.chat_bubble_outline,
-                size: 48, color: Colors.grey.shade400),
-            const SizedBox(height: 12),
-            Text(
-              message,
-              textAlign: TextAlign.center,
-              style: const TextStyle(fontSize: 15),
-            ),
-            if (onRetry != null) ...[
-              const SizedBox(height: 16),
-              FilledButton.icon(
-                onPressed: onRetry,
-                icon: const Icon(Icons.refresh, size: 18),
-                label: const Text('重试'),
-              ),
-            ],
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-/// 空态：暂无评论。
-class _EmptyView extends StatelessWidget {
-  const _EmptyView();
-
-  @override
-  Widget build(BuildContext context) {
-    return Center(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(Icons.chat_bubble_outline,
-              size: 48, color: Colors.grey.shade400),
-          const SizedBox(height: 12),
-          Text('暂无评论', style: TextStyle(color: Colors.grey.shade600)),
-        ],
-      ),
-    );
-  }
-}
 
 /// 单条根评论卡（含置顶角标、楼中楼预览 / 展开区）。
 class _CommentRootTile extends StatelessWidget {
@@ -883,9 +920,12 @@ class _CommentRootTile extends StatelessWidget {
     final theme = Theme.of(context);
     final r = reply;
     final showPreviews = !expanded && r.previews.isNotEmpty;
-    return Container(
-      color: theme.colorScheme.surface,
-      padding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
+    // 块化（P0 批次 B）：外层底色/内边距交给 AppBlock 的统一规格，
+    // 内部结构（头像/用户名/正文/图片/预览/操作行/楼中楼）原样不动；
+    // 原有的尾部 Divider 已删除，条目间距改由块自身 margin(kListGap) 表达。
+    return AppBlock(
+      variant: AppBlockVariant.comment,
+      margin: const EdgeInsets.only(bottom: kListGap),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -913,8 +953,7 @@ class _CommentRootTile extends StatelessWidget {
               child: _PreviewBlock(previews: r.previews),
             ),
           _buildActions(theme),
-          if (expanded) _buildChildrenArea(theme),
-          const Divider(height: 10, thickness: 0.5),
+          if (expanded) _buildChildrenArea(),
         ],
       ),
     );
@@ -967,16 +1006,16 @@ class _CommentRootTile extends StatelessWidget {
       padding: const EdgeInsets.only(top: 8),
       child: Row(
         children: [
-          Icon(Icons.thumb_up_alt_outlined, size: 14, color: Colors.grey.shade500),
+          Icon(Icons.thumb_up_alt_outlined, size: 14, color: kInkGray50),
           const SizedBox(width: 4),
           Text(
             _fmtLike(reply.like),
-            style: TextStyle(fontSize: 12, color: Colors.grey.shade600),
+            style: TextStyle(fontSize: 12, color: kInkGray70),
           ),
           const SizedBox(width: 14),
           Text(
             _fmtCtime(reply.ctime),
-            style: TextStyle(fontSize: 12, color: Colors.grey.shade500),
+            style: TextStyle(fontSize: 12, color: kInkGray50),
           ),
           const Spacer(),
           if (reply.count > 0)
@@ -997,7 +1036,7 @@ class _CommentRootTile extends StatelessWidget {
                           expanded ? '收起' : '${_fmtLike(reply.count)} 条回复',
                           style: TextStyle(
                             fontSize: 12.5,
-                            color: expanded ? Colors.grey.shade600 : primary,
+                            color: expanded ? kInkGray70 : primary,
                           ),
                         ),
                         Icon(
@@ -1005,7 +1044,7 @@ class _CommentRootTile extends StatelessWidget {
                               ? Icons.keyboard_arrow_up
                               : Icons.keyboard_arrow_down,
                           size: 16,
-                          color: expanded ? Colors.grey.shade600 : primary,
+                          color: expanded ? kInkGray70 : primary,
                         ),
                       ],
                     ),
@@ -1019,15 +1058,15 @@ class _CommentRootTile extends StatelessWidget {
   }
 
   /// 楼中楼展开区：已加载子回复列表 + 「加载更多」/ 错误。
-  Widget _buildChildrenArea(ThemeData theme) {
+  ///
+  /// 块化（P0 批次 B）：这里**不再画底板**（原 `surfaceContainerHighest @0.35`
+  /// 圆角容器已去掉）——「挂在某条评论下」由每条回复自己块的冷底 + 左竖条
+  /// 表达，两层底色叠起来只会把层级说两遍。加载/错误/「加载更多回复」这些
+  /// 非回复行保持挂在原位（按回复缩进对齐）。
+  Widget _buildChildrenArea() {
     final state = childState;
-    return Container(
-      margin: const EdgeInsets.only(top: 6),
-      padding: const EdgeInsets.only(left: 8, right: 8, top: 2, bottom: 4),
-      decoration: BoxDecoration(
-        color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.35),
-        borderRadius: BorderRadius.circular(8),
-      ),
+    return Padding(
+      padding: const EdgeInsets.only(top: 6),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -1044,13 +1083,13 @@ class _CommentRootTile extends StatelessWidget {
             ),
           if (state == null && childrenError != null)
             Padding(
-              padding: const EdgeInsets.symmetric(vertical: 10),
+              padding: const EdgeInsets.fromLTRB(kSpace12, 10, 0, 10),
               child: Row(
                 children: [
                   Expanded(
                     child: Text(
                       childrenError!,
-                      style: TextStyle(fontSize: 12.5, color: Colors.grey.shade600),
+                      style: TextStyle(fontSize: 12.5, color: kInkGray70),
                     ),
                   ),
                   TextButton(
@@ -1091,6 +1130,10 @@ class _CommentRootTile extends StatelessWidget {
 }
 
 /// 楼中楼预览块（缩进小字，至多 3 条；仅收起状态显示）。
+///
+/// 块化（P0 批次 B）：预览也是「楼中楼」，走 [AppBlockVariant.reply]
+/// （冷底 + 左竖条，一眼看出是挂靠关系）；**缩进比真回复浅一档**
+/// （[kSpace8] vs [kSpace12]）——预览还没展开，不该和正式楼层齐平。
 class _PreviewBlock extends StatelessWidget {
   final List<CommentReply> previews;
 
@@ -1098,48 +1141,40 @@ class _PreviewBlock extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.fromLTRB(6, 6, 6, 2),
-      decoration: BoxDecoration(
-        color: Theme.of(context)
-            .colorScheme
-            .surfaceContainerHighest
-            .withValues(alpha: 0.35),
-        borderRadius: BorderRadius.circular(8),
-      ),
+    return AppBlock(
+      variant: AppBlockVariant.reply,
+      margin: const EdgeInsets.only(left: kSpace8),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
+        spacing: 6,
         children: [
           for (final p in previews.take(3))
-            Padding(
-              padding: const EdgeInsets.only(bottom: 6),
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  _Avatar(url: p.avatar, size: 18),
-                  const SizedBox(width: 6),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          p.uname.isEmpty ? '匿名用户' : p.uname,
-                          style: TextStyle(
-                            fontSize: 12,
-                            color: Colors.grey.shade600,
-                          ),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                _Avatar(url: p.avatar, size: 18),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        p.uname.isEmpty ? '匿名用户' : p.uname,
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: kInkGray70,
                         ),
-                        Text(
-                          p.message,
-                          maxLines: 2,
-                          overflow: TextOverflow.ellipsis,
-                          style: const TextStyle(fontSize: 13, height: 1.35),
-                        ),
-                      ],
-                    ),
+                      ),
+                      Text(
+                        p.message,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(fontSize: 13, height: 1.35),
+                      ),
+                    ],
                   ),
-                ],
-              ),
+                ),
+              ],
             ),
         ],
       ),
@@ -1161,8 +1196,12 @@ class _SubReplyRow extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 6),
+    // 块化：真回复走 reply 规格（冷底 + 全高左竖条）；缩进 kSpace12 比
+    // 预览（kSpace8）深一档 = 「已展开的正式楼层」。字号保持原样
+    // （用户名 12 / 正文 13.5），不为了「紧凑」再压小。
+    return AppBlock(
+      variant: AppBlockVariant.reply,
+      margin: const EdgeInsets.only(left: kSpace12, bottom: kSpace8),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
@@ -1182,7 +1221,7 @@ class _SubReplyRow extends StatelessWidget {
                         style: TextStyle(
                           fontSize: 12,
                           fontWeight: FontWeight.w600,
-                          color: Colors.grey.shade700,
+                          color: kInkGray70,
                         ),
                       ),
                     ),
@@ -1194,7 +1233,7 @@ class _SubReplyRow extends StatelessWidget {
                     Text(
                       _fmtCtime(reply.ctime),
                       style: TextStyle(
-                          fontSize: 11, color: Colors.grey.shade500),
+                          fontSize: 11, color: kInkGray50),
                     ),
                   ],
                 ),
@@ -1237,7 +1276,7 @@ class _Avatar extends StatelessWidget {
       width: size,
       height: size,
       color: Theme.of(context).colorScheme.surfaceContainerHighest,
-      child: Icon(Icons.person, size: size * 0.62, color: Colors.grey.shade400),
+      child: Icon(Icons.person, size: size * 0.62, color: kInkGray30),
     );
     if (url.isEmpty) {
       return ClipOval(child: base);
@@ -1346,7 +1385,7 @@ class _CommentPictures extends StatelessWidget {
         borderRadius: BorderRadius.circular(6),
       ),
       child: Icon(Icons.broken_image_outlined,
-          size: 28, color: Colors.grey.shade400),
+          size: 28, color: kInkGray30),
     );
     final img = ClipRRect(
       borderRadius: BorderRadius.circular(6),
@@ -1383,12 +1422,12 @@ class _CommentPictures extends StatelessWidget {
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
               decoration: BoxDecoration(
-                color: Colors.black.withValues(alpha: 0.55),
+                color: kInkBlack.withValues(alpha: 0.55),
                 borderRadius: BorderRadius.circular(4),
               ),
               child: const Text(
                 '动图',
-                style: TextStyle(color: Colors.white, fontSize: 10),
+                style: TextStyle(color: kPaper, fontSize: 10),
               ),
             ),
           ),
@@ -1467,7 +1506,7 @@ class _LevelBadge extends StatelessWidget {
       child: Text(
         'Lv$level',
         style: TextStyle(
-          color: Colors.white,
+          color: kPaper,
           fontSize: compact ? 9 : 10,
           height: 1.3,
           fontWeight: FontWeight.w600,
@@ -1484,12 +1523,18 @@ class _PinnedBadge extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 1),
       decoration: BoxDecoration(
-        color: Colors.pinkAccent,
+        // 实心填充底：走 inkFill（而非原墨 ink），保证浅墨配方下也达标
+        color: context.palette.inkFill,
         borderRadius: BorderRadius.circular(3),
       ),
-      child: const Text(
+      child: Text(
         '置顶',
-        style: TextStyle(color: Colors.white, fontSize: 10, height: 1.3),
+        // 填充底上的文字色：与 inkFill ≥ 4.5:1（纸白/近黑按亮度自适应）
+        style: TextStyle(
+          color: context.palette.onInk,
+          fontSize: 10,
+          height: 1.3,
+        ),
       ),
     );
   }

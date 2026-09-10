@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         白名单助手 (Bili-Whitelist) 直连版
+// @name         amoTV · B站白名单标记
 // @namespace    https://github.com/Tukist/bili-whitelist
 // @version      2.3.3
-// @description  B站视频页一键加入白名单（支持多P合集/自定义合集）：直连 GitHub Gist API 读写白名单，零本地服务依赖
+// @description  amoTV · B站视频页一键加入白名单（支持多P合集/自定义合集）：直连 GitHub Gist API 读写白名单，零本地服务依赖
 // @match        https://www.bilibili.com/video/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
@@ -16,7 +16,7 @@
  * ==================== 功能 / 使用 / 配置 ====================
  * 【功能】
  *   在 B 站视频页点按钮，把当前视频信息（bvid/cid/title/cover/duration/up_name/
- *   pubdate/desc/pages）直接写入 GitHub Gist 里的 whitelist.json，手机白名单点播 App
+ *   pubdate/desc/pages）直接写入 GitHub Gist 里的 whitelist.json，手机 amoTV App
  *   拉取 Gist 即见。
  *   完全直连，不再需要本机 whitelist.py / serve 服务。
  *   v2.2.0 起支持多 P 合集：pages 字段存全部分 P（cid/part/duration），
@@ -474,7 +474,7 @@
 
         // 标题
         const title = document.createElement('div');
-        title.textContent = '白名单助手 · 配置';
+        title.textContent = 'amoTV · 配置';
         title.style.cssText = 'font-size:17px;font-weight:700;margin-bottom:8px;';
         card.appendChild(title);
 

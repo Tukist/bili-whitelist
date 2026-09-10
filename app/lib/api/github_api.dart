@@ -127,7 +127,7 @@ class GithubApi {
     final gistId = (await getGistId())?.trim() ?? '';
     if (token.isEmpty || gistId.isEmpty) {
       throw const GithubApiException(
-          '尚未配置 GitHub token 与 Gist ID，请先到右上角管理入口配置');
+          '尚未配置 GitHub token 与 Gist ID，请先到底部导航「个人」页配置');
     }
     return (token, gistId);
   }

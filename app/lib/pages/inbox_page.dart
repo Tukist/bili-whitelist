@@ -4,6 +4,14 @@
 /// 按时间倒序）+ 下拉刷新强制重检。
 ///
 /// 点击条目 → 跳 PlayerPage（缺 cid 时实时 fetchVideoMeta 补齐）。
+///
+/// 块化与动效（批次 4）：
+/// - 条目列表挂 [StaggeredListScope]（代次 = `inbox`：数据源始终是「我的信箱」），
+///   每条包 [StaggeredEntrance]（entryKey = bvid）——首次出现的条目逐条推入，
+///   翻回来/回收重建的条目靠账本不重播（**刻意不在下拉刷新时清账本**：
+///   刷新期间列表一直在屏上，清账本会让回收过的行在滚回时无故重播）；
+/// - 首屏等待 = [AppLoadingHero]，且**必须 `scrollable: true`**：
+///   本页 body 被 [RefreshIndicator] 包着，等待态也要能下拉刷新。
 library;
 
 import 'dart:async';
@@ -15,7 +23,9 @@ import '../api/bilibili_api.dart';
 import '../services/inbox_service.dart';
 import '../services/service_locator.dart';
 import '../services/whitelist_writer.dart';
+import '../widgets/app_state_view.dart';
 import '../widgets/cover_image.dart';
+import '../widgets/staggered_entrance.dart';
 import 'player_page.dart';
 
 class InboxPage extends StatefulWidget {
@@ -37,6 +47,11 @@ class _InboxPageState extends State<InboxPage> {
 
   /// 当前白名单快照（含 upowners，用于显示头像名字等元信息）。
   // 当前 UI 直接用 InboxItem 自带的 upName/upFace 字段，不再依赖 _whitelist。
+
+  /// 交错入场的「已入场」账本：活在列表项之外（State 持有），
+  /// 条目被 ListView 回收再出现时不重播。代次固定用 `inbox`
+  /// （数据源永远是同一个信箱，不因刷新换代）。
+  final EntranceLedger _entranceLedger = EntranceLedger();
 
   @override
   void initState() {
@@ -152,45 +167,44 @@ class _InboxPageState extends State<InboxPage> {
 
   Widget _buildBody() {
     if (_checking && _items.isEmpty) {
-      return const Center(child: CircularProgressIndicator());
+      // 首屏等待：本页在 RefreshIndicator 里 → 必须 scrollable（保下拉刷新）
+      return const AppLoadingHero(seed: 'inbox', scrollable: true);
     }
     if (_error != null && _items.isEmpty) {
-      return ListView(
-        physics: const AlwaysScrollableScrollPhysics(),
-        children: [
-          const SizedBox(height: 120),
-          const Icon(Icons.error_outline, size: 56, color: Colors.grey),
-          const SizedBox(height: 12),
-          Center(child: Text(_error!)),
-        ],
+      // 错误态：细线插画 + 错误文案 + 重试（旧版这里**没有重试按钮**，
+      // 只能靠下拉刷新；补上按钮，回调沿用「立即重检」）
+      return AppErrorView(
+        message: _error!,
+        onRetry: _checkNow,
+        illustrationSeed: 'inbox',
+        scrollable: true,
       );
     }
     if (_items.isEmpty) {
-      return ListView(
-        physics: const AlwaysScrollableScrollPhysics(),
-        children: const [
-          SizedBox(height: 120),
-          Icon(Icons.inbox_outlined, size: 56, color: Colors.grey),
-          SizedBox(height: 12),
-          Center(
-            child: Padding(
-              padding: EdgeInsets.symmetric(horizontal: 32),
-              child: Text(
-                '暂未有白名单 UP 主的新视频\n'
-                '在「搜索」→「搜索 UP 主」中加入 UP 主后，\n'
-                'TA 发布的新视频会出现在这里',
-                textAlign: TextAlign.center,
-              ),
-            ),
-          ),
-        ],
+      // 空态：文案走 UiCopyStore（可在设置页改写）
+      return const AppStateView(
+        kind: AppStateKind.empty,
+        copyId: 'empty.inbox',
+        illustrationSeed: 'inbox',
+        scrollable: true,
       );
     }
-    return ListView.separated(
-      physics: const AlwaysScrollableScrollPhysics(),
-      itemCount: _items.length,
-      separatorBuilder: (_, __) => const Divider(height: 1, indent: 88),
-      itemBuilder: (context, i) => _buildItemTile(_items[i]),
+    return StaggeredListScope(
+      generation: 'inbox',
+      ledger: _entranceLedger,
+      child: ListView.separated(
+        physics: const AlwaysScrollableScrollPhysics(),
+        itemCount: _items.length,
+        separatorBuilder: (_, __) => const Divider(height: 1, indent: 88),
+        itemBuilder: (context, i) {
+          final item = _items[i];
+          return StaggeredEntrance(
+            entryKey: 'bvid:${item.bvid}',
+            index: i,
+            child: _buildItemTile(item),
+          );
+        },
+      ),
     );
   }
 

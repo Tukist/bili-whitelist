@@ -12,6 +12,7 @@ import 'package:flutter/material.dart';
 
 import '../api/bilibili_api.dart';
 import '../services/whitelist_writer.dart';
+import 'add_success_button.dart';
 import 'cover_image.dart';
 
 /// 收藏夹导入进度对话框：逐视频提示「导入中 i/N」，不可点穿/返回，
@@ -175,7 +176,7 @@ Future<void> runFavoritesImportFlow({
   final buf = StringBuffer('已导入 ${summary.added}');
   if (summary.skipped > 0) buf.write('，跳过 ${summary.skipped}（已在白名单）');
   if (summary.failed > 0) buf.write('，失败 ${summary.failed}（失效/获取失败）');
-  _snack(context, buf.toString());
+  _snack(context, buf.toString(), ok: true);
   await onDone?.call(summary);
 }
 
@@ -332,8 +333,14 @@ class _FolderPickerSheetState extends State<_FolderPickerSheet> {
   }
 }
 
-void _snack(BuildContext context, String message) {
+/// 底部提示条。[ok] = true（批量导入成功）时首行加一个小号勾
+/// （与「加入」成功动效同一个勾的形状）；**文案字符串本身不变**。
+void _snack(BuildContext context, String message, {bool ok = false}) {
   ScaffoldMessenger.of(context)
     ..hideCurrentSnackBar()
-    ..showSnackBar(SnackBar(content: Text(message)));
+    ..showSnackBar(
+      SnackBar(
+        content: ok ? AddSuccessSnackContent(message: message) : Text(message),
+      ),
+    );
 }

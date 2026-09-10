@@ -1,0 +1,80 @@
+                       ╎                           │                     │                           additionalConstraints: BoxConstraints(biggest)
+                       ╎                           │                     │
+                       ╎                           │                     └─child with index 1: RenderIndexedSemantics#88edb relayoutBoundary=up3
+                       ╎                           │                       │ needs compositing
+                       ╎                           │                       │ creator: IndexedSemantics ← _SelectionKeepAlive ←
+                       ╎                           │                       │   NotificationListener<KeepAliveNotification> ← KeepAlive ←
+                       ╎                           │                       │   AutomaticKeepAlive ← KeyedSubtree-[Key
+                       ╎                           │                       │   <[_ReorderableItemGlobalKey
+                       ╎                           │                       │   _ReorderableListViewChildGlobalKey#da140]>] ← SliverList ←
+                       ╎                           │                       │   SliverReorderableList ← SliverPadding ← Viewport ←
+                       ╎                           │                       │   IgnorePointer-[GlobalKey#2a99e] ← Semantics ← ⋯
+                       ╎                           │                       │ parentData: index=1; layoutOffset=83.0 (can use size)
+                       ╎                           │                       │ constraints: BoxConstraints(w=411.4, 0.0<=h<=Infinity)
+                       ╎                           │                       │ semantics node: SemanticsNode#8
+                       ╎                           │                       │ size: Size(411.4, 82.0)
+                       ╎                           │                       │ index: 1
+                       ╎                           │                       │
+                       ╎                           │                       └─child: RenderRepaintBoundary#99b11 relayoutBoundary=up4
+                       ╎                           │                         │ needs compositing
+                       ╎                           │                         │ creator: RepaintBoundary ← IndexedSemantics ← _SelectionKeepAlive
+                       ╎                           │                         │   ← NotificationListener<KeepAliveNotification> ← KeepAlive ←
+                       ╎                           │                         │   AutomaticKeepAlive ← KeyedSubtree-[Key
+                       ╎                           │                         │   <[_ReorderableItemGlobalKey
+                       ╎                           │                         │   _ReorderableListViewChildGlobalKey#da140]>] ← SliverList ←
+                       ╎                           │                         │   SliverReorderableList ← SliverPadding ← Viewport ←
+                       ╎                           │                         │   IgnorePointer-[GlobalKey#2a99e] ← ⋯
+                       ╎                           │                         │ parentData: <none> (can use size)
+                       ╎                           │                         │ constraints: BoxConstraints(w=411.4, 0.0<=h<=Infinity)
+                       ╎                           │                         │ layer: OffsetLayer#7c40a
+                       ╎                           │                         │ size: Size(411.4, 82.0)
+                       ╎                           │                         │ metrics: 0.0% useful (1 bad vs 0 good)
+                       ╎                           │                         │ diagnosis: insufficient data to draw conclusion (less than five
+                       ╎                           │                         │   repaints)
+                       ╎                           │                         │
+                       ╎                           │                         └─child: RenderTransform#1627a relayoutBoundary=up5
+                       ╎                           │                           │ creator: Transform ← _ReorderableItem-[_ReorderableItemGlobalKey
+                       ╎                           │                           │   _ReorderableListViewChildGlobalKey#da140] ← RepaintBoundary ←
+                       ╎                           │                           │   IndexedSemantics ← _SelectionKeepAlive ←
+                       ╎                           │                           │   NotificationListener<KeepAliveNotification> ← KeepAlive ←
+                       ╎                           │                           │   AutomaticKeepAlive ← KeyedSubtree-[Key
+                       ╎                           │                           │   <[_ReorderableItemGlobalKey
+                       ╎                           │                           │   _ReorderableListViewChildGlobalKey#da140]>] ← SliverList ←
+                       ╎                           │                           │   SliverReorderableList ← SliverPadding ← ⋯
+                       ╎                           │                           │ parentData: <none> (can use size)
+                       ╎                           │                           │ constraints: BoxConstraints(w=411.4, 0.0<=h<=Infinity)
+                       ╎                           │                           │ size: Size(411.4, 82.0)
+                       ╎                           │                           │ transform matrix:
+                       ╎                           │                           │   [0] 1.0,0.0,0.0,0.0
+                       ╎                           │                           │   [1] 0.0,1.0,0.0,0.0
+                       ╎                           │                           │   [2] 0.0,0.0,1.0,0.0
+                       ╎                           │                           │   [3] 0.0,0.0,0.0,1.0
+                       ╎                           │                           │ origin: null
+                       ╎                           │                           │ alignment: null
+                       ╎                           │                           │ textDirection: ltr
+                       ╎                           │                           │ transformHitTests: true
+                       ╎                           │                           │
+                       ╎                           │                           └─child: RenderSemanticsAnnotations#55d62 relayoutBoundary=up6
+                       ╎                           │                             │ creator: Semantics ← Transform ←
+                       ╎                           │                             │   _ReorderableItem-[_ReorderableItemGlobalKey
+                       ╎                           │                             │   _ReorderableListViewChildGlobalKey#da140] ← RepaintBoundary ←
+                       ╎                           │                             │   IndexedSemantics ← _SelectionKeepAlive ←
+                       ╎                           │                             │   NotificationListener<KeepAliveNotification> ← KeepAlive ←
+                       ╎                           │                             │   AutomaticKeepAlive ← KeyedSubtree-[Key
+                       ╎                           │                             │   <[_ReorderableItemGlobalKey
+                       ╎                           │                             │   _ReorderableListViewChildGlobalKey#da140]>] ← SliverList ←
+                       ╎                           │                             │   SliverReorderableList ← ⋯
+                       ╎                           │                             │ parentData: <none> (can use size)
+                       ╎                           │                             │ constraints: BoxConstraints(w=411.4, 0.0<=h<=Infinity)
+                       ╎                           │                             │ semantics node: SemanticsNode#9
+                       ╎                           │                             │ semantic boundary
+                       ╎                           │                             │ size: Size(411.4, 82.0)
+                       ╎                           │                             │
+                       ╎                           │                             └─child: RenderFlex#fe46e relayoutBoundary=up7
+                       ╎                           │                               │ creator: Column-[<'BVold2#1'>] ←
+                       ╎                           │                               │   KeyedSubtree-[_ReorderableListViewChildGlobalKey
+                       ╎                           │                               │   ValueKey<String>#6a7e7] ← Semantics ← Transform ←
+                       ╎                           │                               │   _ReorderableItem-[_ReorderableItemGlobalKey
+                       ╎                           │                               │   _ReorderableListViewChildGlobalKey#da140] ← RepaintBoundary ←
+23:30 +10 -1: D:/pythoncode/bili-whitelist/app/integration_test/video_tile_pubdate_flow_test.dart: (tearDownAll)
+23:36 +10 -1: Some tests failed.

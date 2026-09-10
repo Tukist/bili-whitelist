@@ -1,0 +1,154 @@
+Flutter assets will be downloaded from https://storage.flutter-io.cn. Make sure you trust this source!
+00:00 +0: loading D:/pythoncode/bili-whitelist/app/test/add_success_button_test.dart
+00:00 +0: D:/pythoncode/bili-whitelist/app/test/add_success_button_test.dart: 三态渲染 idle：文案逐字「加入」+ 可点；没有转圈、没有动效层
+00:00 +1: D:/pythoncode/bili-whitelist/app/test/add_success_button_test.dart: 三态渲染 loading：14px 内联转圈 + 不可点（文案让位）
+00:00 +2: D:/pythoncode/bili-whitelist/app/test/staggered_entrance_test.dart: EntranceLedger claim：首次 true 并记账，之后 false；clear 后可再claim
+00:00 +3: D:/pythoncode/bili-whitelist/app/test/add_success_button_test.dart: 三态渲染 added：勾 + 文案逐字「已加入」+ 不可点（静态态，不带动效）
+00:00 +4: D:/pythoncode/bili-whitelist/app/test/add_success_button_test.dart: 三态渲染 added：勾 + 文案逐字「已加入」+ 不可点（静态态，不带动效）
+00:00 +5: D:/pythoncode/bili-whitelist/app/test/staggered_entrance_test.dart: StaggeredListScope maybeOf：无 scope → null；有 scope → 拿到同一个账本
+00:00 +6: D:/pythoncode/bili-whitelist/app/test/staggered_entrance_test.dart: StaggeredListScope maybeOf：无 scope → null；有 scope → 拿到同一个账本
+00:00 +7: D:/pythoncode/bili-whitelist/app/test/staggered_entrance_test.dart: StaggeredListScope maybeOf：无 scope → null；有 scope → 拿到同一个账本
+00:00 +8: D:/pythoncode/bili-whitelist/app/test/staggered_entrance_test.dart: StaggeredListScope maybeOf：无 scope → null；有 scope → 拿到同一个账本
+00:00 +9: D:/pythoncode/bili-whitelist/app/test/staggered_entrance_test.dart: StaggeredListScope maybeOf：无 scope → null；有 scope → 拿到同一个账本
+00:00 +10: D:/pythoncode/bili-whitelist/app/test/staggered_entrance_test.dart: StaggeredListScope maybeOf：无 scope → null；有 scope → 拿到同一个账本
+00:00 +11: D:/pythoncode/bili-whitelist/app/test/staggered_entrance_test.dart: StaggeredListScope maybeOf：无 scope → null；有 scope → 拿到同一个账本
+00:00 +12: D:/pythoncode/bili-whitelist/app/test/staggered_entrance_test.dart: StaggeredListScope maybeOf：无 scope → null；有 scope → 拿到同一个账本
+00:00 +13: D:/pythoncode/bili-whitelist/app/test/staggered_entrance_test.dart: StaggeredListScope maybeOf：无 scope → null；有 scope → 拿到同一个账本
+00:01 +14: D:/pythoncode/bili-whitelist/app/test/staggered_entrance_test.dart: 关动效 直接是 child：无 FadeTransition / Transform / Opacity
+00:01 +15: D:/pythoncode/bili-whitelist/app/test/staggered_entrance_test.dart: 关动效 MotionControl.enabled = false 走同一条退化路径
+00:01 +16: D:/pythoncode/bili-whitelist/app/test/staggered_entrance_test.dart: 开动效 动画期有飞行层；settle 后包裹层卸载
+00:01 +17: D:/pythoncode/bili-whitelist/app/test/smoke_silhouette_test.dart: animate: false → 不创建 ticker，固定画 t=0.35 那一帧
+00:01 +18: D:/pythoncode/bili-whitelist/app/test/smoke_silhouette_test.dart: animate: false → 不创建 ticker，固定画 t=0.35 那一帧
+00:01 +19: D:/pythoncode/bili-whitelist/app/test/smoke_silhouette_test.dart: animate: false → 不创建 ticker，固定画 t=0.35 那一帧
+00:01 +20: D:/pythoncode/bili-whitelist/app/test/smoke_silhouette_test.dart: animate: false → 不创建 ticker，固定画 t=0.35 那一帧
+00:01 +21: D:/pythoncode/bili-whitelist/app/test/smoke_silhouette_test.dart: animate: false → 不创建 ticker，固定画 t=0.35 那一帧
+00:01 +22: D:/pythoncode/bili-whitelist/app/test/smoke_silhouette_test.dart: animate: false → 不创建 ticker，固定画 t=0.35 那一帧
+00:01 +23: D:/pythoncode/bili-whitelist/app/test/smoke_silhouette_test.dart: animate: false → 不创建 ticker，固定画 t=0.35 那一帧
+00:01 +24: D:/pythoncode/bili-whitelist/app/test/smoke_silhouette_test.dart: animate: false → 不创建 ticker，固定画 t=0.35 那一帧
+00:01 +25: D:/pythoncode/bili-whitelist/app/test/smoke_silhouette_test.dart: animate: false → 不创建 ticker，固定画 t=0.35 那一帧
+00:01 +26: D:/pythoncode/bili-whitelist/app/test/smoke_silhouette_test.dart: animate: true → 1 个 ticker；卸载后归零（不泄漏）
+00:01 +27: D:/pythoncode/bili-whitelist/app/test/smoke_silhouette_test.dart: MotionControl.enabled = false → 走静态路径（零 ticker）
+00:01 +28: D:/pythoncode/bili-whitelist/app/test/smoke_silhouette_test.dart: size <= 0：不崩、不绘制，ticker 记账仍守恒
+00:01 +29: D:/pythoncode/bili-whitelist/app/test/smoke_silhouette_test.dart: 极端尺寸（1 / 140 / 400）都能渲染，不抛异常
+00:01 +30: D:/pythoncode/bili-whitelist/app/test/smoke_silhouette_test.dart: 双色取 palette.inkDeco / palette.accent（显式传参优先）
+00:01 +31: D:/pythoncode/bili-whitelist/app/test/smoke_silhouette_test.dart: 默认主题（克莱因蓝 · 陶土）：inkDeco vs 纸底 ≥ 3:1
+00:01 +32: D:/pythoncode/bili-whitelist/app/test/smoke_silhouette_test.dart: painter 直接构造：静态路径取 kStaticSmokeT，动画路径取进度值
+00:01 +33: D:/pythoncode/bili-whitelist/app/test/cover_hero_test.dart: tag: null → 零 Hero 节点，child 原样渲染
+00:02 +34: D:/pythoncode/bili-whitelist/app/test/cover_hero_test.dart: enabled: false → 即使 tag 非空也不包 Hero
+00:02 +35: D:/pythoncode/bili-whitelist/app/test/cover_hero_test.dart: tag 非空 → 恰好一个 Hero，shuttle 取 to 侧 child 并带淡入
+00:02 +36: D:/pythoncode/bili-whitelist/app/test/cover_hero_test.dart: 同树两个不同 tag 的 CoverHero 不报错
+00:02 +37: D:/pythoncode/bili-whitelist/app/test/cover_hero_test.dart: coverHeroTag：空 bvid → null；分集用后缀区分
+00:02 +38: D:/pythoncode/bili-whitelist/app/test/app_block_test.dart: 规格表（appBlockSpec 逐项） videoInfo：底色/描边/圆角/内边距/竖条
+00:02 +39: D:/pythoncode/bili-whitelist/app/test/app_block_test.dart: 规格表（appBlockSpec 逐项） comment：底色/描边/圆角/内边距/竖条
+00:02 +40: D:/pythoncode/bili-whitelist/app/test/app_block_test.dart: 规格表（appBlockSpec 逐项） reply：底色/描边/圆角/内边距/竖条
+00:02 +41: D:/pythoncode/bili-whitelist/app/test/app_loading_hero_test.dart: 测试环境默认：剪影静态（零 ticker），pumpAndSettle 能收敛
+00:02 +42: D:/pythoncode/bili-whitelist/app/test/app_loading_hero_test.dart: 测试环境默认：剪影静态（零 ticker），pumpAndSettle 能收敛
+00:02 +43: D:/pythoncode/bili-whitelist/app/test/app_loading_hero_test.dart: 测试环境默认：剪影静态（零 ticker），pumpAndSettle 能收敛
+00:02 +44: D:/pythoncode/bili-whitelist/app/test/app_loading_hero_test.dart: 测试环境默认：剪影静态（零 ticker），pumpAndSettle 能收敛
+00:02 +45: D:/pythoncode/bili-whitelist/app/test/app_loading_hero_test.dart: 测试环境默认：剪影静态（零 ticker），pumpAndSettle 能收敛
+00:02 +46: D:/pythoncode/bili-whitelist/app/test/app_loading_hero_test.dart: 测试环境默认：剪影静态（零 ticker），pumpAndSettle 能收敛
+00:02 +47: D:/pythoncode/bili-whitelist/app/test/app_loading_hero_test.dart: 测试环境默认：剪影静态（零 ticker），pumpAndSettle 能收敛
+00:03 +48: D:/pythoncode/bili-whitelist/app/test/app_loading_hero_test.dart: 测试环境默认：剪影静态（零 ticker），pumpAndSettle 能收敛
+00:03 +49: D:/pythoncode/bili-whitelist/app/test/app_loading_hero_test.dart: 测试环境默认：剪影静态（零 ticker），pumpAndSettle 能收敛
+00:03 +50: D:/pythoncode/bili-whitelist/app/test/app_loading_hero_test.dart: 测试环境默认：剪影静态（零 ticker），pumpAndSettle 能收敛
+00:03 +51: D:/pythoncode/bili-whitelist/app/test/app_loading_hero_test.dart: 测试环境默认：剪影静态（零 ticker），pumpAndSettle 能收敛
+00:03 +52: D:/pythoncode/bili-whitelist/app/test/app_loading_hero_test.dart: 测试环境默认：剪影静态（零 ticker），pumpAndSettle 能收敛
+00:03 +53: D:/pythoncode/bili-whitelist/app/test/app_loading_hero_test.dart: 测试环境默认：剪影静态（零 ticker），pumpAndSettle 能收敛
+00:03 +54: D:/pythoncode/bili-whitelist/app/test/app_loading_hero_test.dart: 测试环境默认：剪影静态（零 ticker），pumpAndSettle 能收敛
+00:03 +55: D:/pythoncode/bili-whitelist/app/test/app_loading_hero_test.dart: 测试环境默认：剪影静态（零 ticker），pumpAndSettle 能收敛
+00:03 +56: D:/pythoncode/bili-whitelist/app/test/app_block_test.dart: 渲染 child 原样渲染（find.text 命中）
+00:03 +57: D:/pythoncode/bili-whitelist/app/test/app_loading_hero_test.dart: 主文案是单一 Text：默认命中「正在加载…」
+00:03 +58: D:/pythoncode/bili-whitelist/app/test/app_block_test.dart: 渲染 margin 生效（尺寸不含外边距）
+00:03 +59: D:/pythoncode/bili-whitelist/app/test/app_loading_hero_test.dart: title 直给压过 copyId
+00:03 +60: D:/pythoncode/bili-whitelist/app/test/app_block_test.dart: specOverride / 配色跟随 specOverride 一次性微调生效
+00:03 +61: D:/pythoncode/bili-whitelist/app/test/app_loading_hero_test.dart: scrollable: true → ListView + AlwaysScrollableScrollPhysics
+00:03 +62: D:/pythoncode/bili-whitelist/app/test/app_loading_hero_test.dart: scrollable: true → ListView + AlwaysScrollableScrollPhysics
+00:03 +63: D:/pythoncode/bili-whitelist/app/test/app_loading_hero_test.dart: scrollable: false → 不产生 ListView（纯静态区域）
+00:03 +64: D:/pythoncode/bili-whitelist/app/test/app_loading_hero_test.dart: shrink: true → 靠上（比居中态更靠上），且仍无 ListView
+00:03 +65: D:/pythoncode/bili-whitelist/app/test/list_entrance_flow_test.dart: 交错入场：关动效形态不变 历史页：条目包在 StaggeredEntrance 里、无飞行层，间距 = kListGap
+00:03 +66: D:/pythoncode/bili-whitelist/app/test/list_entrance_flow_test.dart: 交错入场：关动效形态不变 历史页：条目包在 StaggeredEntrance 里、无飞行层，间距 = kListGap
+00:03 +67: D:/pythoncode/bili-whitelist/app/test/list_entrance_flow_test.dart: 交错入场：关动效形态不变 历史页：条目包在 StaggeredEntrance 里、无飞行层，间距 = kListGap
+00:03 +68: D:/pythoncode/bili-whitelist/app/test/list_entrance_flow_test.dart: 交错入场：关动效形态不变 历史页：条目包在 StaggeredEntrance 里、无飞行层，间距 = kListGap
+00:04 +69: D:/pythoncode/bili-whitelist/app/test/player_info_block_test.dart: 信息行块化：key 保留、几何不变、外形是 AppBlock(videoInfo)、空封面不建封面层
+00:04 +70: D:/pythoncode/bili-whitelist/app/test/player_info_block_test.dart: 信息行块化：key 保留、几何不变、外形是 AppBlock(videoInfo)、空封面不建封面层
+00:04 +71: D:/pythoncode/bili-whitelist/app/test/player_info_block_test.dart: 信息行块化：key 保留、几何不变、外形是 AppBlock(videoInfo)、空封面不建封面层
+00:04 +72: D:/pythoncode/bili-whitelist/app/test/player_info_block_test.dart: 信息行块化：key 保留、几何不变、外形是 AppBlock(videoInfo)、空封面不建封面层
+00:04 +73: D:/pythoncode/bili-whitelist/app/test/player_info_block_test.dart: 信息行块化：key 保留、几何不变、外形是 AppBlock(videoInfo)、空封面不建封面层
+00:04 +74: D:/pythoncode/bili-whitelist/app/test/player_info_block_test.dart: 信息行块化：key 保留、几何不变、外形是 AppBlock(videoInfo)、空封面不建封面层
+00:04 +75: D:/pythoncode/bili-whitelist/app/test/player_info_block_test.dart: 信息行块化：key 保留、几何不变、外形是 AppBlock(videoInfo)、空封面不建封面层
+00:04 +76: D:/pythoncode/bili-whitelist/app/test/player_info_block_test.dart: 信息行块化：key 保留、几何不变、外形是 AppBlock(videoInfo)、空封面不建封面层
+00:04 +77: D:/pythoncode/bili-whitelist/app/test/player_info_block_test.dart: 信息行块化：key 保留、几何不变、外形是 AppBlock(videoInfo)、空封面不建封面层
+[player_page] UP 主信息 bvid=BV1INFO000001 mid=1001 name=测试UP主
+[bili_api] fetchVideoComments aid=1001 mode=3 next=0
+[bili_api] fetchVideoComments aid=1001 ok: replies=0 top=0 next=0 isEnd=true total=0
+[comment_list] 主评论页 aid=1001 reset=true roots=0 pinned=0 next=0 isEnd=true
+[comment_list] 首屏样本: 
+[player_page] 取流 bvid=BV1INFO000001 cid=1001 epId=null
+[bili_api] fetchPlayUrl bvid=BV1INFO000001 cid=1001 qn=80 fnval=16
+[bili_api] fetchPlayUrl fnval=16 ok: quality=80 dashV=1 dashA=1 mp4=false (bvid=BV1INFO000001)
+[player_page] 网络流 URL 无 deadline，不主动预取 （回退被动 onUrlExpired）BV1INFO000001#0
+[player] event: BiliDashPreparedEvent textureId=1
+[player] onPrepared 1280x720 duration=200000
+00:04 +78: D:/pythoncode/bili-whitelist/app/test/list_entrance_flow_test.dart: 交错入场：开动效 夹内视频页：滚出去再滚回来的条目不重播入场
+[bili_api] fetchFavoriteVideos media_id=111 pn=1 ps=20
+00:04 +79: D:/pythoncode/bili-whitelist/app/test/player_info_block_test.dart: 信息块补场动效：动画期有包裹层，播完卸载（树里不留 Transform）
+00:05 +80: D:/pythoncode/bili-whitelist/app/test/player_info_block_test.dart: 信息块补场动效：动画期有包裹层，播完卸载（树里不留 Transform）
+00:05 +81: D:/pythoncode/bili-whitelist/app/test/player_info_block_test.dart: 信息块补场动效：动画期有包裹层，播完卸载（树里不留 Transform）
+00:05 +82: D:/pythoncode/bili-whitelist/app/test/player_info_block_test.dart: 信息块补场动效：动画期有包裹层，播完卸载（树里不留 Transform）
+00:05 +83: D:/pythoncode/bili-whitelist/app/test/player_info_block_test.dart: 信息块补场动效：动画期有包裹层，播完卸载（树里不留 Transform）
+00:05 +83: D:/pythoncode/bili-whitelist/app/test/list_entrance_flow_test.dart: 整页加载态 收藏夹总览：加载态 = 剪影 Hero，不是裸转圈
+[bili_api] fetchMyFavorites up_mid=123456
+00:05 +84: D:/pythoncode/bili-whitelist/app/test/player_info_block_test.dart: 信息块补场动效：动画期有包裹层，播完卸载（树里不留 Transform）
+00:05 +85: D:/pythoncode/bili-whitelist/app/test/player_info_block_test.dart: 信息块补场动效：动画期有包裹层，播完卸载（树里不留 Transform）
+00:05 +86: D:/pythoncode/bili-whitelist/app/test/player_info_block_test.dart: 信息块补场动效：动画期有包裹层，播完卸载（树里不留 Transform）
+00:05 +87: D:/pythoncode/bili-whitelist/app/test/player_info_block_test.dart: 信息块补场动效：动画期有包裹层，播完卸载（树里不留 Transform）
+00:05 +88: D:/pythoncode/bili-whitelist/app/test/player_info_block_test.dart: 信息块补场动效：动画期有包裹层，播完卸载（树里不留 Transform）
+00:05 +89: D:/pythoncode/bili-whitelist/app/test/player_info_block_test.dart: 信息块补场动效：动画期有包裹层，播完卸载（树里不留 Transform）
+00:05 +90: D:/pythoncode/bili-whitelist/app/test/player_info_block_test.dart: 信息块补场动效：动画期有包裹层，播完卸载（树里不留 Transform）
+00:05 +91: D:/pythoncode/bili-whitelist/app/test/player_info_block_test.dart: 信息块补场动效：动画期有包裹层，播完卸载（树里不留 Transform）
+[player_page] 取流 bvid=BV1INFO000001 cid=1001 epId=null
+[bili_api] fetchPlayUrl bvid=BV1INFO000001 cid=1001 qn=80 fnval=16
+[bili_api] fetchPlayUrl fnval=16 ok: quality=80 dashV=1 dashA=1 mp4=false (bvid=BV1INFO000001)
+[player_page] 网络流 URL 无 deadline，不主动预取 （回退被动 onUrlExpired）BV1INFO000001#0
+[player] event: BiliDashPreparedEvent textureId=1
+[player] onPrepared 1280x720 duration=200000
+[bili_api] fetchVideoComments aid=1001 mode=3 next=0
+[bili_api] fetchVideoComments aid=1001 ok: replies=0 top=0 next=0 isEnd=true total=0
+[comment_list] 主评论页 aid=1001 reset=true roots=0 pinned=0 next=0 isEnd=true
+00:05 +92: D:/pythoncode/bili-whitelist/app/test/player_info_block_test.dart: 信息块补场动效：动画期有包裹层，播完卸载（树里不留 Transform）
+[comment_list] 首屏样本: 
+00:05 +93: D:/pythoncode/bili-whitelist/app/test/list_entrance_flow_test.dart: 整页加载态 收藏夹总览：加载态下仍能下拉刷新（scrollable: true 生效）
+00:05 +94: D:/pythoncode/bili-whitelist/app/test/list_entrance_flow_test.dart: 整页加载态 收藏夹总览：加载态下仍能下拉刷新（scrollable: true 生效）
+[bili_api] fetchMyFavorites up_mid=123456
+[bili_api] fetchMyFavorites up_mid=123456
+00:05 +95: D:/pythoncode/bili-whitelist/app/test/player_info_block_test.dart: 封面占位层：非空封面 → Hero 落点对齐视频盒 + IgnorePointer + 就绪/超时后淡出
+00:05 +95: D:/pythoncode/bili-whitelist/app/test/list_entrance_flow_test.dart: 整页加载态 夹内视频页：首屏加载态 = 剪影 Hero，且可下拉
+[bili_api] fetchFavoriteVideos media_id=111 pn=1 ps=20
+00:05 +96: D:/pythoncode/bili-whitelist/app/test/player_info_block_test.dart: 封面占位层：非空封面 → Hero 落点对齐视频盒 + IgnorePointer + 就绪/超时后淡出
+[player_page] 取流 bvid=BV1INFO000001 cid=1001 epId=null
+[bili_api] fetchPlayUrl bvid=BV1INFO000001 cid=1001 qn=80 fnval=16
+[bili_api] fetchPlayUrl fnval=16 ok: quality=80 dashV=1 dashA=1 mp4=false (bvid=BV1INFO000001)
+[player_page] 网络流 URL 无 deadline，不主动预取 （回退被动 onUrlExpired）BV1INFO000001#0
+[player] event: BiliDashPreparedEvent textureId=1
+[player] onPrepared 1280x720 duration=200000
+[bili_api] fetchVideoComments aid=1001 mode=3 next=0
+[bili_api] fetchVideoComments aid=1001 ok: replies=0 top=0 next=0 isEnd=true total=0
+[comment_list] 主评论页 aid=1001 reset=true roots=0 pinned=0 next=0 isEnd=true
+[comment_list] 首屏样本: 
+[player_page] 取流 bvid=BV1INFO000001 cid=1001 epId=null
+[bili_api] fetchPlayUrl bvid=BV1INFO000001 cid=1001 qn=80 fnval=16
+[bili_api] fetchPlayUrl fnval=16 ok: quality=80 dashV=1 dashA=1 mp4=false (bvid=BV1INFO000001)
+[player_page] 网络流 URL 无 deadline，不主动预取 （回退被动 onUrlExpired）BV1INFO000001#0
+[bili_api] fetchVideoComments aid=1001 mode=3 next=0
+[bili_api] fetchVideoComments aid=1001 ok: replies=0 top=0 next=0 isEnd=true total=0
+[comment_list] 主评论页 aid=1001 reset=true roots=0 pinned=0 next=0 isEnd=true
+[comment_list] 首屏样本: 
+[player_page] 取流 bvid=BV1INFO000001 cid=1001 epId=null
+[bili_api] fetchPlayUrl bvid=BV1INFO000001 cid=1001 qn=80 fnval=16
+[bili_api] fetchPlayUrl fnval=16 ok: quality=80 dashV=1 dashA=1 mp4=false (bvid=BV1INFO000001)
+[player_page] 网络流 URL 无 deadline，不主动预取 （回退被动 onUrlExpired）BV1INFO000001#0
+[bili_api] fetchVideoComments aid=1001 mode=3 next=0
+[bili_api] fetchVideoComments aid=1001 ok: replies=0 top=0 next=0 isEnd=true total=0
+[comment_list] 主评论页 aid=1001 reset=true roots=0 pinned=0 next=0 isEnd=true
+[comment_list] 首屏样本: 
+00:05 +97: All tests passed!

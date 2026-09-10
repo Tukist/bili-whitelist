@@ -12,6 +12,7 @@ library;
 import 'package:flutter/material.dart';
 
 import '../config.dart';
+import '../theme/app_tokens.dart';
 
 /// UP 主入口：圆形头像（默认 32px）+ 名字（可点）。
 class UpownerBadge extends StatelessWidget {
@@ -64,7 +65,7 @@ class UpownerBadge extends StatelessWidget {
                   fontSize: 13,
                   fontWeight: FontWeight.w500,
                   color: onTap == null
-                      ? Colors.grey.shade600
+                      ? kInkGray50
                       : theme.colorScheme.onSurface,
                 ),
               ),

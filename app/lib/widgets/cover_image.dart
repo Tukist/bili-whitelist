@@ -30,6 +30,10 @@ class CoverImage extends StatelessWidget {
       width: width,
       height: height,
       fit: BoxFit.cover,
+      // gaplessPlayback：Hero 飞行时两端各自持有一份同一 URL 的 Image，
+      // 落地后列表侧重建旧 Image（或换图）会先空一帧再出图 —— 打开后
+      // 保留旧画面直到新帧就绪，飞行/落地不会闪白。
+      gaplessPlayback: true,
       headers: {
         'User-Agent': kBrowserUA,
         'Referer': kBiliReferer,

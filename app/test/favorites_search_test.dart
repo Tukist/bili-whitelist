@@ -23,6 +23,8 @@ import 'package:bili_whitelist_app/models/whitelist_video.dart';
 import 'package:bili_whitelist_app/pages/favorite_videos_page.dart';
 import 'package:bili_whitelist_app/services/service_locator.dart';
 import 'package:bili_whitelist_app/sync/whitelist_source.dart';
+import 'package:bili_whitelist_app/widgets/app_state_view.dart';
+import 'package:bili_whitelist_app/widgets/dot_illustration.dart';
 
 /// 内存版 secure storage。
 final Map<String, String> _store = {};
@@ -367,6 +369,18 @@ void main() {
       await tester.pump(const Duration(milliseconds: 450));
       await tester.pumpAndSettle();
       expect(find.text('未找到匹配的视频'), findsOneWidget);
+
+      // 无匹配空态统一到 AppStateView：细线插画 seed = favorite_videos.search
+      // + 副文案（主文案逐字不变）
+      final state = tester.widget<AppStateView>(find.byType(AppStateView));
+      expect(state.kind, AppStateKind.empty);
+      expect(state.copyId, 'empty.favorite_search');
+      expect(state.subtitleCopyId, 'empty.favorite_search.sub');
+      expect(state.scrollable, isTrue);
+      expect(
+        tester.widget<DotIllustration>(find.byType(DotIllustration)).seed,
+        'favorite_videos.search',
+      );
     });
 
     testWidgets('拉全量中途失败（第 2 页 -412）→ snack 提示 + 退出搜索回浏览',

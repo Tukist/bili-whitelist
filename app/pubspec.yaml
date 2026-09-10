@@ -1,5 +1,5 @@
 name: bili_whitelist_app
-description: "B 站白名单点播安卓 App（防短视频成瘾）：只展示白名单视频并播放"
+description: "amoTV —— B 站白名单点播安卓 App（防短视频成瘾）：只展示白名单视频并播放"
 # The following line prevents the package from being accidentally published to
 # pub.dev using `flutter pub publish`. This is preferred for private packages.
 publish_to: 'none' # Remove this line if you wish to publish to pub.dev
@@ -16,7 +16,7 @@ publish_to: 'none' # Remove this line if you wish to publish to pub.dev
 # https://developer.apple.com/library/archive/documentation/General/Reference/InfoPlistKeyReference/Articles/CoreFoundationKeys.html
 # In Windows, build-name is used as the major, minor, and patch parts
 # of the product and file versions while build-number is used as the build suffix.
-version: 2.17.17+72
+version: 2.18.0+73
 
 environment:
   sdk: ^3.8.1

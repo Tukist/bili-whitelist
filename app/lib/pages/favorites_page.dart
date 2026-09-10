@@ -13,7 +13,9 @@ import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 
 import '../api/bilibili_api.dart' hide FavoriteVideosPage;
+import '../widgets/app_state_view.dart';
 import '../widgets/cover_image.dart';
+import '../widgets/staggered_entrance.dart';
 import 'favorite_videos_page.dart';
 import 'login_page.dart';
 
@@ -51,6 +53,12 @@ class _FavoritesPageState extends State<FavoritesPage> {
   /// 未登录 / 登录已失效提示文案；非 null → 「去登录」引导视图。
   String? _needLogin;
 
+  /// 入场记账本：**由 State 持有**（活在列表项之外），列表项被回收再建时不重播。
+  final EntranceLedger _entranceLedger = EntranceLedger();
+
+  /// 加载代际号（作 [StaggeredListScope.generation]）：拉到新数据 → 自增。
+  int _reloadToken = 0;
+
   @override
   void initState() {
     super.initState();
@@ -83,7 +91,12 @@ class _FavoritesPageState extends State<FavoritesPage> {
     try {
       final folders = await _api.fetchMyFavorites();
       if (!mounted) return;
-      setState(() => _folders = folders);
+      setState(() {
+        _folders = folders;
+        // 数据换新 → 记账作废，列表项重建时可再演一次交错入场
+        _reloadToken++;
+        _entranceLedger.clear();
+      });
     } on BiliApiException catch (e) {
       if (!mounted) return;
       setState(() {
@@ -139,38 +152,51 @@ class _FavoritesPageState extends State<FavoritesPage> {
     final theme = Theme.of(context);
     return Scaffold(
       appBar: AppBar(title: const Text('收藏夹')),
-      body: RefreshIndicator(onRefresh: _load, child: _buildBody(theme)),
+      body: RefreshIndicator(
+        onRefresh: _load,
+        // 列表项交错入场的 scope（InheritedWidget，不参与布局）
+        child: StaggeredListScope(
+          generation: 'favorites#$_reloadToken',
+          ledger: _entranceLedger,
+          child: _buildBody(theme),
+        ),
+      ),
     );
   }
 
   Widget _buildBody(ThemeData theme) {
     // 加载中（首次 / 刷新 / 重试期间）
     if (_folders == null && _error == null && _needLogin == null) {
-      return const Center(child: CircularProgressIndicator());
+      // 本页 body 在 RefreshIndicator 宿主内 → **必须 scrollable: true**，
+      // 否则加载态下没有可滚动区域，下拉刷新失效
+      return const AppLoadingHero(seed: 'favorites', scrollable: true);
     }
     if (_needLogin != null) {
-      return _StateView(
-        icon: Icons.lock_outline,
-        message: _needLogin!,
-        actionIcon: Icons.login,
+      // 登录门禁不是「错误」→ 走空态的克制配色，只给一个「去登录」动作
+      return AppStateView(
+        kind: AppStateKind.empty,
+        title: _needLogin!,
         actionLabel: '去登录',
         onAction: _goLogin,
+        illustrationSeed: 'favorites',
+        scrollable: true,
       );
     }
     if (_error != null) {
-      return _StateView(
-        icon: Icons.error_outline,
+      return AppErrorView(
         message: _error!,
-        actionIcon: Icons.refresh,
-        actionLabel: '重试',
-        onAction: _load,
+        onRetry: _load,
+        illustrationSeed: 'favorites',
+        scrollable: true,
       );
     }
     final folders = _folders!;
     if (folders.isEmpty) {
-      return const _StateView(
-        icon: Icons.bookmark_border,
-        message: '还没有收藏夹。\n在 B 站收藏想看的视频后，这里就能直接点开看',
+      return const AppStateView(
+        kind: AppStateKind.empty,
+        copyId: 'empty.favorites',
+        illustrationSeed: 'favorites',
+        scrollable: true,
       );
     }
     return ListView.separated(
@@ -179,73 +205,31 @@ class _FavoritesPageState extends State<FavoritesPage> {
       separatorBuilder: (_, __) => const Divider(height: 1),
       itemBuilder: (context, i) {
         final f = folders[i];
-        return ListTile(
-          leading: ClipRRect(
-            borderRadius: BorderRadius.circular(4),
-            child: CoverImage(cover: f.cover, width: 64, height: 40),
-          ),
-          title: Text(
-            f.title.isEmpty ? '未命名收藏夹' : f.title,
-            maxLines: 1,
-            overflow: TextOverflow.ellipsis,
-          ),
-          subtitle: Text(
-            '${f.mediaCount} 个视频',
-            style: theme.textTheme.bodySmall?.copyWith(
-              color: theme.colorScheme.onSurfaceVariant,
+        return StaggeredEntrance(
+          // 稳定标识：media_id 是收藏夹的身份，刷新后不乱序重播
+          entryKey: 'fav#${f.mediaId}',
+          index: i,
+          child: ListTile(
+            leading: ClipRRect(
+              borderRadius: BorderRadius.circular(4),
+              child: CoverImage(cover: f.cover, width: 64, height: 40),
             ),
+            title: Text(
+              f.title.isEmpty ? '未命名收藏夹' : f.title,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
+            subtitle: Text(
+              '${f.mediaCount} 个视频',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+            trailing: const Icon(Icons.chevron_right, size: 20),
+            onTap: () => _openFolder(f),
           ),
-          trailing: const Icon(Icons.chevron_right, size: 20),
-          onTap: () => _openFolder(f),
         );
       },
-    );
-  }
-}
-
-/// 收藏夹总览页的整页状态视图（登录引导 / 错误重试 / 空态）。
-///
-/// 用可滚动的 ListView 承载（AlwaysScrollableScrollPhysics），保证这些状态
-/// 下仍可下拉刷新；居中图标 + 说明文字 + 可选操作按钮。
-class _StateView extends StatelessWidget {
-  final IconData icon;
-  final String message;
-  final IconData? actionIcon;
-  final String? actionLabel;
-  final VoidCallback? onAction;
-
-  const _StateView({
-    required this.icon,
-    required this.message,
-    this.actionIcon,
-    this.actionLabel,
-    this.onAction,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    return ListView(
-      physics: const AlwaysScrollableScrollPhysics(),
-      children: [
-        const SizedBox(height: 140),
-        Icon(icon, size: 52, color: theme.colorScheme.outline),
-        const SizedBox(height: 14),
-        Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 32),
-          child: Text(message, textAlign: TextAlign.center),
-        ),
-        if (actionLabel != null && onAction != null) ...[
-          const SizedBox(height: 18),
-          Center(
-            child: FilledButton.tonalIcon(
-              onPressed: onAction,
-              icon: Icon(actionIcon, size: 18),
-              label: Text(actionLabel!),
-            ),
-          ),
-        ],
-      ],
     );
   }
 }
