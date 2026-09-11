@@ -14,7 +14,16 @@
 //   9. **同张图内换格：先回来的结果也能落地**（落地看「还是不是当前这张图」，
 //      不看请求序号），且落地时用**当前位置**重算裁剪矩形 —— 本文件的核心
 //      修复断言；
-//  10. prepare 就绪后预取「当前位置」那一张雪碧图 → 首次拖动直接有图、不重复下载。
+//  10. prepare 就绪后预取「当前位置」那一张雪碧图 → 首次拖动直接有图、不重复下载；
+//  10b. **贴到片尾取帧要回退 kSeekPreviewEndGuardMs**（末格实测纯黑）；
+//  11. **手势横滑 seek = 直接拖进度条**（用户需求）：控制层收着时进度条行单独
+//      浮出（手柄可见、位置跟手），进度条**上方弹出同一个预览浮层**（缩略图 +
+//      时间）；气泡锚点 = 位置比例映射回轨道（两端不越界）；松手气泡立即消失、
+//      seekTo 照常、控制层仍收着（不改用户的显隐偏好）；
+//  12. 与「居中 seek 时间浮层」的关系：**预览管线可用时不再叠它**（同一份读数
+//      不给两遍）；管线不可用（未注入 / 未就绪）→ 保留它作为降级读数；
+//  13. 亮度 / 音量纵滑手势**不受影响**：仍是原浮层，不出气泡、也不浮出进度条行；
+//  14. 全屏横滑同样呈现「拖进度条」（气泡走底栏进度条行那条路，缩略图 180 宽）。
 //
 // 测试环境说明（与 player_seek_gesture_test.dart 同款骨架）：
 // - mock 原生播放器 MethodChannel/EventChannel（create → textureId，
@@ -35,7 +44,8 @@
 //
 // 几何（不硬编码屏幕坐标）：竖屏视口 411×914（dpr=1）→ 16:9 视频区高
 // ≈231.19dp；进度条的矩形运行时用 `player-seek-bar` 这个 key 取，起手点与
-// 落点都按该矩形比例算；全屏换成 914×411（横屏全屏）。
+// 落点都按该矩形比例算；全屏换成 914×411（横屏全屏）。手势横滑的起手点用
+// `player-video-area` 矩形内的「中部净区」（避开顶部 24px / 左右 16px 豁免带）。
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
@@ -62,6 +72,9 @@ const Key _kSeekBar = ValueKey('player-seek-bar');
 const Key _kOverlay = ValueKey('seek-preview-overlay');
 const Key _kThumb = ValueKey('seek-preview-thumb');
 const Key _kTime = ValueKey('seek-preview-time');
+
+/// 视频区（手势层所在盒）：手势横滑的起手点由它的矩形算出。
+const Key _kVideoArea = ValueKey('player-video-area');
 
 WhitelistVideo _video({List<PageInfo>? pages}) => WhitelistVideo(
       bvid: _kBvid,
@@ -569,6 +582,76 @@ Future<_SeekDrag> _startSeekDrag(WidgetTester tester, double fromX) async {
   await tester.pump();
   return _SeekDrag(tester, g, pos);
 }
+
+// ---------------------------------------------------------------------------
+// 手势横滑 seek 助手：在**视频区**（手势层）上滑动，不是拖进度条
+// ---------------------------------------------------------------------------
+
+/// 视频区内的「中部净区」起手点：避开顶部 24px 与左右 16px 豁免带
+/// （非全屏底部豁免带已关闭，见 player_page 的 [_onPanDown] 注释）。
+Offset _safeVideoPoint(Rect r) =>
+    Offset(r.left + r.width * 0.35, r.top + r.height * 0.5);
+
+/// 收起控制层（点画面切显隐）：控制层在**手势层之上**，底部控制行与中央播放簇
+/// 会吃掉起手点的触摸，横滑前先收起（与 player_seek_gesture_test.dart 同款）。
+/// 单击显隐要等双击窗口（~300ms）过期才生效 → 收完再断言，否则起手点落在控制
+/// 层上是坏测试而不是坏实现。
+Future<void> _hideControls(WidgetTester tester) async {
+  bool visible() =>
+      find.byIcon(Icons.fullscreen).evaluate().isNotEmpty ||
+      find.byIcon(Icons.fullscreen_exit).evaluate().isNotEmpty;
+  if (!visible()) return;
+  final r = tester.getRect(find.byKey(_kVideoArea));
+  await tester.tapAt(Offset(r.left + r.width * 0.10, r.top + r.height * 0.30));
+  await tester.pump(const Duration(milliseconds: 400));
+  expect(visible(), isFalse, reason: '控制层应已收起（起手点须落在手势层上）');
+}
+
+/// 视频区手势句柄：分步移动（Pan 需累计位移越 touch slop 才赢得竞技场、
+/// 主导方向也按累计位移锁定），拖动中可断言，抬手即气泡收起。
+class _VideoSwipe {
+  _VideoSwipe(this._tester, this._g);
+
+  final WidgetTester _tester;
+  final TestGesture _g;
+
+  /// 分步移动 [delta]。[settle] = true 时顺带放行真实异步（缩略图解码走
+  /// `dart:ui`，假时钟里不会自己完成，见 [_settleFrames]）。
+  Future<void> by(Offset delta, {int steps = 3, bool settle = false}) async {
+    final step = delta / steps.toDouble();
+    for (var i = 0; i < steps; i++) {
+      await _g.moveBy(step);
+      await _tester.pump();
+    }
+    if (settle) await _settleFrames(_tester);
+  }
+
+  /// 抬手（松手瞬间的断言在该方法返回后做：气泡应已立即消失）。
+  Future<void> up() async {
+    await _g.up();
+    await _tester.pump();
+  }
+
+  /// 抬手后把延迟隐藏计时（600ms）与双击识别器的 tap 计时走完，避免用例
+  /// 结束时报「A Timer is still pending」。
+  Future<void> settleTimers() =>
+      _tester.pump(const Duration(milliseconds: 700));
+}
+
+Future<_VideoSwipe> _startVideoSwipe(WidgetTester tester, Offset start) async {
+  final g = await tester.startGesture(start);
+  await tester.pump();
+  return _VideoSwipe(tester, g);
+}
+
+/// 进度条当前的「位置」参数（`_PlayerSeekBar` 是私有类 → 走 dynamic；
+/// 手柄与已播段都由它折算，**只用于测试断言**）。
+int _barPositionMs(WidgetTester tester) =>
+    (tester.widget(find.byKey(_kSeekBar)) as dynamic).positionMs as int;
+
+/// 进度条当前是否显示手柄（同上，走 dynamic）。
+bool _barShowHandle(WidgetTester tester) =>
+    (tester.widget(find.byKey(_kSeekBar)) as dynamic).showHandle as bool;
 
 /// 浮层矩形（key 挂在 `_SeekPreviewOverlay` 上 → 取其最近 RenderObject）。
 Rect _overlayRect(WidgetTester tester) => tester.getRect(find.byKey(_kOverlay));
@@ -1087,5 +1170,273 @@ void main() {
         reason: '节流 + 服务层缓存：同一张雪碧图只下载一次');
 
     await drag.up();
+  });
+
+  testWidgets('#4 拖到片尾：取帧时刻回退一小段，避开末格（纯黑）', (tester) async {
+    final rec = _Rec();
+    final info = _info();
+    final svc = _ScriptedShotService(info);
+    _installMocks(tester, rec);
+    tester.view.devicePixelRatio = 1.0;
+    tester.view.physicalSize = const Size(411, 914);
+    addTearDown(tester.view.reset);
+
+    await _pumpPlayer(tester, rec, _video(), service: svc);
+
+    final bar = tester.getRect(find.byKey(_kSeekBar));
+    final drag = await _startSeekDrag(tester, bar.width * 0.5);
+    // 拖到最右端 → 目标 == 总时长（现场：这时候预览是一块纯黑）
+    await drag.toX(bar.width);
+
+    expect(svc.requestedMs, isNotEmpty);
+    expect(
+      svc.requestedMs.last,
+      _kDurationMs - kSeekPreviewEndGuardMs,
+      reason: '贴到片尾要回退 kSeekPreviewEndGuardMs 再取帧（末格实测是黑的）',
+    );
+
+    // 收尾：放行在途请求（返回 null = 降级成只有时间气泡）+ 松手
+    svc.complete(svc.pending.length - 1, null);
+    await drag.up();
+    expect(tester.takeException(), isNull);
+  });
+
+  // -------------------------------------------------------------------------
+  // 手势横滑 seek：呈现与「直接拖进度条」一致（用户需求）
+  // -------------------------------------------------------------------------
+
+  testWidgets('手势横滑 seek（竖屏、控制层收起）→ 进度条行浮出 + 手柄跟手 + '
+      '预览气泡（缩略图 + 时间）；松手气泡消失、seekTo 生效', (tester) async {
+    final rec = _Rec();
+    final h = _ShotHarness()..info = _info();
+    _installMocks(tester, rec);
+    tester.view.devicePixelRatio = 1.0;
+    tester.view.physicalSize = const Size(411, 914);
+    addTearDown(tester.view.reset);
+
+    await _pumpPlayer(tester, rec, _video(), service: h.service);
+    final videoRect = tester.getRect(find.byKey(_kVideoArea));
+    await _hideControls(tester);
+    rec.seeks.clear();
+    expect(find.byKey(_kSeekBar), findsNothing,
+        reason: '控制层收着时进度条不在树里（前置状态）');
+
+    final swipe = await _startVideoSwipe(tester, _safeVideoPoint(videoRect));
+    // 右滑 120px：位移/手势区宽 = 时长比例 → 前进到约 58s
+    await swipe.by(const Offset(120, 0), settle: true);
+
+    // ① 控制层仍收着，但**进度条行单独浮出来**（手柄要看得见）
+    expect(find.byIcon(Icons.fullscreen), findsNothing,
+        reason: '不把整套控制层弹出来（显隐是用户点画面定下的偏好）');
+    final bar = tester.getRect(find.byKey(_kSeekBar));
+    expect(bar.height, 44);
+    expect(bar.bottom, closeTo(videoRect.bottom - 44, 0.5),
+        reason: '行位置与底栏里那一行一致（下方留出按钮行的高度）');
+    expect(_barShowHandle(tester), isTrue, reason: '手势 seek 中手柄可见');
+    expect(_barPositionMs(tester), greaterThan(0),
+        reason: '位置跟着目标走 → 手柄与已播段跟手');
+
+    // ② 同一个预览浮层：缩略图 + 时间，贴在进度条上方
+    expect(find.byKey(_kOverlay), findsOneWidget,
+        reason: '手势横滑出现预览气泡（复用拖动进度条的浮层）');
+    expect(find.byKey(_kThumb), findsOneWidget,
+        reason: '服务就绪 → 有缩略图（不是只有时间）');
+    expect(find.byKey(_kTime), findsOneWidget, reason: '时间文字恒有');
+    expect(_overlayRect(tester).bottom, lessThanOrEqualTo(bar.top - 7.9),
+        reason: '气泡在进度条上方留 ~8dp 间隙');
+    expect(_overlayRect(tester).top, greaterThanOrEqualTo(0), reason: '不越出屏幕上缘');
+    expect(_barPositionMs(tester) ~/ 1000 * 1000, _timeTextMs(tester),
+        reason: '气泡时间 = 进度条位置（同一份数据 → 确实跟手）');
+    expect(find.byIcon(Icons.access_time), findsNothing,
+        reason: '预览管线可用 → 不再叠居中时间浮层（同一读数不给两遍）');
+
+    // ③ 松手：气泡消失、进度条行收起、seekTo 目标 = 松手前的位置
+    final target = _barPositionMs(tester);
+    await swipe.up();
+    expect(find.byKey(_kOverlay), findsNothing, reason: '松手气泡立即消失');
+    expect(find.byKey(_kSeekBar), findsNothing,
+        reason: '松手后进度条行收起（控制层仍隐藏）');
+    expect(rec.seeks, isNotEmpty, reason: '松手照常 seekTo（原有语义未动）');
+    expect(rec.seeks.last, target, reason: '落在松手前手指所指的位置');
+    await swipe.settleTimers();
+    expect(tester.takeException(), isNull, reason: '整段手势不崩');
+  });
+
+  testWidgets('手势横滑的位置 → 气泡按位置比例映射（单调跟随），两端夹在轨道内',
+      (tester) async {
+    final rec = _Rec();
+    final h = _ShotHarness()..info = _info();
+    _installMocks(tester, rec);
+    tester.view.devicePixelRatio = 1.0;
+    tester.view.physicalSize = const Size(411, 914);
+    addTearDown(tester.view.reset);
+
+    await _pumpPlayer(tester, rec, _video(), service: h.service);
+    final videoRect = tester.getRect(find.byKey(_kVideoArea));
+    await _hideControls(tester);
+
+    final swipe = await _startVideoSwipe(tester, _safeVideoPoint(videoRect));
+    await swipe.by(const Offset(40, 0));
+    final bar = tester.getRect(find.byKey(_kSeekBar));
+    final left1 = _overlayRect(tester).left;
+
+    await swipe.by(const Offset(80, 0));
+    final left2 = _overlayRect(tester).left;
+    expect(left2, greaterThan(left1),
+        reason: '位置越靠后 → 气泡越靠右（按位置比例映射，与拖进度条同一套换算）');
+
+    // 拖到远超一屏的最右：目标钳到总时长，气泡夹在轨道右端内
+    await swipe.by(const Offset(600, 0));
+    final edgeR = _overlayRect(tester);
+    expect(_timeTextMs(tester), _kDurationMs, reason: '拖满 = 总时长');
+    expect(edgeR.right, lessThanOrEqualTo(bar.right + 0.5),
+        reason: '最右端不越出轨道（= 屏幕）右缘');
+    expect(_barPositionMs(tester), _kDurationMs,
+        reason: '进度条位置同样钳到总时长（手柄不会跑出轨道）');
+
+    // 反向拖到最左：目标钳到 0，气泡夹在轨道左端内
+    await swipe.by(const Offset(-1400, 0));
+    final edgeL = _overlayRect(tester);
+    expect(_timeTextMs(tester), 0, reason: '反向拖满 = 回到 0');
+    expect(edgeL.left, greaterThanOrEqualTo(bar.left - 0.5),
+        reason: '最左端不越出轨道左缘');
+
+    await swipe.up();
+    expect(find.byKey(_kOverlay), findsNothing);
+    await swipe.settleTimers();
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('手势横滑 + 预览服务不可用 → 只有时间气泡（无缩略图）、不崩、'
+      '拖动正常结束（仍 seekTo）', (tester) async {
+    final rec = _Rec();
+    final h = _brokenHarness();
+    _installMocks(tester, rec);
+    tester.view.devicePixelRatio = 1.0;
+    tester.view.physicalSize = const Size(411, 914);
+    addTearDown(tester.view.reset);
+
+    await _pumpPlayer(tester, rec, _video(), service: h.service);
+    expect(h.service.isReady, isFalse, reason: '接口抛错 → 服务未就绪');
+    final videoRect = tester.getRect(find.byKey(_kVideoArea));
+    await _hideControls(tester);
+    rec.seeks.clear();
+
+    final swipe = await _startVideoSwipe(tester, _safeVideoPoint(videoRect));
+    await swipe.by(const Offset(120, 0));
+
+    expect(find.byKey(_kOverlay), findsOneWidget,
+        reason: '未就绪也要有时间气泡（降级路径不空手）');
+    expect(find.byKey(_kTime), findsOneWidget);
+    expect(find.byKey(_kThumb), findsNothing, reason: '降级：没有缩略图');
+    expect(h.loadedUrls, isEmpty, reason: '未就绪不发任何图片请求');
+    expect(_barShowHandle(tester), isTrue, reason: '手柄照旧跟手（退化的只是缩略图）');
+    expect(find.byIcon(Icons.access_time), findsOneWidget,
+        reason: '降级路径保留居中时间浮层（气泡只剩底部时间条，两者不重叠）');
+
+    await swipe.up();
+    expect(find.byKey(_kOverlay), findsNothing, reason: '松手气泡消失');
+    expect(rec.seeks, isNotEmpty, reason: '降级不影响 seekTo（拖动照常结束）');
+    expect(rec.seeks.last, greaterThan(0), reason: '右滑 → 目标 > 0');
+    await swipe.settleTimers();
+    expect(tester.takeException(), isNull, reason: '整段拖动不崩');
+  });
+
+  testWidgets('亮度 / 音量纵滑手势不受影响：仍是原浮层、不出气泡、也不浮出进度条行',
+      (tester) async {
+    final rec = _Rec();
+    final h = _ShotHarness()..info = _info();
+    _installMocks(tester, rec);
+    tester.view.devicePixelRatio = 1.0;
+    tester.view.physicalSize = const Size(411, 914);
+    addTearDown(tester.view.reset);
+
+    await _pumpPlayer(tester, rec, _video(), service: h.service);
+    final videoRect = tester.getRect(find.byKey(_kVideoArea));
+    await _hideControls(tester);
+    rec.seeks.clear();
+
+    // ① 左半屏纵滑 = 亮度：原浮层照旧，没有气泡、也不浮出进度条行
+    final bright = await _startVideoSwipe(tester, _safeVideoPoint(videoRect));
+    expect(_safeVideoPoint(videoRect).dx, lessThan(videoRect.center.dx),
+        reason: '起手点在左半屏（= 亮度）');
+    await bright.by(const Offset(0, 90));
+    expect(find.byIcon(Icons.brightness_6), findsOneWidget,
+        reason: '亮度浮层保持原样（不得被这轮改动波及）');
+    expect(find.byKey(_kOverlay), findsNothing, reason: '纵滑不出现预览气泡');
+    expect(find.byKey(_kSeekBar), findsNothing, reason: '也不浮出进度条行');
+    await bright.up();
+    await bright.settleTimers();
+
+    // ② 右半屏纵滑 = 音量：同上
+    final volStart = Offset(videoRect.left + videoRect.width * 0.7,
+        videoRect.top + videoRect.height * 0.5);
+    expect(volStart.dx, greaterThan(videoRect.center.dx),
+        reason: '起手点在右半屏（= 音量）');
+    final volume = await _startVideoSwipe(tester, volStart);
+    await volume.by(const Offset(0, -90));
+    expect(find.byIcon(Icons.volume_down), findsOneWidget,
+        reason: '音量浮层保持原样（基准 5/15 ≈ 33% → volume_down）');
+    expect(find.byKey(_kOverlay), findsNothing, reason: '纵滑不出现预览气泡');
+    expect(find.byKey(_kSeekBar), findsNothing, reason: '也不浮出进度条行');
+    await volume.up();
+    await volume.settleTimers();
+
+    expect(rec.seeks, isEmpty, reason: '纵向主导不得触发 seek');
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('全屏横滑 → 同样的「拖进度条」呈现（气泡挂在底栏进度条行上、'
+      '缩略图 180 宽）', (tester) async {
+    final rec = _Rec();
+    final h = _ShotHarness()..info = _info();
+    _installMocks(tester, rec);
+    tester.view.devicePixelRatio = 1.0;
+    tester.view.physicalSize = const Size(411, 914);
+    addTearDown(tester.view.reset);
+
+    await _pumpPlayer(tester, rec, _video(), service: h.service);
+
+    // 进全屏（底栏全屏按钮）→ 横屏全屏 914×411；控制层**保持可见**，
+    // 覆盖「气泡挂在 [_buildBottomBar] 的进度条行上」那条路
+    await tester.tap(find.byIcon(Icons.fullscreen));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 150));
+    expect(find.byIcon(Icons.fullscreen_exit), findsOneWidget, reason: '已进全屏');
+    tester.view.physicalSize = const Size(914, 411);
+    await tester.pump();
+
+    final videoRect = tester.getRect(find.byKey(_kVideoArea));
+    expect(videoRect.height, closeTo(411, 0.5), reason: '全屏视频区占满整屏');
+    rec.seeks.clear();
+
+    final swipe = await _startVideoSwipe(tester, _safeVideoPoint(videoRect));
+    await swipe.by(const Offset(200, 0), settle: true);
+
+    expect(find.byKey(_kOverlay), findsOneWidget, reason: '全屏横滑同样出预览气泡');
+    expect(find.byKey(_kThumb), findsOneWidget, reason: '缩略图照旧（服务就绪）');
+    expect(tester.getRect(find.byKey(_kThumb)).width, closeTo(180, 0.01),
+        reason: '全屏档缩略图 180 宽');
+    final bar = tester.getRect(find.byKey(_kSeekBar));
+    expect(_barShowHandle(tester), isTrue, reason: '拖动中手柄可见');
+    expect(_barPositionMs(tester), greaterThan(0), reason: '位置跟手');
+    expect(_overlayRect(tester).bottom, lessThanOrEqualTo(bar.top - 7.9),
+        reason: '气泡在进度条上方');
+    expect(_overlayRect(tester).top, greaterThanOrEqualTo(0),
+        reason: '全屏也不越出屏幕上缘');
+    expect(_overlayRect(tester).left, greaterThan(bar.left),
+        reason: '气泡锚在「目标位置」那一带（不是钉在轨道左端）');
+    expect(find.byIcon(Icons.access_time), findsNothing,
+        reason: '管线可用 → 不出居中时间浮层');
+
+    final target = _barPositionMs(tester);
+    await swipe.up();
+    expect(find.byKey(_kOverlay), findsNothing, reason: '松手气泡消失');
+    expect(rec.seeks, isNotEmpty, reason: '全屏松手照常 seekTo');
+    expect(rec.seeks.last, target, reason: '目标 = 松手前的位置');
+    expect(find.byKey(_kSeekBar), findsOneWidget,
+        reason: '控制层可见 → 进度条行照旧在（不是「浮出」的那种）');
+    await swipe.settleTimers();
+    expect(tester.takeException(), isNull);
   });
 }

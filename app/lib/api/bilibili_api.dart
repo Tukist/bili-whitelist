@@ -2148,7 +2148,7 @@ class BiliApi {
     if (sess == null || sess.isEmpty) {
       throw const BiliApiException(
         code: -101,
-        message: '请先登录 B 站账号，再导入我关注的 UP',
+        message: '请先登录 B 站账号，再导入我的 UP',
         path: '/x/relation/followings',
       );
     }

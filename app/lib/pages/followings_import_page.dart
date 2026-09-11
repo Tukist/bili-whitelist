@@ -1,6 +1,6 @@
 /// 「我关注的 UP 全部加入白名单」导入页（v2.17.12+）。
 ///
-/// 入口：首页 UP 主管理页（主页左滑第 2 页）顶部「导入我关注的 UP」。
+/// 入口：首页 UP 主管理页（主页左滑第 2 页）顶部「导入我的 UP」。
 /// 与收藏夹导入（runFavoritesImportFlow）同模式：
 /// - [runFollowingsImportFlow]：配置门禁 → 登录门禁 → push [FollowingsImportPage]
 ///   → 用户勾选/全选 → 「加入白名单」批量 [UpownerWriter.addBatch]
@@ -43,7 +43,7 @@ const int kFollowingsPageSize = 20;
 /// 最多导入的条数（10 页 × 20）。
 const int kFollowingsImportCap = 200;
 
-/// 执行一次「导入我关注的 UP」全流程（UP 管理页入口用）。
+/// 执行一次「导入我的 UP」全流程（UP 管理页入口用）。
 ///
 /// 步骤：配置门禁 → 登录门禁（未登录提示 + 引导登录）→ push 勾选页 →
 /// 用户批量加入 → [onDone] 回调（页面在此刷新白名单数据）。
@@ -76,7 +76,7 @@ Future<void> runFollowingsImportFlow({
     ScaffoldMessenger.of(context)
       ..hideCurrentSnackBar()
       ..showSnackBar(const SnackBar(
-        content: Text('导入我关注的 UP 需要登录 B 站账号（关注列表属于个人账号数据）'),
+        content: Text('导入我的 UP 需要登录 B 站账号（关注列表属于个人账号数据）'),
       ));
     final loggedIn = await openLogin();
     if (!loggedIn || !context.mounted) return; // 仍匿名 → 中止
@@ -323,7 +323,7 @@ class _FollowingsImportPageState extends State<FollowingsImportPage> {
       },
       child: Scaffold(
         appBar: AppBar(
-          title: const Text('导入我关注的 UP'),
+          title: const Text('导入我的 UP'),
           leading: BackButton(onPressed: _popSelf),
         ),
         body: Column(

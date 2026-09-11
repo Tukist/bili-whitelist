@@ -40,6 +40,7 @@ import 'package:bili_whitelist_app/sync/whitelist_source.dart';
 import 'package:bili_whitelist_app/theme/motion_control.dart';
 import 'package:bili_whitelist_app/widgets/app_state_view.dart';
 import 'package:bili_whitelist_app/widgets/dot_illustration.dart';
+import 'package:bili_whitelist_app/widgets/inbox_swipe_card.dart';
 import 'package:bili_whitelist_app/widgets/smoke_silhouette.dart';
 import 'package:bili_whitelist_app/widgets/staggered_entrance.dart';
 
@@ -378,7 +379,13 @@ void main() {
         videos: [for (var i = 1; i <= 12; i++) _video(i)],
       );
       api.videoGate = Completer<void>(); // 先把页面钉在加载态
+      // ★ 首屏还是「搜索前空态」= AppStateView(empty.search)，里面那张细线插画
+      //   现在是无限 ticker（与 AppLoadingHero 的剪影同理）→ 开着动效就没法
+      //   pumpAndSettle。首帧先按静态挂载，结果列表上场前再开动效；
+      //   本用例要验的是**条目交错入场**，它的包裹层在结果到达时才挂载。
+      MotionControl.enabled = false;
       await _pumpSearch(tester, api);
+      MotionControl.enabled = true;
       await tester.enterText(find.byType(TextField).first, '测试');
       await tester.pump(); // onChanged → 起防抖
       await tester.pump(const Duration(milliseconds: 700)); // 防抖到期
@@ -595,15 +602,24 @@ void main() {
       await tester.pumpAndSettle();
     });
 
-    testWidgets('有条目：逐条入场（entryKey = bvid）', (tester) async {
+    testWidgets('有条目：卡片栈逐条入场（entryKey = bvid）', (tester) async {
       final service = _FakeInboxService([item(1), item(2)]);
       ServiceLocator.overrideInboxService(service);
 
       await tester.pumpWidget(const MaterialApp(home: InboxPage()));
       await tester.pumpAndSettle();
 
+      // 卡片栈只挂「当前 + 下一张」两张卡（不是长列表）：两张都在树里
       expect(find.byType(StaggeredEntrance), findsNWidgets(2));
-      expect(_entryKeys(tester), ['bvid:BV1', 'bvid:BV2']);
+      // ★ 顺序 = Stack 的绘制顺序（自下而上）：下层（下一张）在前、顶层在后，
+      //   顶层才盖得住下层、只露出下移的那一角。entryKey 仍是 `bvid:<bvid>`。
+      expect(_entryKeys(tester), ['bvid:BV2', 'bvid:BV1']);
+      // 语义断言：队首（最新）是顶层卡片，下一张在下层
+      final cards =
+          tester.widgetList<InboxSwipeCard>(find.byType(InboxSwipeCard)).toList();
+      expect(cards.length, 2);
+      expect(cards.first.item.bvid, 'BV2', reason: '下层 = 下一张');
+      expect(cards.last.item.bvid, 'BV1', reason: '顶层 = 队首（最新）');
       expect(find.text('新视频 1'), findsOneWidget);
       expect(find.byType(AppLoadingHero), findsNothing);
     });

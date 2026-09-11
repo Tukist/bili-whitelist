@@ -115,7 +115,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
   /// 白名单写入服务：导入 / 搜索「加入」共用（构造视频 + 查重 + 写 Gist）。
   final WhitelistWriter _writer = WhitelistWriter();
 
-  /// UP 主写入服务：UP 管理页「导入我关注的 UP」批量加入（v2.17.12+）。
+  /// UP 主写入服务：UP 管理页「导入我的 UP」批量加入（v2.17.12+）。
   final UpownerWriter _upwriter = UpownerWriter();
 
   /// 底部显示的版本号：优先 package_info_plus 读 Android versionName，
@@ -1336,7 +1336,7 @@ class _UpownerManagePage extends StatelessWidget {
   final Future<void> Function() onRefresh;
   final VoidCallback onSearch;
 
-  /// 「导入我关注的 UP」（v2.17.12+）：把 B 站关注列表批量加入白名单。
+  /// 「导入我的 UP」（v2.17.12+）：把 B 站关注列表批量加入白名单。
   final VoidCallback onImportFollowings;
   final void Function(Upowner upowner) onOpen;
   final void Function(Upowner upowner) onRemove;
@@ -1381,7 +1381,7 @@ class _UpownerManagePage extends StatelessWidget {
                     child: OutlinedButton.icon(
                       onPressed: onImportFollowings,
                       icon: const Icon(Icons.download_outlined, size: 18),
-                      label: const Text('导入我关注的 UP'),
+                      label: const Text('导入我的 UP'),
                     ),
                   ),
                   const SizedBox(width: 8),
