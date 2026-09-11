@@ -27,6 +27,7 @@ import 'package:bili_whitelist_app/services/service_locator.dart';
 import 'package:bili_whitelist_app/sync/whitelist_source.dart';
 import 'package:bili_whitelist_app/widgets/app_state_view.dart';
 import 'package:bili_whitelist_app/widgets/dot_illustration.dart';
+import 'package:bili_whitelist_app/widgets/swipe_action_box.dart';
 import 'package:bili_whitelist_app/widgets/video_tile.dart';
 
 /// 假同步服务：返回固定数据，不触发任何原生插件/网络。
@@ -190,6 +191,27 @@ Future<void> _dragHandle(WidgetTester tester, Finder from, Offset to) async {
   await tester.pump();
   await gesture.moveTo(to);
   await tester.pump();
+  await gesture.up();
+  await tester.pumpAndSettle();
+}
+
+/// 在卡片上左滑（一步 -160px，> 18px touch slop → 横向拖动识别器直接胜出）。
+///
+/// 与长按拖拽共存：`ReorderableDelayedDragStartListener` 在位移越过 slop 时
+/// 自认输（见 flutter/gestures/multidrag.dart 的 `_DelayedPointerState`），
+/// 所以快速横向滑动不会被它吃掉；按住不动 500ms 才轮到它。
+Future<void> _swipeCardLeft(WidgetTester tester, Finder card) =>
+    _swipeCard(tester, card, -160);
+
+/// 右滑（已露出时用于收回）。
+Future<void> _swipeCardRight(WidgetTester tester, Finder card) =>
+    _swipeCard(tester, card, 160);
+
+Future<void> _swipeCard(WidgetTester tester, Finder card, double dx) async {
+  final gesture = await tester.startGesture(tester.getCenter(card));
+  await tester.pump(const Duration(milliseconds: 16));
+  await gesture.moveBy(Offset(dx, 0));
+  await tester.pump(const Duration(milliseconds: 16));
   await gesture.up();
   await tester.pumpAndSettle();
 }
@@ -442,6 +464,167 @@ void main() {
         tester.getTopLeft(find.text('未分类')).dy,
         greaterThan(tester.getTopLeft(find.text('动画')).dy),
       );
+    });
+
+    testWidgets('左滑露出操作块之后，长按拖拽仍然可用（手势不打架）',
+        (tester) async {
+      final ctx = await _pumpHomeWithGithub(
+        tester,
+        _dataWith(
+          [_video('BV1', '视频A', collection: '动画')],
+          collectionNames: ['动画', '音乐'],
+        ),
+      );
+
+      // 先左滑出一次操作块（同一个 item 上多了一个横向识别器）
+      await _swipeCardLeft(tester, find.text('动画'));
+      expect(find.text('重命名'), findsOneWidget);
+      await _swipeCardRight(tester, find.text('动画')); // 收回，避免挡板干扰
+
+      // 长按拖拽照旧：动画 → 未分类（插到其前）→ [音乐, 动画, 未分类]
+      await _longPressDrag(tester, find.text('动画'), find.text('未分类'));
+
+      expect(ctx.adapter.requests.last.method, 'PATCH');
+      expect(_savedCollectionNames(ctx.adapter), ['音乐', '动画']);
+    });
+  });
+
+  group('合集卡左滑操作块（重命名 / 删除）', () {
+    testWidgets('真实合集卡左滑 → 露出「重命名」「删除」', (tester) async {
+      await _pumpHomeWithGithub(
+        tester,
+        _dataWith(
+          [_video('BV1', '视频A', collection: '动画')],
+          collectionNames: ['动画', '音乐'],
+        ),
+      );
+
+      // 合上时不在树上
+      expect(find.text('重命名'), findsNothing);
+      expect(find.text('删除'), findsNothing);
+
+      await _swipeCardLeft(tester, find.text('动画'));
+
+      expect(find.text('重命名'), findsOneWidget);
+      expect(find.text('删除'), findsOneWidget);
+    });
+
+    testWidgets('滑开「动画」再滑开「音乐」→ 前一张自动收回（同屏只一张露出）',
+        (tester) async {
+      await _pumpHomeWithGithub(
+        tester,
+        _dataWith(
+          [_video('BV1', '视频A', collection: '动画')],
+          collectionNames: ['动画', '音乐'],
+        ),
+      );
+
+      final aniRest = tester.getTopLeft(find.text('动画')).dx;
+      await _swipeCardLeft(tester, find.text('动画'));
+      expect(find.text('重命名'), findsOneWidget);
+
+      await _swipeCardLeft(tester, find.text('音乐'));
+
+      // 整个列表里只允许一份露出的操作块（两张卡同时挂着就会是 2）
+      final renameBlock = find.byKey(SwipeActionBox.actionKey('重命名'));
+      expect(renameBlock, findsOneWidget);
+      expect(find.byKey(SwipeActionBox.actionKey('删除')), findsOneWidget);
+      // 露出的这份属于「音乐」：块和它的卡在同一个 SwipeActionBox 里
+      final owner = find.ancestor(
+        of: renameBlock,
+        matching: find.byType(SwipeActionBox),
+      );
+      expect(
+        find.descendant(of: owner, matching: find.text('音乐')),
+        findsOneWidget,
+      );
+      expect(
+        find.descendant(of: owner, matching: find.text('动画')),
+        findsNothing,
+      );
+      // 「动画」已回到原位（位移归零）
+      expect(tester.getTopLeft(find.text('动画')).dx, aniRest);
+    });
+
+    testWidgets('「未分类」卡左滑 → 不出现操作块', (tester) async {
+      await _pumpHomeWithGithub(
+        tester,
+        _dataWith(
+          [_video('BV1', '视频A', collection: '动画')],
+          collectionNames: ['动画'],
+        ),
+      );
+
+      await _swipeCardLeft(tester, find.text('未分类'));
+
+      expect(find.text('重命名'), findsNothing);
+      expect(find.text('删除'), findsNothing);
+    });
+
+    testWidgets('「收藏夹」卡左滑 → 不出现操作块', (tester) async {
+      await _pumpHomeWithGithub(
+        tester,
+        _dataWith([_video('BV1', '视频A', collection: '动画')],
+            collectionNames: ['动画']),
+      );
+
+      await _swipeCardLeft(tester, find.text('收藏夹'));
+
+      expect(find.text('重命名'), findsNothing);
+      expect(find.text('删除'), findsNothing);
+    });
+
+    testWidgets('点左滑「重命名」→ 打开重命名对话框，确定后写 Gist 并刷新',
+        (tester) async {
+      final ctx = await _pumpHomeWithGithub(
+        tester,
+        _dataWith(
+          [_video('BV1', '视频A', collection: '动画')],
+          collectionNames: ['动画', '音乐'],
+        ),
+      );
+
+      await _swipeCardLeft(tester, find.text('动画'));
+      await tester.tap(find.text('重命名'));
+      await tester.pumpAndSettle();
+
+      // 复用管理面板那套对话框（标题逐字相同）
+      expect(find.text('重命名合集「动画」'), findsOneWidget);
+      await tester.enterText(find.byType(TextField).last, '动画2');
+      await tester.tap(find.text('确定'));
+      await tester.pumpAndSettle();
+
+      // 走的是页面既有 renameCollection 流程：PATCH → 列表刷新出新名
+      expect(ctx.adapter.requests.last.method, 'PATCH');
+      expect(_savedCollectionNames(ctx.adapter), ['动画2', '音乐']);
+      expect(find.text('动画2'), findsOneWidget);
+      expect(find.text('重命名'), findsNothing); // 对话框关掉、操作块也收回
+    });
+
+    testWidgets('点左滑「删除」→ 打开删除确认框，确认后写 Gist（视频移回未分类）',
+        (tester) async {
+      final ctx = await _pumpHomeWithGithub(
+        tester,
+        _dataWith(
+          [_video('BV1', '视频A', collection: '动画')],
+          collectionNames: ['动画', '音乐'],
+        ),
+      );
+
+      await _swipeCardLeft(tester, find.text('动画'));
+      await tester.tap(find.text('删除'));
+      await tester.pumpAndSettle();
+
+      // 复用管理面板那套确认框（含视频数口径）
+      expect(find.text('删除合集「动画」'), findsOneWidget);
+      expect(find.textContaining('该合集下 1 个视频将移回未分类'), findsOneWidget);
+
+      // 对话框里的「删除」按钮（底部一个）
+      await tester.tap(find.widgetWithText(TextButton, '删除'));
+      await tester.pumpAndSettle();
+
+      expect(ctx.adapter.requests.last.method, 'PATCH');
+      expect(_savedCollectionNames(ctx.adapter), ['音乐']); // 动画已移除
     });
   });
 

@@ -29,6 +29,7 @@ import '../widgets/app_state_view.dart';
 import '../widgets/favorites_import_dialog.dart';
 import '../widgets/manage_panel.dart';
 import '../widgets/pgc_import_dialog.dart';
+import '../widgets/swipe_action_box.dart';
 import 'collection_page.dart';
 import 'favorites_page.dart';
 import 'followings_import_page.dart';
@@ -898,6 +899,23 @@ class _PlaylistPageState extends State<PlaylistPage> {
     }
   }
 
+  /// 合集卡左滑「重命名」：弹与管理面板**同一个**对话框，再走
+  /// [_renameCollection]（校验 → 同步引用 → 写 Gist → 刷新）。
+  Future<void> _renameCollectionFromCard(String name) async {
+    final newName = await _showRenameCollectionDialog(context, name);
+    if (newName == null) return;
+    await _renameCollection(name, newName);
+  }
+
+  /// 合集卡左滑「删除」：弹与管理面板**同一个**确认框，再走
+  /// [_deleteCollection]。视频数口径与 [_openCollectionManage] 的 `countOf` 一致。
+  Future<void> _deleteCollectionFromCard(String name) async {
+    final count = _data.videos.where((v) => v.collection == name).length;
+    final confirmed = await _showDeleteCollectionDialog(context, name, count);
+    if (confirmed != true) return;
+    await _deleteCollection(name);
+  }
+
   // ---------------------------------------------------------------------------
   // 合集卡片数据：collections 数组顺序即展示顺序；「未分类」固定最后一张。
   // ---------------------------------------------------------------------------
@@ -1244,6 +1262,13 @@ class _PlaylistPageState extends State<PlaylistPage> {
                           stat: card.stat,
                           draggable: !isUncategorized,
                           onTap: () => _openCollection(card.name),
+                          // 「未分类」不可重命名/删除 → 不传回调 → 不启用左滑
+                          onRename: isUncategorized
+                              ? null
+                              : () => _renameCollectionFromCard(card.name),
+                          onDelete: isUncategorized
+                              ? null
+                              : () => _deleteCollectionFromCard(card.name),
                         ),
                       );
                     },
@@ -1576,6 +1601,11 @@ String? collectionBadgeText(CollectionStat? stat, {DateTime? now}) {
 /// 合集卡片（行式）：左侧代表视觉（封面 / 渐变底 + 图标），右侧合集名 +
 /// 更新时间角标 + 视频数 / 观看进度，尾部拖动手柄提示（未分类不可拖不显示）。
 ///
+/// - **左滑操作块**（v2.19.x）：整卡由 [SwipeActionBox] 包住，左滑露出
+///   「重命名」「删除」；[onRename] / [onDelete] 都不传（「未分类」固定卡）
+///   时左滑整块关掉（`enabled: false`，树里连手势层都没有）。「收藏夹」
+///   入口卡是 [_FavoritesCard]，不经过这里。
+///
 /// 块化（P3「合集卡成为视觉主角」）：
 /// - 底板交给 [AppBlock] 的 [AppBlockVariant.collectionCard] 规格
 ///   （kPaperCool 冷底 + kRuleStrong 1px 描边 + kRadiusMd 圆角 + all(10)
@@ -1596,6 +1626,12 @@ class _CollectionCard extends StatelessWidget {
   final bool draggable; // 是否可拖动（未分类固定最后，不可拖）
   final VoidCallback onTap;
 
+  /// 左滑「重命名」回调；null → 不启用左滑操作块（「未分类」固定卡）。
+  final VoidCallback? onRename;
+
+  /// 左滑「删除」回调；null → 不启用左滑操作块。
+  final VoidCallback? onDelete;
+
   /// 该合集的观看统计；null = 统计未加载完（或加载失败）→ 素态显示。
   final CollectionStat? stat;
 
@@ -1606,6 +1642,8 @@ class _CollectionCard extends StatelessWidget {
     required this.draggable,
     required this.onTap,
     this.stat,
+    this.onRename,
+    this.onDelete,
   });
 
   @override
@@ -1622,7 +1660,7 @@ class _CollectionCard extends StatelessWidget {
     final badge = collectionBadgeText(stat);
     final showProgress = total > 0; // 0 集不画进度条（除法也没意义）
 
-    return ClipRRect(
+    final card = ClipRRect(
       // 圆角裁剪：底部进度条是贴卡片下沿的通栏矩形，不裁就会从卡片圆角处
       // 露出直角（[AppBlock] 只在带左竖条时才自己裁）。
       borderRadius: BorderRadius.circular(kRadiusMd),
@@ -1758,6 +1796,33 @@ class _CollectionCard extends StatelessWidget {
             ),
         ],
       ),
+    );
+
+    // 左滑操作块（v2.19.x）：只对**真实合集**启用 —— 「未分类」是不可
+    // 重命名/删除的固定卡（页面不传回调 → enabled=false → 直接就是这张卡，
+    // 零手势层）。「收藏夹」卡是另一个 widget，压根不经过这里。
+    final canSwipe = onRename != null && onDelete != null;
+    return SwipeActionBox(
+      enabled: canSwipe,
+      actions: [
+        if (onRename != null)
+          SwipeAction(
+            label: '重命名',
+            icon: Icons.drive_file_rename_outline,
+            color: context.palette.inkFill,
+            textColor: context.palette.onInk,
+            onTap: onRename!,
+          ),
+        if (onDelete != null)
+          SwipeAction(
+            label: '删除',
+            icon: Icons.delete_outline,
+            color: kError,
+            textColor: kPaper,
+            onTap: onDelete!,
+          ),
+      ],
+      child: card,
     );
   }
 
@@ -2109,6 +2174,73 @@ class _EmptyView extends StatelessWidget {
   }
 }
 
+/// 重命名对话框（合集卡左滑 + 管理面板**共用同一入口**）。
+///
+/// 只负责收名字：返回用户输入（null = 取消）；校验 / 同步引用 / 落库一律
+/// 交给 [_PlaylistPageState._renameCollection]。文案逐字保留（既有测试锚点）。
+Future<String?> _showRenameCollectionDialog(
+  BuildContext context,
+  String oldName,
+) async {
+  final ctrl = TextEditingController(text: oldName);
+  final newName = await showDialog<String>(
+    context: context,
+    builder: (dialogCtx) => AlertDialog(
+      title: Text('重命名合集「$oldName」'),
+      content: TextField(
+        controller: ctrl,
+        autofocus: true,
+        decoration: const InputDecoration(
+          labelText: '新合集名称',
+          border: OutlineInputBorder(),
+          isDense: true,
+        ),
+        onSubmitted: (v) => Navigator.pop(dialogCtx, v),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(dialogCtx),
+          child: const Text('取消'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(dialogCtx, ctrl.text),
+          child: const Text('确定'),
+        ),
+      ],
+    ),
+  );
+  return newName;
+}
+
+/// 删除确认对话框（合集卡左滑 + 管理面板共用）：提示该合集下 N 个视频将
+/// 移回未分类。返回 true = 用户确认（null = 取消/点外部关掉）。
+Future<bool?> _showDeleteCollectionDialog(
+  BuildContext context,
+  String name,
+  int count,
+) {
+  return showDialog<bool>(
+    context: context,
+    builder: (dialogCtx) => AlertDialog(
+      title: Text('删除合集「$name」'),
+      content: Text(
+        '确定删除合集「$name」吗？\n'
+        '该合集下 $count 个视频将移回未分类（视频本身不会被删除）。',
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(dialogCtx, false),
+          child: const Text('取消'),
+        ),
+        TextButton(
+          onPressed: () => Navigator.pop(dialogCtx, true),
+          child: const Text('删除', style: TextStyle(color: kError)),
+        ),
+      ],
+    ),
+  );
+}
+
 /// 合集管理面板（BottomSheet）：列出所有合集（名字 + 视频数），
 /// 每个合集可重命名 / 删除。
 ///
@@ -2135,33 +2267,7 @@ class _CollectionManageSheet extends StatefulWidget {
 class _CollectionManageSheetState extends State<_CollectionManageSheet> {
   /// 重命名对话框：预填旧名 → 确定后回调页面。
   Future<void> _rename(CollectionInfo collection) async {
-    final ctrl = TextEditingController(text: collection.name);
-    final newName = await showDialog<String>(
-      context: context,
-      builder: (dialogCtx) => AlertDialog(
-        title: Text('重命名合集「${collection.name}」'),
-        content: TextField(
-          controller: ctrl,
-          autofocus: true,
-          decoration: const InputDecoration(
-            labelText: '新合集名称',
-            border: OutlineInputBorder(),
-            isDense: true,
-          ),
-          onSubmitted: (v) => Navigator.pop(dialogCtx, v),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogCtx),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(dialogCtx, ctrl.text),
-            child: const Text('确定'),
-          ),
-        ],
-      ),
-    );
+    final newName = await _showRenameCollectionDialog(context, collection.name);
     if (newName == null || !mounted) return;
     await widget.onRename(collection.name, newName);
     if (mounted) setState(() {}); // 重拉合集列表（页面 _data 已更新）
@@ -2170,26 +2276,8 @@ class _CollectionManageSheetState extends State<_CollectionManageSheet> {
   /// 删除确认对话框：提示该合集下 N 个视频将移回未分类。
   Future<void> _delete(CollectionInfo collection) async {
     final count = widget.countOf(collection.name);
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (dialogCtx) => AlertDialog(
-        title: Text('删除合集「${collection.name}」'),
-        content: Text(
-          '确定删除合集「${collection.name}」吗？\n'
-          '该合集下 $count 个视频将移回未分类（视频本身不会被删除）。',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogCtx, false),
-            child: const Text('取消'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(dialogCtx, true),
-            child: const Text('删除', style: TextStyle(color: kError)),
-          ),
-        ],
-      ),
-    );
+    final confirmed =
+        await _showDeleteCollectionDialog(context, collection.name, count);
     if (confirmed != true || !mounted) return;
     await widget.onDelete(collection.name);
     if (mounted) setState(() {}); // 重拉合集列表

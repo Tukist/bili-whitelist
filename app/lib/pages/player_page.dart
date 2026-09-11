@@ -20,6 +20,7 @@ import '../services/danmaku_settings_store.dart';
 import '../services/device_media.dart';
 import '../services/history_store.dart';
 import '../services/realtime_transcriber.dart';
+import '../services/video_shot_service.dart';
 import '../services/watch_stats.dart';
 import '../theme/app_motion.dart';
 import '../theme/app_tokens.dart';
@@ -204,15 +205,17 @@ bool shouldPrefetchSource({
 // 手势总览（参照 B 站手机端播放器；冲突处理见 build 中手势层注释）：
 // - 双击：播放 / 暂停（与单击显隐共存，单击延迟 ~300ms 等双击判定）
 // - 滑动统一走 Pan + 主导方向判定（v2.16.9+）：斜向滑动按**位移主方向**
-//   归类——水平主导 → 全屏横屏 seek（位移/屏宽 = 时长比例，松手 seekTo）；
-//   垂直主导 → 起点左半屏亮度 / 右半屏音量（原生通道 bili_whitelist/media，
-//   见 services/device_media.dart）。非全屏（竖屏 / v2.17.17 横屏置顶）只
-//   保留亮度/音量（水平主导忽略，无 seek 防误触）。
+//   归类——水平主导 → seek（v2.18.x 起**竖屏 / 横屏置顶 / 横屏全屏统一
+//   可用**，能否 seek 由 [canGestureSeek] 判定；位移/手势区宽 = 时长比例，
+//   松手 seekTo）；垂直主导 → 起点左半屏亮度 / 右半屏音量（原生通道
+//   bili_whitelist/media，见 services/device_media.dart）。
 // - 手势起点豁免带（v2.16.14+ 顶/底 → v2.16.17+ 四边）：起点落在屏幕
 //   底部/顶部/左/右任一条豁免带内的 Pan 整体忽略（不 seek / 不调亮度音量）
 //   ——横屏全屏从**物理屏幕底部**滑动（旋转后 = 逻辑左/右边缘，见类顶注释）
 //   唤醒系统导航不再误触发 seek，让给系统手势；参数与判定见
-//   [isExcludedGestureStart]。
+//   [isExcludedGestureStart]。底部带 v2.18.x 起**仅全屏生效**：非全屏手势层
+//   = 视频黑盒，其底边落在屏幕中部（竖屏 16:9 时约屏高 1/4 处），不是物理
+//   屏幕底边、那里没有系统导航区（见 [_onPanDown]）。
 //
 // 滑动量换算统一走 [slideFraction]：滑满一屏 = ±100%（比例），
 // 方向约定：向右 / 向上为「前进 / 增大」。
@@ -225,7 +228,7 @@ bool shouldPrefetchSource({
 
 /// 手势提示浮层的类型（也即半屏判定可产生的目标）。
 enum PlayerSlideKind {
-  /// 横屏 seek（浮层显示 当前进度 / 总时长）。
+  /// seek（浮层显示 当前进度 / 总时长；竖屏 / 横屏统一可用）。
   seek,
 
   /// 亮度（左半屏纵向滑动）。
@@ -237,7 +240,7 @@ enum PlayerSlideKind {
 
 /// 滑动手势的主导方向（判定锁定后本次手势不再切换，防中途抖动）。
 enum PanSlideMode {
-  /// 水平主导 → seek（仅全屏横屏激活；非全屏忽略）。
+  /// 水平主导 → seek（听视频 / 时长未知时不 seek，见 [canGestureSeek]）。
   horizontal,
 
   /// 垂直主导 → 起点左半屏亮度 / 右半屏音量。
@@ -277,6 +280,11 @@ const double kPanModeThreshold = 12;
 /// 24~48px）——用「比例 or 固定 48px 取较大者」保证窄边（横屏）也够宽；
 /// 竖屏 8% ≈ 屏高 73px 更大。宁宽勿窄（带内仅损失从带内启动的滑动，seek/
 /// 调节都改从中部启动），但整体 < 屏高 15%，不挤压中部正常操作区。
+///
+/// v2.18.x 起该带**只在全屏生效**（语义：底部 = 物理屏幕底边 = 系统导航区）。
+/// 非全屏手势层 = 视频黑盒，底边落在屏幕中部（竖屏 411×914 时视频区高
+/// ≈231dp、底边 ≈ 屏高 1/4 处），既不是系统导航区，按本参数豁免还会白吃
+/// 竖屏视频区约 21% 的起手区 → 非全屏关闭底部带（见 [_onPanDown]）。
 const double kBottomGestureExclusionFactor = 0.08;
 
 /// 底部豁免带的最小绝对宽度（px，见 [kBottomGestureExclusionFactor]）。
@@ -297,7 +305,10 @@ const double kSideGestureExclusionPxPortrait = 16;
 /// 可单测）。逻辑坐标点 (x0, y0)、逻辑尺寸 (width, height)，任一边命中即
 /// 返回 true：
 /// - y0 ≤ [topPx] → 顶部带内（状态栏 / 刘海区）
-/// - y0 ≥ height - max(height × [bottomFactor], [bottomMinPx]) → 底部带内
+/// - y0 ≥ height - max(height × [bottomFactor], [bottomMinPx]) → 底部带内；
+///   [bottomFactor] 与 [bottomMinPx] **同时传 0 即关闭该带**（v2.18.x+：
+///   非全屏手势层 = 视频黑盒，其底边落在屏幕中部，那里没有系统导航区，
+///   见 [_onPanDown]）
 /// - x0 ≤ [leftPx] → 左带内（横屏全屏时物理底边导航区 = 逻辑左边缘）
 /// - x0 ≥ width - [rightPx] → 右带内（物理底边也可能映到逻辑右边缘）
 /// 尺寸异常（≤ 0，防御）→ false（不豁免，退化为旧行为）。
@@ -314,7 +325,9 @@ bool isExcludedGestureStart({
 }) {
   if (width <= 0 || height <= 0) return false;
   final bottomPx = math.max(height * bottomFactor, bottomMinPx);
-  final inTopBottom = y0 <= topPx || y0 >= height - bottomPx;
+  // bottomPx <= 0（两个参数同时为 0）= 显式关闭底部带。必须单独判：否则
+  // 「y0 >= height - 0」会把紧贴手势层底边的起点误判成带内。
+  final inTopBottom = y0 <= topPx || (bottomPx > 0 && y0 >= height - bottomPx);
   final inSides = x0 <= leftPx || x0 >= width - rightPx;
   return inTopBottom || inSides;
 }
@@ -379,6 +392,22 @@ int seekTargetMs({
   if (target < 0) target = 0;
   if (target > durationMs) target = durationMs;
   return target;
+}
+
+/// 当前是否允许「水平滑动调进度」（纯函数，可单测）。
+///
+/// v2.18.x 起**与全屏无关**（用户反馈：竖屏模式下无法左右滑动推动进度）：
+/// 旧实现三处 `if (_fullscreen)` 把非全屏的水平 seek 链整条掐断——竖屏
+/// 水平主导只累计位移、不进 seek 拖动（不出时间浮层）、松手也不 seekTo；
+/// 本函数取代这些 gate，让竖屏 / 横屏置顶 / 横屏全屏统一可滑 seek。
+/// 唯一的两个否定条件是：
+/// - [listenMode]（听视频模式）：画面已隐藏，seek 手势无意义（且此时手势层
+///   本身不挂载，见 build 中 `if (!_listenMode)`，这里只是二次防御）
+/// - [durationMs] <= 0（时长未知：未就绪 / 直播等）：无时长则比例换算无基准，
+///   [seekTargetMs] 也返回 0，此时发起 seek 只会把进度打到 0
+bool canGestureSeek({required bool listenMode, required int durationMs}) {
+  if (listenMode) return false;
+  return durationMs > 0;
 }
 
 /// 音量目标档位：基准档 + 滑动比例 × 灵敏度 × 最大档（钳制 0..max）。
@@ -486,14 +515,19 @@ final Map<String, String> _viewDescCache = {};
 ///   倍速选择（九档 0.5~3x）、听视频（纯音频）开关、全屏切换；
 ///   点击画面切换控制层显隐，长按画面 2x、松手恢复长按前倍速；进入自动播放；
 ///   B 站式快捷手势（v2.16.7+）：双击播放/暂停（单击显隐延迟 ~300ms 防误触）、
-///   滑动按**主导方向**归类（v2.16.9+）：水平主导 → 全屏横屏 seek（时间浮层 +
-///   松手 seekTo）；垂直主导 → 按起点左/右半屏调亮度/音量（原生通道
-///   bili_whitelist/media，仅当前 Activity 内生效）。非全屏（竖屏 / 横屏
-///   置顶）只保留亮度/音量（水平主导忽略，无 seek 防误触）。v2.16.14+/v2.16.17+：
-///   触摸按下点落在手势区（非全屏 = 视频区黑盒，见下；全屏 = 整屏）底部/顶部/
-///   左右豁免带（[isExcludedGestureStart]，四边，按下点判定见 [_onPanDown]）→
+///   滑动按**主导方向**归类（v2.16.9+）：水平主导 → seek（时间浮层 + 松手
+///   seekTo；v2.18.x 起竖屏 / 横屏置顶 / 横屏全屏**统一可用**，见
+///   [canGestureSeek]）；垂直主导 → 按起点左/右半屏调亮度/音量（原生通道
+///   bili_whitelist/media，仅当前 Activity 内生效）。v2.16.14+/v2.16.17+：
+///   触摸按下点落在手势区（非全屏 = 视频区黑盒，见下；全屏 = 整屏）顶部/
+///   左右豁免带，以及**全屏时**的底部豁免带（[isExcludedGestureStart]，
+///   按下点判定见 [_onPanDown]）→
 ///   本次 Pan 整体忽略（不 seek / 不调亮度音量）——横屏全屏从**物理底部**滑动
 ///   （旋转后 = 逻辑左/右边缘，左右带加宽）唤醒系统导航不再误触发 seek
+/// - 进度条拖动预览（缩略图 + 时间）：拖动自绘进度条时在轨道上方弹出跟随
+///   手指的浮层（[VideoShotService] 提供雪碧图，按分 P 异步 prepare；接口
+///   不可用/未就绪 → **降级为只显示时间气泡**，绝不影响拖动与播放）。
+///   非全屏气泡 120 宽、全屏 180 宽（高度按帧比例折算，不拉伸）。
 /// - 非全屏布局（v2.17.0+ 重构；v2.17.17 横屏置顶模式）：
 ///   非全屏 = 视频区顶部置顶（按宽高比的黑盒，竖屏超高视频封顶屏高 60%、
 ///   横屏 16:9 封顶屏高 55%）+ 下方视频信息行（标题/时长 + UP 主入口——
@@ -567,11 +601,22 @@ class PlayerPage extends StatefulWidget {
   /// null/<=0 = 保持原有记忆进度恢复行为。
   final int? initialPositionMs;
 
+  /// 进度条拖动预览的雪碧图服务（**仅测试注入用**；生产一律传 null，
+  /// 由 [_PlayerPageState] 自建并在页面销毁时释放）。
+  ///
+  /// 存在的理由：预览是「接口就绪 → 缩略图；未就绪/失败 → 只显示时间气泡」
+  /// 的双路行为，widget 测试要精确控制这两条路（fake fetcher/loader/decoder
+  /// 必须注入到 service 里，而 service 由 State 持有）——注入点放在这里，
+  /// 服务层接口一行不用改。
+  @visibleForTesting
+  final VideoShotService? videoShotService;
+
   const PlayerPage({
     super.key,
     required this.video,
     this.initialPageIndex = 0,
     this.initialPositionMs,
+    this.videoShotService,
   });
 
   @override
@@ -658,6 +703,47 @@ class _PlayerPageState extends State<PlayerPage>
   bool _fullscreen = false;
   bool _dragging = false;
 
+  // 进度条拖动预览（缩略图 + 时间浮层）
+  // ---------------------------------------------------------------------
+  // 数据/解码/缓存全部由 [VideoShotService] 负责（按需下载 + 降采样 + LRU +
+  // 并发去重），本页只做三件事：进页异步 prepare、拖动时异步取「当前格」的
+  // 图、把结果画成跟随手指的浮层。预览是**纯增强**：接口挂了 / 网络断了 /
+  // prepare 还没回来，一律降级成「只显示时间气泡」，绝不影响拖动与播放。
+  //
+  // 三个字段分工：
+  // - [_previewFrame] 当前可画的帧（null = 只显示时间气泡）；
+  // - [_previewGen] **拖动代次**：每轮拖动起手/结束、切集/换源时自增。异步结果
+  //   回来时代次不等 = 这轮已经不是当前轮（浮层已隐藏/已复位）→ 丢弃；
+  // - [_previewShot] 最近一次已发起请求的「格」序号，用作**节流**：同一格
+  //   （≈同一秒）不重复发请求（服务层虽有 LRU + in-flight 去重，每帧发一次
+  //   仍是白费）。
+  //
+  // 注意这里**没有**「请求序号」：判一个迟到结果该不该落地，看的是它属于哪张
+  // 雪碧图（[SeekPreviewFrame.spriteIndex] vs 当前位置需要的张号），不是它排
+  // 第几个发出——同张图内的迟到结果依然可用，按序号判会把首次拖动整条丢掉。
+  VideoShotService? _videoShot;
+
+  SeekPreviewFrame? _previewFrame;
+  int _previewGen = 0;
+  int _previewShot = -1;
+
+  /// 想预取的播放位置（ms）：服务未就绪时先记下，等元信息到位后补取
+  /// （见 [_prefetchVideoShotAt] / [_prepareVideoShot]）。
+  int? _prefetchWantMs;
+
+  /// [_previewFrame] 引用的雪碧图下标：换张前先扔掉手里的旧帧——LRU（容量 2）
+  /// 淘汰时会 `dispose()` 旧图，继续画一张已释放的图会触发断言。
+  int _previewSprite = -1;
+
+  /// 本轮拖动是否已开始（拖动起手时清帧/复位节流，见 [_onSeekDragPosition]）。
+  bool _previewDragActive = false;
+
+  /// 手指在进度条轨道上的水平位置（轨道局部坐标，0..[_previewTrackWidth]）。
+  double _previewDragX = 0;
+
+  /// 拖动轨道可用宽度（浮层横向夹取用；0 = 尚未回报 → 不显示浮层）。
+  double _previewTrackWidth = 0;
+
   // 非全屏内嵌评论区（v2.17.0+ 布局重构；v2.17.17 横屏置顶模式共用）：
   // ---------------------------------------------------------------------
   // 非全屏（竖屏置顶 / 横屏置顶）时视频下方内嵌 [CommentListView]（与独立
@@ -688,15 +774,16 @@ class _PlayerPageState extends State<PlayerPage>
   // 双击播放/暂停：GestureDetector onDoubleTap；单击显隐因与双击共存自动
   // 延迟 ~300ms（等双击窗口判定，双击赢得则单击取消，不误触显隐）。
   // 滑动统一走单一 Pan（v2.16.9+）：位移累计超 [kPanModeThreshold] 按主导
-  // 方向锁定（[decideMode]）——horizontal → 全屏横屏 seek、竖屏忽略；
-  // vertical → 起点半屏亮度/音量（横竖屏都可用）。锁定后本次手势不再切换
+  // 方向锁定（[decideMode]）——horizontal → seek（v2.18.x 起竖屏 / 横屏
+  // 统一可用，见 [canGestureSeek]）；vertical → 起点半屏亮度/音量（横竖屏
+  // 都可用）。锁定后本次手势不再切换
   // （防中途抖动）；seek 拖动中暂停 tick 位置刷新（松手 seek 后恢复）。
   double _panStartX = 0; // 手势起点 x（垂直模式按半屏判亮度/音量）
-  bool _panExcluded = false; // 起点在豁免带（v2.16.17+ 四边）→ 本次 Pan 整体忽略
+  bool _panExcluded = false; // 起点在豁免带（v2.16.17+ 顶/左右，v2.18.x 底部仅全屏）→ 本次 Pan 整体忽略
   PanSlideMode? _panMode; // 已锁定的主导方向（null = 未定，继续累计判定）
   double _panDx = 0; // 手势累计横向位移（px，仅锁定判定用）
   double _panDy = 0; // 手势累计纵向位移（px，仅锁定判定用）
-  bool _seekDragging = false; // 横屏 seek 拖动中（锁定 horizontal 后）
+  bool _seekDragging = false; // seek 拖动中（锁定 horizontal 且允许 seek 后）
   int _seekDragBaseMs = 0; // seek 起点基准位置（拖动开始时）
   double _seekDragDx = 0; // 累计横向位移（px，向右为正）
   double _seekDragSpan = 1; // 拖满一屏对应的屏宽（px）
@@ -929,6 +1016,8 @@ class _PlayerPageState extends State<PlayerPage>
   void initState() {
     super.initState();
     _video = widget.video; // 换源前的初始视频（换源见 playVideo）
+    // 拖动预览服务：生产自建，测试可注入（见 [PlayerPage.videoShotService]）
+    _videoShot = widget.videoShotService ?? VideoShotService();
     // 历史记录续播：初始定位到对应分 P（越界 / 单 P 回落第 0 集）。
     // 必须在 _init 之前设置，_maybeRestoreProgress 按 _currentPageIndex 取进度。
     final pages = _video.pages;
@@ -1016,6 +1105,8 @@ class _PlayerPageState extends State<PlayerPage>
     // 在状态销毁时断言「ticker 不能还在跑」，正是靠这里 stop。
     _infoBlockCtl.removeStatusListener(_onInfoBlockCtlStatus);
     _infoBlockCtl.dispose();
+    // 拖动预览：释放 LRU 里的雪碧图（原生像素内存）+ 让在途请求作废
+    _videoShot?.dispose();
     _player?.dispose();
     _restoreSystemUi();
     super.dispose();
@@ -1183,6 +1274,10 @@ class _PlayerPageState extends State<PlayerPage>
     // 实时转写（sherpa）随页重置：停止 + 清句子/partial/错误
     _resetRealtime();
     _initSession++; // 播放器重建代次自增（自动续播流程据此安全退出，见字段注释）
+    // 拖动预览：拉当前视频 + 当前分 P 的雪碧图元信息。**不 await**——
+    // 预览只是增强，不能让一次视频接口请求拖慢取流（失败由服务层静默降级）。
+    // 服务内部对「同 bvid + 同分 P 且已就绪」短路，重复调用不会重复请求。
+    unawaited(_prepareVideoShot());
     setState(() {
       _error = null;
       _loginPrompt = false;
@@ -1963,6 +2058,8 @@ class _PlayerPageState extends State<PlayerPage>
       debugPrint('[player_page] 按链接/入参定位 seekTo $target ms '
           '${_video.bvid}#$_currentPageIndex');
       await _player?.seekTo(target);
+      // 预热定位到的位置：这是用户要观看的地方，也是最可能拖动的一带
+      _prefetchVideoShotAt(target);
       return;
     }
     final store = _progressStore;
@@ -1976,6 +2073,8 @@ class _PlayerPageState extends State<PlayerPage>
     debugPrint('[player_page] 恢复进度 '
         '${_video.bvid}#$_currentPageIndex $saved ms');
     await _player?.seekTo(saved);
+    // 同上：预热恢复到的位置（非 0 时，进页那次预取的 0 号图没用）
+    _prefetchVideoShotAt(saved);
     if (!mounted) return;
     _showSnackWithAction(
       '已从上次 ${_fmtMs(saved)} 继续',
@@ -2002,6 +2101,8 @@ class _PlayerPageState extends State<PlayerPage>
       _dragging = true;
       _positionMs = v.round();
     });
+    // 仅追加预览请求：位置/拖动状态的语义与调用时机一字未动
+    _requestSeekPreview(v.round());
   }
 
   void _onSeekEnd(double v) {
@@ -2009,9 +2110,192 @@ class _PlayerPageState extends State<PlayerPage>
     setState(() {
       _dragging = false;
       _positionMs = v.round();
+      // 预览随拖动结束立即隐藏并作废：清帧 + 代次自增（在途的迟到结果不再应用）
+      _previewFrame = null;
+      _previewShot = -1;
+      _previewSprite = -1;
+      _previewDragActive = false;
+      _previewGen++;
     });
     _player?.seekTo(v.round());
     _resetWatchBaseline(); // 进度条拖动跳变：不计观看时长
+    // 预热刚跳到的位置：下一轮拖动大概率还在这一带（图通常已在 LRU 里，
+    // 命中即零成本；拖动太短还没拉上时这里顺手把它补上）
+    _prefetchVideoShotAt(v.round());
+  }
+
+  // -------------------------------------------------------------------------
+  // 进度条拖动预览（缩略图 + 时间浮层）
+  // -------------------------------------------------------------------------
+
+  /// 拉取「当前视频 + 当前分 P」的预览图元信息（进页/切集/换源各调一次），
+  /// 就绪后顺手**预取「当前（或即将恢复到的）播放位置」那一张雪碧图**。
+  ///
+  /// **失败静默**：接口挂了只留服务 `isReady == false`，拖动仍显示时间气泡。
+  /// `index` 是 **1-based** 的分 P 序号（接口约定，与 `_currentPageIndex` 差 1）。
+  Future<void> _prepareVideoShot() async {
+    final bvid = _video.bvid;
+    if (bvid.isEmpty) return;
+    await _videoShot?.prepare(bvid, index: _currentPageIndex + 1);
+    if (!mounted) return;
+    // 位置以「此前报过的预取位置」优先（如记忆进度恢复的位置，见
+    // [_maybeRestoreProgress]）；没有就取当前播放位置（进页通常是 0）
+    _prefetchVideoShotAt(_prefetchWantMs ?? _positionMs);
+  }
+
+  /// 进度条拖动中回报「手指在轨道上的水平位置」（[_PlayerSeekBar.onDragPosition]）。
+  ///
+  /// 只做两件事：记录位置给浮层用；识别「本轮拖动起手」并复位上一轮的残留
+  /// （旧帧/节流位/在途代次）——拖动起手那一次回报先于 [_onSeekStart] 到达，
+  /// 所以这里用「本轮是否已开始」而不是 `_dragging` 判定，不依赖回调时序。
+  void _onSeekDragPosition(double dragX, double trackWidth) {
+    final starting = !_previewDragActive;
+    setState(() {
+      _previewDragX = dragX;
+      _previewTrackWidth = trackWidth;
+      if (starting) {
+        _previewDragActive = true;
+        // 上一轮拖动留下的帧可能已被 LRU 淘汰（dispose 过）→ 起手清空，
+        // 等本轮第一帧到位再画（命中缓存时几乎无感）
+        _previewFrame = null;
+        _previewShot = -1;
+        _previewSprite = -1;
+        _previewGen++;
+      }
+    });
+  }
+
+  /// 取「当前位置」的缩略图（拖动中高频调用）。
+  ///
+  /// - 未就绪（prepare 未完成 / 失败）→ 直接返回：只显示时间气泡（降级）
+  /// - 同一格（≈同一秒）→ 不重复请求（节流；也顺带不对失败反复重试）
+  /// - **落地条件是「这张雪碧图还是当前位置需要的那张」**，不是「请求序号最
+  ///   新」：连续拖动几百毫秒就能换好几格，而一张雪碧图要下 + 解 1.5~2.5s，
+  ///   按序号判新旧会把明明可用的结果整条丢掉（首次拖动就只剩时间气泡，实测
+  ///   松手后再拖一次才出现——图其实已经进了 LRU）。换张了才丢：那时图已经不是
+  ///   当前位置的画面，落地会显示错误区段。
+  /// - 落地时用**当前位置**重算裁剪矩形（见 [_reframeAtCurrentPosition]）：
+  ///   显示的是手指此刻所指的时间，只是图刚下好。
+  void _requestSeekPreview(int ms) {
+    final service = _videoShot;
+    final info = service?.info;
+    if (service == null || info == null || !service.isReady) return;
+    final shot = info.shotIndexForSeconds(ms <= 0 ? 0 : ms ~/ 1000);
+    if (shot < 0 || shot == _previewShot) return;
+    _previewShot = shot;
+    final cell = info.cellForShot(shot);
+    // 换到另一张雪碧图：先扔掉手里的旧帧（它可能马上被 LRU 淘汰并释放）
+    if (_previewFrame != null && cell.spriteIndex != _previewSprite) {
+      setState(() => _previewFrame = null);
+    }
+    _previewSprite = cell.spriteIndex;
+    final gen = _previewGen;
+    unawaited(service.frameAtMs(ms).then((frame) {
+      // 本轮拖动已结束/已复位（浮层已隐藏）→ 丢弃
+      if (!mounted || gen != _previewGen) return;
+      // 图已不是当前位置需要的那张（跨张了）→ 丢弃，避免显示错误区段
+      if (frame == null || frame.spriteIndex != _previewNeededSprite()) return;
+      setState(() => _previewFrame = _reframeAtCurrentPosition(frame));
+    }));
+  }
+
+  /// 「当前位置」需要的是第几张雪碧图（-1 = 元信息不可用 / 该格无效）。
+  ///
+  /// 落地迟到结果时用它判「这张图还是当前需要的吗」，见 [_requestSeekPreview]。
+  int _previewNeededSprite() {
+    final info = _videoShot?.info;
+    if (info == null || info.shotCount == 0) return -1;
+    final shot = info.shotIndexForSeconds(
+      _positionMs <= 0 ? 0 : _positionMs ~/ 1000,
+    );
+    if (shot < 0) return -1;
+    final cell = info.cellForShot(shot);
+    return cell.width > 0 ? cell.spriteIndex : -1;
+  }
+
+  /// 把「同一张雪碧图」的结果落到**当前位置**的格上。
+  ///
+  /// 图是按发起时的格下载的，回来时手指可能已经移到同张图内的另一格（连续
+  /// 拖动几百毫秒就能换好几格）→ 用当前位置重算裁剪矩形与秒数，画出来就是
+  /// 手指此刻所指的时间。[VideoShotService.cellScale] 是服务层算裁剪用的同一个
+  /// 缩放系数，避免两处各算一遍。
+  ///
+  /// 兜底：当前位置的格不可用（元信息边界情况 / 竟已跨张）→ 原样返回结果自带
+  /// 的 `srcRect`（宁可差几格，也不画错图）。
+  SeekPreviewFrame _reframeAtCurrentPosition(SeekPreviewFrame frame) {
+    final info = _videoShot?.info;
+    if (info == null) return frame;
+    final shot = info.shotIndexForSeconds(
+      _positionMs <= 0 ? 0 : _positionMs ~/ 1000,
+    );
+    if (shot < 0 || shot >= info.shotCount) return frame;
+    final cell = info.cellForShot(shot);
+    if (cell.width <= 0 || cell.spriteIndex != frame.spriteIndex) return frame;
+    final scale = VideoShotService.cellScale(
+      spriteWidth: frame.spriteWidth,
+      info: info,
+    );
+    return frame.withCell(
+      srcRect: Rect.fromLTWH(
+        cell.left * scale,
+        cell.top * scale,
+        cell.width * scale,
+        cell.height * scale,
+      ),
+      seconds: info.indexSeconds[shot],
+    );
+  }
+
+  /// 预取「[ms] 位置」所在的那张雪碧图（用户最可能拖到当前位置附近）。
+  ///
+  /// 首次拖动看不到缩略图的根因是「图要现下现解 1.5~2.5s，而这一轮拖动往往
+  /// 早就结束了」；提前把这张送进 LRU，第一次按住拖动就有图。服务未就绪
+  /// （元信息还在路上）→ 先记下位置，等 [_prepareVideoShot] 就绪后补取。
+  /// 已缓存 / 在途的那张由服务层去重，重复调用零成本；失败静默（纯增强）。
+  void _prefetchVideoShotAt(int ms) {
+    _prefetchWantMs = ms;
+    final service = _videoShot;
+    if (service == null || !service.isReady) return;
+    unawaited(service.prefetchAtMs(ms));
+  }
+
+  /// 预览浮层的横向摆放：手指位置 → 气泡左边缘（夹到轨道内，永不越界）。
+  ///
+  /// [bubbleWidth] 为 0（无缩略图，只有时间气泡）时按 [kSeekPreviewTimeBubbleW]
+  /// 估算宽度——只影响「时间气泡居中于手指」的观感，不影响是否越界。
+  double _seekPreviewLeft(double bubbleWidth) {
+    const inset = _PlayerSeekBar.handleWidth / 2;
+    final track = _previewTrackWidth;
+    final span = track - _PlayerSeekBar.handleWidth;
+    final width = bubbleWidth > 0 ? bubbleWidth : kSeekPreviewTimeBubbleW;
+    if (span <= 0) return 0;
+    final ratio = ((_previewDragX - inset) / span).clamp(0.0, 1.0);
+    final center = inset + span * ratio;
+    return (center - width / 2).clamp(0.0, math.max(0.0, track - width));
+  }
+
+  /// 拖动预览浮层（只应在 `_dragging && _previewTrackWidth > 0` 时构建）。
+  ///
+  /// 缩略图目标宽：非全屏 [kSeekPreviewThumbWCompact]（120）、全屏
+  /// [kSeekPreviewThumbWFullscreen]（180）——**非全屏刻意做小**：视频区只有
+  /// ~231dp 高，B 站式 ~90dp 预览框会吃掉半屏画面。高度由浮层按帧比例
+  /// 折算（16:9 → 120×67.5 / 180×101.25），不拉伸变形。
+  ///
+  /// 轨道比缩略图还窄（超窄窗口 / 横屏置顶的窄盒）→ `bubbleWidth = 0`，
+  /// 退化成「只显示时间气泡」，绝不越界。
+  Widget _buildSeekPreview() {
+    final wantThumb = _fullscreen
+        ? kSeekPreviewThumbWFullscreen
+        : kSeekPreviewThumbWCompact;
+    final withThumb = _previewTrackWidth >= wantThumb;
+    final width = withThumb ? wantThumb : 0.0;
+    return _SeekPreviewOverlay(
+      key: const ValueKey('seek-preview-overlay'),
+      timeLabel: _fmtMs(_positionMs),
+      frame: withThumb ? _previewFrame : null,
+      left: _seekPreviewLeft(width),
+      bubbleWidth: width,
+    );
   }
 
   void _toggleControls() {
@@ -2027,8 +2311,8 @@ class _PlayerPageState extends State<PlayerPage>
   // - 双击 = 播放/暂停；单击 = 显隐（延迟 ~300ms 等双击窗口判定）
   // - 滑动统一走单一 Pan：位移累计超 [kPanModeThreshold] 后按主导方向锁定
   //   （[decideMode]），锁定后本次手势不再切换——
-  //   水平主导：全屏横屏 = seek（位移比例 = 时长比例，松手 seekTo）；
-  //             竖屏忽略（v2.16.9 之前即无横屏滑动，防误触）
+  //   水平主导：seek（位移比例 = 时长比例，松手 seekTo；v2.18.x 起竖屏 /
+  //             横屏置顶 / 横屏全屏统一可用，见 [canGestureSeek]）
   //   垂直主导：亮度（起点左半屏）/ 音量（右半屏），横竖屏都可用；
   //             原生通道调节（device_media.dart），调节即生效、松手不恢复
   // - 控制层按钮 / 进度条在 Stack 上层，其区域内的点击与拖动天然优先
@@ -2084,12 +2368,18 @@ class _PlayerPageState extends State<PlayerPage>
     return Size(s.width, _embeddedVideoHeight(s));
   }
 
+  /// 当前是否允许水平滑动 seek：把状态喂给纯函数 [canGestureSeek]（竖屏 /
+  /// 横屏置顶 / 横屏全屏统一判定，不再看 `_fullscreen`——v2.18.x 起用户
+  /// 反馈竖屏也要能左右滑调进度）。
+  bool get _canSeekByGesture =>
+      canGestureSeek(listenMode: _listenMode, durationMs: _durationMs);
+
   /// 按下即判豁免（v2.16.17+，用**触摸按下点**而非 panStart 的竞技场胜出点）：
   /// onPanDown 在手指按下第一时间回调（尚未位移 / 未进 arena），localPosition
   /// 即真实触摸起点；而 onPanStart 的坐标是手势**赢得竞技场那一刻**的位置
   /// （已滑过 touch slop、且边缘滑动常被系统手势区延迟释放——实测横屏右缘
-  /// 起点内移可达 ~100px），按它判边缘豁免带会漏判。命中豁免带（四边，
-  /// [isExcludedGestureStart]）→ [_panExcluded] = true，本次 Pan 整体忽略
+  /// 起点内移可达 ~100px），按它判边缘豁免带会漏判。命中豁免带
+  /// （[isExcludedGestureStart]）→ [_panExcluded] = true，本次 Pan 整体忽略
   /// （update/end/cancel 早退，不 seek / 不调亮度音量 / 不出 hud）——横屏全屏
   /// 从**物理屏幕底部**滑动（旋转后 = 逻辑左或右边缘，取决于 landscapeLeft/
   /// Right）唤醒系统导航不再误触发 seek。tap / 双击 / 长按不走 Pan 竞技场
@@ -2100,11 +2390,21 @@ class _PlayerPageState extends State<PlayerPage>
     final w = size.width;
     final h = size.height;
     final sidePx = _sideGestureExclusionPx(MediaQuery.sizeOf(context));
+    // 底部豁免带只在**全屏**生效（v2.18.x+）：该带的语义是「物理屏幕底边 =
+    // 系统导航区」，而全屏时手势层 = 整屏，底边才等于物理屏幕底边。非全屏
+    // 手势层只是视频黑盒，其底边落在屏幕中部（竖屏 411×914 时视频区高
+    // ≈231dp、底边 ≈ 屏高 1/4 处），那里既没有系统导航区，又会被
+    // 「高 × 8% or 48px」白吃掉竖屏约 21% 的有效起手区——直接关闭（两参数
+    // 同传 0）。顶部带（视频区顶边 = 屏幕顶边，护状态栏）与左右窄带保留。
+    final bottomFactor = _fullscreen ? kBottomGestureExclusionFactor : 0.0;
+    final bottomMinPx = _fullscreen ? kBottomGestureExclusionMinPx : 0.0;
     if (isExcludedGestureStart(
           x0: d.localPosition.dx,
           y0: d.localPosition.dy,
           width: w,
           height: h,
+          bottomFactor: bottomFactor,
+          bottomMinPx: bottomMinPx,
           leftPx: sidePx,
           rightPx: sidePx,
         )) {
@@ -2112,7 +2412,8 @@ class _PlayerPageState extends State<PlayerPage>
       debugPrint('[player_page] 手势按下点在豁免带 x0='
           '${d.localPosition.dx.toStringAsFixed(0)}px y0='
           '${d.localPosition.dy.toStringAsFixed(0)}px'
-          '（屏 ${w.toInt()}x${h.toInt()}，side=${sidePx.toStringAsFixed(0)}px）'
+          '（手势面 ${w.toInt()}x${h.toInt()}，fullscreen=$_fullscreen，'
+          'bottomFactor=$bottomFactor，side=${sidePx.toStringAsFixed(0)}px）'
           '→ 本次 Pan 忽略（让给系统手势）');
     } else {
       _panExcluded = false;
@@ -2153,8 +2454,10 @@ class _PlayerPageState extends State<PlayerPage>
     }
     switch (_panMode) {
       case PanSlideMode.horizontal:
-        // 水平主导：仅全屏横屏有 seek（竖屏忽略 = 无 seek，防误触）
-        if (_fullscreen) _onSeekDragUpdate(d);
+        // 水平主导 → seek（竖屏 / 横屏统一；听视频 / 时长未知时
+        // [_canSeekByGesture] 为 false，此时 [_seekDragging] 也没建立，
+        // [_onSeekDragUpdate] 自身还会二次早退）
+        if (_canSeekByGesture) _onSeekDragUpdate(d);
         break;
       case PanSlideMode.vertical:
         _onVerticalDragUpdate(d);
@@ -2170,7 +2473,9 @@ class _PlayerPageState extends State<PlayerPage>
     _panMode = m;
     switch (m) {
       case PanSlideMode.horizontal:
-        if (_fullscreen) _beginSeekDrag();
+        // v2.18.x：不再要求全屏（[_canSeekByGesture] 只看听视频 / 时长），
+        // 竖屏也能横滑 seek
+        if (_canSeekByGesture) _beginSeekDrag();
         break;
       case PanSlideMode.vertical:
         _beginVerticalAdjust();
@@ -2191,7 +2496,9 @@ class _PlayerPageState extends State<PlayerPage>
     _panMode = null;
     switch (m) {
       case PanSlideMode.horizontal:
-        if (_fullscreen) await _onSeekDragEnd(d);
+        // 竖屏 / 横屏统一（同 [_lockPanMode]）；未建立 seek 拖动时
+        // [_onSeekDragEnd] 自身早退，不会误 seekTo
+        if (_canSeekByGesture) await _onSeekDragEnd(d);
         break;
       case PanSlideMode.vertical:
         _onVerticalDragEnd(d);
@@ -2217,10 +2524,11 @@ class _PlayerPageState extends State<PlayerPage>
     }
   }
 
-  // ---------- horizontal（水平主导）→ 全屏横屏 seek ----------
+  // ---------- horizontal（水平主导）→ seek（竖屏 / 横屏统一） ----------
 
-  /// 锁定为水平且在全屏横屏：初始化 seek（基准 = 当前播放位置，位移从
-  /// 锁定起累计）。竖屏不建 seek（水平主导忽略）。
+  /// 锁定为水平且当前允许 seek（见 [canGestureSeek]）：初始化 seek（基准 =
+  /// 当前播放位置，位移从锁定起累计）。时长未知（<=0）时不建拖动状态
+  /// （纯防御，正常入口已被 [_canSeekByGesture] 拦下）。
   void _beginSeekDrag() {
     if (_player == null || _durationMs <= 0) return;
     _seekDragging = true;
@@ -2228,7 +2536,7 @@ class _PlayerPageState extends State<PlayerPage>
     _seekDragDx = 0;
     _seekDragSpan = MediaQuery.sizeOf(context).width;
     _showSeekHud(_positionMs);
-    debugPrint('[player_page] 横屏 seek 开始 base=${_positionMs}ms '
+    debugPrint('[player_page] seek 开始 base=${_positionMs}ms '
         'span=${_seekDragSpan}px');
   }
 
@@ -2252,10 +2560,10 @@ class _PlayerPageState extends State<PlayerPage>
       fraction: fraction,
       durationMs: _durationMs,
     );
-    debugPrint('[player_page] 横屏 seekTo ${target}ms'
+    debugPrint('[player_page] seekTo ${target}ms'
         '（比例 ${fraction.toStringAsFixed(2)}）');
     await _player?.seekTo(target);
-    _resetWatchBaseline(); // 横屏 seek 跳变：跳过内容不计观看时长
+    _resetWatchBaseline(); // seek 跳变：跳过内容不计观看时长
     if (mounted) setState(() => _positionMs = target);
     _saveProgress(); // seek 后保存，防滑到新位置丢进度
     _scheduleHudHide(const Duration(milliseconds: 600));
@@ -3771,7 +4079,15 @@ class _PlayerPageState extends State<PlayerPage>
       // 弹幕：切集清空渲染数据（缓存按 cid 保留）；开关状态保留，
       // 下方 _loadStreamAndPlay 成功后若开关仍开则自动拉新集弹幕
       _danmaku = const [];
+      // 拖动预览：清掉上一集的帧 + 复位节流/代次与预取位置（新集要重新 prepare）
+      _previewFrame = null;
+      _previewShot = -1;
+      _previewSprite = -1;
+      _previewGen++;
+      _prefetchWantMs = null;
     });
+    // 切集 = 换分 P：预览图按分 P 提供 → 必须重新拉（index 1-based）
+    unawaited(_prepareVideoShot());
     try {
       await _loadStreamAndPlay(positionMs: 0);
       await _player?.setPlaybackSpeed(_speed);
@@ -3856,6 +4172,13 @@ class _PlayerPageState extends State<PlayerPage>
       _hudKind = null;
       _hudValue = 0;
       _hudSeekPosMs = 0;
+      // 拖动预览：同样复位（新视频的预览图由 _init 里的 prepare 重拉）
+      _previewFrame = null;
+      _previewShot = -1;
+      _previewSprite = -1;
+      _previewDragActive = false;
+      _previewGen++;
+      _prefetchWantMs = null;
       _listenMode = false; // 新视频正常显示画面
       // 弹幕：清空旧视频渲染数据（缓存按 cid 保留，重开秒显示）
       _danmaku = const [];
@@ -4292,20 +4615,22 @@ class _PlayerPageState extends State<PlayerPage>
           //    - 长按 2x：按住不动 500ms 赢得，期间不响应滑动（松开再滑）
           //    - 滑动（v2.16.9+）：**单一 Pan 注册**（横竖屏统一）——pan 需位移
           //      超 touchSlop 才赢得竞技场（tap 无位移不受影响）；赢后由
-          //      [decideMode] 按主导方向锁定：水平主导 → 仅全屏横屏 seek，
+          //      [decideMode] 按主导方向锁定：水平主导 → seek（v2.18.x 起竖屏 /
+          //      横屏置顶 / 横屏全屏统一可用，见 [canGestureSeek]），
           //      垂直主导 → 起点半屏亮度/音量（横竖屏都可用，斜向按主方向归类；
           //      锁定后本次手势不再切换）。v2.16.7 旧实现「横屏只注册横向、
           //      竖屏只注册纵向」→ 横屏全屏稍斜的上下滑被误判为横向 seek、
           //      纯上下滑完全无响应——本次修复让两者共存
-          //    - 豁免带（v2.16.14+ 顶/底 → v2.16.17+ 四边 + 按下点判定）：
-          //      **触摸按下点**（onPanDown 的真实坐标；onPanStart 是竞技场胜出
-          //      点，边缘滑动会因 slop/系统延迟内移，实测可达 ~100px，不可靠）
-          //      落在底部/顶部/左/右豁免带（[isExcludedGestureStart]，见类顶
-          //      常量）→ 本次 Pan 整体忽略，不 seek / 不调亮度音量 / 不出
-          //      hud——横屏全屏从**物理屏幕底部**滑动（旋转后 = 逻辑左/右
-          //      边缘，左右带加宽覆盖物理底边导航区）唤醒系统导航不再误触发
-          //      seek（按下点带内该次触摸让给系统手势）；tap / 双击 / 长按无
-          //      位移不触发 Pan、不受豁免影响
+          //    - 豁免带（v2.16.14+ 顶/底 → v2.16.17+ 四边 + 按下点判定；
+          //      v2.18.x 起**底部带仅全屏**，非全屏手势层底边在屏幕中部、无系统
+          //      导航区）：**触摸按下点**（onPanDown 的真实坐标；onPanStart 是
+          //      竞技场胜出点，边缘滑动会因 slop/系统延迟内移，实测可达 ~100px，
+          //      不可靠）落在顶部/左/右（+全屏时的底部）豁免带
+          //      （[isExcludedGestureStart]，见类顶常量）→ 本次 Pan 整体忽略，
+          //      不 seek / 不调亮度音量 / 不出 hud——横屏全屏从**物理屏幕底部**
+          //      滑动（旋转后 = 逻辑左/右边缘，左右带加宽覆盖物理底边导航区）
+          //      唤醒系统导航不再误触发 seek（按下点带内该次触摸让给系统手势）；
+          //      tap / 双击 / 长按无位移不触发 Pan、不受豁免影响
           //    - 控制层按钮 / 进度条在本层**之后**渲染（Stack 上层），其区域内
           //      点击与拖动天然拦截（按钮优先）；弹幕层 IgnorePointer 不参与命中
           //    听视频模式下让位给占位层（其自己处理点按恢复画面 + 长按 2x），
@@ -4318,8 +4643,8 @@ class _PlayerPageState extends State<PlayerPage>
                 onDoubleTap: _player == null ? null : _onDoubleTap,
                 onLongPressStart: _player == null ? null : _onLongPressStart,
                 onLongPressEnd: _player == null ? null : _onLongPressEnd,
-                // 滑动统一 Pan（v2.16.9+）：方向判定在手势内完成——全屏横屏
-                // 水平主导 seek、垂直主导亮度/音量共存；竖屏水平主导忽略
+                // 滑动统一 Pan（v2.16.9+）：方向判定在手势内完成——水平主导
+                // seek（竖屏 / 横屏统一）、垂直主导亮度/音量共存
                 onPanDown: _player == null ? null : _onPanDown,
                 onPanStart: _player == null ? null : _onPanStart,
                 onPanUpdate: _player == null ? null : _onPanUpdate,
@@ -4973,20 +5298,41 @@ class _PlayerPageState extends State<PlayerPage>
                       // 细轨与两端时间文本之间留白（原 Slider 内建 24px 边距，
                       // 自绘后按印刷语汇收紧到 8）
                       padding: const EdgeInsets.symmetric(horizontal: 8),
-                      child: _PlayerSeekBar(
-                        positionMs: _positionMs,
-                        durationMs: _durationMs,
-                        // 原生播放器未上报缓冲进度（BiliDashEvent 只有
-                        // prepared/completed/error/urlExpired 四类），因此
-                        // 不画缓冲段——不伪造数据；将来原生补 onBufferUpdate
-                        // 时在此传值即可点亮轨道中段的 kPlayerOnDim。
-                        bufferedMs: null,
-                        showHandle: _controlsVisible,
-                        // 回调完全沿用原 Slider：拖动中 = onChanged
-                        // （_onSeekStart 只更新 UI 位置），松手 = onChangeEnd
-                        // （_onSeekEnd 提交 seekTo）——播放行为零改动
-                        onDrag: _onSeekStart,
-                        onDragEnd: _onSeekEnd,
+                      // Stack 只为了让拖动预览浮层**以进度条自身盒为坐标系**
+                      // 摆放（比在整屏坐标系里反推「两端时间文本 + 8px 内边距」
+                      // 稳得多，换字号/换文本宽都不用改）；clipBehavior 放开，
+                      // 浮层才能向上溢出到进度条行之外（视频区范围内仍不越界）。
+                      child: Stack(
+                        clipBehavior: Clip.none,
+                        children: [
+                          _PlayerSeekBar(
+                            // 测试锚点：进度条盒（拖动预览的定位/断言都以它为
+                            // 基准；与 'player-video-area' 同款约定）
+                            key: const ValueKey('player-seek-bar'),
+                            positionMs: _positionMs,
+                            durationMs: _durationMs,
+                            // 原生播放器未上报缓冲进度（BiliDashEvent 只有
+                            // prepared/completed/error/urlExpired 四类），因此
+                            // 不画缓冲段——不伪造数据；将来原生补
+                            // onBufferUpdate 时在此传值即可点亮轨道中段的
+                            // kPlayerOnDim。
+                            bufferedMs: null,
+                            showHandle: _controlsVisible,
+                            // 回调完全沿用原 Slider：拖动中 = onChanged
+                            // （_onSeekStart 只更新 UI 位置），松手 =
+                            // onChangeEnd（_onSeekEnd 提交 seekTo）——
+                            // 播放行为零改动
+                            onDrag: _onSeekStart,
+                            onDragEnd: _onSeekEnd,
+                            onDragPosition: _onSeekDragPosition,
+                          ),
+                          // 拖动预览浮层：拖动中才在树里，松手即消失（无淡出——
+                          // 跟手的东西淡出会读成「没跟上手」）。位置跟随手指
+                          // 并且水平夹在轨道内（必然不越出屏幕）；轨道太窄放
+                          // 不下缩略图 → 只给时间气泡。
+                          if (_dragging && _previewTrackWidth > 0)
+                            _buildSeekPreview(),
+                        ],
                       ),
                     ),
                   ),
@@ -5180,6 +5526,135 @@ class _PlayerPageState extends State<PlayerPage>
   }
 }
 
+/// 预览缩略图基准宽（逻辑像素）：非全屏（竖屏置顶 / 横屏置顶）与全屏两档。
+///
+/// 为什么非全屏要小：非全屏视频区只有 ~231dp 高（16:9 铺满 411dp 宽屏），
+/// B 站式 ~90dp 高的预览框会吃掉半屏画面；120×67.5（16:9）压在控制行上方
+/// 仍读得清，画面干扰最小。全屏空间充裕 → 放到 180×101。
+const double kSeekPreviewThumbWCompact = 120;
+const double kSeekPreviewThumbWFullscreen = 180;
+
+/// 无缩略图时「时间气泡」的定位估算宽（**只用于横向夹取**，不参与绘制）：
+/// 气泡实际宽度由文字决定（等宽数字 '12:34' 约 34px + 左右内边距 12）。
+const double kSeekPreviewTimeBubbleW = 46;
+
+/// 气泡底边距进度条行的间隙（dp）。
+const double kSeekPreviewGap = 8;
+
+/// 拖动预览浮层：缩略图（有帧时）+ 一行时间文字，压在进度条**上方**、
+/// 水平跟随手指。整体 [IgnorePointer]——纯展示，绝不参与命中（拖动必须
+/// 一路畅通）。
+///
+/// 摆放：[left] 由调用方按手指位置算好并夹在轨道内 → 这里只管落位；
+/// 位置基准是**进度条自身的盒**（调用处把它直接放进进度条的 Stack），
+/// `bottom = 进度条行高 + [kSeekPreviewGap]` 即「贴在进度条上方留 8dp」。
+///
+/// 降级：`frame == null`（服务未就绪 / prepare 失败 / 该格加载失败 / 轨道
+/// 太窄放不下缩略图）时只画时间气泡——[bubbleWidth] 传 0 即此路，**任何
+/// 情况下都至少给出时间信息**。
+class _SeekPreviewOverlay extends StatelessWidget {
+  /// 格式化后的时间（如 '12:34'）。
+  final String timeLabel;
+
+  /// 当前可画的帧（null → 只显示时间气泡）。
+  final SeekPreviewFrame? frame;
+
+  /// 气泡左边缘（已由调用方夹到不越界）。
+  final double left;
+
+  /// 缩略图宽（无缩略图时为 0）。
+  final double bubbleWidth;
+
+  const _SeekPreviewOverlay({
+    super.key,
+    required this.timeLabel,
+    required this.frame,
+    required this.left,
+    required this.bubbleWidth,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final image = frame;
+    // 高按帧的真实宽高比折算（不拉伸变形）：srcRect 就是该格在雪碧图里的
+    // 裁剪矩形，比例恒等于后端 xSize/ySize
+    final thumbHeight = (image == null || image.srcRect.width <= 0)
+        ? 0.0
+        : bubbleWidth * image.srcRect.height / image.srcRect.width;
+    return Positioned(
+      left: left,
+      bottom: _PlayerSeekBar.height + kSeekPreviewGap,
+      child: IgnorePointer(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            if (image != null && bubbleWidth > 0 && thumbHeight > 0) ...[
+              ClipRRect(
+                borderRadius: BorderRadius.circular(kRadiusSm),
+                child: CustomPaint(
+                  key: const ValueKey('seek-preview-thumb'),
+                  size: Size(bubbleWidth, thumbHeight),
+                  painter: _SeekPreviewPainter(image),
+                ),
+              ),
+              const SizedBox(height: 4),
+            ],
+            // 时间气泡：半透明黑底 + 等宽数字（与手势 seek 浮层同一墨）
+            Container(
+              key: const ValueKey('seek-preview-time'),
+              padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+              decoration: BoxDecoration(
+                color: kInkBlack.withValues(alpha: 0.55),
+                borderRadius: BorderRadius.circular(kRadiusSm),
+              ),
+              child:
+                  Text(timeLabel, style: kTypeNum.copyWith(color: kPlayerOn)),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+/// [_SeekPreviewOverlay] 的缩略图画笔：把雪碧图里的那一格裁到目标框 + 1px 描边。
+///
+/// 只做一次 `drawImageRect`（[SeekPreviewFrame] 自带裁剪矩形与降采样后的
+/// 图），描边画在裁剪内（否则会被 ClipRRect 削掉一半）。**不缓存画布/画笔
+/// 之外的东西**，也不持有 [SeekPreviewFrame.sprite]（图归服务层 LRU 管）。
+class _SeekPreviewPainter extends CustomPainter {
+  final SeekPreviewFrame frame;
+
+  const _SeekPreviewPainter(this.frame);
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()..filterQuality = FilterQuality.medium;
+    canvas.drawImageRect(
+      frame.sprite,
+      frame.srcRect,
+      Offset.zero & size,
+      paint,
+    );
+    // 1px 白 24% 描边（kPlayerRule，与播放器导轨同墨）：画面什么颜色都有，
+    // 需要一条边界把预览框从画面里拎出来；不抢画面所以不用实心白
+    canvas.drawRRect(
+      RRect.fromRectAndRadius(
+        Rect.fromLTWH(0.5, 0.5, size.width - 1, size.height - 1),
+        const Radius.circular(kRadiusSm),
+      ),
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 1
+        ..color = kPlayerRule,
+    );
+  }
+
+  @override
+  bool shouldRepaint(_SeekPreviewPainter old) => !identical(old.frame, frame);
+}
+
 /// 自绘播放进度条（P5）：2px 三段轨道 + 4×14 竖条拖动柄，替代原生
 /// Material `Slider`。
 ///
@@ -5209,6 +5684,11 @@ class _PlayerPageState extends State<PlayerPage>
 /// 回调，播放页只更新 UI 位置）、[onDragEnd] = `onChangeEnd`（松手/抬手
 /// 提交 `seekTo`）。播放页传入 [_PlayerPageState._onSeekStart] /
 /// [_PlayerPageState._onSeekEnd]，**播放行为零改动**。
+///
+/// [onDragPosition] 是**唯一的额外回调**（拖动预览浮层定位用）：把「手指在
+/// 轨道上的水平位置」原样带出去——拖动开始/更新与抬手点按都会回报，其中
+/// 拖动起手那一次**先于** [onDrag] 发出（预览据此判定「本轮拖动起手」）。
+/// 它不参与取值与提交，纯粹是几何信息，不改变上两个回调的语义与时机。
 class _PlayerSeekBar extends StatelessWidget {
   /// 已播位置（ms）。
   final int positionMs;
@@ -5233,13 +5713,22 @@ class _PlayerSeekBar extends StatelessWidget {
   /// 松手/抬手回调（Slider.onChangeEnd 语义）。
   final ValueChanged<double>? onDragEnd;
 
+  /// 拖动中回报「手指在轨道的哪个水平位置」——用于精确摆放预览气泡。
+  ///
+  /// [dragX] 是相对于轨道可用宽度的像素偏移（0..trackWidth，即
+  /// [_PlayerSeekBar] 自身盒宽），[trackWidth] 是可用宽度。**不夹取**：
+  /// 越界（手指滑出轨道）时原样回报，由调用方决定怎么摆。
+  final void Function(double dragX, double trackWidth)? onDragPosition;
+
   const _PlayerSeekBar({
+    super.key,
     required this.positionMs,
     required this.durationMs,
     required this.showHandle,
     this.bufferedMs,
     this.onDrag,
     this.onDragEnd,
+    this.onDragPosition,
   });
 
   /// 触摸目标高度（与 [_PlayerPageState._buildBottomBar] 的进度条行一致）。
@@ -5269,6 +5758,10 @@ class _PlayerSeekBar extends StatelessWidget {
             return ((dx - handleWidth / 2) / span).clamp(0.0, 1.0) * max;
           }
 
+          // 预览浮层定位用的几何回报（与 [valueAt] 同一套坐标：轨道两端各
+          // 内缩 handleWidth/2，dx 未夹取，越界原样带出）
+          void reportAt(double dx) => onDragPosition?.call(dx, width);
+
           return GestureDetector(
             behavior: HitTestBehavior.opaque,
             // 手势集刻意只有两种，且**不注册 onTapDown**：
@@ -5281,12 +5774,25 @@ class _PlayerSeekBar extends StatelessWidget {
             // 回调）——那会让播放页的 _dragging 停在 true、tick 循环永久
             // 停摆。只在抬手/松手提交，就没有任何「开了收不住」的路径。
             onTapUp: draggable
-                ? (d) => onDragEnd!(valueAt(d.localPosition.dx))
+                ? (d) {
+                    // 先回报位置再提交：预览浮层只见于拖动（_dragging），
+                    // 点按这条路上的回报只是保持几何信息一致
+                    reportAt(d.localPosition.dx);
+                    onDragEnd!(valueAt(d.localPosition.dx));
+                  }
                 : null,
-            onHorizontalDragStart:
-                draggable ? (d) => onDrag!(valueAt(d.localPosition.dx)) : null,
-            onHorizontalDragUpdate:
-                draggable ? (d) => onDrag!(valueAt(d.localPosition.dx)) : null,
+            onHorizontalDragStart: draggable
+                ? (d) {
+                    reportAt(d.localPosition.dx);
+                    onDrag!(valueAt(d.localPosition.dx));
+                  }
+                : null,
+            onHorizontalDragUpdate: draggable
+                ? (d) {
+                    reportAt(d.localPosition.dx);
+                    onDrag!(valueAt(d.localPosition.dx));
+                  }
+                : null,
             onHorizontalDragEnd: draggable
                 ? (d) => onDragEnd!(valueAt(d.localPosition.dx))
                 : null,

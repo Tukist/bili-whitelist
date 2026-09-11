@@ -12,6 +12,7 @@ import '../models/media_search_result.dart';
 import '../models/search_result.dart';
 import '../models/subtitle.dart';
 import '../models/upowner.dart';
+import '../models/video_shot.dart';
 import '../models/whitelist_video.dart';
 import '../services/secure_store.dart';
 import '../wbi/wbi_signer.dart';
@@ -854,6 +855,53 @@ class BiliApi {
       return info;
     }
     throw StateError('view 接口重试后仍失败（$bvid）');
+  }
+
+  /// 拉取视频进度预览图（雪碧图）信息。
+  ///
+  /// [index] = 分P序号（**1-based；必传**——不传时 `data.index` 返回空数组）。
+  ///
+  /// 2026-09 实测结论（调研员 curl 复核）：
+  /// - 接口 `x/player/videoshot` **免 WBI 签名、免登录态**，匿名 + 完整浏览器头即可
+  /// - `image[]` 是协议相对 URL（`//i0.hdslb.com/...`），由 [VideoShotInfo.fromJson] 补 `https:`
+  /// - 帧粒度 ≈5~8 秒/张（不是逐秒），长视频有多张雪碧图
+  ///
+  /// 风格与 [fetchVideoMeta] 一致：注入登录态 → GET → `-412` 刷新 WBI key
+  /// 重试一次（本接口不需要签名，刷新只为走既有的风控兜底）→ 非 0 抛
+  /// [BiliApiException]。**失败保持抛异常**：预览是增强功能，由服务层捕获降级，
+  /// 不影响播放/拖动。
+  Future<VideoShotInfo> fetchVideoShot(String bvid, {int index = 1}) async {
+    await _injectAuth();
+    final params = {'bvid': bvid, 'index': '$index'};
+    for (var attempt = 0; attempt < 2; attempt++) {
+      final resp = await _dio.get<Map<String, dynamic>>(
+        '/x/player/videoshot',
+        queryParameters: params,
+      );
+      final data = resp.data;
+      final code = data?['code'] as int?;
+      if (code == -412 && attempt == 0) {
+        // 可能 key 过期，刷新后重试一次
+        await _refreshWbiKeys();
+        continue;
+      }
+      if (code != 0) {
+        throw BiliApiException(
+          code: code ?? -1,
+          message: '${data?['message']}（$bvid p$index）',
+          path: '/x/player/videoshot',
+        );
+      }
+      final info = data?['data'] as Map<String, dynamic>?;
+      if (info == null) {
+        throw DioException(
+          requestOptions: resp.requestOptions,
+          message: 'videoshot 接口未返回数据（$bvid p$index）',
+        );
+      }
+      return VideoShotInfo.fromJson(info);
+    }
+    throw StateError('videoshot 接口重试后仍失败（$bvid p$index）');
   }
 
   /// 番剧/电影整季信息（`pgc/view/web/season`，**匿名 + 完整浏览器头即可，

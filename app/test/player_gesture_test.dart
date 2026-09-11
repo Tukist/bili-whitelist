@@ -4,7 +4,9 @@
 //   斜向按位移主方向归类，|dx|>=|dy|→horizontal、|dy|>|dx|→vertical）
 // - nextPanMode：方向锁定（已有模式不受后续位移影响，本次手势不切换）
 // - slideFraction：位移 → 比例（拖满一屏 = ±100%，防除零 / 越界钳制）
-// - seekTargetMs：横屏 seek 目标位置（基准 + 比例 × 时长，钳制 0..时长）
+// - seekTargetMs：seek 目标位置（基准 + 比例 × 时长，钳制 0..时长）
+// - canGestureSeek：是否允许水平滑动 seek（v2.18.x：**不再看全屏**——竖屏 /
+//   横屏置顶 / 横屏全屏统一可用，只看「听视频模式」与「时长是否已知」）
 // - volumeTargetLevel：音量目标档（基准 + 比例 × 灵敏度 × 最大档，钳制 0..max）
 // - adjustPercent / brightnessPercent：纵向调节百分比（灵敏度 0.3：滑满一屏
 //   ±30%、小幅平滑；亮度下限 5%）
@@ -12,7 +14,10 @@
 //   v2.16.17+ 扩展四边：起点 x0/y0 落在顶部 topPx 带、底部 max(屏高×factor,
 //   minPx) 带、或左/右边缘带内 → 本次 Pan 忽略，让给系统导航手势——横屏全屏
 //   时物理底边导航区 = 逻辑左/右边缘，靠左右带命中；边界含等号；尺寸 <=0
-//   防御不豁免）
+//   防御不豁免）。v2.18.x 起**底部带只在全屏生效**：非全屏手势层 = 视频
+//   黑盒（竖屏屏宽 411 时高 ≈231），其底边落在屏幕中部、不是物理屏幕底边，
+//   调用处传 bottomFactor=bottomMinPx=0 关闭该带（两参数同传 0 = 关闭，
+//   不会残留 y0>=height 的误判）
 //
 // 逻辑见 lib/pages/player_page.dart 顶部的纯函数（与会员集 pgc 回退同风格，
 // 便于脱离 Widget/原生通道直接测判定与换算）。
@@ -143,6 +148,26 @@ void main() {
       // 100s 视频拖 1/3 屏 ≈ +33s（33.33 取整 33）
       expect(seekTargetMs(baseMs: 0, fraction: 1 / 3, durationMs: 100_000),
           33_333);
+    });
+  });
+
+  group('canGestureSeek（是否允许水平滑动 seek，v2.18.x）', () {
+    // 用户反馈「竖屏模式下无法使用左右滑动推动进度手势」的修复点：旧实现
+    // 三处 `if (_fullscreen)` 把非全屏的水平 seek 链整条掐断。新判定
+    // **不含全屏 / 方向维度**——竖屏、横屏置顶、横屏全屏同一结论。
+    test('竖屏（非全屏）且时长已知 → true（用户反馈的修复点）', () {
+      expect(canGestureSeek(listenMode: false, durationMs: 200000), isTrue);
+      expect(canGestureSeek(listenMode: false, durationMs: 1), isTrue);
+    });
+
+    test('听视频模式 → false（画面已隐藏，seek 手势无意义）', () {
+      expect(canGestureSeek(listenMode: true, durationMs: 200000), isFalse);
+      expect(canGestureSeek(listenMode: true, durationMs: 0), isFalse);
+    });
+
+    test('时长未知（<= 0）→ false（无比例基准，seekTargetMs 也只会给 0）', () {
+      expect(canGestureSeek(listenMode: false, durationMs: 0), isFalse);
+      expect(canGestureSeek(listenMode: false, durationMs: -1), isFalse);
     });
   });
 
@@ -376,6 +401,122 @@ void main() {
               x0: 200, y0: 360, width: 914, height: 400,
               bottomFactor: 0.12, bottomMinPx: 0),
           isTrue); // 400×0.12=48px 带上缘 352
+    });
+
+    // v2.18.x：非全屏手势层 = 视频黑盒，其底边落在屏幕中部（不是物理屏幕
+    // 底边、那里没有系统导航区）→ 调用处按是否全屏传参关闭底部带（见
+    // _onPanDown：非全屏 bottomFactor=bottomMinPx=0）。下面用**竖屏 16:9
+    // 视频区**验证关闭后的行为——411 宽屏 → 视频区高 411÷16×9 ≈ 231.19dp
+    // （与用户机一致），而**此前测试完全没有覆盖这个尺寸**。
+    test('非全屏竖屏视频区（h≈231，底部带关闭）：底边附近不再豁免', () {
+      const w = 411.0;
+      const h = 411 / 16 * 9; // ≈231.19 = 竖屏 16:9 视频区高
+      expect(h, closeTo(231.19, 0.01));
+      for (final y0 in [h, h - 1, 200.0, 183.19, 183.2, h / 2, 25.0]) {
+        expect(
+            isExcludedGestureStart(
+                x0: w / 2,
+                y0: y0,
+                width: w,
+                height: h,
+                bottomFactor: 0,
+                bottomMinPx: 0),
+            isFalse,
+            reason: 'y0=$y0 在非全屏视频区内应可起手（底部带已关闭）');
+      }
+      // 对照（旧参数 / 全屏语义）：同尺寸下底部带 = max(h×0.08, 48) = 48px，
+      // 带上缘 ≈183.19 → 覆盖视频区约 21% 的起手区（竖屏中部白吃一条横带）
+      expect(isExcludedGestureStart(x0: w / 2, y0: 200, width: w, height: h),
+          isTrue, reason: '旧行为确实会把视频区中部的起点当底部带');
+      expect(isExcludedGestureStart(x0: w / 2, y0: 183.19, width: w, height: h),
+          isTrue);
+      expect(isExcludedGestureStart(x0: w / 2, y0: 183.1, width: w, height: h),
+          isFalse);
+    });
+
+    test('显式关闭底部带（两参数同传 0）：连贴手势层底边的起点也不豁免', () {
+      // 不单独判 bottomPx<=0 会残留「y0 >= height - 0」→ 紧贴底边的起点被误判
+      for (final y0 in [225.0, 224.9, 200.0]) {
+        expect(
+            isExcludedGestureStart(
+                x0: 200,
+                y0: y0,
+                width: 400,
+                height: 225,
+                bottomFactor: 0,
+                bottomMinPx: 0),
+            isFalse,
+            reason: 'y0=$y0 应可起手');
+      }
+    });
+
+    test('非全屏竖屏视频区：顶部带仍豁免（视频区顶边 = 屏幕顶边，护状态栏）', () {
+      const w = 411.0, h = 411 / 16 * 9;
+      bool excluded(double y0) => isExcludedGestureStart(
+          x0: w / 2,
+          y0: y0,
+          width: w,
+          height: h,
+          bottomFactor: 0,
+          bottomMinPx: 0);
+      expect(excluded(0), isTrue); // 贴顶
+      expect(excluded(10), isTrue);
+      expect(excluded(24), isTrue); // 边界含等号
+      expect(excluded(25), isFalse);
+      expect(excluded(100), isFalse);
+      expect(excluded(h), isFalse, reason: '底边不豁免（底部带已关闭）');
+    });
+
+    test('非全屏竖屏视频区：左右窄带仍豁免（16px）', () {
+      const w = 411.0, h = 411 / 16 * 9;
+      bool excluded(double x0) => isExcludedGestureStart(
+          x0: x0,
+          y0: h / 2,
+          width: w,
+          height: h,
+          bottomFactor: 0,
+          bottomMinPx: 0);
+      expect(excluded(0), isTrue); // 贴左缘
+      expect(excluded(16), isTrue); // 边界含等号
+      expect(excluded(17), isFalse);
+      expect(excluded(41.1), isFalse); // widget 测试「切显隐」起手点（中部净区内）
+      expect(excluded(w - 16), isTrue);
+      expect(excluded(w - 17), isFalse);
+    });
+
+    test('非全屏横屏置顶视频区（h≈220）：底部带同样关闭、左右加宽带仍豁免', () {
+      // 800×400 横屏置顶模式：视频区高 = 400×55% = 220（物理屏底不在视频区内；
+      // 横向时物理底边导航区 = 逻辑左/右边缘，由加宽的左右带覆盖，见
+      // _sideGestureExclusionPx）
+      expect(
+          isExcludedGestureStart(
+              x0: 400,
+              y0: 220,
+              width: 800,
+              height: 220,
+              bottomFactor: 0,
+              bottomMinPx: 0),
+          isFalse);
+      expect(
+          isExcludedGestureStart(
+              x0: 400,
+              y0: 150,
+              width: 800,
+              height: 220,
+              bottomFactor: 0,
+              bottomMinPx: 0),
+          isFalse);
+      expect(
+          isExcludedGestureStart(
+              x0: 10,
+              y0: 110,
+              width: 800,
+              height: 220,
+              leftPx: 48,
+              rightPx: 48,
+              bottomFactor: 0,
+              bottomMinPx: 0),
+          isTrue); // 左右加宽带（横屏物理底边导航区）仍生效
     });
 
     test('顶部带可关（topPx=0）：仅贴屏幕顶（y0=0）在顶带内', () {
