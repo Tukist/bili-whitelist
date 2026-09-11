@@ -13,6 +13,7 @@ import 'package:flutter/material.dart';
 import '../api/bilibili_api.dart';
 import '../services/whitelist_writer.dart';
 import 'add_success_button.dart';
+import 'app_state_view.dart';
 import 'cover_image.dart';
 
 /// 收藏夹导入进度对话框：逐视频提示「导入中 i/N」，不可点穿/返回，
@@ -250,15 +251,11 @@ class _FolderPickerSheetState extends State<_FolderPickerSheet> {
         ],
       );
     } else if (_folders == null) {
+      // 弹层正文的"整块等待"：印刷语言的三颗方点（与整页加载态同源），
+      // 不再用 Material 转圈。占位 24×24 —— 与原来的转圈占位一致，布局不变。
       body = const Padding(
         padding: EdgeInsets.symmetric(vertical: 48),
-        child: Center(
-          child: SizedBox(
-            width: 24,
-            height: 24,
-            child: CircularProgressIndicator(strokeWidth: 2.5),
-          ),
-        ),
+        child: AppLoadingView(size: 24),
       );
     } else if (_folders!.isEmpty) {
       body = Column(

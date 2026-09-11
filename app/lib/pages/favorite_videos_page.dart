@@ -603,27 +603,17 @@ class _FavoriteVideosPageState extends State<FavoriteVideosPage> {
     );
   }
 
-  /// 搜索中：拉全量进度（居中转圈 + 页码进度文案）。
+  /// 搜索中：拉全量进度（三颗方点 + 进度文案）。
+  ///
+  /// 走全 App 统一的状态视图：整块等待 = 印刷语言的三颗方点（[PressDots]），
+  /// 与整页加载态 [AppLoadingHero] 同源、节奏共用 `kPressCycle`；
+  /// `scrollable: true` 保住宿主 [RefreshIndicator] 的下拉刷新（与同页
+  /// 空态 / 错误态同一约定）。
   Widget _buildSearchProgress() {
-    return ListView(
-      physics: const AlwaysScrollableScrollPhysics(),
-      children: [
-        const SizedBox(height: 120),
-        const Center(
-          child: SizedBox(
-            width: 28,
-            height: 28,
-            child: CircularProgressIndicator(strokeWidth: 3),
-          ),
-        ),
-        const SizedBox(height: 14),
-        Center(
-          child: Text(
-            _fullProgress ?? '正在读取收藏夹全部视频…',
-            textAlign: TextAlign.center,
-          ),
-        ),
-      ],
+    return AppStateView(
+      kind: AppStateKind.loading,
+      title: _fullProgress ?? '正在读取收藏夹全部视频…',
+      scrollable: true,
     );
   }
 

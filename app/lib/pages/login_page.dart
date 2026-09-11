@@ -6,6 +6,7 @@ import 'package:flutter/services.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
 import '../api/bilibili_api.dart';
+import '../widgets/app_state_view.dart';
 
 /// 登录页 WebView 专用移动 UA（仅影响登录页，不动 API 层的 kBrowserUA）。
 ///
@@ -293,8 +294,12 @@ class _LoginPageState extends State<LoginPage> {
               dividerColor: Colors.transparent,
             ),
           Expanded(
+            // WebView 就绪前那一块 = "整块等待"：走印刷语言的指示器
+            // （`AppLoadingView` = 三颗方点），不再用 Material 转圈
+            // （AppBar 底下那条 `LinearProgressIndicator` 是 WebView 自己的
+            // 加载进度，属"有确定进度的等待"，保留）。
             child: controller == null
-                ? const Center(child: CircularProgressIndicator())
+                ? const AppLoadingView()
                 : WebViewWidget(controller: controller),
           ),
         ],

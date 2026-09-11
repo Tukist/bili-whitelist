@@ -90,11 +90,20 @@ void main() {
 
   group('加载动画与逐字文案', () {
     test('数值锚定', () {
+      // 旧的烟缕周期（历史值，锚定住别被顺手改掉）
       expect(kSmokeCycle, const Duration(milliseconds: 3200));
+      // 印刷走纸（当前的加载动效）：2.8s
+      expect(kPressCycle, const Duration(milliseconds: 2800));
       expect(kCopyCharStep, const Duration(milliseconds: 24));
       expect(kCopyCharDur, const Duration(milliseconds: 200));
       expect(kCopyCharRisePx, 4.0);
       expect(kCopyCharStepDense, const Duration(milliseconds: 12));
+    });
+
+    test('印刷走纸的节奏：比旧烟缕快一档，落在"呼吸节奏 2–2.8s"区间内', () {
+      expect(kPressCycle, lessThan(kSmokeCycle));
+      expect(kPressCycle, greaterThanOrEqualTo(const Duration(seconds: 2)));
+      expect(kPressCycle, lessThanOrEqualTo(const Duration(milliseconds: 2800)));
     });
 
     test('降级档更密：单字步进减半，整句不拖成长镜头', () {

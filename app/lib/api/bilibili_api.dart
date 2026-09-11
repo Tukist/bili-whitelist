@@ -6,8 +6,10 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import '../config.dart';
+import '../models/article.dart';
 import '../models/comment.dart';
 import '../models/danmaku.dart';
+import '../models/dynamic_item.dart';
 import '../models/media_search_result.dart';
 import '../models/search_result.dart';
 import '../models/subtitle.dart';
@@ -2341,6 +2343,265 @@ class BiliApi {
       seasons: parseList('seasons_list', UpownerCollectionKind.season),
       series: parseList('series_list', UpownerCollectionKind.series),
     );
+  }
+
+  /// 「间歇空页」重试前的等待：实测同一 mid 连续请求偶尔返回 `code=0` 但
+  /// `items` 空（真风控的软返回），隔一小段时间再打就正常。等待很短——
+  /// 只是给风控判定一个「新请求」的时间差，不是退避（大退避留给页面层）。
+  static const Duration _dynEmptyRetryDelay = Duration(milliseconds: 500);
+
+  /// 拉取某用户的动态流（`x/polymer/web-dynamic/v1/feed/space`，v2.22.0+）。
+  ///
+  /// 匿名可读，但**必须同时带 WBI 签名 + buvid 指纹**（2026-09 实测：
+  /// 不带 WBI → 服务端直接回 HTML 风控页；只带 WBI 不带 buvid → -412）。
+  ///
+  /// - [offset]：上一页返回的游标（[DynamicPage.nextOffset]）**原样**回传；
+  ///   首屏传 null / 空串。分页是 **offset 游标**——传 `page` 会被服务端忽略；
+  /// - 返回本页 items + 下一页游标 + [DynamicPage.hasMore]；
+  /// - 解析一律宽松（见 [DynamicItem]）：脏条目丢弃、缺字段给安全默认。
+  ///
+  /// 容错两层：
+  /// 1. `-412` → 刷新 WBI key 后**重新签名**再试一次（key 过期是常见原因）；
+  /// 2. **间歇空页**：`code=0` 但本页空且 `has_more=false` → 隔
+  ///    [_dynEmptyRetryDelay] 重试一次（真到底时只多打一次空请求）。
+  /// 仍失败/仍空 → 返回 [DynamicPage.empty]（页面层按空态展示）。
+  /// `-352`（限流）与其它业务码照常抛 [BiliApiException]（页面层有退避重试）。
+  Future<DynamicPage> fetchUserDynamics(int mid, {String? offset}) async {
+    final cursor = offset ?? '';
+    debugPrint('[bili_api] fetchUserDynamics mid=$mid offset="$cursor"');
+    for (var attempt = 0; attempt < 2; attempt++) {
+      if (attempt > 0) await _refreshWbiKeys(); // 换 key 后重签（wts 同步刷新）
+      await _injectAuth();
+      final (imgKey, subKey) = await _ensureWbiKeys();
+      final params = WbiSigner.encodeWbi(
+        {
+          'host_mid': '$mid',
+          if (cursor.isNotEmpty) 'offset': cursor,
+          'features': 'itemOpusStyle',
+          'platform': 'web',
+          'timezone_offset': '-480',
+        },
+        imgKey: imgKey,
+        subKey: subKey,
+      );
+      final resp = await _dio.get<Map<String, dynamic>>(
+        '/x/polymer/web-dynamic/v1/feed/space',
+        queryParameters: params,
+      );
+      final data = resp.data;
+      final code = data?['code'] as int?;
+      if (code == -412 && attempt == 0) {
+        debugPrint('[bili_api] fetchUserDynamics -412 风控，刷新 WBI key 重试');
+        continue;
+      }
+      if (code == -412) {
+        throw const BiliApiException(
+          code: -412,
+          message: '动态接口被风控拦截，请稍后再试',
+          path: '/x/polymer/web-dynamic/v1/feed/space',
+        );
+      }
+      if (code == -352) {
+        throw const BiliApiException(
+          code: -352,
+          message: '动态接口被限流，请稍后再试',
+          path: '/x/polymer/web-dynamic/v1/feed/space',
+        );
+      }
+      if (code != 0) {
+        throw BiliApiException(
+          code: code ?? -1,
+          message: data?['message'] as String? ?? '动态获取失败',
+          path: '/x/polymer/web-dynamic/v1/feed/space',
+        );
+      }
+      final page = _parseDynamicPage(data?['data']);
+      if (page.isEmpty && !page.hasMore && attempt == 0) {
+        debugPrint('[bili_api] fetchUserDynamics mid=$mid 空页且无更多 '
+            '→ 疑似间歇风控，稍后重试一次');
+        await Future<void>.delayed(_dynEmptyRetryDelay);
+        continue;
+      }
+      debugPrint('[bili_api] fetchUserDynamics mid=$mid offset="$cursor" → '
+          'items=${page.items.length} hasMore=${page.hasMore}');
+      return page;
+    }
+    return DynamicPage.empty;
+  }
+
+  /// 解析 feed/space 的 `data`：items 宽松解析 + id 去重（空 id 脏条目丢弃），
+  /// `offset` 原样作下一页游标（`has_more=false` 时游标作废）。
+  DynamicPage _parseDynamicPage(dynamic rawData) {
+    if (rawData is! Map<String, dynamic>) return DynamicPage.empty;
+    final items = <DynamicItem>[];
+    final seen = <String>{};
+    final rawItems = rawData['items'];
+    if (rawItems is List) {
+      for (final raw in rawItems.whereType<Map<String, dynamic>>()) {
+        final item = DynamicItem.fromJson(raw);
+        if (item.id.isEmpty || !seen.add(item.id)) continue;
+        items.add(item);
+      }
+    }
+    final rawOffset = rawData['offset'];
+    final nextOffset =
+        rawOffset is String ? rawOffset : (rawOffset is num ? '$rawOffset' : '');
+    final hasMore = rawData['has_more'] == true && nextOffset.isNotEmpty;
+    return DynamicPage(
+      items: items,
+      nextOffset: hasMore ? nextOffset : '',
+      hasMore: hasMore,
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // 专栏（B 站「文章」，v2.23.0+）
+  // -------------------------------------------------------------------------
+
+  /// 专栏接口 `-509`（请求过于频繁）的退避时长（实测该接口有限频，等一会
+  /// 再打即成功）。页面层的退避重试（1s → 2s）会再兜一层。
+  static const Duration _articleFloodRetryDelay = Duration(milliseconds: 1200);
+
+  /// 某用户的专栏列表（`x/space/article?mid=&pn=&ps=`，匿名可读）。
+  ///
+  /// **不需要 WBI 签名**（与 [fetchSeasonArchives] 同：公开只读接口）。
+  /// 响应 `data{articles[], pn, ps, count}`，条目解析见 [ArticleSummary]。
+  ///
+  /// 容错：`-509`（请求过于频繁）→ 等 [_articleFloodRetryDelay] 重试一次；
+  /// `-412`（风控）/ `-352`（限流）按既有风格分类抛 [BiliApiException]。
+  /// 脏 data（null / articles 非 List / 空 cvid 条目）一律不崩：脏条目丢弃，
+  /// 整块缺失按空页返回（页面层据此显示空态）。
+  Future<ArticleListPage> fetchUserArticles(
+    int mid, {
+    int pn = 1,
+    int ps = 10,
+  }) async {
+    await _injectAuth();
+    debugPrint('[bili_api] fetchUserArticles mid=$mid pn=$pn ps=$ps');
+    final data = await _getArticleApi(
+      '/x/space/article',
+      what: '专栏列表',
+      queryParameters: {'mid': '$mid', 'pn': '$pn', 'ps': '$ps'},
+    );
+    final d = data?['data'] as Map<String, dynamic>?;
+    final rawList = d?['articles'];
+    final items = <ArticleSummary>[];
+    final seen = <int>{};
+    if (rawList is List) {
+      for (final raw in rawList.whereType<Map<String, dynamic>>()) {
+        final item = ArticleSummary.fromJson(raw);
+        // 空 cvid = 脏条目（点不进去）；同页重复 cvid 去重
+        if (item.cvid <= 0 || !seen.add(item.cvid)) continue;
+        items.add(item);
+      }
+    }
+    final page = ArticleListPage(
+      items: items,
+      // pn/ps/count 一律宽松读：B 站偶发把数字给成字符串，硬转 `as num?`
+      // 会直接抛（脏响应不该让整页崩）
+      pn: _looseInt(d?['pn']) ?? pn,
+      ps: _looseInt(d?['ps']) ?? ps,
+      count: _looseInt(d?['count']) ?? 0,
+    );
+    debugPrint('[bili_api] fetchUserArticles mid=$mid pn=$pn → '
+        'items=${page.items.length} count=${page.count} '
+        'hasMore=${page.hasMore}');
+    return page;
+  }
+
+  /// 专栏正文（`x/article/view?id=<cvid>`，匿名可读、不需要 WBI 签名）。
+  ///
+  /// ⚠️ 参数名是 **`id`**（不是 `cv`——用 `cv=` 会被拒 `-400`）。
+  /// `data.content` 是 **HTML 源码**（渲染见 `lib/utils/bili_html.dart`）；
+  /// 纯文本专栏（实测有）则 content 一个标签都没有，解析器按单段文本处理。
+  ///
+  /// 错误分类同 [fetchUserArticles]（`-509` 退避重试一次）。
+  Future<ArticleDetail> fetchArticleView(int cvid) async {
+    await _injectAuth();
+    debugPrint('[bili_api] fetchArticleView id=$cvid');
+    final data = await _getArticleApi(
+      '/x/article/view',
+      what: '专栏正文',
+      queryParameters: {'id': '$cvid'},
+    );
+    final d = data?['data'] as Map<String, dynamic>?;
+    if (d == null) {
+      throw const BiliApiException(
+        code: -1,
+        message: '专栏正文接口未返回数据',
+        path: '/x/article/view',
+      );
+    }
+    final detail = ArticleDetail.fromJson(d);
+    debugPrint('[bili_api] fetchArticleView id=$cvid → '
+        'title="${detail.title}" 正文 ${detail.contentHtml.length} 字符');
+    return detail;
+  }
+
+  /// 专栏接口的公共 GET：`-509` 退避重试一次 + 业务码分类。
+  ///
+  /// 返回响应体（`data` 由调用方按接口结构自行解析）；`code != 0` 一律抛
+  /// [BiliApiException]（`-412` 风控 / `-352` 限流 / `-509` 过于频繁 / 其他）。
+  /// 网络失败（[DioException]）原样上抛。
+  Future<Map<String, dynamic>?> _getArticleApi(
+    String path, {
+    required String what,
+    required Map<String, String> queryParameters,
+  }) async {
+    for (var attempt = 0; attempt < 2; attempt++) {
+      final resp = await _dio.get<Map<String, dynamic>>(
+        path,
+        queryParameters: queryParameters,
+      );
+      final data = resp.data;
+      final code = _looseInt(data?['code']);
+      // -509 是服务端限频（实测专栏接口常见）：等一会再打一次，多数即成功
+      if (code == -509 && attempt == 0) {
+        debugPrint('[bili_api] $what -509 请求过于频繁，'
+            '${_articleFloodRetryDelay.inMilliseconds}ms 后退避重试');
+        await Future<void>.delayed(_articleFloodRetryDelay);
+        continue;
+      }
+      if (code == -412) {
+        throw BiliApiException(
+          code: -412,
+          message: '$what接口被风控拦截，请稍后再试',
+          path: path,
+        );
+      }
+      if (code == -352) {
+        throw BiliApiException(
+          code: -352,
+          message: '$what接口被限流，请稍后再试',
+          path: path,
+        );
+      }
+      if (code == -509) {
+        throw BiliApiException(
+          code: -509,
+          message: '$what请求过于频繁，请稍后再试',
+          path: path,
+        );
+      }
+      if (code != 0) {
+        throw BiliApiException(
+          code: code ?? -1,
+          message: data?['message'] as String? ?? '$what获取失败',
+          path: path,
+        );
+      }
+      return data;
+    }
+    // 理论不可达：循环内要么 return，要么抛
+    return null;
+  }
+
+  /// 宽松取整数：num 直接转、数字串容错解析，其余（null / Map / 布尔…）→
+  /// null。专栏接口的 `data` 偶发把数字给成字符串，硬 `as num?` 会直接抛。
+  static int? _looseInt(dynamic raw) {
+    if (raw is num) return raw.toInt();
+    if (raw is String) return int.tryParse(raw.trim());
+    return null;
   }
 
   /// 合集（season）内视频分页（`x/polymer/web-space/seasons_archives_list`，

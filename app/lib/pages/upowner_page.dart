@@ -1,9 +1,19 @@
 /// UP 主详情页（v2.13.0+ 起）：
 /// - 顶部 UP 主信息卡：头像（大）+ 名字 + 粉丝 + 简介
-/// - 「合集·列表」区（v2.17.4+，仿 B 站 UP 主页）：页面顶部一排横向 chips——
-///   第一个「全部视频」（默认），其后为该 UP 主的合集（season）与列表
-///   （series，过滤 creator='auto' 的直播回放等系统自动列表——与 B 站网页端
-///   UP 主页一致，非 UP 主动整理内容不进此区）；无合集/列表时整区隐藏
+/// - 顶部内容 switch 行（横向 chips，仿 B 站 UP 主页）：第一个「全部视频」
+///   （默认）+ 固定项「动态」「专栏」（v2.22.0+/v2.23.0+）+ 该 UP 主的合集
+///   （season）与列表（series，过滤 creator='auto' 的直播回放等系统自动列表
+///   —— 与 B 站网页端 UP 主页一致，非 UP 主动整理内容不进此区）；没有合集/
+///   列表时不显示「合集」分组名，但 chips 行本身保留——「动态」「专栏」是
+///   固定入口，不依赖合集是否存在
+/// - 「动态」区（v2.22.0+）：该 UP 主的动态流（[BiliApi.fetchUserDynamics]，
+///   offset 游标分页 + 触底加载更多），卡片见 [DynamicCard]（图文 / 转发 /
+///   视频投稿）；**懒加载**——首次点「动态」才请求（进页不多打一次风控接口）。
+///   他人「收藏」匿名不可读（实测 8 位热门 UP 全空）→ 本页不做收藏区
+/// - 「专栏」区（v2.23.0+）：该 UP 主的专栏列表（[BiliApi.fetchUserArticles]，
+///   pn/ps 分页 + 触底加载更多），卡片见 [_ArticleCard]，点击进 [ArticlePage]
+///   阅读页；同样是**懒加载**（首次点「专栏」才请求）。三个内容源（视频 /
+///   动态 / 专栏）互斥，同一时刻只有一个在下面显示
 /// - 视频列表：分页（滚动到底加载更多 20 条/页）+ 排序 chip（最新发布 /
 ///   最多播放 / 最多收藏）+ 站内搜索（搜索/排序只作用于「全部视频」）
 /// - 合集/列表视频视图（选中某合集后）：独立分页列表（fetchSeasonArchives /
@@ -17,7 +27,8 @@
 ///
 /// 与 BiliApi.fetchUpownerVideos / fetchUpownerInfo / fetchUpownerFollower /
 /// fetchVideoMeta / fetchUpownerCollections / fetchSeasonArchives /
-/// fetchSeriesArchives 共用：不写 Gist；视频不入库，仅供点播。
+/// fetchSeriesArchives / fetchUserDynamics / fetchUserArticles 共用：不写
+/// Gist；视频不入库，仅供点播。
 ///
 /// 容错（v2.17.8）：UP 主信息按 mid 会话级缓存（_upInfoCache），重进直接
 /// 显示不重复请求；粉丝数走 relation/stat（acc/info 实测不含 fans 字段）；
@@ -29,7 +40,7 @@
 ///   代次 = `upowner.videos#<加载代际>`（复用已有的 `_listGen`）
 ///   与 `upowner.seasons#<合集代次>`（换合集自增，用来重演入场）；
 ///   每条视频包 [StaggeredEntrance]（entryKey = bvid），首屏逐条推入、
-///   翻页追加用更短节奏；
+///   翻页追加用更短节奏；「动态」「专栏」两区同款（entryKey = 动态 id / cvid）；
 /// - 整页等待（首屏拉视频）= [AppLoadingHero]，列表底部翻页 = 小剪影 + 闲话；
 ///   顶部「关注」按钮的 14px 内联转圈**保持不变**（那是操作反馈）。
 library;
@@ -41,6 +52,8 @@ import 'package:flutter/material.dart';
 
 import '../api/bilibili_api.dart';
 import '../api/github_api.dart';
+import '../models/article.dart';
+import '../models/dynamic_item.dart';
 import '../models/upowner.dart';
 import '../models/whitelist_video.dart';
 import '../services/followings_auto_sync.dart';
@@ -49,11 +62,16 @@ import '../services/upowner_writer.dart';
 import '../services/whitelist_writer.dart';
 import '../theme/app_motion.dart';
 import '../theme/app_tokens.dart';
+import '../utils/relative_time.dart';
 import '../widgets/animated_copy_line.dart';
+import '../widgets/app_block.dart';
 import '../widgets/app_state_view.dart';
 import '../widgets/cover_image.dart';
+import '../widgets/dynamic_card.dart';
 import '../widgets/smoke_silhouette.dart';
 import '../widgets/staggered_entrance.dart';
+import 'article_page.dart';
+import 'image_viewer_page.dart';
 import 'player_page.dart';
 
 /// UP 主视频列表排序选项（与 BiliApi.fetchUpownerVideos order 参数对应）。
@@ -62,6 +80,9 @@ const List<({String value, String label})> _kUpownerVideoOrders = [
   (value: 'click', label: '最多播放'),
   (value: 'stow', label: '最多收藏'),
 ];
+
+/// 「专栏」区每页条数（`x/space/article` 的 `ps`）。
+const int _kUpownerArticlePageSize = 10;
 
 /// 时长格式化（与搜索页一致）：秒 → `4:45` / `1:02:03`。
 String _fmtDuration(int seconds) {
@@ -220,6 +241,75 @@ class _UpownerPageState extends State<UpownerPage> {
   int _videoBatchStart = 0;
   int _colBatchStart = 0;
 
+  // -------------------------------------------------------------------------
+  // 「动态」区（v2.22.0+）：评论头像 → 个人页 的第二个内容源。
+  // -------------------------------------------------------------------------
+
+  /// 当前是否在「动态」视图（与 [_activeCollection] 互斥：动态视图下
+  /// [_activeCollection] 必为 null）。
+  bool _dynamicMode = false;
+
+  /// 已加载的动态（按 id 去重）。
+  final List<DynamicItem> _dynamics = [];
+
+  /// 下一页游标（feed/space 的 `offset`；空串 = 首屏或已到底）。
+  String _dynOffset = '';
+
+  /// 是否还有下一页（接口 `has_more`）。
+  bool _dynHasMore = true;
+
+  /// 是否正在拉动态（首屏整页等待 / 翻页脚部转圈共用）。
+  bool _dynLoading = false;
+
+  /// 是否已成功拉过一页（懒加载判据：没拉过才在切进来时请求）。
+  bool _dynLoadedOnce = false;
+
+  /// 首屏错误（非空且列表为空 → 整页错误态 + 重试）。
+  String? _dynError;
+
+  /// 动态数据代次（重新加载 +1；在途请求发现代际不一致即放弃）。
+  int _dynGen = 0;
+
+  /// 本批次起点（翻页追加时置为「追加前的条数」）。
+  int _dynBatchStart = 0;
+
+  /// 动态列表的入场账本（与两个视频列表分开记账）。
+  final EntranceLedger _dynLedger = EntranceLedger();
+
+  // -------------------------------------------------------------------------
+  // 「专栏」区（v2.23.0+）：UP 主主页的第三个内容源（视频 / 动态 / 专栏互斥）。
+  // -------------------------------------------------------------------------
+
+  /// 当前是否在「专栏」视图（与 [_dynamicMode]、[_activeCollection] 互斥）。
+  bool _articleMode = false;
+
+  /// 已加载的专栏（按 cvid 去重）。
+  final List<ArticleSummary> _articles = [];
+
+  /// 已加载到第几页（`pn`）。
+  int _artPage = 1;
+
+  /// 是否还有下一页（[ArticleListPage.hasMore]）。
+  bool _artHasMore = true;
+
+  /// 是否正在拉专栏（首屏整页等待 / 翻页脚部转圈共用）。
+  bool _artLoading = false;
+
+  /// 是否已成功拉过一页（懒加载判据：没拉过才在切进来时请求）。
+  bool _artLoadedOnce = false;
+
+  /// 首屏错误（非空且列表为空 → 整页错误态 + 重试）。
+  String? _artError;
+
+  /// 专栏数据代次（重新加载 +1；在途请求发现代际不一致即放弃）。
+  int _artGen = 0;
+
+  /// 本批次起点（翻页追加时置为「追加前的条数」）。
+  int _artBatchStart = 0;
+
+  /// 专栏列表的入场账本（与其它三个列表分开记账）。
+  final EntranceLedger _artLedger = EntranceLedger();
+
   @override
   void initState() {
     super.initState();
@@ -248,13 +338,17 @@ class _UpownerPageState extends State<UpownerPage> {
     super.dispose();
   }
 
-  /// 滚动监听：距底部 ≤ 200px 触发加载下一页（当前是合集视图就翻合集的页，
-  /// 否则翻「全部视频」的页）。
+  /// 滚动监听：距底部 ≤ 200px 触发加载下一页（当前是动态/专栏视图就翻它的
+  /// 页，是合集视图就翻合集的页，否则翻「全部视频」的页）。
   void _onScroll() {
     if (!_scrollCtrl.hasClients) return;
     final pos = _scrollCtrl.position;
     if (pos.pixels >= pos.maxScrollExtent - 200) {
-      if (_activeCollection != null) {
+      if (_dynamicMode) {
+        _loadDynamicPage(reset: false);
+      } else if (_articleMode) {
+        _loadArticlePage(reset: false);
+      } else if (_activeCollection != null) {
         _loadCollectionMore();
       } else {
         _loadMore();
@@ -563,10 +657,17 @@ class _UpownerPageState extends State<UpownerPage> {
     return a.kind == b.kind && a.id == b.id;
   }
 
-  /// 选中/切回合集（null = 切回「全部视频」）。
+  /// 选中/切回合集（null = 切回「全部视频」）。切合集会自动离开「动态」/
+  /// 「专栏」视图（三个内容源互斥）。
   void _selectCollection(UpownerCollection? c) {
-    if (_sameCollection(_activeCollection, c)) return;
+    if (_sameCollection(_activeCollection, c) &&
+        !_dynamicMode &&
+        !_articleMode) {
+      return;
+    }
     setState(() {
+      _dynamicMode = false;
+      _articleMode = false;
       _activeCollection = c;
       _colVideos.clear();
       _colPage = 1;
@@ -634,6 +735,256 @@ class _UpownerPageState extends State<UpownerPage> {
     if (_colLoadingMore || !_colHasMore) return;
     if (_colVideos.isEmpty) return;
     _loadCollectionPage(_colPage + 1);
+  }
+
+  // -------------------------------------------------------------------------
+  // 「动态」区逻辑（v2.22.0+）
+  // -------------------------------------------------------------------------
+
+  /// 切到「动态」视图：懒加载（首次点才请求，进页不多打一次风控接口）+
+  /// 滚动回顶部。已是动态视图时直接返回（重复点 chip 不重载）。
+  void _selectDynamics() {
+    if (_dynamicMode) return;
+    setState(() {
+      _dynamicMode = true;
+      _articleMode = false;
+      _activeCollection = null;
+      _colVideos.clear();
+      _colPage = 1;
+      _colHasMore = true;
+      _colLoadingMore = false;
+      _colError = null;
+    });
+    if (_scrollCtrl.hasClients) _scrollCtrl.jumpTo(0);
+    if (!_dynLoadedOnce) _loadDynamicPage(reset: true);
+  }
+
+  /// 加载动态：reset=true 清空重载首屏；false 用 [_dynOffset] 拉下一页。
+  ///
+  /// 翻页守卫严格（已在加载 / 已到底 / 首屏还没成功过都直接 return）——
+  /// 滚动监听在一帧里可能被多次触发，必须在这里收敛成一次请求。
+  void _loadDynamicPage({required bool reset}) {
+    if (reset) {
+      final gen = ++_dynGen;
+      _dynLedger.clear();
+      _dynBatchStart = 0;
+      setState(() {
+        _dynamics.clear();
+        _dynOffset = '';
+        _dynHasMore = true;
+        _dynError = null;
+      });
+      unawaited(_fetchDynamics(gen: gen, offset: ''));
+      return;
+    }
+    if (_dynLoading || !_dynHasMore || _dynamics.isEmpty) return;
+    unawaited(_fetchDynamics(gen: _dynGen, offset: _dynOffset));
+  }
+
+  /// 拉一页动态。失败自动重试（指数退避 1s → 2s，与视频列表同一套：吸收
+  /// space 类接口对匿名/高频请求的间歇风控 -352/-412）。[gen] 代际不一致
+  /// （重新加载 / 切走视图）或页面销毁时放弃本次结果。
+  Future<void> _fetchDynamics({
+    required int gen,
+    required String offset,
+  }) async {
+    final isFirst = offset.isEmpty;
+    setState(() => _dynLoading = true);
+    try {
+      final page = await _retryWithBackoff(
+        () => _api.fetchUserDynamics(
+          widget.mid,
+          offset: offset.isEmpty ? null : offset,
+        ),
+      );
+      if (!mounted || gen != _dynGen) return;
+      final seen = _dynamics.map((d) => d.id).toSet();
+      final appended = [
+        ..._dynamics,
+        for (final d in page.items)
+          if (seen.add(d.id)) d,
+      ];
+      setState(() {
+        // 本批新增项的入场序号从 0 起算（旧项已记账不会重播）
+        _dynBatchStart = isFirst ? 0 : _dynamics.length;
+        _dynamics
+          ..clear()
+          ..addAll(appended);
+        _dynOffset = page.nextOffset;
+        _dynHasMore = page.hasMore;
+        _dynLoading = false;
+        _dynError = null;
+        _dynLoadedOnce = true;
+      });
+      debugPrint('[upowner] 动态 mid=${widget.mid} offset="$offset" '
+          'items=${page.items.length} hasMore=${page.hasMore}');
+    } on BiliApiException catch (e) {
+      _onDynamicsError(e.message, gen: gen, isFirst: isFirst);
+    } on DioException {
+      _onDynamicsError('网络请求失败，请检查网络后重试', gen: gen, isFirst: isFirst);
+    }
+  }
+
+  /// 动态加载失败：首屏 → 整页错误态（带重试；标记「没成功过」让下次切进来
+  /// 自动再拉）；翻页 → 保留已加载内容 + 底部轻提示（不清列表）。
+  void _onDynamicsError(
+    String message, {
+    required int gen,
+    required bool isFirst,
+  }) {
+    if (!mounted || gen != _dynGen) return;
+    setState(() {
+      _dynLoading = false;
+      if (isFirst) {
+        _dynError = message;
+        _dynLoadedOnce = false;
+      }
+    });
+    if (!isFirst) _showSnack('加载失败：$message');
+  }
+
+  /// 点动态配图 → 全屏查看（与评论图片共用同一个查看页）。
+  void _openDynamicImage(List<String> urls, int index) {
+    debugPrint('[upowner] 打开动态配图 ${index + 1}/${urls.length}');
+    Navigator.of(context).push(MaterialPageRoute<void>(
+      builder: (_) => ImageViewerPage(urls: urls, initialIndex: index),
+    ));
+  }
+
+  /// 点动态里的视频投稿 → 构造 [WhitelistVideo]（cid 未知填 0）交给
+  /// [_openVideo]（它用 view 接口补 cid 后再进播放页）。
+  ///
+  /// 动态投稿**不受白名单限制**：播放页本身不校验白名单（评论区的视频链接
+  /// 预览就是这么直接播的），所以投稿视频点开即播；代价是它不会自动进白名单
+  /// （要收藏可在「全部视频」里长按加入）。
+  Future<void> _openDynamicVideo(DynamicItem d) async {
+    final bvid = d.videoBvid;
+    if (bvid == null || bvid.isEmpty) return;
+    await _openVideo(WhitelistVideo(
+      bvid: bvid,
+      cid: 0,
+      title: d.videoTitle ?? '',
+      cover: d.videoCover ?? '',
+      duration: 0,
+      upName: _info?.name ?? '',
+      addedAt: DateTime.now().toUtc().toIso8601String(),
+    ));
+  }
+
+  /// 切到「专栏」视图：懒加载（首次点才请求）+ 滚动回顶部。已是专栏视图时
+  /// 直接返回（重复点 chip 不重载）。与「动态」「合集」互斥。
+  void _selectArticles() {
+    if (_articleMode) return;
+    setState(() {
+      _articleMode = true;
+      _dynamicMode = false;
+      _activeCollection = null;
+      _colVideos.clear();
+      _colPage = 1;
+      _colHasMore = true;
+      _colLoadingMore = false;
+      _colError = null;
+    });
+    if (_scrollCtrl.hasClients) _scrollCtrl.jumpTo(0);
+    if (!_artLoadedOnce) _loadArticlePage(reset: true);
+  }
+
+  /// 加载专栏：reset=true 清空重载首屏（pn=1）；false 拉下一页。
+  ///
+  /// 翻页守卫严格（已在加载 / 已到底 / 首屏还没成功过都直接 return）——
+  /// 滚动监听在一帧里可能被多次触发，必须在这里收敛成一次请求。
+  void _loadArticlePage({required bool reset}) {
+    if (reset) {
+      final gen = ++_artGen;
+      _artLedger.clear();
+      _artBatchStart = 0;
+      setState(() {
+        _articles.clear();
+        _artPage = 1;
+        _artHasMore = true;
+        _artError = null;
+      });
+      unawaited(_fetchArticles(gen: gen, page: 1));
+      return;
+    }
+    if (_artLoading || !_artHasMore || _articles.isEmpty) return;
+    unawaited(_fetchArticles(gen: _artGen, page: _artPage + 1));
+  }
+
+  /// 拉一页专栏。失败自动重试（与动态/视频同一套退避：吸收 B 站接口对匿名
+  /// 高频请求的间歇风控，专栏接口还会 -509 限频——API 层已先退避一次）。
+  /// [gen] 代际不一致（重新加载 / 切走视图）或页面销毁时放弃本次结果。
+  Future<void> _fetchArticles({required int gen, required int page}) async {
+    final isFirst = page <= 1;
+    setState(() => _artLoading = true);
+    try {
+      final result = await _retryWithBackoff(
+        () => _api.fetchUserArticles(
+          widget.mid,
+          pn: page,
+          ps: _kUpownerArticlePageSize,
+        ),
+      );
+      if (!mounted || gen != _artGen) return;
+      // 去重（按 cvid；防接口重复条目/翻页边界重复）
+      final seen = _articles.map((a) => a.cvid).toSet();
+      final appended = [
+        ..._articles,
+        for (final a in result.items)
+          if (seen.add(a.cvid)) a,
+      ];
+      setState(() {
+        // 本批新增项的入场序号从 0 起算（旧项已记账不会重播）
+        _artBatchStart = isFirst ? 0 : _articles.length;
+        _articles
+          ..clear()
+          ..addAll(appended);
+        _artPage = page;
+        _artHasMore = result.hasMore;
+        _artLoading = false;
+        _artError = null;
+        _artLoadedOnce = true;
+      });
+      debugPrint('[upowner] 专栏 mid=${widget.mid} pn=$page '
+          'items=${result.items.length} hasMore=${result.hasMore}');
+    } on BiliApiException catch (e) {
+      _onArticlesError(e.message, gen: gen, isFirst: isFirst);
+    } on DioException {
+      _onArticlesError('网络请求失败，请检查网络后重试', gen: gen, isFirst: isFirst);
+    }
+  }
+
+  /// 专栏加载失败：首屏 → 整页错误态（带重试；标记「没成功过」让下次切进来
+  /// 自动再拉）；翻页 → 保留已加载内容 + 底部轻提示（不清列表）。
+  void _onArticlesError(
+    String message, {
+    required int gen,
+    required bool isFirst,
+  }) {
+    if (!mounted || gen != _artGen) return;
+    setState(() {
+      _artLoading = false;
+      if (isFirst) {
+        _artError = message;
+        _artLoadedOnce = false;
+      }
+    });
+    if (!isFirst) _showSnack('加载失败：$message');
+  }
+
+  /// 点专栏卡 → 专栏阅读页（[ArticlePage]；携带列表里的标题，首屏不闪）。
+  ///
+  /// 把本页的 [_api] 一起传下去：同一个实例（buvid 指纹 / 会话 Cookie 复用，
+  /// 少一次握手），widget 测试里也能继续吃注入的 mock。
+  void _openArticle(ArticleSummary a) {
+    debugPrint('[upowner] 打开专栏 cv${a.cvid} 《${a.title}》');
+    Navigator.of(context).push(MaterialPageRoute<void>(
+      builder: (_) => ArticlePage(
+        cvid: a.cvid,
+        initialTitle: a.title,
+        api: _api,
+      ),
+    ));
   }
 
   /// 点击视频：缺 cid 时 fetch view 补齐 → push PlayerPage。
@@ -787,16 +1138,22 @@ class _UpownerPageState extends State<UpownerPage> {
         body: Column(
           children: [
             _buildHeader(theme),
-            // 搜索/排序只作用于「全部视频」；选中合集时隐藏（合集视频按
-            // 合集自身顺序展示，与 B 站一致，不受站内搜索影响）
-            if (_activeCollection == null) _buildVideoSearchBar(),
-            _buildCollectionBar(),
-            if (_activeCollection == null) _buildOrderBar(),
+            // 搜索/排序只作用于「全部视频」「合集·列表」两个视频视图；动态/
+            // 专栏视图有自己的卡片排版（不做站内搜索/排序）
+            if (!_dynamicMode && !_articleMode && _activeCollection == null)
+              _buildVideoSearchBar(),
+            _buildContentBar(),
+            if (!_dynamicMode && !_articleMode && _activeCollection == null)
+              _buildOrderBar(),
             const Divider(height: 1),
             Expanded(
-              child: _activeCollection == null
-                  ? _buildVideoList()
-                  : _buildCollectionVideoList(),
+              child: _dynamicMode
+                  ? _buildDynamicList()
+                  : (_articleMode
+                      ? _buildArticleList()
+                      : (_activeCollection == null
+                          ? _buildVideoList()
+                          : _buildCollectionVideoList())),
             ),
           ],
         ),
@@ -946,12 +1303,16 @@ class _UpownerPageState extends State<UpownerPage> {
     );
   }
 
-  /// 「合集·列表」区：横向 chips 行（第一个「全部视频」+ 该 UP 主各合集/
-  /// 列表）。UP 主没有合集/列表时整区隐藏（不占位）。选中某合集后列表区
-  /// 切换到该合集视频（[._buildCollectionVideoList]），本行仍保留在顶部
-  /// 方便随时切回「全部视频」或换合集。
-  Widget _buildCollectionBar() {
-    if (_collections.isEmpty) return const SizedBox.shrink();
+  /// 顶部内容 switch 行：横向 chips（「全部视频」/「动态」/「专栏」+ 该 UP 主
+  /// 各合集/列表）——整页的「看哪一类内容」开关，也是三个固定入口的所在。
+  ///
+  /// - 「全部视频」默认选中；「动态」「专栏」为固定项（v2.22.0+ / v2.23.0+），
+  ///   选中后下方换成对应列表（[._buildDynamicList] / [._buildArticleList]）；
+  /// - 「合集」分组名只在真有合集/列表时显示；但 chips 行**始终保留**——
+  ///   旧版「没有合集就整行隐藏」的写法会让「动态」「专栏」失去入口；
+  /// - 选中某合集后列表区切换到该合集视频（[._buildCollectionVideoList]），
+  ///   本行仍留在顶部方便随时切回「全部视频」/「动态」/「专栏」或换合集。
+  Widget _buildContentBar() {
     final theme = Theme.of(context);
     return Container(
       width: double.infinity,
@@ -960,24 +1321,39 @@ class _UpownerPageState extends State<UpownerPage> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Padding(
-            padding: const EdgeInsets.only(bottom: 6, right: 12),
-            child: Text(
-              '合集',
-              style: theme.textTheme.labelMedium?.copyWith(
-                color: theme.colorScheme.onSurfaceVariant,
-                fontWeight: FontWeight.w600,
+          if (_collections.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(bottom: 6, right: 12),
+              child: Text(
+                '合集',
+                style: theme.textTheme.labelMedium?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                  fontWeight: FontWeight.w600,
+                ),
               ),
             ),
-          ),
           SingleChildScrollView(
             scrollDirection: Axis.horizontal,
             child: Row(
               children: [
                 ChoiceChip(
                   label: const Text('全部视频'),
-                  selected: _activeCollection == null,
+                  selected: _activeCollection == null &&
+                      !_dynamicMode &&
+                      !_articleMode,
                   onSelected: (_) => _selectCollection(null),
+                ),
+                const SizedBox(width: 8),
+                ChoiceChip(
+                  label: const Text('动态'),
+                  selected: _dynamicMode,
+                  onSelected: (_) => _selectDynamics(),
+                ),
+                const SizedBox(width: 8),
+                ChoiceChip(
+                  label: const Text('专栏'),
+                  selected: _articleMode,
+                  onSelected: (_) => _selectArticles(),
                 ),
                 const SizedBox(width: 8),
                 for (final c in _collections) ...[
@@ -995,6 +1371,131 @@ class _UpownerPageState extends State<UpownerPage> {
             ),
           ),
         ],
+      ),
+    );
+  }
+
+  /// 「动态」区列表（选中「动态」chip 后取代视频列表）。
+  ///
+  /// 状态视图与视频列表同一套：首屏整页等待 = [AppLoadingHero]（seed
+  /// `upowner.dynamics`，与两个视频视图的闲话不串味）；首屏失败 =
+  /// [AppErrorView]（可重试）；空 = [AppStateView]（文案直给——动态空态
+  /// 不进设置页的文案表，避免为一个空态新增可编辑文案）；翻页 = 脚部小剪影。
+  Widget _buildDynamicList() {
+    if (_dynLoading && _dynamics.isEmpty) {
+      return const AppLoadingHero(seed: 'upowner.dynamics');
+    }
+    final err = _dynError;
+    if (err != null && _dynamics.isEmpty) {
+      return AppErrorView(
+        message: err,
+        onRetry: () => _loadDynamicPage(reset: true),
+        illustrationSeed: 'upowner.dynamics',
+      );
+    }
+    if (_dynamics.isEmpty) {
+      return const AppStateView(
+        kind: AppStateKind.empty,
+        title: '该 UP 主暂无动态',
+        subtitle: '可能 TA 还没发过动态，或动态设置了可见范围',
+        illustrationSeed: 'upowner.dynamics',
+      );
+    }
+    final extraSlots = (_dynLoading || !_dynHasMore) ? 1 : 0;
+    final appendBatch = _dynBatchStart > 0;
+    // 交错入场：代次 = 动态代际（重新加载 +1），与两个视频列表分开记账
+    return StaggeredListScope(
+      generation: 'upowner.dynamics#$_dynGen',
+      ledger: _dynLedger,
+      child: ListView.builder(
+        controller: _scrollCtrl,
+        padding: const EdgeInsets.fromLTRB(
+          kPagePadH,
+          kSpace12,
+          kPagePadH,
+          kSpace12,
+        ),
+        itemCount: _dynamics.length + extraSlots,
+        itemBuilder: (context, i) {
+          if (i >= _dynamics.length) {
+            return _buildListFooter(_dynLoading, seed: 'upowner.dynamics');
+          }
+          final d = _dynamics[i];
+          final int rawIndex = i - _dynBatchStart;
+          return StaggeredEntrance(
+            entryKey: 'dyn:${d.id}',
+            index: rawIndex < 0 ? 0 : rawIndex,
+            step: appendBatch ? kStaggerStepAppend : kStaggerStep,
+            duration: appendBatch ? kDurEntranceAppend : kDurEntrance,
+            maxIndex: appendBatch ? kStaggerMaxIndexAppend : kStaggerMaxIndex,
+            child: DynamicCard(
+              item: d,
+              fallbackAuthorName: _info?.name ?? '',
+              fallbackAuthorFace: _info?.face ?? '',
+              onImageTap: _openDynamicImage,
+              onVideoTap: () => _openDynamicVideo(d),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  /// 「专栏」区列表（选中「专栏」chip 后取代视频列表）。
+  ///
+  /// 状态视图与其它两套列表同一套：首屏整页等待 = [AppLoadingHero]（seed
+  /// `upowner.articles`）；首屏失败 = [AppErrorView]（可重试）；空 =
+  /// [AppStateView]（文案直给，与动态空态同处理）；翻页 = 脚部小剪影。
+  Widget _buildArticleList() {
+    if (_artLoading && _articles.isEmpty) {
+      return const AppLoadingHero(seed: 'upowner.articles');
+    }
+    final err = _artError;
+    if (err != null && _articles.isEmpty) {
+      return AppErrorView(
+        message: err,
+        onRetry: () => _loadArticlePage(reset: true),
+        illustrationSeed: 'upowner.articles',
+      );
+    }
+    if (_articles.isEmpty) {
+      return const AppStateView(
+        kind: AppStateKind.empty,
+        title: '该 UP 主暂无专栏',
+        subtitle: '可能 TA 还没发过专栏',
+        illustrationSeed: 'upowner.articles',
+      );
+    }
+    final extraSlots = (_artLoading || !_artHasMore) ? 1 : 0;
+    final appendBatch = _artBatchStart > 0;
+    // 交错入场：代次 = 专栏代际（重新加载 +1），与其它三个列表分开记账
+    return StaggeredListScope(
+      generation: 'upowner.articles#$_artGen',
+      ledger: _artLedger,
+      child: ListView.builder(
+        controller: _scrollCtrl,
+        padding: const EdgeInsets.fromLTRB(
+          kPagePadH,
+          kSpace12,
+          kPagePadH,
+          kSpace12,
+        ),
+        itemCount: _articles.length + extraSlots,
+        itemBuilder: (context, i) {
+          if (i >= _articles.length) {
+            return _buildListFooter(_artLoading, seed: 'upowner.articles');
+          }
+          final a = _articles[i];
+          final int rawIndex = i - _artBatchStart;
+          return StaggeredEntrance(
+            entryKey: 'cv:${a.cvid}',
+            index: rawIndex < 0 ? 0 : rawIndex,
+            step: appendBatch ? kStaggerStepAppend : kStaggerStep,
+            duration: appendBatch ? kDurEntranceAppend : kDurEntrance,
+            maxIndex: appendBatch ? kStaggerMaxIndexAppend : kStaggerMaxIndex,
+            child: _ArticleCard(item: a, onTap: () => _openArticle(a)),
+          );
+        },
       ),
     );
   }
@@ -1234,5 +1735,100 @@ class _UpownerPageState extends State<UpownerPage> {
       setState(() => _followBusy = false);
       _showSnack('取消失败：${e.message}');
     }
+  }
+}
+
+/// 一条专栏卡（UP 主主页「专栏」区，v2.23.0+）。
+///
+/// 结构：**封面（有则显示）+ 标题（2 行截断）+ 摘要（2 行截断）+
+/// 统计行（阅读 / 点赞）+ 相对时间**；点击交给宿主进 [ArticlePage]。
+///
+/// 设计语言：与动态卡同款——[AppBlock]（comment 规格：纸底 + hairline 四边
+/// 框）承载「一大片同级重复项」，圆角只用 [kRadiusSm]/[kRadiusMd]，无阴影；
+/// 文字只用 token（标题 [kTypeTitleS]、摘要 [kTypeBodyS] + [kInkGray70]、
+/// 统计 [kTypeNum] + [kInkGray50]）。
+class _ArticleCard extends StatelessWidget {
+  final ArticleSummary item;
+  final VoidCallback? onTap;
+
+  const _ArticleCard({required this.item, this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    // 封面：banner 优先、无 banner 退回正文首图（[ArticleSummary.coverUrl]）
+    final cover = item.coverUrl;
+    final ts = item.publishTs;
+    final time = ts > 0
+        ? fmtRelativeTime(DateTime.fromMillisecondsSinceEpoch(ts * 1000))
+        : '';
+    final body = Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        if (cover.isNotEmpty) ...[
+          ClipRRect(
+            borderRadius: BorderRadius.circular(kRadiusSm),
+            child: CoverImage(cover: cover, width: 96, height: 60),
+          ),
+          const SizedBox(width: kSpace8),
+        ],
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                item.title.trim().isEmpty ? '无标题专栏' : item.title,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: kTypeTitleS.copyWith(color: kInkBlack),
+              ),
+              if (item.summary.trim().isNotEmpty) ...[
+                const SizedBox(height: kSpace4),
+                Text(
+                  item.summary,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: kTypeBodyS.copyWith(color: kInkGray70),
+                ),
+              ],
+              const SizedBox(height: kSpace4),
+              Row(
+                children: [
+                  Text(
+                    '阅读 ${fmtArticleCount(item.view)}',
+                    style: kTypeNum.copyWith(color: kInkGray50),
+                  ),
+                  const SizedBox(width: kSpace8),
+                  Text(
+                    '点赞 ${fmtArticleCount(item.like)}',
+                    style: kTypeNum.copyWith(color: kInkGray50),
+                  ),
+                  if (time.isNotEmpty) ...[
+                    const Spacer(),
+                    Text(time, style: kTypeNum.copyWith(color: kInkGray50)),
+                  ],
+                ],
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+    final tap = onTap;
+    return AppBlock(
+      variant: AppBlockVariant.comment,
+      margin: const EdgeInsets.only(bottom: kListGap),
+      child: tap == null
+          ? body
+          : Semantics(
+              button: true,
+              label: '专栏「${item.title}」，点击阅读',
+              // 透明 Material 承载水波纹（外层 AppBlock 的纸底会盖住更外层的
+              // Material 水波纹，同动态卡的处理）
+              child: Material(
+                type: MaterialType.transparency,
+                child: InkWell(onTap: tap, child: body),
+              ),
+            ),
+    );
   }
 }

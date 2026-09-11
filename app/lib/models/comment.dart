@@ -51,7 +51,8 @@ class CommentPicture {
 ///   [parent] 直接父级 rpid（根评论自己为 0）
 /// - [count] 根评论的回复总数（楼中楼条数；子回复恒为 0）
 /// - [like] 点赞数；[ctime] 发布时间（Unix 秒）
-/// - [member] → [uname]/[avatar]/[level]（member.level_info.current_level）
+/// - [member] → [uname]/[avatar]/[level]（member.level_info.current_level）/
+///   [mid]（作者 uid，**接口返回字符串**，见字段说明）
 /// - [content.message] 纯文本（含 `<br />` 需转行）→ [message] 已清洗；
 ///   [content.pictures] → [pictures]（图片评论）
 /// - [previews] 内嵌楼中楼预览（仅主评论接口返回，至多 3 条；展开预览子条
@@ -63,6 +64,15 @@ class CommentReply {
   final int count;
   final int like;
   final int ctime;
+
+  /// 作者 uid（`member.mid`）。**接口返回的是字符串**（如 `"12345678"`），
+  /// 此处统一转成 int；缺失 / 非数字 / `"0"` 一律落到 0。
+  ///
+  /// 0 = 「没有可跳转的主页」（老数据、脏数据、已注销账号）——UI 据此
+  /// **不给头像挂点击**（[canOpenProfile]），避免跳到无效 mid 的空白页。
+  /// 与 [Upowner.mid] 同型（int），可直接传 `UpownerPage(mid:)`。
+  final int mid;
+
   final String uname;
   final String avatar;
   final int level;
@@ -77,6 +87,7 @@ class CommentReply {
     required this.count,
     required this.like,
     required this.ctime,
+    required this.mid,
     required this.uname,
     required this.avatar,
     required this.level,
@@ -88,6 +99,9 @@ class CommentReply {
   /// 是否根评论（root=0 && parent=0）。
   bool get isRoot => root == 0 && parent == 0;
 
+  /// 是否有可跳转的个人主页（mid 有效）。false 时头像不做点击（见 [mid]）。
+  bool get canOpenProfile => mid > 0;
+
   /// 完整解析：同时解析内嵌 `replies[]` 为 [previews]（主评论列表用）。
   factory CommentReply.fromJson(Map<String, dynamic> json) =>
       CommentReply._fromJson(json, parsePreviews: true);
@@ -96,6 +110,15 @@ class CommentReply {
   /// 防脏数据把嵌套无限展开）。
   factory CommentReply.previewFromJson(Map<String, dynamic> json) =>
       CommentReply._fromJson(json, parsePreviews: false);
+
+  /// 解析 `member.mid` 为 int（接口实测给**字符串**，历史响应/脏数据里也可能
+  /// 是 num）。缺失 / 非数字 / `"0"` / 负数 → 0（= 无有效主页，见 [mid]）。
+  static int parseMemberMid(dynamic raw) {
+    final int? n = raw is num
+        ? raw.toInt()
+        : (raw is String ? int.tryParse(raw.trim()) : null);
+    return (n != null && n > 0) ? n : 0;
+  }
 
   factory CommentReply._fromJson(
     Map<String, dynamic> json, {
@@ -135,6 +158,7 @@ class CommentReply {
       count: (json['count'] as num?)?.toInt() ?? 0,
       like: (json['like'] as num?)?.toInt() ?? 0,
       ctime: (json['ctime'] as num?)?.toInt() ?? 0,
+      mid: parseMemberMid(member['mid']),
       uname: member['uname'] as String? ?? '',
       avatar: avatar,
       level: (levelInfo['current_level'] as num?)?.toInt() ?? 0,

@@ -54,8 +54,21 @@ const kCoverFadeOutDur = Duration(milliseconds: 220);
 
 // ==================== 加载动画 ====================
 
-/// 烟缕一个完整周期
+/// 旧的烟缕上升周期（`SmokeSilhouette` 烟缕版本留下的值）。
+///
+/// 现在的加载动效是「印刷走纸」，用 [kPressCycle]；本常量保留：它是
+/// `app_motion_test.dart` 里锚定的历史值，也是回滚时的依据。
 const kSmokeCycle = Duration(milliseconds: 3200);
+
+/// 「印刷走纸」（Press Sweep）一个完整周期。
+///
+/// 一页纸被排版印刷：5 条 1px 文字线依次被墨填满 → 停一息 → 整片淡掉 → 重来。
+/// 2.8s 落在「呼吸节奏 2–2.8s」区间内（Tailwind `animate-pulse` 是 2s）：
+/// 比旧烟缕的 3.2s 快一档，一轮一轮读得出来，又不会快到像在闪。
+///
+/// 同一节奏也被加载指示 [PressDots]（`app_state_view.dart`）复用 ——
+/// 全 App 的"等待"只有一个节拍。
+const kPressCycle = Duration(milliseconds: 2800);
 
 // ==================== 加载文案逐字特效 ====================
 

@@ -577,6 +577,13 @@ final Map<String, String> _viewDescCache = {};
 const double kPortraitVideoHeightRatio = 0.6;
 const double kLandscapeVideoHeightRatio = 0.55;
 
+/// 「评论区滚动收起视频信息块」（竖屏非全屏）的方向判定阈值（px）。
+///
+/// 评论列表滚动时按**累积位移**判方向：连续向下翻（内容上移，scrollDelta > 0）
+/// 累积到本阈值才收起信息块，反向累积到本阈值才展开——避免一有位移就切换
+/// （手指微抖/惯性尾巴造成来回跳）。取 12px ≈ 一次轻微滑动的量级。
+const double kInfoBarHideScrollThreshold = 12;
+
 /// 播放页**非全屏**状态允许的方向（v2.17.17）：
 /// 「竖屏 + 双向横屏」三向——退出全屏时不再强制回竖屏：设备横放停在横屏
 /// 「顶部置顶+下方评论区」（横屏置顶模式），设备竖放仍竖屏置顶布局
@@ -755,6 +762,24 @@ class _PlayerPageState extends State<PlayerPage>
   // 上，供 Scrollable.ensureVisible 锚定滚动到评论区。
   final ScrollController _commentScroll = ScrollController();
   final GlobalKey _commentCountHeaderKey = GlobalKey();
+
+  // 评论滚动 → 信息块收起/展开（竖屏非全屏专用）：
+  // ---------------------------------------------------------------------
+  // 向下翻评论（内容上移，`scrollDelta > 0`）= 想看评论 → 把标题/简介块收起，
+  // 高度让给评论列表；向上翻（内容下移）再放回来；滚到列表顶部强制展开
+  // （回到顶部就该看见标题）。判定与动画见 [_onCommentScrollNotification] /
+  // [_buildCollapsibleInfoBlock]。
+  /// 信息块当前是否因评论滚动而收起（仅竖屏非全屏渲染时生效）。
+  bool _infoBarCollapsed = false;
+
+  /// 方向判定的累积位移（px，正 = 内容上移 = 向下翻评论）。达到
+  /// [kInfoBarHideScrollThreshold] 就切换一次并清零，故取值被夹在阈值内。
+  double _infoBarScrollAccum = 0;
+
+  /// 本轮滚动是否由**手指拖拽**发起（含其后惯性段）。
+  /// 程序化滚动（点控制层「评论」的 `Scrollable.ensureVisible` / `animateTo`）
+  /// 不算 → 不参与收起判定（不然点个按钮标题就没了）。
+  bool _commentScrollByUser = false;
 
   // 信息行 UP 主入口（阶段 C，仿 B 站）
   // ---------------------------------------------------------------------
@@ -4396,7 +4421,15 @@ class _PlayerPageState extends State<PlayerPage>
   Future<void> _toggleFullscreen() async {
     debugPrint('[player_page] _toggleFullscreen called, full=$_fullscreen');
     final full = !_fullscreen;
-    setState(() => _fullscreen = full);
+    setState(() {
+      _fullscreen = full;
+      // 全屏没有下方内容区（评论区不在树里），收起态在两个方向上来回切都
+      // 没有意义——退出全屏时评论区是从头重建的，信息块也一并复位成展开，
+      // 免得出现「列表停在顶部、标题却是收起」的错位。
+      _infoBarCollapsed = false;
+      _infoBarScrollAccum = 0;
+      _commentScrollByUser = false;
+    });
     if (full) {
       // 进全屏：锁横屏（原行为）——整屏沉浸横屏播放（无下方内容区）。
       await SystemChrome.setPreferredOrientations([
@@ -4578,11 +4611,22 @@ class _PlayerPageState extends State<PlayerPage>
             //      +名字可点进 UP 主页；横屏自动紧凑；块化见 [_buildInfoBlock]）
             //      + 内嵌评论区（评论区底部避开系统手势导航条）。
             //      全屏不渲染（下方内容区不占位）。
+            //      竖屏额外支持「滚评论收信息块」：收起/展开见
+            //      [_buildCollapsibleInfoBlock]（横屏置顶不参与，返回原块）。
             if (!_fullscreen) ...[
-              _buildInfoBlock(context),
+              // 竖屏：评论区滚动可把这块收起（见 _buildCollapsibleInfoBlock）
+              _buildCollapsibleInfoBlock(context),
               Expanded(
                 key: const ValueKey('player-comments'),
-                child: SafeArea(top: false, child: _buildEmbeddedComments()),
+                // 评论滚动 → 信息块显隐的监听放在页面侧（评论区组件自己那个
+                // NotificationListener 返回 false 会继续冒泡上来，不必改组件）。
+                child: NotificationListener<ScrollNotification>(
+                  onNotification: _onCommentScrollNotification,
+                  child: SafeArea(
+                    top: false,
+                    child: _buildEmbeddedComments(),
+                  ),
+                ),
               ),
             ],
           ],
@@ -4826,6 +4870,114 @@ class _PlayerPageState extends State<PlayerPage>
       child: _buildVideoInfoBar(context),
     );
     return _withInfoBlockEntrance(context, block);
+  }
+
+  // -------------------------------------------------------------------------
+  // 评论滚动 → 信息块收起/展开（竖屏非全屏专用）
+  // -------------------------------------------------------------------------
+
+  /// 本特性是否适用：**竖屏（屏高 ≥ 屏宽）的非全屏**播放页。
+  ///
+  /// 全屏没有下方内容区（不渲染信息块/评论区）；横屏置顶模式（v2.17.17）
+  /// 屏高低、评论区本来就只占一小条，把标题收掉收益也小、还容易误触，
+  /// 故保持原行为不变（横屏滚评论一律不收）。
+  bool get _infoBarScrollCollapseApplies {
+    if (!mounted || _fullscreen) return false;
+    final s = MediaQuery.sizeOf(context);
+    return s.height >= s.width;
+  }
+
+  /// 评论列表滚动通知：按**方向 + 累积阈值**决定信息块收起/展开。
+  ///
+  /// - 判定量 = [ScrollUpdateNotification.scrollDelta] 的累积：内容上移
+  ///   （向下翻评论，delta > 0）累积到 [kInfoBarHideScrollThreshold] → 收起；
+  ///   内容下移（向上翻）反向累积到阈值 → 展开。切换后清零，所以取值被夹在
+  ///   ±阈值内（否则反向时要先"还清"前面攒的位移，手感很黏）；
+  /// - **滚到列表顶部强制展开**（用户回到顶部就该看见标题），连同累积量一起
+  ///   复位；
+  /// - 只认「手指拖拽发起」的那一轮滚动（[ScrollStartNotification.dragDetails]
+  ///   非空 → 连其后惯性段一起认，[ScrollEndNotification] 收尾）。程序化的
+  ///   `Scrollable.ensureVisible` / `animateTo`（点「评论」按钮定位）不参与
+  ///   ——否则点一下按钮标题就被收掉；
+  /// - 收起/展开会改变评论区视口高度，可能反过来触发一次位置修正通知；
+  ///   阈值 + 每轮清零足以让它自稳，不会来回抖。
+  bool _onCommentScrollNotification(ScrollNotification n) {
+    if (!_infoBarScrollCollapseApplies) return false;
+    if (n is ScrollStartNotification) {
+      _commentScrollByUser = n.dragDetails != null;
+      if (_commentScrollByUser) _infoBarScrollAccum = 0;
+      return false;
+    }
+    if (n is ScrollEndNotification) {
+      _commentScrollByUser = false;
+      return false;
+    }
+    // 到顶：强制展开（含过滚到负值）。放在方向判定之前——到顶那一刻的方向
+    // 可能是"继续向上翻"，跟展开是同一个结果，直接短路更省事。
+    if (n.metrics.pixels <= n.metrics.minScrollExtent) {
+      _infoBarScrollAccum = 0;
+      if (_infoBarCollapsed) setState(() => _infoBarCollapsed = false);
+      return false;
+    }
+    if (!_commentScrollByUser || n is! ScrollUpdateNotification) return false;
+    final delta = n.scrollDelta ?? 0;
+    if (delta == 0) return false;
+    const t = kInfoBarHideScrollThreshold;
+    final acc = (_infoBarScrollAccum + delta).clamp(-t, t);
+    if (acc >= t && !_infoBarCollapsed) {
+      _infoBarScrollAccum = 0;
+      setState(() => _infoBarCollapsed = true);
+    } else if (acc <= -t && _infoBarCollapsed) {
+      _infoBarScrollAccum = 0;
+      setState(() => _infoBarCollapsed = false);
+    } else {
+      _infoBarScrollAccum = acc;
+    }
+    return false;
+  }
+
+  /// 可收起的视频信息块：竖屏非全屏时，评论滚动可把它收起（高度让给评论）。
+  ///
+  /// 结构（自外向内）：[ClipRect] → [AnimatedSize] → [Align] → 信息块
+  ///
+  /// - `Align(heightFactor: 0/1)` 决定**目标**高度：0 = 收起。用 Align 而不是
+  ///   直接把块从树里摘掉，是为了让 `ValueKey('player-info-bar')` 与其内容
+  ///   始终在位（每帧都在同一处，没有"重建/卸载"的额外状态）；
+  /// - [AnimatedSize] 让**高度**在 0 ↔ 固有高之间平滑过渡（[kDurBase] +
+  ///   [kCurveOut]，`alignment: topCenter` 保证动画期间块顶边钉在视频区下沿，
+  ///   所以「信息行顶部 == 视频区底部」这条几何断言在两种状态下都成立）；
+  /// - 外层 [ClipRect] 负责动画期间把超出的内容裁掉：AnimatedSize 只动自己的
+  ///   盒子、不动 child 的尺寸，而它的自动裁剪在动画收尾（盒子 == 目标尺寸）
+  ///   时就停了，剩 Align 里那份**固有高**的内容会画到评论区上。自己在外面
+  ///   再套一层：盒子多高就裁多高（高度为 0 时 Flutter 直接整棵子树跳过绘制，
+  ///   也就不可能挡住评论区的点击）；
+  /// - 关动效（[MotionControl]）时**根本不套 [AnimatedSize]**：它的
+  ///   `duration: Duration.zero` 会在自己的 performLayout 里同步 `forward()`
+  ///   → 在 layout 期间 `markNeedsLayout`，Flutter 直接断言失败
+  ///   （"RenderAnimatedSize was mutated in its own performLayout"）。这条路上
+  ///   本来也不需要动画，直接 `ClipRect + Align` 瞬时到位，一个 controller
+  ///   都不建。
+  ///
+  /// 横屏置顶 / 全屏不套这一层（直接返回原块，行为与改动前完全一致）。
+  Widget _buildCollapsibleInfoBlock(BuildContext context) {
+    final block = _buildInfoBlock(context);
+    if (!_infoBarScrollCollapseApplies) return block;
+    // heightFactor 0 = 目标高度为零（收起），但块本身仍按固有高布局 →
+    // 外层 ClipRect 按"当前实际高度"裁剪，就是抽出/收回的视觉效果。
+    final shrinkWrap = Align(
+      alignment: Alignment.topCenter,
+      heightFactor: _infoBarCollapsed ? 0.0 : 1.0,
+      child: block,
+    );
+    if (!MotionControl.of(context)) return ClipRect(child: shrinkWrap);
+    return ClipRect(
+      child: AnimatedSize(
+        duration: kDurBase,
+        curve: kCurveOut,
+        alignment: Alignment.topCenter,
+        child: shrinkWrap,
+      ),
+    );
   }
 
   /// 给信息块套「补场」动效：延迟 [kInfoBlockDelay] 后淡入 + 从 96%

@@ -1,7 +1,8 @@
 // UpownerPage「合集·列表」区 widget 测试（注入 mock BiliApi，不访问真实网络）：
 // - 有合集/列表 → 页面顶部出现「合集」区：区头 + chips（全部视频 + 各合集/
 //   列表）；creator='auto' 的系统自动列表（直播回放）被过滤不展示
-// - 没有合集/列表 → 整区隐藏（不出「合集」区头/全部视频 chip）
+// - 没有合集/列表 → 不显示「合集」分组名，但 chips 行保留（「全部视频」+
+//   「动态」——动态是固定入口，不依赖合集是否存在）
 // - 点合集 chip → 下方列表切换为该合集视频（fetchSeasonArchives），
 //   原「全部视频」列表卸载、搜索框/排序 chips 隐藏（搜索排序只作用于全部视频）
 // - 点列表 chip → 切 x/series/archives 数据源（fetchSeriesArchives）
@@ -279,8 +280,8 @@ void main() {
     expect(find.text('主列表视频'), findsOneWidget);
   });
 
-  testWidgets('没有合集/列表：整区隐藏（无「合集」区头、无全部视频 chip）',
-      (tester) async {
+  testWidgets('没有合集/列表：「合集」分组名不显示，但 chips 行保留'
+      '（全部视频 + 动态 + 专栏）', (tester) async {
     final api = _fakeApi({
       ..._baseHandlers(),
       '/x/polymer/web-space/seasons_series_list': _emptyCollectionsBody,
@@ -288,8 +289,12 @@ void main() {
     await _pumpPage(tester, api);
 
     expect(find.text('合集'), findsNothing);
-    expect(find.text('全部视频'), findsNothing);
     expect(find.text('合集·经典领读'), findsNothing);
+    // chips 行本身保留：「动态」「专栏」是固定入口（v2.22.0+ / v2.23.0+），
+    // 不能因为没合集就藏起来
+    expect(find.text('全部视频'), findsOneWidget);
+    expect(find.text('动态'), findsOneWidget);
+    expect(find.text('专栏'), findsOneWidget);
     // 主列表不受影响
     expect(find.text('主列表视频'), findsOneWidget);
   });

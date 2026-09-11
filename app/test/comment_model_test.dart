@@ -30,6 +30,8 @@ Map<String, dynamic> _replyJson({
   String avatar = 'http://i0.hdslb.com/bfs/face/a.jpg',
   int level = 3,
   String message = '前排',
+  // member.mid：接口实测是**字符串**；传 null 表示整个字段缺失（老数据）
+  Object? mid = '10086',
   List<Map<String, dynamic>>? pictures,
   List<Map<String, dynamic>>? nested,
 }) =>
@@ -43,6 +45,7 @@ Map<String, dynamic> _replyJson({
       'member': {
         'uname': uname,
         'avatar': avatar,
+        if (mid != null) 'mid': mid,
         'level_info': {'current_level': level},
       },
       'content': {
@@ -197,6 +200,51 @@ void main() {
       expect(r.uname, '');
       expect(r.message, '');
       expect(r.previews, isEmpty);
+    });
+  });
+
+  group('CommentReply.mid（作者 uid，v2.22.0+ 头像跳个人页用）', () {
+    test('接口实测形态：member.mid 是字符串 → 解析成 int', () {
+      final r = CommentReply.fromJson(_replyJson(rpid: 1, mid: '12345678'));
+      expect(r.mid, 12345678);
+      expect(r.canOpenProfile, isTrue);
+    });
+
+    test('历史/脏响应里是 num → 同样收下', () {
+      expect(CommentReply.fromJson(_replyJson(rpid: 1, mid: 42)).mid, 42);
+    });
+
+    test('缺 mid / "0" / 非数字 / 空串 → 0，且不可跳个人页', () {
+      final missing = CommentReply.fromJson(_replyJson(rpid: 1, mid: null));
+      expect(missing.mid, 0);
+      expect(missing.canOpenProfile, isFalse);
+
+      final zero = CommentReply.fromJson(_replyJson(rpid: 1, mid: '0'));
+      expect(zero.mid, 0);
+      expect(zero.canOpenProfile, isFalse);
+
+      expect(CommentReply.fromJson(_replyJson(rpid: 1, mid: 'abc')).mid, 0);
+      expect(CommentReply.fromJson(_replyJson(rpid: 1, mid: '')).mid, 0);
+      expect(CommentReply.fromJson(_replyJson(rpid: 1, mid: -5)).mid, 0);
+    });
+
+    test('parseMemberMid 直接单测（含空白串/负数/脏类型）', () {
+      expect(CommentReply.parseMemberMid(' 99 '), 99);
+      expect(CommentReply.parseMemberMid('0'), 0);
+      expect(CommentReply.parseMemberMid(100), 100);
+      expect(CommentReply.parseMemberMid(null), 0);
+      expect(CommentReply.parseMemberMid(const []), 0);
+      expect(CommentReply.parseMemberMid(-1), 0);
+    });
+
+    test('楼中楼预览也带 mid（浅解析同样解析 member）', () {
+      final r = CommentReply.fromJson(_replyJson(
+        rpid: 1,
+        mid: '111',
+        nested: [_replyJson(rpid: 2, mid: '222', message: '预览')],
+      ));
+      expect(r.mid, 111);
+      expect(r.previews.single.mid, 222);
     });
   });
 

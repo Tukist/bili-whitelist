@@ -47,6 +47,7 @@ import 'package:url_launcher/url_launcher.dart';
 import '../api/bilibili_api.dart';
 import '../config.dart';
 import '../models/comment.dart';
+import '../models/upowner.dart';
 import '../models/whitelist_video.dart';
 import '../services/loading_copy.dart';
 import '../services/whitelist_writer.dart';
@@ -71,6 +72,10 @@ const Map<String, String> _imgHeaders = {
   'User-Agent': kBrowserUA,
   'Referer': kBiliReferer,
 };
+
+/// 可点头像的热区最小边长（Android 触摸目标 ≥48dp）：头像本体只有
+/// 34/20/18px，撑出这个方形热区才够手指点。
+const double _kAvatarTapMin = 48.0;
 
 /// 评论内视频链接点击回调：把目标视频交给宿主打开，可携带链接 ?p/?t 定位
 /// 参数（v2.17.6+；来源见 utils/comment_links.dart 的 CommentLink.pageIndex /
@@ -596,6 +601,38 @@ class _CommentListViewState extends State<CommentListView> {
       ));
   }
 
+  /// 点评论头像 → 该作者的个人主页（v2.22.0+）。
+  ///
+  /// 路由方式与评论区「UP 空间链接」进主页完全一致（[Navigator.push] +
+  /// [UpownerPage]，不带 RouteSettings）。评论数据里已有名字/头像时预填
+  /// `initial`：个人页头部（标题 + 头像）立即成形，不必先等 `acc/info`
+  /// （资料加载成功后再覆盖，失败也不至于标题空白）。
+  /// [CommentReply.mid] 无效时不 push（避免跳进一张空白页）——UI 侧本来
+  /// 就不会给无效 mid 的头像挂点击，这里是第二道守卫。
+  void _openCommentAuthor(CommentReply reply) {
+    final mid = reply.mid;
+    if (mid <= 0) {
+      debugPrint('[comment_list] 头像点击：mid 无效（0），不跳个人页');
+      return;
+    }
+    debugPrint('[comment_list] 点头像进个人主页 mid=$mid uname=${reply.uname}');
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => UpownerPage(
+          mid: mid,
+          initial: (reply.uname.isEmpty && reply.avatar.isEmpty)
+              ? null
+              : Upowner(
+                  mid: mid,
+                  name: reply.uname,
+                  face: reply.avatar,
+                  addedAt: DateTime.now().toUtc(),
+                ),
+        ),
+      ),
+    );
+  }
+
   /// 打开图片全屏查看页（点击缩略图）。
   void _openImageGallery(BuildContext ctx, List<CommentPicture> pictures,
       int index) {
@@ -797,6 +834,7 @@ class _CommentListViewState extends State<CommentListView> {
                 onLoadMore: () => _loadMoreChildren(reply),
                 onLinkTap: _onCommentLinkTap,
                 onImageTap: _openImageGallery,
+                onAvatarTap: _openCommentAuthor,
               ),
             );
           },
@@ -902,6 +940,9 @@ class _CommentRootTile extends StatelessWidget {
   /// 图片缩略图点击（打开全屏查看页）。
   final void Function(BuildContext, List<CommentPicture>, int) onImageTap;
 
+  /// 头像点击（进作者个人主页；mid 无效时头像不挂手势，不会回调）。
+  final ValueChanged<CommentReply> onAvatarTap;
+
   const _CommentRootTile({
     required this.reply,
     required this.pinned,
@@ -913,6 +954,7 @@ class _CommentRootTile extends StatelessWidget {
     required this.onLoadMore,
     required this.onLinkTap,
     required this.onImageTap,
+    required this.onAvatarTap,
   });
 
   @override
@@ -950,7 +992,10 @@ class _CommentRootTile extends StatelessWidget {
           if (showPreviews)
             Padding(
               padding: const EdgeInsets.only(top: 8),
-              child: _PreviewBlock(previews: r.previews),
+              child: _PreviewBlock(
+                previews: r.previews,
+                onAvatarTap: onAvatarTap,
+              ),
             ),
           _buildActions(theme),
           if (expanded) _buildChildrenArea(),
@@ -964,7 +1009,12 @@ class _CommentRootTile extends StatelessWidget {
     return Row(
       crossAxisAlignment: CrossAxisAlignment.center,
       children: [
-        _Avatar(url: reply.avatar, size: 34),
+        _Avatar(
+          url: reply.avatar,
+          size: 34,
+          tapAlign: Alignment.centerLeft,
+          onTap: reply.canOpenProfile ? () => onAvatarTap(reply) : null,
+        ),
         const SizedBox(width: 8),
         Expanded(
           child: Column(
@@ -1105,6 +1155,7 @@ class _CommentRootTile extends StatelessWidget {
                 reply: child,
                 onLinkTap: onLinkTap,
                 onImageTap: onImageTap,
+                onAvatarTap: onAvatarTap,
               ),
           if (state != null && state.hasMore)
             Center(
@@ -1137,7 +1188,13 @@ class _CommentRootTile extends StatelessWidget {
 class _PreviewBlock extends StatelessWidget {
   final List<CommentReply> previews;
 
-  const _PreviewBlock({required this.previews});
+  /// 头像点击（进作者个人主页；mid 无效时头像不挂手势）。
+  final ValueChanged<CommentReply> onAvatarTap;
+
+  const _PreviewBlock({
+    required this.previews,
+    required this.onAvatarTap,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -1152,7 +1209,12 @@ class _PreviewBlock extends StatelessWidget {
             Row(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                _Avatar(url: p.avatar, size: 18),
+                _Avatar(
+                  url: p.avatar,
+                  size: 18,
+                  tapAlign: Alignment.topLeft,
+                  onTap: p.canOpenProfile ? () => onAvatarTap(p) : null,
+                ),
                 const SizedBox(width: 6),
                 Expanded(
                   child: Column(
@@ -1188,10 +1250,14 @@ class _SubReplyRow extends StatelessWidget {
   final ValueChanged<CommentLink> onLinkTap;
   final void Function(BuildContext, List<CommentPicture>, int) onImageTap;
 
+  /// 头像点击（进作者个人主页；mid 无效时头像不挂手势）。
+  final ValueChanged<CommentReply> onAvatarTap;
+
   const _SubReplyRow({
     required this.reply,
     required this.onLinkTap,
     required this.onImageTap,
+    required this.onAvatarTap,
   });
 
   @override
@@ -1205,7 +1271,12 @@ class _SubReplyRow extends StatelessWidget {
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          _Avatar(url: reply.avatar, size: 20),
+          _Avatar(
+            url: reply.avatar,
+            size: 20,
+            tapAlign: Alignment.topLeft,
+            onTap: reply.canOpenProfile ? () => onAvatarTap(reply) : null,
+          ),
           const SizedBox(width: 6),
           Expanded(
             child: Column(
@@ -1264,11 +1335,32 @@ class _SubReplyRow extends StatelessWidget {
 }
 
 /// 圆形头像（圆图，带 UA/Referer 兜底；加载失败显示占位）。
+///
+/// **可点**（[onTap] 非空，v2.22.0+）：头像本体只有 34/20/18px，远小于
+/// Android 的 48dp 触摸目标 → 用 [_kAvatarTapMin] 在**不放大头像**的前提下
+/// 撑出一块正方形热区（头像在热区内按 [tapAlign] 摆位）。代价是热区占的
+/// 布局空间：根评论行由 34 撑到 48 高（头像仍左对齐、正文起点右移 14px）；
+/// 楼中楼/预览行用 topLeft，头像与首行文字顶对齐、多出来的高度落在头像
+/// 下方，正文起始位置与旧版一致。
+///
+/// [onTap] 为 null（作者 mid 无效 / 老数据）时**不包任何手势**：头像照旧，
+/// 不会点进一张空白个人页。
 class _Avatar extends StatelessWidget {
   final String url;
   final double size;
 
-  const _Avatar({required this.url, required this.size});
+  /// 点击回调（进作者个人主页）；null = 不可点。
+  final VoidCallback? onTap;
+
+  /// 头像在热区内的对齐（根评论行 centerLeft；楼中楼/预览行 topLeft）。
+  final Alignment tapAlign;
+
+  const _Avatar({
+    required this.url,
+    required this.size,
+    this.onTap,
+    this.tapAlign = Alignment.center,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -1278,17 +1370,37 @@ class _Avatar extends StatelessWidget {
       color: Theme.of(context).colorScheme.surfaceContainerHighest,
       child: Icon(Icons.person, size: size * 0.62, color: kInkGray30),
     );
-    if (url.isEmpty) {
-      return ClipOval(child: base);
-    }
-    return ClipOval(
-      child: Image.network(
-        url,
-        width: size,
-        height: size,
-        fit: BoxFit.cover,
-        headers: _imgHeaders,
-        errorBuilder: (_, __, ___) => base,
+    final Widget visual = url.isEmpty
+        ? ClipOval(child: base)
+        : ClipOval(
+            child: Image.network(
+              url,
+              width: size,
+              height: size,
+              fit: BoxFit.cover,
+              headers: _imgHeaders,
+              errorBuilder: (_, __, ___) => base,
+            ),
+          );
+    final tap = onTap;
+    if (tap == null) return visual;
+    final double edge = size >= _kAvatarTapMin ? size : _kAvatarTapMin;
+    return Semantics(
+      button: true,
+      label: '查看该作者的个人主页',
+      child: SizedBox(
+        width: edge,
+        height: edge,
+        // 透明 Material 只为承载水波纹：头像上方是 AppBlock 的纸底 Container，
+        // 水波纹若画在更外层的 Material 上会被那层底色盖掉（看不见反馈）。
+        child: Material(
+          type: MaterialType.transparency,
+          child: InkWell(
+            onTap: tap,
+            customBorder: const CircleBorder(),
+            child: Align(alignment: tapAlign, child: visual),
+          ),
+        ),
       ),
     );
   }

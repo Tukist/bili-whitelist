@@ -1,6 +1,10 @@
 // AppStateView / AppLoadingView / AppErrorView 组件测试
 // （lib/widgets/app_state_view.dart）：
-// - 三种 kind 的渲染（空态插画+标题+副文案 / 加载转圈 / 错误插画+重试）
+// - 三种 kind 的渲染（空态插画+标题+副文案 / 加载指示 PressDots / 错误插画+重试）
+// - 加载态不再走 Material 转圈，改用印刷语言的 [PressDots]；
+//   ⚠️ 但 Material 转圈**没有**在全 App 消失——按钮内联 / 进度缓冲 / 黑底反色 /
+//   图片占位那几类按各自语义保留（清单见 AppLoadingView 的注释，实测仍有 19 处）。
+//   "存在性 + 尺寸克制（24）"的断言意图保留：锚点从转圈挪到 [PressDots]
 // - scrollable: true 时确实是 ListView 且 physics = AlwaysScrollableScrollPhysics
 //   （宿主 RefreshIndicator 下拉刷新的硬约束）
 // - scrollable: false 时不产生 ListView（纯静态区域）
@@ -217,7 +221,7 @@ void main() {
   });
 
   group('加载态（loading）', () {
-    testWidgets('渲染主墨转圈 + 文案', (tester) async {
+    testWidgets('渲染三颗方点 + 文案', (tester) async {
       await _pump(
         tester,
         const AppStateView(
@@ -226,19 +230,23 @@ void main() {
         ),
       );
 
-      expect(find.byType(CircularProgressIndicator), findsOneWidget);
+      // 锚点从 Material 转圈挪到印刷语言的 PressDots（尺寸/存在性意图不变）
+      expect(find.byType(PressDots), findsOneWidget);
+      expect(find.byType(CircularProgressIndicator), findsNothing,
+          reason: '本组件的加载态走印刷语言；App 其它位置的转圈按语义另外保留');
       expect(find.text('正在同步白名单…'), findsOneWidget);
       expect(find.byType(DotIllustration), findsNothing); // 加载态不画插画
       expect(find.byType(ListView), findsNothing);
     });
 
-    testWidgets('无文案时只有转圈', (tester) async {
+    testWidgets('无文案时只有指示器', (tester) async {
       await _pump(
         tester,
         const AppStateView(kind: AppStateKind.loading),
       );
 
-      expect(find.byType(CircularProgressIndicator), findsOneWidget);
+      expect(find.byType(PressDots), findsOneWidget);
+      expect(find.byType(CircularProgressIndicator), findsNothing);
       expect(find.byType(Text), findsNothing);
     });
 
@@ -261,10 +269,36 @@ void main() {
     testWidgets('AppLoadingView 尺寸克制（默认 24）', (tester) async {
       await _pump(tester, const AppLoadingView());
 
-      // SizedBox 包住转圈，直径 = 24
-      final box = tester.getSize(find.byType(CircularProgressIndicator));
+      // 指示器占位仍是一个 24×24 的方框（与原来的转圈占位一致，布局不用改）
+      final box = tester.getSize(find.byType(PressDots));
       expect(box.width, 24);
       expect(box.height, 24);
+    });
+
+    testWidgets('AppLoadingView：三颗方点排开，第一颗亮、另两颗低墨量', (tester) async {
+      await _pump(tester, const AppLoadingView());
+
+      final painter = tester
+          .widget<CustomPaint>(
+            find.descendant(
+              of: find.byType(PressDots),
+              matching: find.byType(CustomPaint),
+            ),
+          )
+          .painter! as PressDotsPainter;
+      // 测试环境动效默认关 → 静态帧停在 t = 0（第一颗亮）
+      expect(painter.progress, isNull);
+      expect(painter.effectiveT, kStaticPressDotsT);
+      expect(PressDotsPainter.litIndexAt(kStaticPressDotsT), 0);
+      // 三颗点在 size × (1/4, 2/4, 3/4) 处水平排开、垂直居中
+      expect(PressDotsPainter.dotCenterAt(0, 24), const Offset(6, 12));
+      expect(PressDotsPainter.dotCenterAt(1, 24), const Offset(12, 12));
+      expect(PressDotsPainter.dotCenterAt(2, 24), const Offset(18, 12));
+      // 依次亮起：一个周期内三颗各轮一次
+      expect(PressDotsPainter.litIndexAt(0.0), 0);
+      expect(PressDotsPainter.litIndexAt(0.5), 1);
+      expect(PressDotsPainter.litIndexAt(0.9), 2);
+      expect(PressDotsPainter.litIndexAt(1.0), 0);
     });
   });
 
