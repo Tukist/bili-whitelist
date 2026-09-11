@@ -38,17 +38,24 @@ const Key _kVideoArea = ValueKey('player-video-area');
 const Key _kInfoBar = ValueKey('player-info-bar');
 const Key _kComments = ValueKey('player-comments');
 
-WhitelistVideo _video({String cover = '', String desc = '一段用于占位的简介文本。'}) =>
+WhitelistVideo _video({
+  String cover = '',
+  String desc = '一段用于占位的简介文本。',
+  String title = '块化测试视频',
+}) =>
     WhitelistVideo(
       bvid: _kBvid,
       cid: 1001,
-      title: '块化测试视频',
+      title: title,
       cover: cover,
       duration: 200,
       upName: '测试UP主',
       addedAt: '2026-01-01',
       desc: desc,
     );
+
+/// 超长标题：测试字体下（每字符宽 = fontSize）远超信息行的 2 行上限。
+final String _kLongTitle = '很长的播放页标题' * 30;
 
 // ---------------------------------------------------------------------------
 // mock HTTP：flutter_test 默认把所有请求 mock 成 400，这里换成合法 JSON，
@@ -433,5 +440,47 @@ void main() {
     expect(find.byType(CoverHero), findsNothing);
     expect(find.byType(Hero), findsNothing);
     expect(find.byType(Image), findsNothing);
+  });
+
+  testWidgets('信息行标题：短标题无「展开」；长标题超 2 行 → 「展开」可原地展开',
+      (tester) async {
+    tester.view.devicePixelRatio = 1.0;
+    tester.view.physicalSize = const Size(400, 800);
+    addTearDown(tester.view.reset);
+
+    // 短标题（默认 fixture）：信息行里没有展开入口，标题照旧在
+    await _pumpPlayer(tester, _video());
+    await tester.pump(const Duration(milliseconds: 600));
+    expect(
+      find.descendant(of: find.byKey(_kInfoBar), matching: find.text('展开')),
+      findsNothing,
+    );
+    expect(
+      find.descendant(
+          of: find.byKey(_kInfoBar), matching: find.text('块化测试视频')),
+      findsOneWidget,
+    );
+
+    // 超长标题 → 2 行截断 + 「展开」；点开 → 全文 + 「收起」
+    await _pumpPlayer(tester, _video(title: _kLongTitle));
+    await tester.pump(const Duration(milliseconds: 600));
+    final longInBar =
+        find.descendant(of: find.byKey(_kInfoBar), matching: find.text(_kLongTitle));
+    expect(longInBar, findsOneWidget);
+    expect(tester.widget<Text>(longInBar).maxLines, 2);
+    expect(find.text('展开'), findsOneWidget);
+
+    await tester.tap(find.text('展开'));
+    await tester.pump(const Duration(milliseconds: 600));
+    expect(tester.widget<Text>(longInBar).maxLines, isNull, reason: '展开后全文');
+    expect(find.text('收起'), findsOneWidget);
+
+    // 收起复原（信息块几何契约不受影响）
+    await tester.tap(find.text('收起'));
+    await tester.pump(const Duration(milliseconds: 600));
+    expect(tester.widget<Text>(longInBar).maxLines, 2);
+    final videoRect = tester.getRect(find.byKey(_kVideoArea));
+    expect(tester.getRect(find.byKey(_kInfoBar)).top,
+        closeTo(videoRect.bottom, 0.5));
   });
 }

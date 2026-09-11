@@ -1978,6 +1978,9 @@ class BiliApi {
   /// vlist 字段：`bvid` / `title` / `pic` / `length`(秒) / `author` / `mid` /
   /// `created`(Unix 秒) / `play` / `favorites`。其中 `length` 是「mm:ss」
   /// 字符串而非秒数，需解析。
+  ///
+  /// `created` 就是**发布时间**（Unix 秒）→ 同时写进 `pubdate`，UP 主页视频
+  /// 列表的副信息行才能显示发布日期（该接口是这里唯一的元数据来源）。
   WhitelistVideo _videoFromVlist(Map<String, dynamic> j, int mid) {
     final length = j['length'] as String? ?? '';
     final secs = _parseLength(length);
@@ -1997,6 +2000,7 @@ class BiliApi {
       addedAt: addedAt,
       collection: '',
       order: 0,
+      pubdate: created > 0 ? created : null,
     );
   }
 

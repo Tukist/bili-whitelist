@@ -4,6 +4,7 @@
 // - 纯文本形态（完整态 SelectableText）/ 富文本形态（链接混排 Text.rich）
 //   两套渲染路径各自验证折叠展开
 // - maxExpandedHeight 封顶（超长正文展开不爆布局）
+// - animated（v2.23.x+ 视频卡标题用）：开动效 → 套 AnimatedSize；关 → 不套
 //
 // 测试环境字体为等宽测试字体（每字符宽 = fontSize），宽度与字号给定即可
 // 确定每行字符数，折叠判定稳定可复现。
@@ -11,6 +12,7 @@ import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 
+import 'package:bili_whitelist_app/theme/motion_control.dart';
 import 'package:bili_whitelist_app/widgets/expandable_text.dart';
 
 /// 固定宽度宿主：宽 240，字号 12 → 每行 20 字（测试字体等宽）。
@@ -152,6 +154,57 @@ void main() {
       await tester.tap(find.text('收起'));
       await tester.pumpAndSettle();
       expect(find.text('展开'), findsOneWidget);
+    });
+  });
+
+  group('animated（展开/收起轻动效开关）', () {
+    testWidgets('默认 false：不套 AnimatedSize（既有调用方形态不变）',
+        (tester) async {
+      await tester.pumpWidget(_host(
+        ExpandableText(text: _longText(20, 6), style: _style, foldLines: 2),
+      ));
+      expect(find.text('展开'), findsOneWidget);
+      expect(find.byType(AnimatedSize), findsNothing);
+    });
+
+    testWidgets('animated=true + 开动效：套 AnimatedSize，展开仍可达全文',
+        (tester) async {
+      MotionControl.enabled = true;
+      addTearDown(MotionControl.reset);
+      await tester.pumpWidget(_host(
+        ExpandableText(
+          text: _longText(20, 6),
+          style: _style,
+          foldLines: 2,
+          selectable: false,
+          animated: true,
+        ),
+      ));
+      expect(find.byType(AnimatedSize), findsOneWidget);
+
+      await tester.tap(find.text('展开'));
+      await tester.pumpAndSettle();
+      expect(find.text('收起'), findsOneWidget);
+      expect(tester.widget<Text>(find.text(_longText(20, 6))).maxLines, isNull);
+    });
+
+    testWidgets('animated=true + 关动效：不套 AnimatedSize（瞬时到位、零 controller）',
+        (tester) async {
+      MotionControl.reset(); // flutter test 默认关
+      await tester.pumpWidget(_host(
+        ExpandableText(
+          text: _longText(20, 6),
+          style: _style,
+          foldLines: 2,
+          selectable: false,
+          animated: true,
+        ),
+      ));
+      expect(find.byType(AnimatedSize), findsNothing);
+      // 瞬时到位：一帧就展开（无需 pumpAndSettle 等动画）
+      await tester.tap(find.text('展开'));
+      await tester.pump();
+      expect(find.text('收起'), findsOneWidget);
     });
   });
 }

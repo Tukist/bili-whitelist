@@ -7,7 +7,7 @@ import '../models/whitelist_video.dart';
 /// 单条播放历史（看过的视频）。
 ///
 /// 与 [PlaybackProgress] 不同：进度记忆只存位置毫秒，历史记录还保存视频
-/// 元信息（标题/封面/UP 主/时长/分 P），用于历史页列表展示与点击续播。
+/// 元信息（标题/封面/UP 主/时长/分 P/发布时间），用于历史页列表展示与点击续播。
 class HistoryEntry {
   final String bvid;
   final int pageIndex; // 播放到第几个分 P（0 = 单 P / 第一集）
@@ -20,6 +20,10 @@ class HistoryEntry {
   final DateTime watchedAt; // 最近一次观看时间（本地时间）
   final List<PageInfo>? pages; // 分 P 列表（若有；续播保留选集 UI）
 
+  /// 视频发布时间（Unix 秒；来自 [WhitelistVideo.pubdate]）。
+  /// 旧记录 / 未知（导入数据本身没有发布时间）→ null（列表不显示该段）。
+  final int? pubdate;
+
   const HistoryEntry({
     required this.bvid,
     required this.pageIndex,
@@ -31,6 +35,7 @@ class HistoryEntry {
     required this.positionMs,
     required this.watchedAt,
     this.pages,
+    this.pubdate,
   });
 
   /// 去重主键：同一 (bvid, pageIndex) 视为同一条观看记录（覆盖更新）。
@@ -52,6 +57,10 @@ class HistoryEntry {
           ?.whereType<Map<String, dynamic>>()
           .map(PageInfo.fromJson)
           .toList(),
+      // 旧记录无 pubdate / 脏类型 → null（不显示发布日期，不崩）
+      pubdate: json['pubdate'] is num
+          ? (json['pubdate'] as num).toInt()
+          : null,
     );
   }
 
@@ -67,6 +76,8 @@ class HistoryEntry {
         'watchedAt': watchedAt.toIso8601String(),
         if (pages != null)
           'pages': pages!.map((p) => p.toJson()).toList(),
+        // 未知发布时间不写多余字段（旧记录形态逐字不变）
+        if (pubdate != null) 'pubdate': pubdate,
       };
 }
 

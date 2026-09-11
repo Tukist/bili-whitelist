@@ -11,6 +11,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:bili_whitelist_app/models/whitelist_video.dart';
 import 'package:bili_whitelist_app/theme/app_tokens.dart';
+import 'package:bili_whitelist_app/theme/motion_control.dart';
 import 'package:bili_whitelist_app/widgets/cover_hero.dart';
 import 'package:bili_whitelist_app/widgets/cover_image.dart';
 import 'package:bili_whitelist_app/widgets/video_tile.dart';
@@ -23,16 +24,24 @@ String _dateText(int sec) {
   return '${dt.year}-$m-$d';
 }
 
-WhitelistVideo _video({int? pubdate, String bvid = 'BV1'}) => WhitelistVideo(
+WhitelistVideo _video({
+  int? pubdate,
+  String bvid = 'BV1',
+  String title = '测试视频标题',
+}) =>
+    WhitelistVideo(
       bvid: bvid,
       cid: 1,
-      title: '测试视频标题',
+      title: title,
       cover: '',
       duration: 90, // 1:30
       upName: 'UP主',
       addedAt: '2026-01-01T00:00:00Z',
       pubdate: pubdate,
     );
+
+/// 超长标题：测试字体下（每字符宽 = fontSize = 14）必然超过 2 行。
+final String _longTitle = '超长标题' * 30;
 
 Widget _wrap(Widget tile) => MaterialApp(
       home: Scaffold(
@@ -114,5 +123,78 @@ void main() {
     // 多选态结构照旧：勾选框在
     expect(find.byType(Checkbox), findsOneWidget);
     expect(find.byType(ListTile), findsOneWidget);
+  });
+
+  group('标题过长 → 展开/收起', () {
+    testWidgets('短标题：不出现「展开」入口（点标题照旧进播放页）', (tester) async {
+      var tapped = 0;
+      await tester.pumpWidget(_wrap(VideoTile(
+        video: _video(),
+        onTap: () => tapped++,
+      )));
+
+      expect(find.text('展开'), findsNothing);
+      expect(find.text('收起'), findsNothing);
+      // 标题仍是普通 Text（未超行 → ExpandableText 只渲染正文，不套任何手势）
+      expect(find.text('测试视频标题'), findsOneWidget);
+
+      await tester.tap(find.text('测试视频标题'));
+      await tester.pump();
+      expect(tapped, 1, reason: '短标题点按穿透给整卡 → 进播放页');
+    });
+
+    testWidgets('长标题：出现「展开」；点开展开全文 + 「收起」；再点收起复原',
+        (tester) async {
+      await tester.pumpWidget(_wrap(VideoTile(video: _video(title: _longTitle))));
+
+      // 折叠态：2 行截断 + 「展开」
+      expect(find.text('展开'), findsOneWidget);
+      final folded = tester.widget<Text>(find.text(_longTitle));
+      expect(folded.maxLines, 2);
+      expect(folded.overflow, TextOverflow.ellipsis);
+
+      // 展开 → 全文（无 maxLines）+「收起」
+      await tester.tap(find.text('展开'));
+      await tester.pumpAndSettle();
+      expect(find.text('收起'), findsOneWidget);
+      expect(tester.widget<Text>(find.text(_longTitle)).maxLines, isNull);
+
+      // 收起 → 复原
+      await tester.tap(find.text('收起'));
+      await tester.pumpAndSettle();
+      expect(find.text('展开'), findsOneWidget);
+      expect(tester.widget<Text>(find.text(_longTitle)).maxLines, 2);
+    });
+
+    testWidgets('展开态点标题正文 → 不抢整卡点击（仍进播放页）', (tester) async {
+      var tapped = 0;
+      await tester.pumpWidget(_wrap(VideoTile(
+        video: _video(title: _longTitle),
+        onTap: () => tapped++,
+      )));
+
+      await tester.tap(find.text('展开'));
+      await tester.pumpAndSettle();
+      expect(tester.widget<Text>(find.text(_longTitle)).maxLines, isNull);
+
+      // 点展开后的正文（不是「收起」按钮）→ 整卡 onTap 照旧触发
+      await tester.tap(find.text(_longTitle));
+      await tester.pump();
+      expect(tapped, 1, reason: '展开态标题正文不挂手势，点击穿透给 ListTile');
+    });
+
+    testWidgets('动效开关：MotionControl 关 → 不套 AnimatedSize；开 → 套上',
+        (tester) async {
+      // 默认（flutter test）= 关：展开瞬时到位，一个 controller 都不建
+      MotionControl.reset();
+      await tester.pumpWidget(_wrap(VideoTile(video: _video(title: _longTitle))));
+      expect(find.byType(AnimatedSize), findsNothing);
+
+      MotionControl.enabled = true;
+      await tester.pumpWidget(_wrap(VideoTile(video: _video(title: _longTitle))));
+      expect(find.byType(AnimatedSize), findsOneWidget,
+          reason: '开动效 → 展开/收起走 AnimatedSize 高度过渡');
+      addTearDown(MotionControl.reset);
+    });
   });
 }

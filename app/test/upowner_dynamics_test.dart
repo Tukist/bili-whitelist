@@ -441,7 +441,9 @@ void main() {
     await _switchToDynamics(tester);
 
     expect(find.text('动态里的视频标题'), findsOneWidget);
-    expect(find.text('视频投稿'), findsOneWidget);
+    // 标签带上动态发布时间（相对）：投递自身的发布日期接口不返回，用 pub_ts
+    // 兜底（fixture 里 pub_ts = 3 小时前）
+    expect(find.text('视频投稿 · 3 小时前'), findsOneWidget);
 
     final card = tester.widget<DynamicCard>(find.byType(DynamicCard));
     expect(card.onVideoTap, isNotNull, reason: '视频投稿点击已接线');

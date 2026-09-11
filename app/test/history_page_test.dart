@@ -21,6 +21,7 @@ HistoryEntry _entry(
   int positionMs = 30000,
   int durationMs = 120000,
   int cid = 100,
+  int? pubdate,
 }) => HistoryEntry(
   bvid: bvid,
   pageIndex: pageIndex,
@@ -31,7 +32,16 @@ HistoryEntry _entry(
   durationMs: durationMs,
   positionMs: positionMs,
   watchedAt: watchedAt,
+  pubdate: pubdate,
 );
+
+/// 与模型 formatPubdate 同语义的本地日期推导（跨时区机器测试稳定）。
+String _dateText(int sec) {
+  final dt = DateTime.fromMillisecondsSinceEpoch(sec * 1000);
+  final m = dt.month.toString().padLeft(2, '0');
+  final d = dt.day.toString().padLeft(2, '0');
+  return '${dt.year}-$m-$d';
+}
 
 Future<void> _pump(WidgetTester tester) async {
   await tester.pumpWidget(
@@ -97,6 +107,31 @@ void main() {
         .widgetList<ListTile>(find.byType(ListTile))
         .toList();
     expect(tiles, hasLength(2));
+  });
+
+  testWidgets('发布日期的显示与缺省：有 pubdate → 「发布 yyyy-MM-dd」；无 → 该段不出现',
+      (tester) async {
+    SharedPreferences.setMockInitialValues({});
+    final store = HistoryStore.instance;
+    const pubdate = 1715212800; // 2024-05-09T00:00:00Z
+    await store.addOrUpdate(
+      _entry('BV1a', 0, DateTime.now().subtract(const Duration(minutes: 30)),
+          title: '带日期', pubdate: pubdate),
+    );
+    await store.addOrUpdate(
+      _entry('BV2b', 0, DateTime.now().subtract(const Duration(hours: 3)),
+          title: '旧记录'),
+    );
+    await _pump(tester);
+
+    // 有发布日期：UP主 · 发布 yyyy-MM-dd · 观看时间
+    expect(
+      find.text('UP主 · 发布 ${_dateText(pubdate)} · 30 分钟前'),
+      findsOneWidget,
+    );
+    // 旧记录（pubdate 为 null）→ 与旧版逐字一致，不带「发布」段
+    expect(find.text('UP主 · 3 小时前'), findsOneWidget);
+    expect(find.textContaining('发布 1970-01-01'), findsNothing);
   });
 
   testWidgets('点击条目跳播放页（构造视频 + initialPageIndex）', (tester) async {

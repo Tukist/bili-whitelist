@@ -16,6 +16,7 @@ HistoryEntry _entry(
   int durationMs = 120000,
   int cid = 100,
   List<PageInfo>? pages,
+  int? pubdate,
 }) => HistoryEntry(
   bvid: bvid,
   pageIndex: pageIndex,
@@ -27,6 +28,7 @@ HistoryEntry _entry(
   positionMs: positionMs,
   watchedAt: watchedAt,
   pages: pages,
+  pubdate: pubdate,
 );
 
 void main() {
@@ -150,6 +152,28 @@ void main() {
     expect(raw, isNotNull);
     expect(raw, contains('watchedAt'));
     expect(raw, contains('pages'));
+  });
+
+  test('pubdate 持久化：写入 → 读回一致；未写（null）时不落键、读回 null', () async {
+    SharedPreferences.setMockInitialValues({});
+    final store = HistoryStore.instance;
+    await store.addOrUpdate(
+      _entry('BV1a', 0, DateTime(2026, 9, 1), pubdate: 1715212800),
+    );
+    await store.addOrUpdate(_entry('BV2b', 0, DateTime(2026, 9, 2)));
+
+    final list = await store.getAll();
+    expect(
+      list.singleWhere((e) => e.bvid == 'BV1a').pubdate,
+      1715212800,
+    );
+    expect(list.singleWhere((e) => e.bvid == 'BV2b').pubdate, isNull);
+
+    // 未知发布时间不落键（旧记录形态逐字不变）
+    final prefs = await SharedPreferences.getInstance();
+    final raw = prefs.getString('history_store:entries')!;
+    expect(raw, contains('"pubdate":1715212800'));
+    expect(raw, isNot(contains('"pubdate":null')));
   });
 
   test('数据损坏视为空历史（不崩溃）', () async {

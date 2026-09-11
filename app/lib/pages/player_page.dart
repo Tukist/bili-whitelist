@@ -2053,6 +2053,8 @@ class _PlayerPageState extends State<PlayerPage>
           positionMs: positionMs,
           watchedAt: DateTime.now(),
           pages: _video.pages,
+          // 发布时间随历史一起存：历史卡副信息行显示「发布 yyyy-MM-dd」
+          pubdate: _video.pubdate,
         ),
       );
     } catch (_) {
@@ -5028,6 +5030,9 @@ class _PlayerPageState extends State<PlayerPage>
   /// 两路都空（番剧/拉取失败）→ **不显示、不占位**。长简介超 3 行折叠 +
   /// 「展开」看全文、「收起」复原；展开态封顶高度内可滚动（防超长简介把
   /// 固定信息行撑爆布局，见 [_descMaxExpandedHeight]）。
+  ///
+  /// 标题同列表视频卡：超过折叠行数（竖屏 2 / 横屏 1）时多出「展开/收起」
+  /// 入口（[ExpandableText]），否则不增任何子树。
   Widget _buildVideoInfoBar(BuildContext context) {
     // 中性墨分层（P5）：标题主墨（kInkBlack）→ UP 主/集数/简介次级
     // （kInkGray70）→ 时长三级（kInkGray50，等宽数字）。标题/正文/元信息
@@ -5059,11 +5064,15 @@ class _PlayerPageState extends State<PlayerPage>
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(
-          titleText,
-          maxLines: landscape ? 1 : 2,
-          overflow: TextOverflow.ellipsis,
+        // 标题：竖屏 2 行 / 横屏 1 行截断；**超行才有**「展开/收起」入口
+        // （长标题在播放页同样是重灾区）。未超行时不增一棵子树，与旧版一致。
+        ExpandableText(
+          text: titleText,
+          foldLines: landscape ? 1 : 2,
           style: kTypeTitleM.copyWith(color: kInkBlack),
+          // 标题不需要选择/复制，完整态用 Text（不引入选择手势与滚动手势打架）
+          selectable: false,
+          animated: true,
         ),
         const SizedBox(height: 4),
         Row(

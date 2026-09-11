@@ -3,6 +3,9 @@
 ///
 /// 从 playlist_page 原私有 `_VideoTile` 抽出，首页合集视频列表页
 /// （collection_page）复用同一实现，避免两份样式漂移。
+///
+/// 标题：2 行截断，**超行才**在标题下多出一个克制的「展开/收起」入口
+/// （[ExpandableText]，未超行时一棵树都不多、点标题照旧进播放页）。
 library;
 
 import 'package:flutter/material.dart';
@@ -11,6 +14,7 @@ import '../models/whitelist_video.dart';
 import '../theme/app_tokens.dart';
 import 'cover_hero.dart';
 import 'cover_image.dart';
+import 'expandable_text.dart';
 
 /// 时长格式化：秒 → `12:34` / `1:02:03`（与 M1 脚本 fmt_duration 一致）。
 String fmtDuration(int seconds) {
@@ -144,11 +148,15 @@ class VideoTile extends StatelessWidget {
                 ],
               )
             : cover,
-        title: Text(
-          video.title,
-          maxLines: 2,
-          overflow: TextOverflow.ellipsis,
+        title: ExpandableText(
+          text: video.title,
+          // 标题语汇不变（14/w500）；2 行截断，超行才有「展开」入口。
+          // selectable=false：完整态也用 Text，不引入选择手势抢卡片点按；
+          // animated：展开/收起走轻动效（关动效时瞬时到位）。
           style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+          foldLines: 2,
+          selectable: false,
+          animated: true,
         ),
         subtitle: Text(
           // 副信息行：时长 · UP主（· 发布时间；日期为空时与旧版逐字符一致）

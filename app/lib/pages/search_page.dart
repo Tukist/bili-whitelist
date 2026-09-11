@@ -66,6 +66,7 @@ import '../widgets/add_success_button.dart';
 import '../widgets/animated_copy_line.dart';
 import '../widgets/app_state_view.dart';
 import '../widgets/cover_image.dart';
+import '../widgets/expandable_text.dart';
 import '../widgets/pgc_import_dialog.dart';
 import '../widgets/smoke_silhouette.dart';
 import '../widgets/staggered_entrance.dart';
@@ -126,15 +127,6 @@ String _fmtPlay(int count) {
 /// 去掉 `12.0` 尾部的 `.0`。
 String _trimDot(double v) =>
     v == v.roundToDouble() ? v.toInt().toString() : v.toStringAsFixed(1);
-
-/// 发布日期格式化：Unix 秒 → `2021-01-30`。
-String _fmtPubDate(int unixSec) {
-  if (unixSec <= 0) return '';
-  final dt = DateTime.fromMillisecondsSinceEpoch(unixSec * 1000);
-  final m = dt.month.toString().padLeft(2, '0');
-  final d = dt.day.toString().padLeft(2, '0');
-  return '${dt.year}-$m-$d';
-}
 
 class SearchPage extends StatefulWidget {
   final int initialTab;
@@ -1186,11 +1178,14 @@ class _SearchPageState extends State<SearchPage>
         borderRadius: BorderRadius.circular(4),
         child: CoverImage(cover: r.cover, width: 96, height: 60),
       ),
-      title: Text(
-        r.title,
-        maxLines: 2,
-        overflow: TextOverflow.ellipsis,
+      title: ExpandableText(
+        text: r.title,
+        // 标题 2 行截断；超行才有「展开/收起」（未超行时不增子树，点标题
+        // 照旧传给 ListTile → 不会抢走整卡点击）
         style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+        foldLines: 2,
+        selectable: false,
+        animated: true,
       ),
       subtitle: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -1204,7 +1199,12 @@ class _SearchPageState extends State<SearchPage>
             ),
           ),
           Text(
-            '${_fmtPlay(r.playCount)} 播放 · ${_fmtPubDate(r.pubDate)}',
+            // 播放量 · 发布日期（pubDate ≤ 0 = 接口没给 → 只留播放量，不留悬空分隔符）
+            [
+              '${_fmtPlay(r.playCount)} 播放',
+              if (formatPubdate(r.pubDate).isNotEmpty)
+                formatPubdate(r.pubDate),
+            ].join(' · '),
             maxLines: 1,
             style: theme.textTheme.bodySmall?.copyWith(
               color: theme.colorScheme.outline,
@@ -1295,7 +1295,10 @@ class _SearchPageState extends State<SearchPage>
     final imported = _isSeasonImported(m);
     final importing = _importingSeasonIds.contains(m.seasonId);
     final typeLabel = m.typeLabel.isNotEmpty ? m.typeLabel : _scope.label;
-    // 副标题行：角标（独家/大会员）+ 集数/上映信息 + 风格标签
+    // 副标题行：角标（独家/大会员）+ 集数/上映信息 + 风格标签。
+    // 番剧/影视**是「季」不是单条视频**：media 搜索接口不返回发布时间字段，
+    // 唯一的时间信息在 `index_show`（电影为「2010-12-16上映」，番剧为「全14话」
+    // ——接口没给日期就没有），已经在本行展示，故不为它逐条再发一次详情请求。
     final metaParts = <String>[
       if (m.badge.isNotEmpty) m.badge,
       if (m.indexShow.isNotEmpty) m.indexShow,
@@ -1325,11 +1328,14 @@ class _SearchPageState extends State<SearchPage>
             ),
           ),
           Expanded(
-            child: Text(
-              m.title,
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+            child: ExpandableText(
+              text: m.title,
+              // 季名同样 2 行截断；超行才有「展开/收起」（未超行不增子树）
+              style:
+                  const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+              foldLines: 2,
+              selectable: false,
+              animated: true,
             ),
           ),
         ],
@@ -1383,14 +1389,23 @@ class _SearchPageState extends State<SearchPage>
             borderRadius: BorderRadius.circular(4),
             child: CoverImage(cover: v.cover),
           ),
-          title: Text(
-            v.title,
-            maxLines: 2,
-            overflow: TextOverflow.ellipsis,
+          title: ExpandableText(
+            text: v.title,
+            // 与 VideoTile 同一套：2 行截断 + 超行才有「展开/收起」
             style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+            foldLines: 2,
+            selectable: false,
+            animated: true,
           ),
           subtitle: Text(
-            '${_fmtDuration(v.duration)} · ${v.upName}',
+            // 副信息行：时长 · UP主（· 发布时间；pubdate 为空时不出现该段，
+            // 与 VideoTile 的副信息行同格式、同数据源）
+            [
+              _fmtDuration(v.duration),
+              v.upName,
+              if (formatPubdate(v.pubdate).isNotEmpty)
+                formatPubdate(v.pubdate),
+            ].join(' · '),
             style: theme.textTheme.bodySmall?.copyWith(
               color: theme.colorScheme.onSurfaceVariant,
             ),

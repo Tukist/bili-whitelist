@@ -219,6 +219,14 @@ Map<String, dynamic> _emptyCollectionsBody() => {
   },
 };
 
+/// 与模型 formatPubdate 同语义的本地日期推导（跨时区机器测试稳定）。
+String _dateText(int sec) {
+  final dt = DateTime.fromMillisecondsSinceEpoch(sec * 1000);
+  final m = dt.month.toString().padLeft(2, '0');
+  final d = dt.day.toString().padLeft(2, '0');
+  return '${dt.year}-$m-$d';
+}
+
 BiliApi _fakeApi(Map<String, Map<String, dynamic> Function()> handlers) {
   final dio = Dio(BaseOptions(baseUrl: kBiliApi, headers: biliHeaders()));
   dio.httpClientAdapter = _RoutingAdapter(handlers);
@@ -278,6 +286,8 @@ void main() {
     expect(find.text('直播回放 · 列表'), findsNothing);
     // 主列表照常显示（不受合集区影响）
     expect(find.text('主列表视频'), findsOneWidget);
+    // 副信息行：时长 · 发布日期（arc/search 的 created 就是发布时间）
+    expect(find.text('4:45 · ${_dateText(1700000000)}'), findsOneWidget);
   });
 
   testWidgets('没有合集/列表：「合集」分组名不显示，但 chips 行保留'
@@ -319,6 +329,9 @@ void main() {
     expect(find.text('合集视频一号'), findsOneWidget);
     expect(find.text('合集视频二号'), findsOneWidget);
     expect(find.text('主列表视频'), findsNothing);
+    // 副信息行：时长 · 发布日期（archives[].pubdate）。
+    // 用 findsWidgets：视口只装得下第一条（ListView 惰性构建，第二条可能被回收）
+    expect(find.text('8:23 · ${_dateText(1728792000)}'), findsWidgets);
     expect(find.byType(TextField), findsNothing);
     expect(find.text('最新发布'), findsNothing);
     expect(find.text('最新发布'), findsNothing);
@@ -348,6 +361,8 @@ void main() {
     expect(find.text('系列视频一号'), findsOneWidget);
     // 期间不会误发 season 接口（走的是 series 接口）
     expect(find.text('合集视频一号'), findsNothing);
+    // 副信息行：时长 · 发布日期
+    expect(find.text('11:40 · ${_dateText(1728792000)}'), findsOneWidget);
   });
 
   testWidgets('合集视频长按 → 弹「加入白名单视频 / 取消」菜单，可取消关闭',
@@ -422,5 +437,50 @@ void main() {
       tester.widget<DotIllustration>(find.byType(DotIllustration)).seed,
       'upowner.list',
     );
+  });
+
+  testWidgets('视频行标题过长 → 出现「展开」入口（短标题不出现）', (tester) async {
+    final api = _fakeApi({
+      ..._baseHandlers(),
+      '/x/polymer/web-space/seasons_series_list': _emptyCollectionsBody,
+      '/x/space/wbi/arc/search': () => {
+            'code': 0,
+            'message': 'OK',
+            'data': {
+              'list': {
+                'count': 2,
+                'vlist': [
+                  {
+                    'bvid': 'BV1main',
+                    'title': '主列表视频',
+                    'length': '4:45',
+                    'author': '测试UP主',
+                    'pic': '',
+                    'created': 1700000000,
+                  },
+                  {
+                    'bvid': 'BV2main',
+                    'title': '超长标题' * 30,
+                    'length': '1:00',
+                    'author': '测试UP主',
+                    'pic': '',
+                    'created': 1700000000,
+                  },
+                ],
+              },
+            },
+          },
+    });
+    await _pumpPage(tester, api);
+
+    // 只有超长标题那条出现展开入口（短标题一条没有）
+    expect(find.text('展开'), findsOneWidget);
+    final longTitle = find.text('超长标题' * 30);
+    expect(tester.widget<Text>(longTitle).maxLines, 2);
+
+    await tester.tap(find.text('展开'));
+    await tester.pumpAndSettle();
+    expect(find.text('收起'), findsOneWidget);
+    expect(tester.widget<Text>(longTitle).maxLines, isNull);
   });
 }

@@ -68,6 +68,7 @@ import '../widgets/app_block.dart';
 import '../widgets/app_state_view.dart';
 import '../widgets/cover_image.dart';
 import '../widgets/dynamic_card.dart';
+import '../widgets/expandable_text.dart';
 import '../widgets/smoke_silhouette.dart';
 import '../widgets/staggered_entrance.dart';
 import 'article_page.dart';
@@ -1633,22 +1634,30 @@ class _UpownerPageState extends State<UpownerPage> {
     );
   }
 
-  /// 单个视频行（封面 + 标题 + 时长）：点击播放、长按加入白名单。
+  /// 单个视频行（封面 + 标题 + 时长 · 发布时间）：点击播放、长按加入白名单。
   /// 「全部视频」与「合集/列表」两个视图共用同一行样式与交互。
+  ///
+  /// 副信息行 = `时长 · yyyy-MM-dd`（与 [VideoTile] 同格式）；发布时间来自
+  /// `x/space/wbi/arc/search` 的 `created` / archives 的 `pubdate`，接口没给
+  /// （脏数据）时该段不出现。标题同列表视频卡：2 行截断、超行才有「展开」。
   Widget _buildVideoTile(WhitelistVideo v) {
+    final pubdateText = formatPubdate(v.pubdate);
     return ListTile(
       leading: ClipRRect(
         borderRadius: BorderRadius.circular(4),
         child: CoverImage(cover: v.cover, width: 72, height: 45),
       ),
-      title: Text(
-        v.title,
-        maxLines: 2,
-        overflow: TextOverflow.ellipsis,
+      title: ExpandableText(
+        text: v.title,
         style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+        foldLines: 2,
+        selectable: false,
+        animated: true,
       ),
       subtitle: Text(
-        _fmtDuration(v.duration),
+        pubdateText.isEmpty
+            ? _fmtDuration(v.duration)
+            : '${_fmtDuration(v.duration)} · $pubdateText',
         style: Theme.of(context).textTheme.bodySmall?.copyWith(
           color: Theme.of(context).colorScheme.onSurfaceVariant,
         ),

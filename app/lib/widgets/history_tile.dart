@@ -1,17 +1,23 @@
 import 'package:flutter/material.dart';
 
+import '../models/whitelist_video.dart' show formatPubdate;
 import '../services/history_store.dart';
 import '../theme/app_tokens.dart';
 import 'cover_image.dart';
+import 'expandable_text.dart';
 
 /// 历史记录条目（v2.17.10+ 自 HistoryPage 抽取为公共组件）：
-/// 封面 + 标题 + UP 主 + 上次看到位置/总时长 + 观看时间（相对描述）。
+/// 封面 + 标题 + UP 主 + 上次看到位置/总时长 + 发布日期 + 观看时间（相对描述）。
 ///
 /// 历史记录页 [HistoryPage]（PageView 内嵌页）与该日历史页
 /// [DailyHistoryPage]（点击热力格进入的独立页）**共用**：
 /// - [onOpen]：点击续播（宿主构造 WhitelistVideo → push 播放页）
 /// - [onRemove]：可选。提供 → 右侧删除按钮 + 长按删除（历史页用）；
 ///   不提供 → 纯查看条目（该日历史页用）
+///
+/// 发布日期与列表视频卡同格式（[formatPubdate] → `2024-05-09`），接在 UP 主
+/// 之后、观看时间之前；条目没存到 pubdate（旧记录）时该段不出现。
+/// 标题同列表视频卡：2 行截断，超行才有「展开/收起」入口。
 class HistoryTile extends StatelessWidget {
   final HistoryEntry entry;
   final VoidCallback onOpen;
@@ -67,11 +73,13 @@ class HistoryTile extends StatelessWidget {
           borderRadius: BorderRadius.circular(kRadiusSm),
           child: CoverImage(cover: entry.cover, width: 112, height: 63),
         ),
-        title: Text(
-          entry.title,
-          maxLines: 2,
-          overflow: TextOverflow.ellipsis,
+        title: ExpandableText(
+          text: entry.title,
+          // 与 VideoTile 同一套：2 行截断 + 超行才有「展开」（轻动效）
           style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+          foldLines: 2,
+          selectable: false,
+          animated: true,
         ),
         subtitle: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
@@ -83,8 +91,17 @@ class HistoryTile extends StatelessWidget {
               ),
             ),
             Text(
-              '${entry.upName.isEmpty ? '未知 UP 主' : entry.upName}'
-              ' · ${relativeTime(entry.watchedAt)}',
+              // 副信息：UP主（· 发布 yyyy-MM-dd）· 观看时间。
+              // 这一行有两个日期 → 发布日期加「发布」前缀区分（列表视频卡的
+              // 副信息行只有一个日期，所以裸日期即可，见 VideoTile）。
+              [
+                entry.upName.isEmpty ? '未知 UP 主' : entry.upName,
+                if (formatPubdate(entry.pubdate).isNotEmpty)
+                  '发布 ${formatPubdate(entry.pubdate)}',
+                relativeTime(entry.watchedAt),
+              ].join(' · '),
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
               style: theme.textTheme.bodySmall?.copyWith(
                 color: theme.colorScheme.outline,
               ),

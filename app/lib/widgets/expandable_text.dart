@@ -1,4 +1,5 @@
-/// 长文本「折叠 + 原地展开/收起」（v2.17.3+，播放页简介与评论正文共用）。
+/// 长文本「折叠 + 原地展开/收起」（v2.17.3+，播放页简介与评论正文共用；
+/// v2.23.x+ 视频卡/播放页标题也复用同一份折叠逻辑）。
 ///
 /// 折叠判定按**行数**而非字符数：LayoutBuilder 拿到可用宽度 → TextPainter
 /// 按 [foldLines] 布局 → `didExceedMaxLines` 超行即折叠。换行/宽字符/字号
@@ -21,10 +22,16 @@
 ///   [maxExpandedHeight] 内部滚动，SelectableText 的选择手势会与滚动打架）。
 /// - [maxExpandedHeight] 非空 → 展开态正文封顶该高度、超高内部滚动（防超长
 ///   简介把播放页固定信息行撑爆布局）；「收起」按钮始终在滚动区外可见。
+/// - [animated] = true → 展开/收起时正文本体走 [AnimatedSize] 高度过渡
+///   （[kDurBase] + [kCurveOut]），视频卡标题这类「只多出一行」的场景用它。
+///   默认 false → 既有调用方（评论正文 / 动态正文 / 播放页简介）行为不变。
 library;
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+
+import '../theme/app_tokens.dart';
+import '../theme/motion_control.dart';
 
 class ExpandableText extends StatefulWidget {
   /// 完整正文。纯文本形态即直接显示此文本；富文本形态它仍是原文
@@ -49,6 +56,13 @@ class ExpandableText extends StatefulWidget {
   /// 展开态正文封顶高度（超高内部滚动）；null = 不封顶（随内容增高）。
   final double? maxExpandedHeight;
 
+  /// 展开/收起是否走轻动效（[kDurBase] + [kCurveOut] 的高度过渡）。
+  ///
+  /// 只在「超行可折叠」的分支上生效；未超行时没有展开动作、也就没有动画。
+  /// 关动效（[MotionControl]）时**根本不套** [AnimatedSize]——展开即瞬时到位，
+  /// 一个 controller 都不建（与播放页信息块收起的做法一致）。
+  final bool animated;
+
   const ExpandableText({
     super.key,
     required this.text,
@@ -58,6 +72,7 @@ class ExpandableText extends StatefulWidget {
     this.copyTip,
     this.selectable = true,
     this.maxExpandedHeight,
+    this.animated = false,
   }) : assert(foldLines > 0);
 
   @override
@@ -93,15 +108,30 @@ class _ExpandableTextState extends State<ExpandableText> {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            _buildBody(
+            _maybeAnimated(
               context,
-              full: _expanded,
-              scrollCapped: widget.maxExpandedHeight != null && _expanded,
+              _buildBody(
+                context,
+                full: _expanded,
+                scrollCapped: widget.maxExpandedHeight != null && _expanded,
+              ),
             ),
             _buildToggle(context),
           ],
         );
       },
+    );
+  }
+
+  /// 展开/收起的高度过渡（[ExpandableText.animated] 且动效开启时才套）。
+  /// 关动效直接返回本体：瞬时到位，不建 controller。
+  Widget _maybeAnimated(BuildContext context, Widget body) {
+    if (!widget.animated || !MotionControl.of(context)) return body;
+    return AnimatedSize(
+      duration: kDurBase,
+      curve: kCurveOut,
+      alignment: Alignment.topCenter,
+      child: body,
     );
   }
 

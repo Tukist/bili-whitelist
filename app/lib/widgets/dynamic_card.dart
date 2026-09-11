@@ -6,7 +6,9 @@
 /// - **正文**：多行可折叠（复用 [ExpandableText]，与评论正文同一套折叠逻辑）
 /// - **图文**：1/2/3/4 图布局（4 图以上只画 4 张，第 4 张压「+N」）；点图由
 ///   宿主打开全屏查看页
-/// - **视频投稿**：封面 + 标题（点击由宿主取流后进播放页）
+/// - **视频投稿**：封面 + 标题（超 2 行可展开）+ 「视频投稿 · 相对时间」
+///   （投递自身的发布日期接口不返回，用动态的 pub_ts 兜底），点击由宿主
+///   取流后进播放页
 /// - **转发**：正文下方挂一块「原文」引用块（[AppBlockVariant.reply]：冷底 +
 ///   左竖条 + 缩进，与评论区楼中楼同一套「块」语言）
 ///
@@ -261,7 +263,8 @@ class _DynamicImages extends StatelessWidget {
   }
 }
 
-/// 视频投稿：封面 + 标题（1px 描边小卡；点击交给宿主进播放页）。
+/// 视频投稿：封面 + 标题 + 「视频投稿 · 相对时间」（1px 描边小卡；点击交给
+/// 宿主进播放页）。标题超过 2 行时多出「展开/收起」入口（[ExpandableText]）。
 class _DynamicVideo extends StatelessWidget {
   final DynamicItem item;
   final VoidCallback? onTap;
@@ -286,11 +289,14 @@ class _DynamicVideo extends StatelessWidget {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text(
-                item.videoTitle ?? '视频投稿',
-                maxLines: 2,
-                overflow: TextOverflow.ellipsis,
+              ExpandableText(
+                text: item.videoTitle ?? '视频投稿',
+                // 投稿标题 2 行截断；超行才有「展开/收起」（未超行不增子树，
+                // 点标题照旧传给整块 InkWell → 仍进播放页）
                 style: kTypeTitleS,
+                foldLines: 2,
+                selectable: false,
+                animated: true,
               ),
               const SizedBox(height: kSpace4),
               Row(
@@ -298,8 +304,13 @@ class _DynamicVideo extends StatelessWidget {
                   const Icon(Icons.play_circle_outline,
                       size: 14, color: kInkGray50),
                   const SizedBox(width: 4),
+                  // 「视频投稿」+ 该动态的发布时间（相对）。
+                  // 投递自身的 pubdate **接口不返回**（`major.archive` 只有
+                  // bvid/title/cover/desc/duration_text 等），能拿到的时间只有
+                  // 动态的 `pub_ts`（B 站投稿动态由发布动作生成，两者基本同时），
+                  // 所以这里用它；pub_ts ≤ 0（脏数据）→ 只显示标签。
                   Text(
-                    '视频投稿',
+                    _labelWithTime(),
                     style: kTypeBodyS.copyWith(color: kInkGray50),
                   ),
                 ],
@@ -333,6 +344,18 @@ class _DynamicVideo extends StatelessWidget {
               ),
             ),
     );
+  }
+
+  /// 底部标签文案：`视频投稿`（+ ` · 3 天前`；pub_ts ≤ 0 = 时间未知 → 省略）。
+  ///
+  /// 相对时间（不是绝对日期）是有意的：这条时间的语义是「动态/投稿的发生
+  /// 时间」，与本卡作者行的时间同一套语汇（[fmtRelativeTime]），投递自身的
+  /// 发布日期接口取不到（见 build 内注释）。
+  String _labelWithTime() {
+    if (item.pubTs <= 0) return '视频投稿';
+    final t =
+        fmtRelativeTime(DateTime.fromMillisecondsSinceEpoch(item.pubTs * 1000));
+    return '视频投稿 · $t';
   }
 }
 
