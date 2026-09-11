@@ -43,6 +43,13 @@ tmp_drive.py
 # ---------- 录屏抽帧中间产物（可由 docs/screenshots 下的 mp4 重新生成） ----------
 docs/screenshots/**/_frames_*/
 
+# ---------- 验证期中间产物（未打码的 prefs / 白名单快照，不入库） ----------
+# _work/ 里有 adb 拉下来的 FlutterSharedPreferences.xml（真实 mid / bvid / 观看历史）
+# 与注入用 XML、wl.json、server*.log；_backup/ 同样是整份真实 prefs + 白名单缓存快照。
+# 都是取证中间件而非交付物，且未做任何打码，一律排除。
+docs/screenshots/**/_work/
+docs/screenshots/**/_backup/
+
 # ---------- 调试期截图（Gist ID 未打码，不入库；README 用的是 v2.18.0/） ----------
 docs/screenshots/v2.18.0-r2/
 

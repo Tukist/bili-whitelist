@@ -6,12 +6,14 @@ import '../api/bilibili_api.dart';
 import '../api/github_api.dart';
 import '../api/translate_api.dart';
 import '../cache/download_manager.dart';
+import '../services/inbox_card_style_store.dart';
 import '../services/theme_store.dart';
 import '../services/ui_copy_store.dart';
 import '../theme/app_palette.dart';
 import '../theme/app_tokens.dart';
 import '../theme/ink_recipes.dart';
 import 'app_state_view.dart';
+import 'inbox_card_styles.dart';
 
 /// 管理面板内容组件（v2.17.10+ 抽取自首页 _ManageSheet；v2.19.0 起由
 /// 底部导航「个人」页内联承载）：
@@ -24,6 +26,7 @@ import 'app_state_view.dart';
 ///   动作，干净上下文）
 ///
 /// 内容分区：B 站账号（登录/重新登录）→ 配色主题（P1.5 双墨配方切换）→
+/// 信箱卡片样式（v2.21.0+ 多版式切换）→
 /// GitHub 配置（token/gist）→ 合集管理（重命名/删除）→ 离线缓存管理 →
 /// 翻译服务 → 界面文案（空态/加载/错误/页脚，可改可恢复，v2.19.0 补）→
 /// 版本更新（检查更新）。面板只含内容本身（无自己的滚动/
@@ -270,6 +273,36 @@ class _ManagePanelState extends State<ManagePanel> {
         const SizedBox(height: 16),
         const Divider(height: 1),
         const SizedBox(height: 16),
+        // ---- 信箱卡片样式（v2.21.0+：多版式，选中立即生效）----
+        Text('信箱卡片样式', style: theme.textTheme.titleMedium),
+        const SizedBox(height: 4),
+        Text(
+          '信箱页左右滑动的卡片版式：都是扑克牌比例（1:1.39），'
+          '只是排版不同。选中立即生效，仅存本机。',
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+        const SizedBox(height: 8),
+        // 按钮上的当前风格名要跟着 store 走 → 单独监听 InboxCardStyleStore
+        ListenableBuilder(
+          listenable: InboxCardStyleStore.instance,
+          builder: (context, _) => SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: () => _openCardStylePicker(context),
+              icon: const Icon(Icons.style_outlined, size: 18),
+              label: Text(
+                '卡片样式：${InboxCardStyleStore.instance.style.label}',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(height: 16),
+        const Divider(height: 1),
+        const SizedBox(height: 16),
         // ---- GitHub 配置 ----
         Text('GitHub 配置', style: theme.textTheme.titleMedium),
         const SizedBox(height: 4),
@@ -458,6 +491,17 @@ class _ManagePanelState extends State<ManagePanel> {
       isScrollControlled: true,
       useSafeArea: true,
       builder: (_) => const _InkRecipeSheet(),
+    );
+  }
+
+  /// 打开「信箱卡片样式」选择器（v2.21.0+）：列出全部版式（带缩略预览），
+  /// 选中立即生效并关闭弹层。
+  void _openCardStylePicker(BuildContext context) {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      builder: (_) => const _InboxCardStyleSheet(),
     );
   }
 
@@ -957,6 +1001,139 @@ class _InkSwatch extends StatelessWidget {
         color: color,
         borderRadius: BorderRadius.circular(kRadiusSm),
         border: Border.all(color: kRule.withValues(alpha: .6)),
+      ),
+    );
+  }
+}
+
+// ==================== 信箱卡片样式（v2.21.0+） ====================
+//
+// 与「配色主题」同一种组织方式：选项来自 `widgets/inbox_card_styles.dart`
+// 的 [kInboxCardStyles]（唯一真相源），点击调 [InboxCardStyleStore.select]
+// （立即换版式 + 持久化），信箱页的 ListenableBuilder 随之重建卡片栈。
+//
+// 每个选项带一张**缩略预览**：直接用同一个渲染器 [InboxCardPreview]
+// （内部 = [InboxCardStyleView] + FittedBox 等比缩小）→ 预览与真机一致，
+// 不另画一套简图（那样迟早与真机排版脱节）。
+
+/// 风格选项整块的 key（`inbox-card-style-option:<id>`）：测试里按 id 点选。
+Key _cardStyleOptionKey(String id) => Key('inbox-card-style-option:$id');
+
+/// 信箱卡片样式选择弹层：列出全部版式，当前选中打勾；点击即生效并关闭。
+class _InboxCardStyleSheet extends StatelessWidget {
+  const _InboxCardStyleSheet();
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return SafeArea(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Padding(
+            padding: const EdgeInsets.fromLTRB(20, 20, 20, 8),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('信箱卡片样式', style: theme.textTheme.titleLarge),
+                const SizedBox(height: 4),
+                Text(
+                  '都是扑克牌比例（宽 : 高 = 1 : 1.39），只有排版不同。'
+                  '缩略图就是卡片本身等比缩小的效果。',
+                  style: theme.textTheme.bodySmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          const Divider(height: 1),
+          // 选中项打勾要跟着当前选择走 → 单独监听 InboxCardStyleStore
+          Flexible(
+            child: ListenableBuilder(
+              listenable: InboxCardStyleStore.instance,
+              builder: (context, _) {
+                final currentId = InboxCardStyleStore.instance.styleId;
+                return ListView.builder(
+                  shrinkWrap: true,
+                  padding: const EdgeInsets.only(bottom: 12),
+                  itemCount: kInboxCardStyles.length,
+                  itemBuilder: (context, i) {
+                    final style = kInboxCardStyles[i];
+                    return _InboxCardStyleTile(
+                      style: style,
+                      selected: style.id == currentId,
+                      onTap: () {
+                        // 立即生效（信箱页换版式 + 持久化），再关掉弹层
+                        InboxCardStyleStore.instance.select(style.id);
+                        Navigator.of(context).pop();
+                      },
+                    );
+                  },
+                );
+              },
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 单个卡片风格选项：缩略预览 + 中文名 + 一句话说明 + 当前选中打勾。
+///
+/// 不用 [ListTile]：它会把 leading 的高度限死在 56dp，缩略卡（≈100dp 高）
+/// 会被压扁、看不出各版式的差别 → 自己排一行（行高 ≈100，触摸目标远超 48dp）。
+class _InboxCardStyleTile extends StatelessWidget {
+  const _InboxCardStyleTile({
+    required this.style,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final InboxCardStyle style;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return InkWell(
+      key: _cardStyleOptionKey(style.id),
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+        child: Row(
+          children: [
+            InboxCardPreview(style: style),
+            const SizedBox(width: kSpace16),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(style.label, style: theme.textTheme.titleSmall),
+                  const SizedBox(height: kSpace4),
+                  Text(
+                    style.description,
+                    style: theme.textTheme.bodySmall?.copyWith(
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(width: kSpace12),
+            // 打勾位固定占位：选中与否文字都不跳
+            SizedBox(
+              width: 20,
+              child: selected
+                  ? Icon(Icons.check, size: 20, color: context.palette.inkText)
+                  : null,
+            ),
+          ],
+        ),
       ),
     );
   }

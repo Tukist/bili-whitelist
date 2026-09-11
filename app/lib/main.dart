@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import 'pages/playlist_page.dart';
+import 'services/inbox_card_style_store.dart';
 import 'services/theme_store.dart';
 import 'theme/app_theme.dart';
 
@@ -21,6 +22,9 @@ void main() {
   // 首帧即用用户选的墨色，不闪默认色。
   WidgetsFlutterBinding.ensureInitialized();
   unawaited(ThemeStore.instance.ensureLoaded());
+  // 读已保存的**信箱卡片样式**（v2.21.0+）：同上，首帧即用用户选的版式，
+  // 不先闪一下默认版式。store 内部读失败静默（回退默认）。
+  unawaited(InboxCardStyleStore.instance.ensureLoaded());
   runApp(const BiliWhitelistApp());
 }
 

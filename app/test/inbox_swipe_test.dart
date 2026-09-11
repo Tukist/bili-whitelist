@@ -1,6 +1,8 @@
 // 信箱页 Tinder 式卡片栈的 widget 测试（v2.19.0+）：
-// - 卡片排版：封面（16:9）/ 标题 / 作者（头像 + 名字）/ 时长 / 相对时间；
-//   卡片宽度 ≈ 屏宽 88%，竖屏 411×914 下不出屏
+// - 卡片排版：封面 / 标题 / 作者（头像 + 名字）/ 时长 / 相对时间；
+//   卡片 = **扑克牌比例**（1:1.39）、宽度 ≈ 屏宽 88%，竖屏 411×914 下不出屏；
+//   默认版式 classic = 全出血氛围（16:9 的封面完整居中 + 同图模糊底衬铺满整卡）
+//   ——版式细节见 `test/inbox_card_style_test.dart`（每个风格各有一条渲染用例）
 // - 卡片栈：下层**底边对齐**（底边恒定露出 kInboxStackOffset + 缩放 kInboxStackScale
 //   以底边为锚）→ 不论下一张标题 1 行还是 2 行，顶层下方都稳定可见它的边（#3）
 // - 手势：右滑过阈值 = 加入（写白名单）、左滑过阈值 = 跳过（只记已处理）、
@@ -11,6 +13,8 @@
 //   空态下底部仍留着「撤销上一张」（#2）
 // - 后台 checkAll 进行中不阻塞交互：仍能点卡开播放页 / 划卡 / 撤销，
 //   检查回来只追加新条目 → 卡片栈不跳回第一张、已消费的不复活（#1）
+// - 检查**进行中**的新条目也会进卡片栈：页面每隔几秒只读盘回读一次本地未读
+//   （见 inbox_page.dart 的 _pollProgress），不必退出重进（#2）
 // - 队列被用户划空（后台检查还在跑）→ 显示空态而不是整页加载态（#6）
 // - 点按卡片仍是「打开播放页」（本文件用"是否去 fetch view 元数据"当证据：
 //   真去 push PlayerPage 要 mock 播放器通道，这里只验点按链路被触发）
@@ -41,6 +45,8 @@ import 'package:bili_whitelist_app/theme/motion_control.dart';
 import 'package:bili_whitelist_app/utils/relative_time.dart';
 import 'package:bili_whitelist_app/widgets/app_state_view.dart';
 import 'package:bili_whitelist_app/widgets/cover_image.dart';
+import 'package:bili_whitelist_app/widgets/inbox_card_stack.dart';
+import 'package:bili_whitelist_app/widgets/inbox_card_styles.dart';
 import 'package:bili_whitelist_app/widgets/inbox_swipe_card.dart';
 
 // ---------------------------------------------------------------------------
@@ -152,6 +158,52 @@ Finder _topCard() => find.byType(InboxSwipeCard).last;
 
 /// 下层卡片（下一张）。
 Finder _behindCard() => find.byType(InboxSwipeCard).first;
+
+/// 按 bvid 找那张卡。
+///
+/// 卡片栈是多层的（v2.22.0+），「第几张」不再能靠位置猜 —— 用数据身份定位。
+Finder _cardByBvid(String bvid) => find.byWidgetPredicate(
+      (w) => w is InboxSwipeCard && w.item.bvid == bvid,
+    );
+
+/// 某层卡片的**降调不透明度**：从卡片往上找最近的那层 `Opacity`
+///（卡片栈给每层铺的深度变换，见 `inbox_card_stack.dart` 的 `_depthLayer`）。
+double _layerAlpha(WidgetTester tester, String bvid) {
+  final el = _cardByBvid(bvid).evaluate().single;
+  Opacity? found;
+  el.visitAncestorElements((a) {
+    if (a.widget is Opacity) {
+      found = a.widget as Opacity;
+      return false;
+    }
+    return true;
+  });
+  return found!.opacity;
+}
+
+/// 起一个**开着动效**的信箱页：飞出/推进/弹回都是真在跑（用于验证动画过程）。
+Future<_Harness> _pumpInboxAnimated(
+  WidgetTester tester,
+  List<InboxItem> items,
+) async {
+  MotionControl.enabled = true;
+  _usePortraitPhone(tester);
+  final service = _FakeInboxService(items);
+  final api = _FakeBiliApi();
+  final github = _FakeGithubApi();
+  ServiceLocator.overrideInboxService(service);
+  ServiceLocator.overrideSyncService(_FakeSyncService());
+  await tester.pumpWidget(MaterialApp(
+    home: InboxPage(
+      api: api,
+      writer: WhitelistWriter(github: github, api: api),
+    ),
+  ));
+  // 数据到达 + 交错入场跑完（此后屏上没有无限 ticker，才敢继续按帧 pump）
+  await tester.pump();
+  await tester.pump(const Duration(milliseconds: 500));
+  return _Harness(service: service, api: api, github: github);
+}
 
 /// 卡片上的浮层标记文字（**只**在卡片内找：底部按钮也有「加入」/「跳过」）。
 Finder _badgeText(String label) => find.descendant(
@@ -284,19 +336,36 @@ void main() {
         findsOneWidget,
       );
 
-      // 封面：16:9（未被高度预算压扁）+ 走共享 CoverImage（带防盗链头）
+      // 封面：**完整显示的那张**走共享 CoverImage（带防盗链头）——老实现拿它
+      // 铺满 1:1.39 的整卡（`BoxFit.cover` 按高撑满 → 左右各裁 20%+，图上的
+      // 标题被切断）；现在给它的是 16:9 的盒子 → cover == contain，左右不裁
       final cover = tester.widget<CoverImage>(
         find.descendant(
-          of: find.byType(InboxSwipeCard),
+          of: find.byKey(kInboxCardCoverKey),
           matching: find.byType(CoverImage),
         ),
       );
-      expect(cover.height, closeTo(cover.width * 9 / 16, 1));
       expect(cover.cover, '');
+      expect(cover.width / cover.height, closeTo(kInboxCoverAspect, 0.01));
+      expect(cover.width, closeTo(411 * 0.88 - 2, 1),
+          reason: '封面按卡宽铺开（卡面 1px 描边吃掉 2dp）');
 
-      // 卡片宽度 ≈ 屏宽 88%（411 × 0.88 ≈ 361.7）
+      // 卡片 = 扑克牌比例（宽 : 高 = 1 : kInboxCardAspect = 1 : 1.39）
       final size = tester.getSize(find.byType(InboxSwipeCard));
       expect(size.width, closeTo(411 * 0.88, 1));
+      expect(size.height, closeTo(size.width * kInboxCardAspect, 1));
+      // classic 的「全出血」由同一张图的模糊底衬保住（铺满整卡）；
+      // 图本身完整居中（高度小于整卡 → 没有被拉高裁切）
+      expect(
+        tester.getSize(find.byType(ImageFiltered)).height,
+        closeTo(size.height - 2, 1),
+        reason: 'classic：模糊底衬铺满整卡（1px 描边吃掉 2dp）',
+      );
+      expect(
+        tester.getSize(find.byKey(kInboxCardCoverKey)).height,
+        lessThan(size.height - 2),
+        reason: 'classic：16:9 的图完整显示，不是被拉高裁掉',
+      );
 
       // 竖屏 411×914 下整张卡片都在屏内（越界会被下面的断言/溢出报错抓到）
       final rect = tester.getRect(find.byType(InboxSwipeCard));
@@ -357,6 +426,266 @@ void main() {
           reason: '露出量恒为 kInboxStackOffset，与两张卡片的高度差无关');
       // 下层卡片还要横向窄一点（缩放的可见证据，不只是"多露出一点背景"）
       expect(behind.width, closeTo(top.width * kInboxStackScale, 0.6));
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // 卡片栈：一叠牌 + 向前推进（v2.22.0+）
+  // -------------------------------------------------------------------------
+
+  group('卡片栈：一叠牌', () {
+    testWidgets('静止时同时叠 4 张，深度越大越小/越低/越淡（几何断言）',
+        (tester) async {
+      // 队列给长一点（30 条）：证明**只渲染前 4 张**，不为整条队列建 widget
+      await _pumpInbox(tester, [for (var i = 1; i <= 30; i++) _item(i)]);
+
+      expect(find.byType(InboxSwipeCard), findsNWidgets(4));
+      expect(_cardByBvid('BV5'), findsNothing, reason: '第 5 张不进 widget 树');
+      expect(_cardByBvid('BV30'), findsNothing);
+
+      const cardW = 411 * 0.88;
+      const scales = [1.0, kInboxStackScale, 0.92, 0.88];
+      const drops = [0.0, kInboxStackOffset, 20.0, 28.0];
+      final rects = <Rect>[
+        for (var d = 0; d < 4; d++) tester.getRect(_cardByBvid('BV${d + 1}')),
+      ];
+      final top = rects.first;
+
+      // 每层的缩放/下移都按表落位（不是目测，是几何）
+      for (var d = 0; d < 4; d++) {
+        expect(rects[d].width, closeTo(cardW * scales[d], 0.6),
+            reason: '深度 $d 的缩放');
+        expect(rects[d].bottom - top.bottom, closeTo(drops[d], 0.6),
+            reason: '深度 $d 的底边露出量（底边对齐语义）');
+      }
+      // 递进：一眼是「一叠」，不是「一张 + 一条边」
+      for (var d = 1; d < 4; d++) {
+        expect(rects[d].width, lessThan(rects[d - 1].width - 4));
+        expect(rects[d].bottom, greaterThan(rects[d - 1].bottom + 4));
+        expect(rects[d].bottom, greaterThan(top.bottom),
+            reason: '后层底边稳定可见（与卡片内容高度无关）');
+      }
+      // 很轻的降调：下一张（深度 1）仍是满不透明，深两档起才压一点
+      expect(_layerAlpha(tester, 'BV2'), 1.0);
+      expect(_layerAlpha(tester, 'BV3'), closeTo(0.94, 0.001));
+      expect(_layerAlpha(tester, 'BV4'), closeTo(0.88, 0.001));
+    });
+
+    testWidgets('拖动时后层不动，且后层的 widget 实例一帧都不重建', (tester) async {
+      await _pumpInboxAnimated(tester, [for (var i = 1; i <= 5; i++) _item(i)]);
+
+      final topRest = tester.getTopLeft(_cardByBvid('BV1'));
+      final before = <Rect>[
+        for (var d = 2; d <= 4; d++) tester.getRect(_cardByBvid('BV$d')),
+      ];
+      final beforeWidgets = <InboxSwipeCard>[
+        for (var d = 2; d <= 4; d++)
+          tester.widget<InboxSwipeCard>(_cardByBvid('BV$d')),
+      ];
+
+      final gesture = await tester.startGesture(tester.getCenter(_topCard()));
+      await gesture.moveBy(const Offset(60, 0)); // 第一次移动被 touch slop 吃掉
+      await tester.pump();
+      await gesture.moveBy(const Offset(40, 0));
+      await tester.pump();
+
+      // 顶层跟手走了（拖动幅度没过阈值 → 松手会弹回，不影响本用例断言）
+      expect(tester.getTopLeft(_cardByBvid('BV1')).dx,
+          greaterThan(topRest.dx + 20));
+
+      // 后层：位置/尺寸/实例都没变 —— 「跟手只在顶层」
+      for (var d = 2; d <= 4; d++) {
+        final now = tester.getRect(_cardByBvid('BV$d'));
+        expect(now.left, closeTo(before[d - 2].left, 0.01));
+        expect(now.top, closeTo(before[d - 2].top, 0.01));
+        expect(now.width, closeTo(before[d - 2].width, 0.01));
+        expect(now.bottom, closeTo(before[d - 2].bottom, 0.01));
+        expect(
+          identical(
+            tester.widget<InboxSwipeCard>(_cardByBvid('BV$d')),
+            beforeWidgets[d - 2],
+          ),
+          isTrue,
+          reason: '拖动期间后层的版式子树不该被逐帧重建（widget 实例原样交回）',
+        );
+      }
+
+      await gesture.up();
+      await _flush(tester);
+      // 弹回原位（既有行为不受影响）
+      expect(tester.getTopLeft(_cardByBvid('BV1')).dx, closeTo(topRest.dx, 0.5));
+    });
+
+    testWidgets('关动效：栈内不建 controller（没有逐帧驱动者），出栈瞬时到位',
+        (tester) async {
+      await _pumpInbox(tester, [_item(1), _item(2), _item(3)]);
+      expect(MotionControl.enabled, isFalse, reason: 'flutter test 默认关动效');
+
+      // 栈内没有任何 AnimatedBuilder → 没有以 controller 驱动的逐帧层
+      expect(
+        find.descendant(
+          of: find.byType(InboxCardStack),
+          matching: find.byType(AnimatedBuilder),
+        ),
+        findsNothing,
+      );
+
+      final topRest = tester.getRect(_cardByBvid('BV1'));
+      await tester.drag(_topCard(), const Offset(300, 0));
+      await tester.pump(); // 只走一帧：没有「还在推」的中间态
+      expect(find.byType(InboxSwipeCard), findsNWidgets(2),
+          reason: '关动效时不预留"多渲染一张"的窗口');
+      final nowTop = tester.getRect(_cardByBvid('BV2'));
+      expect(nowTop.topLeft.dx, closeTo(topRest.topLeft.dx, 0.6));
+      expect(nowTop.topLeft.dy, closeTo(topRest.topLeft.dy, 0.6));
+      await tester.pumpAndSettle();
+    });
+  });
+
+  group('卡片栈：向前推进', () {
+    testWidgets('滑走顶层 → 第二张平滑长大上移（中途态 + 层次感 + 补卡不突兀）',
+        (tester) async {
+      await _pumpInboxAnimated(tester, [for (var i = 1; i <= 6; i++) _item(i)]);
+
+      final cardW = tester.getRect(_cardByBvid('BV1')).width;
+      final topRest = tester.getRect(_cardByBvid('BV1'));
+      final secondRest = tester.getRect(_cardByBvid('BV2'));
+      final thirdRest = tester.getRect(_cardByBvid('BV3'));
+      expect(secondRest.width, closeTo(cardW * kInboxStackScale, 0.6));
+      expect(thirdRest.width, closeTo(cardW * 0.92, 0.6));
+      expect(_cardByBvid('BV5'), findsNothing, reason: '静止时只渲染 4 张');
+
+      await tester.drag(_topCard(), const Offset(300, 0)); // 右滑过阈值 → 提交
+      await tester.pump(); // 门禁通过 → 飞出与推进一起启动
+
+      // 逐帧采样（20ms 一帧，覆盖推进前半程）：推进必须是"从旧深度走到新深度"，
+      // 不是跳变。★ 几何一律用 getRect：getSize 不套祖先的 Transform，量不出缩放。
+      final second = <double>[];
+      final third = <double>[];
+      final incoming = <double>[];
+      for (var i = 0; i < 8; i++) {
+        await tester.pump(const Duration(milliseconds: 20));
+        second.add(tester.getRect(_cardByBvid('BV2')).width);
+        third.add(tester.getRect(_cardByBvid('BV3')).width);
+        final f = _cardByBvid('BV5');
+        incoming.add(f.evaluate().isEmpty ? -1 : _layerAlpha(tester, 'BV5'));
+      }
+
+      // ① 平滑推进：逐帧单调增长（不回跳），且**中途确实停在两层之间**
+      for (var i = 1; i < second.length; i++) {
+        expect(second[i], greaterThanOrEqualTo(second[i - 1] - 0.001),
+            reason: '推进只能向前，不会回跳');
+      }
+      expect(
+        second.where((w) => w > secondRest.width + 0.5 && w < cardW - 0.5),
+        isNotEmpty,
+        reason: '要有"介于原深度与新深度之间"的中间态（跳变就不可能有）',
+      );
+
+      // ② 层次感：不同深度错峰推进（前排先走、后排末尾追上来）
+      var layered = false;
+      for (var i = 0; i < second.length; i++) {
+        final p2 =
+            (second[i] - secondRest.width) / (cardW - secondRest.width);
+        final p3 = (third[i] - thirdRest.width) /
+            (secondRest.width - thirdRest.width);
+        expect(p2, greaterThanOrEqualTo(p3 - 0.001),
+            reason: '前排只能更快，不能反超（否则深层的牌会从前面那张里冒出来）');
+        if (p2 - p3 > 0.005) layered = true;
+      }
+      expect(layered, isTrue, reason: '不同深度要有不同的推进节奏');
+
+      // ③ 补卡：栈底补上第 5 张，从全透明浮现 → 分层落位，不突兀
+      expect(incoming.contains(-1), isFalse,
+          reason: '推进期间要多带一张（第 5 张）');
+      expect(incoming.first, lessThan(0.3), reason: '它从更深处（不透明度 0）浮现');
+      expect(
+        incoming.where((a) => a > 0.05 && a < 0.85),
+        isNotEmpty,
+        reason: '淡入过程中要有中间态',
+      );
+
+      await tester.pumpAndSettle(); // 顶层飞出屏幕 → 出栈
+
+      // ④ 收尾：原第二张长成顶层大小，并落在顶层原来的位置上
+      final nowTop = tester.getRect(_cardByBvid('BV2'));
+      expect(nowTop.width, closeTo(cardW, 0.6));
+      expect(nowTop.topLeft.dx, closeTo(topRest.topLeft.dx, 0.6));
+      expect(nowTop.topLeft.dy, closeTo(topRest.topLeft.dy, 0.6));
+      expect(nowTop.bottom, closeTo(topRest.bottom, 0.6));
+
+      // ⑤ 数量不减少：滑走一张又补一张，栈内仍是 4 张
+      expect(find.byType(InboxSwipeCard), findsNWidgets(4));
+      expect(_cardByBvid('BV1'), findsNothing);
+      expect(_cardByBvid('BV5'), findsOneWidget);
+      expect(_layerAlpha(tester, 'BV5'), closeTo(0.88, 0.001),
+          reason: '到位后它就是深度 3 的那一层');
+      expect(
+        tester.widgetList<InboxSwipeCard>(find.byType(InboxSwipeCard)).last.item.bvid,
+        'BV2',
+        reason: '推进到位后顶层就是原第二张',
+      );
+    });
+
+    test('推进时长必须 ≤ 飞出时长（出栈与推进无缝续上的前提）', () {
+      expect(
+        kDurAdvance.inMilliseconds,
+        lessThanOrEqualTo(kDurSlow.inMilliseconds),
+        reason: '出栈早于推进到位会把没走完的层硬拽到位（跳变）',
+      );
+    });
+
+    testWidgets('撤销：反着播推进（放回的从屏外飞回来 + 后层退回），无跳变',
+        (tester) async {
+      await _pumpInboxAnimated(tester, [for (var i = 1; i <= 5; i++) _item(i)]);
+
+      final cardW = tester.getRect(_cardByBvid('BV1')).width;
+      final topRest = tester.getRect(_cardByBvid('BV1'));
+      final secondRest = tester.getRect(_cardByBvid('BV2'));
+
+      // 划走一张：飞出 + 推进（原第二张长成顶层大小）
+      await tester.drag(_topCard(), const Offset(300, 0));
+      await tester.pump();
+      await tester.pumpAndSettle();
+      expect(tester.getRect(_cardByBvid('BV2')).width, closeTo(cardW, 0.6));
+      expect(_cardByBvid('BV1'), findsNothing);
+
+      // 撤销 → 反向播同一条推进
+      await tester.tap(find.byTooltip('撤销'));
+      await tester.pump();
+
+      final flying = <double>[];
+      final second = <double>[];
+      for (var i = 0; i < 8; i++) {
+        await tester.pump(const Duration(milliseconds: 20));
+        flying.add(tester.getRect(_cardByBvid('BV1')).left);
+        second.add(tester.getRect(_cardByBvid('BV2')).width);
+      }
+
+      // ① 放回来的那张从屏外飞回来（不是「啪」地出现在原位），且一路往回走
+      expect(flying.first, greaterThan(topRest.left + 200));
+      for (var i = 1; i < flying.length; i++) {
+        expect(flying[i], lessThanOrEqualTo(flying[i - 1] + 0.001));
+      }
+      // ② 后层正在退回：起点在「推进到位」那一侧，中途有"介于两者之间"的态
+      expect(second.first, greaterThan(secondRest.width + 0.5),
+          reason: '退回的起点就是"已经推进到位"的位置');
+      expect(
+        second.where((w) => w > secondRest.width + 0.5 && w < cardW - 0.5),
+        isNotEmpty,
+        reason: '退回是"从到位处走回原位"，不是跳变',
+      );
+
+      await tester.pumpAndSettle();
+      // ③ 全部复原：顶层回到原位，后层回到原深度
+      final backTop = tester.getRect(_cardByBvid('BV1'));
+      expect(backTop.topLeft.dx, closeTo(topRest.topLeft.dx, 0.6));
+      expect(backTop.topLeft.dy, closeTo(topRest.topLeft.dy, 0.6));
+      final backSecond = tester.getRect(_cardByBvid('BV2'));
+      expect(backSecond.width, closeTo(secondRest.width, 0.6));
+      expect(backSecond.bottom, closeTo(secondRest.bottom, 0.6));
+      // 静止窗口仍是 4 张（多渲染的那张在退回结束后收掉）
+      expect(find.byType(InboxSwipeCard), findsNWidgets(4));
     });
   });
 
@@ -882,6 +1211,36 @@ void main() {
         ['BV1', 'BV1', 'BV2'],
         reason: '划走 BV1 → 撤销 → 再划走 BV1 → 划走 BV2（替身只记调用）',
       );
+    });
+
+    testWidgets('#2 检查进行中：新入队的条目能进卡片栈（不必退出重进）',
+        (tester) async {
+      final gate = Completer<void>();
+      // 可变队列：模拟服务层"边查边落盘"之后本地未读变多了
+      final items = <InboxItem>[_item(1)];
+      final h = await _pumpInbox(tester, items, checkGate: gate);
+      expect(_cardByBvid('BV1'), findsOneWidget);
+      expect(find.text('检查中…'), findsOneWidget);
+
+      // 检查还在跑：服务层又落盘了一条（页面此刻还不知道）
+      items.add(_item(2));
+      expect(_cardByBvid('BV2'), findsNothing, reason: '回读间隔还没到');
+
+      // 页面在检查期间周期性回读本地未读（只读盘、不触网；间隔同
+      // inbox_page.dart 的 _kProgressPoll = 3s）→ 新卡自动追加进来
+      await tester.pump(const Duration(seconds: 3));
+      await _flush(tester);
+      expect(_cardByBvid('BV2'), findsOneWidget,
+          reason: '检查进行中的新条目必须能进卡片栈 —— 老实现要等整轮跑完');
+      expect(tester.widget<InboxSwipeCard>(_topCard()).item.bvid, 'BV1',
+          reason: '只追加不重排：当前正在看的那张不能换人');
+
+      // 检查回来：不重复追加（还是那 2 张），提示收掉
+      gate.complete();
+      await _flush(tester);
+      expect(find.byType(InboxSwipeCard), findsNWidgets(2));
+      expect(find.text('检查中…'), findsNothing);
+      expect(h.service.checkCalls, 1);
     });
   });
 }

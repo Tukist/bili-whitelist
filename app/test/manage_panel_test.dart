@@ -164,6 +164,10 @@ void main() {
       // 填 token（第 0 个输入框 = GitHub Token）与 gist id（第 1 个）
       await tester.enterText(find.byType(TextField).at(0), 'ghp_test_token');
       await tester.enterText(find.byType(TextField).at(1), 'gist_abc123');
+      // 面板在 600px 高的测试视口里放不下全部设置区（v2.21.0 起多了
+      // 「信箱卡片样式」分区）→ 先滚到按钮再点（同文件「管理合集」用例的做法）
+      await tester.ensureVisible(find.text('保存配置'));
+      await tester.pumpAndSettle();
       await tester.tap(find.text('保存配置'));
       await tester.pumpAndSettle();
 
