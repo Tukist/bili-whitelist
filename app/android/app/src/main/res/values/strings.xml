@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 播放媒体通知（v2.25.x）：Android 8+ 的通知渠道名与说明，显示在系统
+         「设置 → 应用 → amoTV → 通知」里。渠道重要性由代码设为 IMPORTANCE_LOW
+         （不出声、不震动、不弹横幅）——播放控制通知不应打断用户。 -->
+    <string name="playback_notification_channel_name">播放控制</string>
+    <string name="playback_notification_channel_desc">显示正在播放的视频，并提供播放/暂停、快退快进 15 秒与关闭</string>
+</resources>

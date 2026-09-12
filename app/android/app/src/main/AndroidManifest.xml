@@ -10,6 +10,12 @@
     <uses-permission
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28"/>
+    <!-- 播放媒体通知（v2.25.x）：Android 13+ 的通知运行时权限。
+         绑定 MediaSession 的媒体通知**本身豁免**该权限（Android 官方
+         notification-permission#exemptions-media-sessions），这里声明 + 在
+         BiliDashPlayerPlugin 里主动请求，是为了少数忽略豁免的 OEM，以及让用户
+         能在系统设置里看到本 App 的通知开关；即使被拒绝，媒体通知照常显示。 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <application
         android:label="amoTV"
         android:name="${applicationName}"

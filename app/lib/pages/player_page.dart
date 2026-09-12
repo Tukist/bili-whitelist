@@ -843,6 +843,21 @@ class _PlayerPageState extends State<PlayerPage>
   // 听视频（纯音频）模式：隐藏画面，音频继续
   bool _listenMode = false;
 
+  // 媒体通知（v2.25.x：B 站式播放通知 + 耳机按键控制）
+  // ---------------------------------------------------------------------
+  // 播放状态变化时调 _syncNowPlaying 把标题/UP/封面/状态推给原生媒体通知；原生侧
+  // 通知上的操作（播放暂停/快退快进/关闭）经 onMediaAction 事件回传，见 [_onMediaAction]。
+
+  /// 原生播放器已被通知栏「关闭（✕）」停止（媒体项被清空）。
+  ///
+  /// 置位后界面按「已停止」显示：再点播放需要重新取流（[_init]），因为原生播放器
+  /// 已经没有可播的源了。伪事件（如换源瞬间媒体项暂时为空）会在下一次
+  /// [onPrepared] 里自动复位，所以这个标志不会把界面卡在停止态。
+  bool _stoppedByNotification = false;
+
+  /// 通知权限（Android 13+）是否已请求过：每个播放页只请求一次。
+  bool _notifPermissionRequested = false;
+
   // 字幕（M-字幕功能）
   // ---------------------------------------------------------------------
   // 面板打开时拉取轨道列表（登录态可能变化，每次进入重新拉）；
@@ -988,6 +1003,13 @@ class _PlayerPageState extends State<PlayerPage>
   int _initSession = 0;
 
   String? _loginExpiryText;
+
+  /// 进度/字幕轮询定时器（500ms 一次 [_tick]）。
+  ///
+  /// 生命周期约定：**同一时刻最多一个**，且「取消」必须伴随置 null（或交给
+  /// [_ensureTickTimer] 用 `isActive` 判定后重建）——`Timer` 被 cancel 后引用
+  /// 仍是非 null 的**死实例**，一旦有人用 `??=` 想去「确保它在跑」，拿到的就是
+  /// 这个死实例，于是进度条/字幕从此不再刷新（v2.25.0 修的即此类 bug）。
   Timer? _timer;
 
   // 播放进度记忆（本地 shared_preferences，按 bvid+pageIndex 分别记忆）
@@ -1203,6 +1225,8 @@ class _PlayerPageState extends State<PlayerPage>
     }
     if (mounted) setState(() => _playing = false);
     await _saveProgress();
+    // 让路期间通知跟随本页（显示已暂停）；新页开始播放时会改绑到它的播放器
+    unawaited(_syncNowPlaying());
   }
 
   /// 从「新播放页」返回后恢复续播：
@@ -1231,6 +1255,7 @@ class _PlayerPageState extends State<PlayerPage>
       return;
     }
     if (mounted) setState(() => _playing = true);
+    unawaited(_syncNowPlaying()); // 恢复续播：通知重新跟随本页
   }
 
   /// 退出/换源前保存一次进度 + 写入历史（fire-and-forget，防杀进程/直接
@@ -1302,6 +1327,18 @@ class _PlayerPageState extends State<PlayerPage>
   // -------------------------------------------------------------------------
 
   Future<void> _init() async {
+    // 重建播放器前先收掉上一个：取消事件订阅 + 释放原生播放器。
+    // ⚠️ 必须做——Dart 侧的事件流是**共享**广播流（`BiliDashPlayer._sharedRawEvents`），
+    // 上一个播放器的订阅若留着，同一事件会被处理两次；且旧原生播放器会一直
+    // 出声（_player 被覆盖后再也没人 dispose 它）。通知栏「关闭（✕）后再点播放」
+    // 与「评论区链接换视频」都会走到这条「_init 第二次」的路径。
+    // （原 _retry 里的同款收尾已并入这里，不再重复。）
+    _eventSub?.cancel();
+    _eventSub = null;
+    final previous = _player;
+    _player = null;
+    _textureId = null; // 旧纹理随旧播放器释放（同 playVideo/_retry 原行为）
+    previous?.dispose();
     // 实时转写（sherpa）随页重置：停止 + 清句子/partial/错误
     _resetRealtime();
     _initSession++; // 播放器重建代次自增（自动续播流程据此安全退出，见字段注释）
@@ -1368,8 +1405,7 @@ class _PlayerPageState extends State<PlayerPage>
       if (!mounted) return;
       setState(() => _textureId = player.textureId);
       await _loadStreamAndPlay(positionMs: 0);
-      _timer ??= Timer.periodic(
-          const Duration(milliseconds: 500), (_) => _tick());
+      _ensureTickTimer();
     } catch (e) {
       if (!mounted) return;
       await _handleLoadFailure(e);
@@ -1396,6 +1432,9 @@ class _PlayerPageState extends State<PlayerPage>
             ? null
             : Uri.file(cached.audioPath).toString(),
         positionMs: positionMs,
+        title: _video.title,
+        artist: _video.upName,
+        coverUrl: _video.cover,
       );
       // 本地缓存播放无 deadline（也不应去取网络流）：主动预取不适用，
       // 标记清除（防上一次网络流的 deadline 残留误触发）
@@ -1467,7 +1506,11 @@ class _PlayerPageState extends State<PlayerPage>
       audioUrl = null;
     }
     await player.setDataSource(videoUrl,
-        audioUrl: audioUrl, positionMs: positionMs);
+        audioUrl: audioUrl,
+        positionMs: positionMs,
+        title: _video.title,
+        artist: _video.upName,
+        coverUrl: _video.cover);
     // 记录当前网络流 URL 的过期时刻：主动预取判定依据（解析失败=URL 无
     // deadline → null → 回退被动恢复）。仅记录不换源，换源由
     // [_maybePrefetchSource] 按剩余时间决策。
@@ -1654,25 +1697,146 @@ class _PlayerPageState extends State<PlayerPage>
     debugPrint('[player] event: ${e.runtimeType} textureId=${e.textureId}');
     if (!mounted) return;
     switch (e) {
-      case BiliDashPreparedEvent(:final width, :final height, :final durationMs):
-        _onPrepared(width, height, durationMs);
+      case BiliDashPreparedEvent(
+          :final width,
+          :final height,
+          :final durationMs,
+          :final playWhenReady,
+        ):
+        _onPrepared(width, height, durationMs, playWhenReady);
       case BiliDashCompletedEvent():
         _onCompleted();
       case BiliDashErrorEvent(:final code, :final message):
         _onNativeError(code, message);
       case BiliDashUrlExpiredEvent():
         _onAutoRecover();
+      case BiliDashMediaActionEvent(:final action, :final positionMs):
+        _onMediaAction(action, positionMs);
     }
   }
 
-  void _onPrepared(int width, int height, int durationMs) {
-    debugPrint('[player] onPrepared ${width}x$height duration=$durationMs');
+  // -------------------------------------------------------------------------
+  // 媒体通知（B 站式通知 + 耳机按键控制，v2.25.x）
+  // -------------------------------------------------------------------------
+
+  /// 通知/耳机操作回传到界面（原生播放器**已经**执行了对应动作，这里只对齐 UI）。
+  Future<void> _onMediaAction(String action, int positionMs) async {
+    debugPrint('[player] onMediaAction action=$action positionMs=$positionMs');
+    switch (action) {
+      case 'play':
+      case 'pause':
+        // 播放器已在播 / 已暂停：复用播放按钮的同一条路径改状态（内含「看完后
+        // 重播」复位与暂停时保存进度），`_togglePlay` 自身按 _playing 取反，
+        // 所以只有状态确实不一致时才调用（否则会反向把它切回去）。
+        if (_error != null) return; // 错误态：播放器无源，别把界面改成在播
+        if (action == 'play' && !_playing) {
+          await _togglePlay();
+        } else if (action == 'pause' && _playing) {
+          await _togglePlay();
+        }
+      case 'seek':
+        // 通知栏快退/快进 15 秒等：位置跳变不计入观看时长，且不再是「已播完」
+        _resetWatchBaseline();
+        if (mounted) {
+          setState(() {
+            _positionMs = positionMs;
+            if (positionMs < _durationMs) _completed = false;
+          });
+        }
+      case 'stop':
+        if (mounted) await _onStoppedByNotification();
+      default:
+        debugPrint('[player] 未知媒体动作：$action');
+    }
+  }
+
+  /// 通知栏「关闭（✕）」：原生已 stop + 清空媒体项 → 界面收成停止态。
+  ///
+  /// 位置按 Dart 侧最后一次 tick 的位置存（原生已 stop，getPosition 归零），再点
+  /// 播放时 [_togglePlay] 会重新取流并走「记忆进度恢复」续播。
+  Future<void> _onStoppedByNotification() async {
+    if (_stoppedByNotification) return;
+    debugPrint('[player_page] 通知关闭（✕）→ 界面收成停止态');
+    final pos = _positionMs;
+    // 停掉 tick 轮询（并置 null，同 [_onCompleted] 的约定）：播放器已被原生
+    // stop、媒体项被清空，getPosition 恒为 0 —— 继续轮询只是空转，还会把界面
+    // 位置刷回 0:00、把「关闭时保存的续播位置」冲掉（v2.25.0-r2 修复）。
+    // 再点播放走 [_togglePlay] → [_init]（内含 [_ensureTickTimer]）重建轮询。
+    _timer?.cancel();
+    _timer = null;
+    setState(() {
+      _playing = false;
+      _stoppedByNotification = true;
+    });
+    final store = _progressStore;
+    if (pos > 0 && !_completed) {
+      if (store != null) {
+        await store.saveProgress(_video.bvid, _currentPageIndex, pos);
+      }
+      await _writeHistory(pos);
+    }
+  }
+
+  /// 当前副标题里的状态文案（原生拼成 `<UP 名> · <状态>`，与 B 站一致）。
+  String _nowPlayingStatus() {
+    if (_error != null) return '播放失败';
+    if (_completed) return '已播完';
+    if (!_playing) return '已暂停';
+    return _listenMode ? '后台听视频省流量' : '正在播放';
+  }
+
+  /// 把当前播放状态推给原生媒体通知（播放状态变化时调用，空操作安全）。
+  ///
+  /// 通知只是增强：原生通道异常（老版本原生 / 测试环境）一律静默忽略，
+  /// 绝不能因为通知失败影响播放。
+  Future<void> _syncNowPlaying() async {
+    final player = _player;
+    if (player == null) return;
+    if (!_notifPermissionRequested) {
+      // 第一次要显示通知了：顺手请求一次通知权限（Android 13+，原生侧自带
+      // 版本判断与去重）。v2.25.0-r2 起通知不绑媒体会话 token，不再享受
+      // 「媒体会话通知」的权限豁免 → 被拒绝时通知不显示（播放不受影响）。
+      _notifPermissionRequested = true;
+      unawaited(BiliDashPlayer.requestNotificationPermission());
+    }
+    try {
+      await player.updateNowPlaying(
+        title: _video.title,
+        artist: _video.upName,
+        coverUrl: _video.cover,
+        status: _nowPlayingStatus(),
+        playing: _playing,
+        positionMs: _positionMs,
+        durationMs: _durationMs,
+      );
+    } catch (_) {
+      // 通道异常：忽略（通知不显示，播放照常）
+    }
+  }
+
+  void _onPrepared(
+    int width,
+    int height,
+    int durationMs,
+    bool playWhenReady,
+  ) {
+    debugPrint('[player] onPrepared ${width}x$height duration=$durationMs '
+        'playWhenReady=$playWhenReady');
     if (!mounted) return;
     setState(() {
       _loaded = true;
-      _playing = true;
+      // 播放态取**原生的真实播放意图**，不再无条件置 true：onPrepared 每次进
+      // READY 都会发（seek、重新缓冲后也发），旧写法会让「暂停态下拖通知进度条 /
+      // 点卡片快退」把界面错报成「正在播放」（位置冻结、与 dumpsys 的
+      // state=NONE 矛盾，v2.25.0-r2 修复）。正常起播（setDataSource 后原生
+      // 自动 play）playWhenReady=true，行为与旧版一致。
+      _playing = playWhenReady;
       _buffering = false;
-      _completed = false;
+      // 只有确实在播才清「已播完」：暂停态下 seek 到结尾附近不该被当成重新起播
+      if (playWhenReady) _completed = false;
+      // 新流就绪 = 确实在播：清掉「通知关闭」的停止态（换源瞬间媒体项为空可能
+      // 误触发过停止事件，这里自愈；原生真被关闭时不会再有 onPrepared）
+      _stoppedByNotification = false;
       _durationMs = durationMs;
       if (width > 0 && height > 0) _aspectRatio = width / height;
       // 新流成功 READY → 自动续播预算清零：每段播放独立预算，
@@ -1686,11 +1850,17 @@ class _PlayerPageState extends State<PlayerPage>
     // 新流开始：观看时长累计基线重建（旧流位置与此无关；若本流 onPrepared
     // 后还要 seek 恢复进度，_maybeRestoreProgress/seek 处会再次置 null）
     _resetWatchBaseline();
+    // 媒体通知：标题/UP/封面/状态（首次进入即显示通知）
+    unawaited(_syncNowPlaying());
   }
 
   void _onCompleted() {
     if (!mounted) return;
+    // 看完 → 停掉 tick（画面已停，没必要再轮询），**并置 null**：否则这个已
+    // cancel 的死实例会让后面的 `??=`/isActive 判定失真（旧 bug：播完再播进度
+    // 条/字幕不再刷新）。重建走 [_ensureTickTimer]。
     _timer?.cancel();
+    _timer = null;
     setState(() {
       _playing = false;
       _positionMs = _durationMs;
@@ -1698,6 +1868,7 @@ class _PlayerPageState extends State<PlayerPage>
     });
     // 观看完成 → 清除进度记忆（下次从头播）
     _clearProgress();
+    unawaited(_syncNowPlaying()); // 通知副标题 → 已播完
   }
 
   void _onNativeError(int code, String message) {
@@ -1711,6 +1882,7 @@ class _PlayerPageState extends State<PlayerPage>
     });
     // 原生报错：画面不会来了，封面占位层让位给错误视图
     _dismissCoverOverlay();
+    unawaited(_syncNowPlaying()); // 通知副标题 → 播放失败
   }
 
   /// 自动续播（流 URL 过期 / 瞬时网络错误，原生已统一归类为可恢复）：
@@ -1839,7 +2011,16 @@ class _PlayerPageState extends State<PlayerPage>
     final player = _player;
     if (player == null || _dragging || _seekDragging) return;
     final pos = await player.getPosition();
-    if (mounted) setState(() => _positionMs = pos);
+    // 两种「停止带来的假位置」都要挡（v2.25.0-r2，模拟器实测）：
+    // 1) 原生 stop() 之后、Dart 收到 onMediaAction=stop 之前有一个窗口（实测
+    //    ~150ms）；这段里 getPosition 会报 0 —— 播放中位置不可能倒退到 0，
+    //    这种值一律丢弃，否则界面位置被冲成 0:00，而且「✕ 时按 _positionMs
+    //    存进度」会一并落空（实测：进度停在上一轮定期保存的值）；
+    // 2) 在途的这次 tick 可能在 await 期间被停止事件抢跑（_stoppedByNotification
+    //    已置位）—— 同样不能覆盖界面位置。
+    if (_playing && pos == 0 && _positionMs > 0) return;
+    if (!mounted || _stoppedByNotification) return;
+    setState(() => _positionMs = pos);
     // 观看时长累计（纯本地；每 500ms tick 增量判断真实播放，攒够批量落盘）
     _accumulateWatchTime(pos);
     if (mounted) _updateSubtitleText(pos);
@@ -1850,6 +2031,20 @@ class _PlayerPageState extends State<PlayerPage>
       _saveProgress();
       unawaited(_maybePrefetchSource());
     }
+  }
+
+  /// 确保 [_tick] 轮询定时器在跑（幂等：同一时刻**最多一个**）。
+  ///
+  /// 判定用 `isActive` 而不是 `??=`：cancel 过的 `Timer` 引用仍非 null，`??=` 会
+  /// 把它当成「已在跑」而永不重建 → 进度条/时间文本/字幕从此停在原地。改动前的
+  /// 「播完 → 再播」（点中央播放键 / 耳机播放键 / 通知播放键都会走 [_togglePlay]）
+  /// 正是踩了这个：[_onCompleted] 只 cancel 没置 null。
+  void _ensureTickTimer() {
+    if (!mounted) return;
+    final existing = _timer;
+    if (existing != null && existing.isActive) return; // 已在跑：不重开（防双计时器）
+    existing?.cancel(); // 死实例：先收尾再重建
+    _timer = Timer.periodic(const Duration(milliseconds: 500), (_) => _tick());
   }
 
   /// 观看时长累计（口径）：仅当 **playing（含听视频纯音频模式）** 且相对
@@ -1964,6 +2159,15 @@ class _PlayerPageState extends State<PlayerPage>
     debugPrint('[player_page] _togglePlay called, playing=$_playing');
     final player = _player;
     if (player == null) return;
+    if (_stoppedByNotification) {
+      // 通知栏「关闭（✕）」后原生播放器已没有媒体项：重新取流续播
+      // （_pendingRestore 令新流 onPrepared 时 seek 回记忆进度）
+      debugPrint('[player_page] 通知关闭后点播放 → 重新取流续播');
+      _stoppedByNotification = false;
+      _pendingRestore = true;
+      await _init();
+      return;
+    }
     if (_playing) {
       await player.pause();
       setState(() => _playing = false);
@@ -1978,7 +2182,11 @@ class _PlayerPageState extends State<PlayerPage>
       }
       await player.play();
       setState(() => _playing = true);
+      // 复活 tick：看完（[_onCompleted] 停掉了轮询）后重播，或任何「定时器被取消
+      // 过」的路径，都必须在这里重建，否则进度条/时间文本/字幕不再刷新。
+      _ensureTickTimer();
     }
+    unawaited(_syncNowPlaying()); // 媒体通知：播放/暂停状态 + 副标题
   }
 
   // -------------------------------------------------------------------------
@@ -2928,6 +3136,8 @@ class _PlayerPageState extends State<PlayerPage>
   void _toggleListenMode() {
     debugPrint('[player_page] toggle listenMode -> ${!_listenMode}');
     setState(() => _listenMode = !_listenMode);
+    // 通知副标题跟着变（听视频时显示「后台听视频省流量」，与 B 站一致）
+    unawaited(_syncNowPlaying());
   }
 
   /// 评论按钮行为（v2.17.0+ 竖屏布局重构 / v2.17.17 横屏置顶共用 /
@@ -4470,12 +4680,7 @@ class _PlayerPageState extends State<PlayerPage>
   void _retry() {
     _autoRecoverFails = 0; // 手动重试：自动续播预算重置（_init 内也会重置）
     _autoRecovering = false;
-    _eventSub?.cancel();
-    _eventSub = null;
-    final old = _player;
-    _player = null;
-    _textureId = null;
-    old?.dispose();
+    // 旧播放器的收尾（退订 + dispose）由 [_init] 统一负责
     _pendingRestore = true; // 手动重试视为重新进入：onPrepared 恢复记忆进度
     _init();
   }

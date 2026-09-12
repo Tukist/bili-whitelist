@@ -765,9 +765,14 @@ void main() {
       await tester.pumpAndSettle();
       expect(_entryKeys(tester), ['bvid:BV1']);
 
-      // 点合集 chip → 合集视频列表加载中 → 另一套 seed 的加载态
+      // 点合集 chip → 内容区动画滑到合集分区 → 合集视频列表加载中 →
+      // 另一套 seed 的加载态。
+      // 注意这里要 pump 两帧：切分区是 PageView 的横滑动画（kDurBase），
+      // 第一帧只是让动画起步、目标页还没进视口（也就还没被建出来），
+      // 推到动画中段才看得到它。
       await tester.tap(find.text('合集·测试'));
       await tester.pump();
+      await tester.pump(const Duration(milliseconds: 120));
       expect(find.byType(AppLoadingHero), findsOneWidget);
       expect(
         tester.widget<AppLoadingHero>(find.byType(AppLoadingHero)).seed,

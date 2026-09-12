@@ -2,10 +2,12 @@ package com.biliwhitelist.bili_whitelist_app
 
 import android.content.Context
 import android.graphics.SurfaceTexture
+import android.net.Uri
 import android.util.Log
 import android.view.Surface
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
+import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
 import androidx.media3.common.VideoSize
@@ -30,8 +32,15 @@ import java.net.UnknownHostException
  * 本地缓存播放：Dart 侧传 `file://`（或本地绝对路径）时走 [DefaultDataSource]
  * （file scheme → FileDataSource，无需防盗链头），其余逻辑（MergingMediaSource/
  * 事件/onUrlExpired）不变；本地文件不产生 HttpDataSource 错误，onUrlExpired 不误报。
+ *
+ * 媒体通知 / 耳机按键（v2.25.x）：本类不管通知，只把 `playWhenReady` 与 seek 事件
+ * 通过 [Listener] 上报（见 [Listener.onPlayWhenReadyChanged] / [Listener.onSeeked]）；
+ * 通知与会话由 [DashMediaNotification] 持有，通过 [mediaPlayer] 直接驱动播放器。
  */
 private const val TAG = "DashExoPlayer"
+
+/** 通知栏 / 耳机「快退、快进」步长（毫秒）：与 B 站媒体通知一致（15 秒）。 */
+private const val kSeekIncrementMs = 15_000L
 
 class DashExoPlayer(
     context: Context,
@@ -41,10 +50,25 @@ class DashExoPlayer(
 ) {
     /** 保留 applicationContext 供本地数据源使用（构造参数只在属性初始化期可用）。 */
     private val appContext: Context = context
+
+    /**
+     * 当前视频的展示信息：写进 [MediaItem] 的 [MediaMetadata]，供**会话侧**
+     * 消费者（Android Auto / 车机 / Wear 的 MediaController、`dumpsys media_session`）
+     * 读到；本 App 自己那条通知的标题 / 副标题 / 封面由 [DashMediaNotification]
+     * 渲染（防盗链头不同）。
+     */
+    data class Meta(val title: String, val artist: String, val coverUrl: String)
+
     /** 播放器事件回调（主线程触发），由插件层转成 EventChannel 事件推给 Dart。 */
     interface Listener {
-        /** 准备完成：[width]/[height] 为视频像素尺寸，[durationMs] 为总时长（未知时为 0）。 */
-        fun onPrepared(width: Int, height: Int, durationMs: Long)
+        /**
+         * 准备完成：[width]/[height] 为视频像素尺寸，[durationMs] 为总时长（未知时为 0）。
+         *
+         * ⚠️ **每次进 `STATE_READY` 都会回调**（不只 setDataSource 之后：seek、
+         * 重新缓冲后也会），所以 [playWhenReady] 必须带上——Dart 侧据此决定界面
+         * 播放态，否则「暂停态下 seek」会被误报成「正在播放」（v2.25.0-r2 修复）。
+         */
+        fun onPrepared(width: Int, height: Int, durationMs: Long, playWhenReady: Boolean)
 
         /** 播放到结尾。 */
         fun onCompleted()
@@ -55,6 +79,16 @@ class DashExoPlayer(
         /** 可自动恢复的数据源错误（URL 过期 / 瞬时网络错误）：Dart 侧重取 playurl
          *  后调 prepare 续播（保留位置），避免弹错误打断观看。 */
         fun onUrlExpired()
+
+        /**
+         * `playWhenReady` 变化：用户经**通知栏按钮 / 耳机媒体键**点了播放或暂停。
+         * 用 playWhenReady（用户意图）而不是 isPlaying（缓冲中会翻成 false）——
+         * 否则每次缓冲抖动都会让播放页的播放/暂停图标闪一下。
+         */
+        fun onPlayWhenReadyChanged(playWhenReady: Boolean)
+
+        /** 发生 seek（通知栏快退/快进 15 秒、拖动、断点恢复等）：回传新位置（毫秒）。 */
+        fun onSeeked(positionMs: Long)
     }
 
     private val surfaceTexture: SurfaceTexture = surfaceTextureEntry.surfaceTexture().apply {
@@ -90,7 +124,12 @@ class DashExoPlayer(
     @Volatile
     private var speed: Float = 1f
 
-    private val player: ExoPlayer = ExoPlayer.Builder(appContext).build().apply {
+    private val player: ExoPlayer = ExoPlayer.Builder(appContext).apply {
+        // 通知栏「快退 15 秒 / 快进 15 秒」与耳机线控的 seekBack()/seekForward()
+        // 都按这个步长走（默认 5s/15s 不符合 B 站习惯，这里统一 15s）
+        setSeekBackIncrementMs(kSeekIncrementMs)
+        setSeekForwardIncrementMs(kSeekIncrementMs)
+    }.build().apply {
         setVideoSurface(surface)
         addListener(object : Player.Listener {
             override fun onPlaybackStateChanged(state: Int) {
@@ -109,6 +148,22 @@ class DashExoPlayer(
                 }
             }
 
+            override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                listener.onPlayWhenReadyChanged(playWhenReady)
+            }
+
+            override fun onPositionDiscontinuity(
+                oldPosition: Player.PositionInfo,
+                newPosition: Player.PositionInfo,
+                reason: Int,
+            ) {
+                // 只回传 seek（通知栏快退快进 / 拖动 / 断点恢复）：其他原因（自动
+                // 跳变、repeat）不是用户操作，不必让 Dart 侧刷新状态
+                if (reason == Player.DISCONTINUITY_REASON_SEEK) {
+                    listener.onSeeked(newPosition.positionMs)
+                }
+            }
+
             override fun onPlayerError(error: PlaybackException) {
                 if (isRecoverableSourceError(error)) {
                     // URL 过期或瞬时网络错误（超时/断连/5xx 等）：交给 Dart 侧重取
@@ -124,17 +179,28 @@ class DashExoPlayer(
         })
     }
 
+    /** 底层播放器：媒体会话（耳机媒体键）与媒体通知直接读它的播放状态。 */
+    val mediaPlayer: Player get() = player
+
     /**
      * 组源并播放：video/audio 各建 ProgressiveMediaSource，再 MergingMediaSource 合并。
      * [audioUrl] 传空/Null 时退化为 mp4 单流（老视频降级）。[positionMs] 用于过期续播。
      *
      * 本地缓存（[isLocalUri]）走 [localDataSourceFactory]（无防盗链头）；
      * 网络流走 [dataSourceFactory]（Referer + UA）。
+     *
+     * [meta] 非空时写进 video 源 MediaItem 的 MediaMetadata（标题 / UP 名 / 封面
+     * URL）——系统媒体控件与「媒体续播」卡片据此显示，不影响解码与播放。
      */
-    fun prepare(videoUrl: String, audioUrl: String?, positionMs: Long) {
+    fun prepare(
+        videoUrl: String,
+        audioUrl: String?,
+        positionMs: Long,
+        meta: Meta? = null,
+    ) {
         val videoFactory = if (isLocalUri(videoUrl)) localDataSourceFactory else dataSourceFactory
         val videoSource = ProgressiveMediaSource.Factory(videoFactory)
-            .createMediaSource(MediaItem.fromUri(videoUrl))
+            .createMediaSource(buildMediaItem(videoUrl, meta))
         val mediaSource = if (audioUrl.isNullOrEmpty()) {
             videoSource
         } else {
@@ -150,6 +216,17 @@ class DashExoPlayer(
         player.play()
         // 兜底：换源（prepare）后按当前倍速重设，防被重置回 1x
         if (speed != 1f) player.setPlaybackSpeed(speed)
+    }
+
+    /** 组 MediaItem：带展示元信息（会话侧消费者读）；字段为空则不带，保持干净。 */
+    private fun buildMediaItem(url: String, meta: Meta?): MediaItem {
+        if (meta == null) return MediaItem.fromUri(url)
+        val metadata = MediaMetadata.Builder()
+            .setTitle(meta.title.ifEmpty { null })
+            .setArtist(meta.artist.ifEmpty { null })
+            .setArtworkUri(meta.coverUrl.takeIf { it.isNotEmpty() }?.let { Uri.parse(it) })
+            .build()
+        return MediaItem.Builder().setUri(url).setMediaMetadata(metadata).build()
     }
 
     /** 是否为本地文件地址：`file:` scheme，或不存在 scheme 的绝对路径。 */
@@ -182,11 +259,13 @@ class DashExoPlayer(
 
     fun getPosition(): Long = player.currentPosition
 
-    /** 准备完成：回报视频宽高与总时长（ms），Dart 侧据此初始化进度条。 */
+    /** 准备完成：回报视频宽高与总时长（ms）+ 当前播放意图，Dart 侧据此初始化进度条与播放态。 */
     private fun emitPrepared() {
         val duration = if (player.duration == C.TIME_UNSET) 0L else player.duration
         val size = player.videoSize
-        listener.onPrepared(size.width, size.height, duration)
+        // playWhenReady（用户意图）而不是 isPlaying（缓冲中会翻成 false）：
+        // 暂停态下 seek 也会走到这里，带上它 Dart 才不会把界面改成「正在播放」
+        listener.onPrepared(size.width, size.height, duration, player.playWhenReady)
     }
 
     /**

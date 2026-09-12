@@ -8,6 +8,46 @@
 
 ---
 
+## v2.25.0 (2026-09-13)
+
+**UP 主页支持左右滑动切换分区（横滑切区 / 纵滑滚列表、chips 双向同步、每区独立状态与滚动位置）；接入 Android 媒体通知 + 耳机媒体键控制（封面缩略图、视频标题、`UP名 · 状态`，快退15s / 播放暂停 / 快进15s / 关闭）；并修掉快退语义、暂停态 seek 错报播放、通知封面 cleartext 被拦、重播 tick 停滞等问题；v2.25.0**
+
+**A. UP 主页支持左右滑动切换分区**
+
+- **UP 主页内容区改成 `PageView`**：**横滑切分区**（全部视频 / 动态 / 专栏 / 各合集·列表），**纵滑仍然滚列表** —— 由 Flutter 按**首次移动方向**自行裁决，**没有写任何自定义手势代码**（不抢纵向滚动，无方向判定偏差）
+- **顶部 chips 双向同步**：滑动切页后 chips 选中态跟着变；点 chips 也能切；**第一个 / 最后一个分区继续滑不出界**（`PageView` 默认边界行为）
+- **每个分区独立状态**：新增 `_CollectionView`，**各持自己的 videos / page / loading / error / ledger** —— 切回**不重拉**、翻页进度不丢
+- **滚动位置按分区保留**：先试了 `PageStorageKey` 但**实测踩坑**（页内 `ExpandableText` 里还有别的滚动容器，框架按上下文算 key/slot 会算成同一个、把外层位置覆盖成 0）→ 改成**自记账**（`_sectionOffsets` + `_SectionScrollHost`，**重建即从上次位置起步**）
+- **chips 顺序未变**（「全部视频 / 动态 / 专栏 / 合集…」），因此从「全部视频」左滑到的是「动态」
+
+**B. Android 媒体通知 + 耳机按键控制**（用户要求「和 B 站一样、能用耳机控制暂停继续」）
+
+- **原生新增 `DashMediaNotification.kt`**：media3 `MediaSession` + 通知，展示**封面缩略图 + 视频标题 + `UP名 · 状态`**，四个动作：**快退15s / 播放暂停 / 快进15s / 关闭**
+- **Dart 侧新增通道** `updateNowPlaying(...)`（同步标题 / UP / 封面 / 播放态 / 进度）与 `onMediaAction` 事件（原生 → 界面）；**通知操作与界面状态双向一致**（不会出现「通知暂停了界面还在播」）
+- **耳机 / 蓝牙媒体键**走 MediaSession：`KEYCODE_MEDIA_PLAY_PAUSE` → 系统派发到活跃会话 → 播放器 play/pause（链路仅在代码级确认，**真机耳机需用户实测**）
+
+**C. 本轮实测发现并修掉的问题**
+
+- **快退 / 快进语义**：系统媒体卡片的「上一曲」会被映射成 `seekToPrevious`（对单集而言 = **回开头**）→ 改为**显式算目标位置并夹到 `[0, duration]`**，实测**每次恰好 ±15000ms**
+- **暂停态 seek 后界面错报「正在播放」**：`_onPrepared` **无条件**置 `_playing = true`，而它**每次进 READY 都会触发** → 改为按原生 `playWhenReady` 决定（同时修正「只有 `playWhenReady` 才清 `_completed`」）
+- **通知封面不显示**：部分视频 cover 是 `http://`，被 **cleartext 策略拦截**（logcat 有原文）→ **原生与 Dart 两处**都把 URL 归一化到 `https`
+- **✕ 之后 tick 空转 + 两处竞态**：停止后仍轮询；且在途 tick / 原生 stop 到事件到达的 **~150ms 窗口**里 `getPosition()` 恒报 0，会把界面位置冲成 0:00 → 加**双守卫**（停止态早退、播放中位置不可能倒退到 0）
+- **顺带修掉一个真 bug**：`_init()` 原来**不取消旧订阅、不 dispose 旧播放器** → 「✕ 后再播」/「评论区链接换视频」时事件被**双份处理**、且旧播放器一直出声
+- **修掉一个既有 bug**（上一轮发现）：`_onCompleted` 只 `cancel` 不置 null，而 `_init` 用 `_timer ??=` → **播完再播时进度条 / 字幕不再刷新**；改为新增幂等 `_ensureTickTimer()`（用 `Timer.isActive` 判定，能**自愈重建**且**不会叠加双计时器**）
+
+**D. 一处必须说明的平台取舍**
+
+- **实测 + 字节码双证：Android 13+ 的系统媒体卡片不允许 App 自定义按钮** —— 它只渲染自己的固定槽位（上 / 播放暂停 / 下），media3 1.5.1 也**不把 `setCustomLayout` 导出到 `PlaybackStateCompat`**
+- 因此**让用户看到的那张卡片改为 App 自己的通知**（四个动作齐全、语义精确），**MediaSession 保留**给耳机 / 蓝牙媒体键与 MediaController 用
+- **代价**：该通知**不再出现在系统锁屏的媒体控制区**，也不再豁免 Android 13+ 的 `POST_NOTIFICATIONS`（会照常请求授权；**被拒时通知不显示、播放不受影响**）
+- 收起态一屏最多 **3 个 action**（Android 对普通通知的硬限制），第 4 个（关闭）需展开
+
+- 测试：`flutter analyze` **0 issue**；全量 `flutter test` **1571 例全绿**（本轮由 **1562 → 1571**，净增 **9 例**）；`:app:compileDebugKotlin` **BUILD SUCCESSFUL**；关键回归做了**红 / 绿双向验证**（去掉修复必红）
+- 验证：**模拟器实测** —— UP 主页左右滑切分区 / chips 同步 / 纵滑不误切 / 切回保留数据与滚动位置；通知**展开态可见封面 + 四个按钮**、**快退 / 快进实测每次恰好 15000ms**、关闭后**通知消失 + `state=NONE(0)`** + 界面停止态且位置保留、**暂停态 seek 后仍暂停**、封面 `largeIcon=BITMAP 125x70`
+- ⚠ 未验证项（如实）：**耳机按键在模拟器上无法验证**（无耳机；已用 `cmd media_session dispatch play-pause/rewind/fast-forward` 验证**等价链路**正确、`dumpsys media_session` 显示 Media button session 仍是本 App）→ **需真机确认**
+
+---
+
 ## v2.24.0 (2026-09-12)
 
 **修复专栏正文渲染（用户反馈「图片没法正常显示、界面直接把原始 JSON 显示出来了」）：新增 Quill Delta 格式解析并自动判别两种正文形态，图片 / 标题 / 列表 / 引用块全部正常显示，界面不再泄漏原始 JSON；v2.24.0**

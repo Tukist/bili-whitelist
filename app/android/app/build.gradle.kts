@@ -84,4 +84,12 @@ dependencies {
     // B 站 DASH 双流播放：与 video_player_android 2.8.15 传递的 Media3 版本对齐（1.5.1），
     // 避免 APK 里出现两份 media3（Gradle 按同版本合并成一份）。
     implementation("androidx.media3:media3-exoplayer:1.5.1")
+    // 媒体通知 + 耳机按键控制播放（v2.25.x）：
+    // - media3-session：MediaSession（系统媒体会话；耳机/蓝牙媒体键由系统派发到
+    //   活跃会话，media3 直接驱动 ExoPlayer，无需自写 MediaButtonReceiver）；
+    // - media3-ui：PlayerNotificationManager（MediaStyle 通知 = 封面 + 标题 +
+    //   `UP 名 · 状态` + 快退15s/播放暂停/快进15s/关闭）。
+    // 同为 1.5.1：与 media3-exoplayer 严格同版本，避免 media3 同库多版本共存。
+    implementation("androidx.media3:media3-session:1.5.1")
+    implementation("androidx.media3:media3-ui:1.5.1")
 }

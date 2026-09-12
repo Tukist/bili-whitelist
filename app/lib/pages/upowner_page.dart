@@ -14,10 +14,21 @@
 ///   pn/ps 分页 + 触底加载更多），卡片见 [_ArticleCard]，点击进 [ArticlePage]
 ///   阅读页；同样是**懒加载**（首次点「专栏」才请求）。三个内容源（视频 /
 ///   动态 / 专栏）互斥，同一时刻只有一个在下面显示
+/// - 内容区**可左右滑动切分区**（+ 可横滑切换）：内容区是 [PageView]，一页 =
+///   一个分区（「全部视频」/「动态」/「专栏」/ 各合集·列表，顺序与 chips 行
+///   一致）；点 chips 与左右滑动**双向同步**（chips 选中态跟着滑到哪一页走，
+///   点 chips 则动画滑过去）。横向手势归 PageView、纵向手势归页内列表，互不
+///   干扰（各挂各的手势识别器，靠方向分流）
+/// - 每个分区的数据、翻页进度、滚动位置**各自保留**：页内列表由
+///   [_SectionScrollHost] 挂一个「一个挂载期一个」的 [ScrollController]，
+///   位置在 [_UpownerPageState._sectionOffsets] 里记账（滑走再滑回来不重新
+///   请求、不回顶）；分区被滑走时其列表 Element 会被 PageView 回收，但数据
+///   活在 State 里（见 [_CollectionView]），下次滑回来直接用
 /// - 视频列表：分页（滚动到底加载更多 20 条/页）+ 排序 chip（最新发布 /
 ///   最多播放 / 最多收藏）+ 站内搜索（搜索/排序只作用于「全部视频」）
 /// - 合集/列表视频视图（选中某合集后）：独立分页列表（fetchSeasonArchives /
-///   fetchSeriesArchives），不受搜索/排序影响
+///   fetchSeriesArchives），不受搜索/排序影响；每个合集/列表是**独立分区**
+///   （各自的数据/翻页/滚动位置，见 [_CollectionView]）
 /// - 列表项点击 → 构造 WhitelistVideo（缺 cid 时实时 fetchVideoMeta 拿，
 ///   两个视图共用）→ push 到 PlayerPage
 /// - 列表项长按 → 弹菜单「加入白名单视频」/「取消」（两个视图共用）
@@ -38,9 +49,10 @@
 /// 块化与动效（批次 4）：
 /// - 两套列表（「全部视频」/「合集·列表」视频）各挂一个 [StaggeredListScope]：
 ///   代次 = `upowner.videos#<加载代际>`（复用已有的 `_listGen`）
-///   与 `upowner.seasons#<合集代次>`（换合集自增，用来重演入场）；
+///   与 `upowner.seasons#<合集代次>`（该合集重新加载自增，用来重演入场）；
 ///   每条视频包 [StaggeredEntrance]（entryKey = bvid），首屏逐条推入、
 ///   翻页追加用更短节奏；「动态」「专栏」两区同款（entryKey = 动态 id / cvid）；
+///   每个合集/列表有**各自**的入场账本（滑回同一个合集不重播）
 /// - 整页等待（首屏拉视频）= [AppLoadingHero]，列表底部翻页 = 小剪影 + 闲话；
 ///   顶部「关注」按钮的 14px 内联转圈**保持不变**（那是操作反馈）。
 library;
@@ -160,9 +172,52 @@ class UpownerPage extends StatefulWidget {
 class _UpownerPageState extends State<UpownerPage> {
   late final BiliApi _api = widget.api ?? BiliApi();
   late final UpownerWriter _upwriter = widget.writer ?? UpownerWriter();
-  final ScrollController _scrollCtrl = ScrollController();
   final TextEditingController _searchCtrl = TextEditingController();
   Timer? _searchDebounce;
+
+  // -------------------------------------------------------------------------
+  // 分区（PageView 的一页 = 一个分区）
+  // -------------------------------------------------------------------------
+
+  /// 内容区控制器：左右滑动切分区、点 chips 也走它（[._goToSection]）。
+  final PageController _pageCtrl = PageController();
+
+  /// 当前分区下标：0 = 「全部视频」、1 = 「动态」、2 = 「专栏」、
+  /// 3+ = 各合集/列表（下标 - 3 = [_collections] 下标，顺序与 chips 行一致）。
+  ///
+  /// **唯一**的「现在看的是哪一类内容」判据：搜索框/排序 chips 是否显示、
+  /// chips 行哪个高亮、触底翻哪一页都从它派生（滑动落页与点 chips 都改它）。
+  int _section = 0;
+
+  /// 各分区列表「上次离开时」的滚动位置（分区 key → offset）。
+  ///
+  /// 为什么要自己记账：PageView 滑走后页内列表会被回收（不留 State），滑回来
+  /// 得把位置放回去；用框架的 `PageStorageKey` 不行——页内还有别的滚动容器
+  /// （动态卡/视频行的 [ExpandableText] 里就有一个 `SingleChildScrollView`），
+  /// 它们没有自己的 PageStorageKey，会和**外层列表**算成同一个存储 slot，
+  /// 把外层位置覆盖成 0（实测：外部列表 180 → 被内层写回 0）。所以改为在
+  /// [_SectionScrollHost] 里给每个分区挂一个「一个挂载期一个」的控制器、
+  /// 用本表记住位置并在重新挂载时按它起步（同 PageStorage 的做法，但不撞车）。
+  final Map<String, double> _sectionOffsets = {};
+
+  /// 包某分区列表：给这一个「列表挂载期」一个滚动控制器（初始位置 = 上次
+  /// 离开时的位置），并把滚动位置写回 [_sectionOffsets]。
+  ///
+  /// [builder] 拿到控制器去建 `ListView`；[onNearBottom] 是该分区自己的
+  /// 「触底加载下一页」。
+  Widget _sectionScrollHost({
+    required String sectionKey,
+    required VoidCallback onNearBottom,
+    required Widget Function(BuildContext context, ScrollController controller)
+        builder,
+  }) {
+    return _SectionScrollHost(
+      initialOffset: _sectionOffsets[sectionKey] ?? 0,
+      onOffset: (offset) => _sectionOffsets[sectionKey] = offset,
+      onNearBottom: onNearBottom,
+      builder: builder,
+    );
+  }
 
   /// UP 主信息（头部卡片用）：先用 [widget.initial] 预填；fetch 后覆盖。
   UpownerInfo? _info;
@@ -204,17 +259,15 @@ class _UpownerPageState extends State<UpownerPage> {
 
   /// 该 UP 主的合集 + 列表（series 已过滤 creator='auto' 系统自动项）；
   /// 空 = 没有合集/列表 → 整区不显示。
+  ///
+  /// 也决定分区的页数（`3 + _collections.length`）与 chips 行的合集 chip 数：
+  /// 合集清单是异步来的，**只在末尾追加**分区 → 已选中的分区下标不会错位。
   final List<UpownerCollection> _collections = [];
 
-  /// 当前选中的合集/列表（null = 全部视频）。
-  UpownerCollection? _activeCollection;
-
-  /// 当前合集/列表内视频 + 翻页（选中合集时用）。
-  final List<WhitelistVideo> _colVideos = [];
-  int _colPage = 1;
-  bool _colHasMore = true;
-  bool _colLoadingMore = false;
-  String? _colError;
+  /// 各合集/列表分区的视图状态（分区 key → 状态，见 [_CollectionView]）：
+  /// 每个合集是 PageView 里独立的一页，各自持有列表/翻页/错误/入场账本 ——
+  /// 左右滑回来时数据与翻页进度都还在（不重复请求）。
+  final Map<String, _CollectionView> _colViews = {};
 
   /// 当前是否「关注」（= 白名单 UP 主）。初始取进入时的 [widget.isInWhitelist]；
   /// 页面内「关注/取消关注」成功后更新（与外部数据源 Gist 同步由写入结果驱动）。
@@ -228,27 +281,16 @@ class _UpownerPageState extends State<UpownerPage> {
 
   // ---- 交错入场（批次 4）---------------------------------------------------
 
-  /// 两套列表各一本「已入场」账本（活在列表项之外，回收再出现不重播）。
+  /// 「全部视频」列表的「已入场」账本（活在列表项之外，回收再出现不重播）。
   final EntranceLedger _videoLedger = EntranceLedger();
-  final EntranceLedger _colLedger = EntranceLedger();
-
-  /// 合集/列表视图的数据代次：换合集（[._selectCollection]）自增 ——
-  /// 配合清空的账本，让同一批视频在换合集后能重演一次。
-  /// 「全部视频」列表直接用已有的 [_listGen]（每次全新加载 +1）。
-  int _colToken = 0;
 
   /// 本批次起点（翻页追加时置为「追加前的条数」）：新增项按
   /// `i - batchStart` 从 0 排队；0 = 首屏，直接用 i。
   int _videoBatchStart = 0;
-  int _colBatchStart = 0;
 
   // -------------------------------------------------------------------------
-  // 「动态」区（v2.22.0+）：评论头像 → 个人页 的第二个内容源。
+  // 「动态」区（v2.22.0+）：评论头像 → 个人页 的第二个内容源（分区 1）。
   // -------------------------------------------------------------------------
-
-  /// 当前是否在「动态」视图（与 [_activeCollection] 互斥：动态视图下
-  /// [_activeCollection] 必为 null）。
-  bool _dynamicMode = false;
 
   /// 已加载的动态（按 id 去重）。
   final List<DynamicItem> _dynamics = [];
@@ -278,11 +320,8 @@ class _UpownerPageState extends State<UpownerPage> {
   final EntranceLedger _dynLedger = EntranceLedger();
 
   // -------------------------------------------------------------------------
-  // 「专栏」区（v2.23.0+）：UP 主主页的第三个内容源（视频 / 动态 / 专栏互斥）。
+  // 「专栏」区（v2.23.0+）：UP 主主页的第三个内容源（分区 2）。
   // -------------------------------------------------------------------------
-
-  /// 当前是否在「专栏」视图（与 [_dynamicMode]、[_activeCollection] 互斥）。
-  bool _articleMode = false;
 
   /// 已加载的专栏（按 cvid 去重）。
   final List<ArticleSummary> _articles = [];
@@ -324,7 +363,6 @@ class _UpownerPageState extends State<UpownerPage> {
         sign: '',
       );
     }
-    _scrollCtrl.addListener(_onScroll);
     _loadInfo();
     _loadFirstPage();
     _loadCollections();
@@ -333,27 +371,121 @@ class _UpownerPageState extends State<UpownerPage> {
   @override
   void dispose() {
     _searchDebounce?.cancel();
-    _scrollCtrl.removeListener(_onScroll);
-    _scrollCtrl.dispose();
+    _pageCtrl.dispose();
     _searchCtrl.dispose();
     super.dispose();
   }
 
-  /// 滚动监听：距底部 ≤ 200px 触发加载下一页（当前是动态/专栏视图就翻它的
-  /// 页，是合集视图就翻合集的页，否则翻「全部视频」的页）。
-  void _onScroll() {
-    if (!_scrollCtrl.hasClients) return;
-    final pos = _scrollCtrl.position;
-    if (pos.pixels >= pos.maxScrollExtent - 200) {
-      if (_dynamicMode) {
-        _loadDynamicPage(reset: false);
-      } else if (_articleMode) {
-        _loadArticlePage(reset: false);
-      } else if (_activeCollection != null) {
-        _loadCollectionMore();
-      } else {
-        _loadMore();
-      }
+  // -------------------------------------------------------------------------
+  // 分区模型（PageView 一页 = 一个分区）
+  // -------------------------------------------------------------------------
+
+  /// 分区总页数 = 「全部视频」+「动态」+「专栏」+ 各合集/列表。
+  ///
+  /// 合集清单异步到货只会往**末尾追加**（[._loadCollections]），已选中分区的
+  /// 下标因此不会错位；万一分区数变少（清单被换掉），[_syncSectionBounds]
+  /// 会把下标夹回合法范围。
+  int get _sectionCount => 3 + _collections.length;
+
+  /// 分区 key（PageView 页 key / 滚动控制器 key 共用）。
+  String _sectionKey(int index) {
+    if (index == 1) return 'dynamics';
+    if (index == 2) return 'articles';
+    if (index >= 3 && index - 3 < _collections.length) {
+      return _colKey(_collections[index - 3]);
+    }
+    return 'videos';
+  }
+
+  /// 合集/列表分区的 key（kind + id 唯一）。
+  String _colKey(UpownerCollection c) => '${c.kind.name}#${c.id}';
+
+  /// 分区下标 → 页面 Widget。
+  ///
+  /// 每个分区给一个稳定 key（[._sectionKey]）：切分区（尤其是换合集）时按 key
+  /// 匹配 Element，页内的滚动宿主/列表状态不会错配到别的分区上。
+  Widget _buildSection(int index) {
+    final key = _sectionKey(index);
+    final Widget page;
+    if (index == 1) {
+      page = _buildDynamicList();
+    } else if (index == 2) {
+      page = _buildArticleList();
+    } else {
+      final view = _colViews[key];
+      page = view != null ? _buildCollectionVideoList(view) : _buildVideoList();
+    }
+    return KeyedSubtree(key: ValueKey(key), child: page);
+  }
+
+  /// 切分区（点 chips 走这里；左右滑动由 [._onSectionChanged] 接管）：
+  /// 先按需触发目标分区的懒加载（不等动画走完），再动画滑过去。
+  void _goToSection(int index) {
+    if (index < 0 || index >= _sectionCount) return;
+    _ensureSectionData(index);
+    if (index == _section) return;
+    if (_pageCtrl.hasClients) {
+      _pageCtrl.animateToPage(index, duration: kDurBase, curve: kCurveOut);
+    } else {
+      setState(() => _section = index);
+    }
+  }
+
+  /// 滑动落页：同步「当前分区」——chips 行的选中态由 [_section] 派生，于是
+  /// 滑动与点 chips 双向同步。分页过半（PageView 报新页号）就切，手感跟手。
+  void _onSectionChanged(int index) {
+    if (index != _section) setState(() => _section = index);
+    _ensureSectionData(index);
+  }
+
+  /// 懒加载：切到某分区才拉它的首屏（已成功拉过的不再请求）。
+  ///
+  /// 三个固定区 + 各合集/列表都走这里：滑到哪一页就只请求哪一页的数据，
+  /// 进页时不会多打「动态/专栏」等风控接口（[._dynLoadedOnce] /
+  /// [._artLoadedOnce] / [_CollectionView.loadedOnce] 是各自的一次性闸门）。
+  void _ensureSectionData(int index) {
+    if (index == 1) {
+      if (!_dynLoadedOnce && !_dynLoading) _loadDynamicPage(reset: true);
+      return;
+    }
+    if (index == 2) {
+      if (!_artLoadedOnce && !_artLoading) _loadArticlePage(reset: true);
+      return;
+    }
+    if (index < 3) return;
+    if (index - 3 >= _collections.length) return; // 越界（清单刚变短）：无分区可拉
+    final view = _colViews[_colKey(_collections[index - 3])];
+    if (view != null && !view.loadedOnce && !view.loading) {
+      unawaited(_loadCollectionPage(view, 1));
+    }
+  }
+
+  /// 分区数变化（合集清单到货/被换掉）后把当前下标夹回合法范围：
+  /// 只是「清单变短了」的兜底，正常路径（合集只往末尾追加）不会走到。
+  ///
+  /// 必须在改动 [_collections] 的 setState **之后**调用：`jumpToPage` 会同步
+  /// 派发滚动通知 → [._onSectionChanged] 里还有一次 setState，不能在
+  /// setState 回调里嵌套触发。
+  void _syncSectionBounds() {
+    if (_section < _sectionCount) return;
+    setState(() => _section = _sectionCount - 1);
+    if (_pageCtrl.hasClients) _pageCtrl.jumpToPage(_section);
+  }
+
+  /// 某分区列表滑到近底（≤ 200px）：触发**该分区**的下一页。
+  ///
+  /// 每个分区挂的是自己的列表（自己的 [_SectionScrollHost]），所以这里按
+  /// key 分派——不会出现「在动态区触底却翻了视频区的页」。
+  void _onNearBottom(String sectionKey) {
+    if (sectionKey == 'videos') {
+      _loadMore();
+    } else if (sectionKey == 'dynamics') {
+      _loadDynamicPage(reset: false);
+    } else if (sectionKey == 'articles') {
+      _loadArticlePage(reset: false);
+    } else {
+      final view = _colViews[sectionKey];
+      if (view != null) _loadCollectionMore(view);
     }
   }
 
@@ -501,6 +633,9 @@ class _UpownerPageState extends State<UpownerPage> {
     // 全新加载 = 换了一批数据：清空账本（允许同一 bvid 再演一次）+ 批次起点归零
     _videoLedger.clear();
     _videoBatchStart = 0;
+    // 换了一批数据 → 滚动原点归零（否则搜索结果会从上次的位置开始，见
+    // [_SectionScrollHost]：列表重建时按记账的位置起步）
+    _sectionOffsets['videos'] = 0;
     setState(() {
       _videos.clear();
       _page = 1;
@@ -629,6 +764,9 @@ class _UpownerPageState extends State<UpownerPage> {
 
   /// 拉 UP 主合集/列表清单。失败静默隐藏整区（不影响主视频列表，
   /// 下次进入本页会重试）；「合集」区只在拿到 ≥1 项后显示。
+  ///
+  /// 清单到货 = 分区页数从 3 涨到 `3 + n`（**只在末尾追加**，已选中分区的
+  /// 下标不错位）；同时为每个合集/列表建一份独立的视图状态（[_CollectionView]）。
   Future<void> _loadCollections() async {
     try {
       final result = await _api.fetchUpownerCollections(widget.mid);
@@ -644,7 +782,16 @@ class _UpownerPageState extends State<UpownerPage> {
         _collections
           ..clear()
           ..addAll(kept);
+        // 每项一份视图状态（已在看过的那份**保留**：滑回来不重拉、不回顶）；
+        // 清单里没了的项连视图一起清掉（理论不会发生，接口给了就稳定）
+        final alive = kept.map(_colKey).toSet();
+        _colViews.removeWhere((k, _) => !alive.contains(k));
+        for (final c in kept) {
+          _colViews.putIfAbsent(_colKey(c), () => _CollectionView(c));
+        }
       });
+      // 分区页数变了：当前下标越界就夹回来（setState 之外调用，见其注释）
+      _syncSectionBounds();
     } on BiliApiException {
       // 合集接口失败（风控/限流等）：静默，仅不显示合集区
     } on DioException {
@@ -652,113 +799,82 @@ class _UpownerPageState extends State<UpownerPage> {
     }
   }
 
-  /// 两个合集条目是否同一（null == null；同 kind 且同 id）。
-  bool _sameCollection(UpownerCollection? a, UpownerCollection? b) {
-    if (a == null || b == null) return a == b;
-    return a.kind == b.kind && a.id == b.id;
-  }
-
-  /// 选中/切回合集（null = 切回「全部视频」）。切合集会自动离开「动态」/
-  /// 「专栏」视图（三个内容源互斥）。
-  void _selectCollection(UpownerCollection? c) {
-    if (_sameCollection(_activeCollection, c) &&
-        !_dynamicMode &&
-        !_articleMode) {
-      return;
-    }
-    setState(() {
-      _dynamicMode = false;
-      _articleMode = false;
-      _activeCollection = c;
-      _colVideos.clear();
-      _colPage = 1;
-      _colHasMore = true;
-      _colLoadingMore = false;
-      _colError = null;
-      // 换合集 = 换数据源：代次 +1 + 清空账本（同一批视频可再演一次）
-      _colToken++;
-      _colLedger.clear();
-      _colBatchStart = 0;
-    });
-    // 切视图时滚动回顶部（主/合集两个列表共用一个 controller）
-    if (_scrollCtrl.hasClients) _scrollCtrl.jumpTo(0);
-    if (c != null) _loadCollectionPage(1);
-  }
-
-  /// 加载合集/列表内指定页视频（page=1 时 _colVideos 已在 _selectCollection
-  /// 清空）。合集用 season 接口、列表用 series 接口。
-  Future<void> _loadCollectionPage(int pn) async {
-    final c = _activeCollection;
-    if (c == null) return;
-    setState(() => _colLoadingMore = true);
+  /// 加载合集/列表内指定页视频（合集用 season 接口、列表用 series 接口）。
+  ///
+  /// 结果写回**该合集自己的**视图状态（[view]）：等待期间用户滑走了也不会
+  /// 串到别的合集上（判据是视图对象本身还在册）。
+  Future<void> _loadCollectionPage(_CollectionView view, int pn) async {
+    final c = view.collection;
+    setState(() => view.loading = true);
     try {
       final result = c.kind == UpownerCollectionKind.season
           ? await _api.fetchSeasonArchives(c.id, page: pn)
           : await _api.fetchSeriesArchives(widget.mid, c.id, page: pn);
       if (!mounted) return;
-      // 等待期间用户切走了 → 丢弃本次结果，不污染新视图
-      if (!_sameCollection(_activeCollection, c)) return;
-      // 去重（按 bvid；防接口重复条目）
-      final existing = _colVideos.map((v) => v.bvid).toSet();
+      // 等待期间该合集被换掉/移除 → 丢弃本次结果，不污染新视图
+      if (!identical(_colViews[view.key], view)) return;
+      // 去重（按 bvid；防接口重复条目/翻页边界重复）
+      final prevCount = view.videos.length;
+      final seen = view.videos.map((v) => v.bvid).toSet();
       final appended = [
-        ..._colVideos,
+        ...view.videos,
         for (final v in result.videos)
-          if (!existing.contains(v.bvid)) v,
+          if (seen.add(v.bvid)) v,
       ];
       setState(() {
-        _colVideos
+        view.videos
           ..clear()
           ..addAll(appended);
-        _colPage = pn;
-        _colHasMore = result.hasMore;
-        _colLoadingMore = false;
-        _colError = null;
+        view.page = pn;
+        view.hasMore = result.hasMore;
+        view.loading = false;
+        view.error = null;
+        view.loadedOnce = true;
         // 本批新增项的入场序号从 0 起算（旧项已记账不会重播）
-        _colBatchStart = existing.length;
+        view.batchStart = prevCount;
       });
     } on BiliApiException catch (e) {
-      if (!mounted || !_sameCollection(_activeCollection, c)) return;
+      if (!mounted || !identical(_colViews[view.key], view)) return;
       setState(() {
-        _colLoadingMore = false;
-        _colError = e.message;
+        view.loading = false;
+        view.error = e.message;
       });
     } on DioException {
-      if (!mounted || !_sameCollection(_activeCollection, c)) return;
+      if (!mounted || !identical(_colViews[view.key], view)) return;
       setState(() {
-        _colLoadingMore = false;
-        _colError = '网络请求失败，请检查网络后重试';
+        view.loading = false;
+        view.error = '网络请求失败，请检查网络后重试';
       });
     }
   }
 
-  /// 滚动到底翻合集/列表下一页。
-  void _loadCollectionMore() {
-    if (_colLoadingMore || !_colHasMore) return;
-    if (_colVideos.isEmpty) return;
-    _loadCollectionPage(_colPage + 1);
+  /// 重新拉某合集/列表的首屏（首屏错误态的「重试」）：清空 + 代次自增
+  /// （配合清空的账本，让同一批视频再演一次入场）。
+  void _reloadCollectionPage(_CollectionView view) {
+    view.token++;
+    view.ledger.clear();
+    view.batchStart = 0;
+    // 重新加载 → 滚动原点归零（同 [_loadFirstPage]）
+    _sectionOffsets[view.key] = 0;
+    setState(() {
+      view.videos.clear();
+      view.page = 1;
+      view.hasMore = true;
+      view.error = null;
+    });
+    unawaited(_loadCollectionPage(view, 1));
+  }
+
+  /// 滚动到底翻该合集/列表的下一页。
+  void _loadCollectionMore(_CollectionView view) {
+    if (view.loading || !view.hasMore) return;
+    if (view.videos.isEmpty) return;
+    unawaited(_loadCollectionPage(view, view.page + 1));
   }
 
   // -------------------------------------------------------------------------
   // 「动态」区逻辑（v2.22.0+）
   // -------------------------------------------------------------------------
-
-  /// 切到「动态」视图：懒加载（首次点才请求，进页不多打一次风控接口）+
-  /// 滚动回顶部。已是动态视图时直接返回（重复点 chip 不重载）。
-  void _selectDynamics() {
-    if (_dynamicMode) return;
-    setState(() {
-      _dynamicMode = true;
-      _articleMode = false;
-      _activeCollection = null;
-      _colVideos.clear();
-      _colPage = 1;
-      _colHasMore = true;
-      _colLoadingMore = false;
-      _colError = null;
-    });
-    if (_scrollCtrl.hasClients) _scrollCtrl.jumpTo(0);
-    if (!_dynLoadedOnce) _loadDynamicPage(reset: true);
-  }
 
   /// 加载动态：reset=true 清空重载首屏；false 用 [_dynOffset] 拉下一页。
   ///
@@ -870,24 +986,6 @@ class _UpownerPageState extends State<UpownerPage> {
       upName: _info?.name ?? '',
       addedAt: DateTime.now().toUtc().toIso8601String(),
     ));
-  }
-
-  /// 切到「专栏」视图：懒加载（首次点才请求）+ 滚动回顶部。已是专栏视图时
-  /// 直接返回（重复点 chip 不重载）。与「动态」「合集」互斥。
-  void _selectArticles() {
-    if (_articleMode) return;
-    setState(() {
-      _articleMode = true;
-      _dynamicMode = false;
-      _activeCollection = null;
-      _colVideos.clear();
-      _colPage = 1;
-      _colHasMore = true;
-      _colLoadingMore = false;
-      _colError = null;
-    });
-    if (_scrollCtrl.hasClients) _scrollCtrl.jumpTo(0);
-    if (!_artLoadedOnce) _loadArticlePage(reset: true);
   }
 
   /// 加载专栏：reset=true 清空重载首屏（pn=1）；false 拉下一页。
@@ -1139,22 +1237,22 @@ class _UpownerPageState extends State<UpownerPage> {
         body: Column(
           children: [
             _buildHeader(theme),
-            // 搜索/排序只作用于「全部视频」「合集·列表」两个视频视图；动态/
-            // 专栏视图有自己的卡片排版（不做站内搜索/排序）
-            if (!_dynamicMode && !_articleMode && _activeCollection == null)
-              _buildVideoSearchBar(),
+            // 搜索/排序只作用于「全部视频」视图（分区 0）；动态/专栏/合集
+            // 分区有自己的排版（不做站内搜索/排序）
+            if (_section == 0) _buildVideoSearchBar(),
             _buildContentBar(),
-            if (!_dynamicMode && !_articleMode && _activeCollection == null)
-              _buildOrderBar(),
+            if (_section == 0) _buildOrderBar(),
             const Divider(height: 1),
+            // 内容区：可左右滑动切分区（一页 = 一个分区，顺序同 chips 行）。
+            // 横向手势归这里的 PageView、纵向手势归页内列表——各挂各的
+            // 手势识别器，Flutter 按首次移动方向分派，互不抢。
             Expanded(
-              child: _dynamicMode
-                  ? _buildDynamicList()
-                  : (_articleMode
-                      ? _buildArticleList()
-                      : (_activeCollection == null
-                          ? _buildVideoList()
-                          : _buildCollectionVideoList())),
+              child: PageView.builder(
+                controller: _pageCtrl,
+                onPageChanged: _onSectionChanged,
+                itemCount: _sectionCount,
+                itemBuilder: (context, i) => _buildSection(i),
+              ),
             ),
           ],
         ),
@@ -1307,11 +1405,13 @@ class _UpownerPageState extends State<UpownerPage> {
   /// 顶部内容 switch 行：横向 chips（「全部视频」/「动态」/「专栏」+ 该 UP 主
   /// 各合集/列表）——整页的「看哪一类内容」开关，也是三个固定入口的所在。
   ///
+  /// - chips 的顺序**就是**内容区 PageView 的页序（第 i 个 chip = 第 i 页）：
+  ///   选中态由 [_section] 派生，于是「点 chips 切页」与「左右滑切页」双向同步；
   /// - 「全部视频」默认选中；「动态」「专栏」为固定项（v2.22.0+ / v2.23.0+），
-  ///   选中后下方换成对应列表（[._buildDynamicList] / [._buildArticleList]）；
+  ///   选中后内容区滑到对应分区（[._buildDynamicList] / [._buildArticleList]）；
   /// - 「合集」分组名只在真有合集/列表时显示；但 chips 行**始终保留**——
   ///   旧版「没有合集就整行隐藏」的写法会让「动态」「专栏」失去入口；
-  /// - 选中某合集后列表区切换到该合集视频（[._buildCollectionVideoList]），
+  /// - 选中某合集后内容区滑到该合集分区（[._buildCollectionVideoList]），
   ///   本行仍留在顶部方便随时切回「全部视频」/「动态」/「专栏」或换合集。
   Widget _buildContentBar() {
     final theme = Theme.of(context);
@@ -1339,32 +1439,33 @@ class _UpownerPageState extends State<UpownerPage> {
               children: [
                 ChoiceChip(
                   label: const Text('全部视频'),
-                  selected: _activeCollection == null &&
-                      !_dynamicMode &&
-                      !_articleMode,
-                  onSelected: (_) => _selectCollection(null),
+                  selected: _section == 0,
+                  onSelected: (_) => _goToSection(0),
                 ),
                 const SizedBox(width: 8),
                 ChoiceChip(
                   label: const Text('动态'),
-                  selected: _dynamicMode,
-                  onSelected: (_) => _selectDynamics(),
+                  selected: _section == 1,
+                  onSelected: (_) => _goToSection(1),
                 ),
                 const SizedBox(width: 8),
                 ChoiceChip(
                   label: const Text('专栏'),
-                  selected: _articleMode,
-                  onSelected: (_) => _selectArticles(),
+                  selected: _section == 2,
+                  onSelected: (_) => _goToSection(2),
                 ),
                 const SizedBox(width: 8),
-                for (final c in _collections) ...[
+                for (var i = 0; i < _collections.length; i++) ...[
                   ChoiceChip(
                     // season 名已含「合集·」前缀（与 B 站一致）；series 为纯名
-                    label: Text(c.kind == UpownerCollectionKind.season
-                        ? c.name
-                        : '${c.name} · 列表'),
-                    selected: _sameCollection(_activeCollection, c),
-                    onSelected: (_) => _selectCollection(c),
+                    label: Text(
+                      _collections[i].kind == UpownerCollectionKind.season
+                          ? _collections[i].name
+                          : '${_collections[i].name} · 列表',
+                    ),
+                    // 分区下标 = 3 + 合集下标（与 PageView 页号一致）
+                    selected: _section == 3 + i,
+                    onSelected: (_) => _goToSection(3 + i),
                   ),
                   const SizedBox(width: 8),
                 ],
@@ -1376,12 +1477,15 @@ class _UpownerPageState extends State<UpownerPage> {
     );
   }
 
-  /// 「动态」区列表（选中「动态」chip 后取代视频列表）。
+  /// 「动态」区列表（分区 1）。
   ///
   /// 状态视图与视频列表同一套：首屏整页等待 = [AppLoadingHero]（seed
   /// `upowner.dynamics`，与两个视频视图的闲话不串味）；首屏失败 =
   /// [AppErrorView]（可重试）；空 = [AppStateView]（文案直给——动态空态
   /// 不进设置页的文案表，避免为一个空态新增可编辑文案）；翻页 = 脚部小剪影。
+  ///
+  /// 列表用本分区**自己的**滚动控制器（[_SectionScrollHost]）：滑走再滑回来时
+  /// 滚动位置按 [_sectionOffsets] 恢复（不回顶），数据本来就在 State 里（不重拉）。
   Widget _buildDynamicList() {
     if (_dynLoading && _dynamics.isEmpty) {
       return const AppLoadingHero(seed: 'upowner.dynamics');
@@ -1405,48 +1509,53 @@ class _UpownerPageState extends State<UpownerPage> {
     final extraSlots = (_dynLoading || !_dynHasMore) ? 1 : 0;
     final appendBatch = _dynBatchStart > 0;
     // 交错入场：代次 = 动态代际（重新加载 +1），与两个视频列表分开记账
-    return StaggeredListScope(
-      generation: 'upowner.dynamics#$_dynGen',
-      ledger: _dynLedger,
-      child: ListView.builder(
-        controller: _scrollCtrl,
-        padding: const EdgeInsets.fromLTRB(
-          kPagePadH,
-          kSpace12,
-          kPagePadH,
-          kSpace12,
+    return _sectionScrollHost(
+      sectionKey: 'dynamics',
+      onNearBottom: () => _onNearBottom('dynamics'),
+      builder: (context, scrollCtrl) => StaggeredListScope(
+        generation: 'upowner.dynamics#$_dynGen',
+        ledger: _dynLedger,
+        child: ListView.builder(
+          controller: scrollCtrl,
+          padding: const EdgeInsets.fromLTRB(
+            kPagePadH,
+            kSpace12,
+            kPagePadH,
+            kSpace12,
+          ),
+          itemCount: _dynamics.length + extraSlots,
+          itemBuilder: (context, i) {
+            if (i >= _dynamics.length) {
+              return _buildListFooter(_dynLoading, seed: 'upowner.dynamics');
+            }
+            final d = _dynamics[i];
+            final int rawIndex = i - _dynBatchStart;
+            return StaggeredEntrance(
+              entryKey: 'dyn:${d.id}',
+              index: rawIndex < 0 ? 0 : rawIndex,
+              step: appendBatch ? kStaggerStepAppend : kStaggerStep,
+              duration: appendBatch ? kDurEntranceAppend : kDurEntrance,
+              maxIndex: appendBatch ? kStaggerMaxIndexAppend : kStaggerMaxIndex,
+              child: DynamicCard(
+                item: d,
+                fallbackAuthorName: _info?.name ?? '',
+                fallbackAuthorFace: _info?.face ?? '',
+                onImageTap: _openDynamicImage,
+                onVideoTap: () => _openDynamicVideo(d),
+              ),
+            );
+          },
         ),
-        itemCount: _dynamics.length + extraSlots,
-        itemBuilder: (context, i) {
-          if (i >= _dynamics.length) {
-            return _buildListFooter(_dynLoading, seed: 'upowner.dynamics');
-          }
-          final d = _dynamics[i];
-          final int rawIndex = i - _dynBatchStart;
-          return StaggeredEntrance(
-            entryKey: 'dyn:${d.id}',
-            index: rawIndex < 0 ? 0 : rawIndex,
-            step: appendBatch ? kStaggerStepAppend : kStaggerStep,
-            duration: appendBatch ? kDurEntranceAppend : kDurEntrance,
-            maxIndex: appendBatch ? kStaggerMaxIndexAppend : kStaggerMaxIndex,
-            child: DynamicCard(
-              item: d,
-              fallbackAuthorName: _info?.name ?? '',
-              fallbackAuthorFace: _info?.face ?? '',
-              onImageTap: _openDynamicImage,
-              onVideoTap: () => _openDynamicVideo(d),
-            ),
-          );
-        },
       ),
     );
   }
 
-  /// 「专栏」区列表（选中「专栏」chip 后取代视频列表）。
+  /// 「专栏」区列表（分区 2）。
   ///
   /// 状态视图与其它两套列表同一套：首屏整页等待 = [AppLoadingHero]（seed
   /// `upowner.articles`）；首屏失败 = [AppErrorView]（可重试）；空 =
   /// [AppStateView]（文案直给，与动态空态同处理）；翻页 = 脚部小剪影。
+  /// 滚动控制器与位置保存同 [._buildDynamicList]（各分区各一份）。
   Widget _buildArticleList() {
     if (_artLoading && _articles.isEmpty) {
       return const AppLoadingHero(seed: 'upowner.articles');
@@ -1470,38 +1579,42 @@ class _UpownerPageState extends State<UpownerPage> {
     final extraSlots = (_artLoading || !_artHasMore) ? 1 : 0;
     final appendBatch = _artBatchStart > 0;
     // 交错入场：代次 = 专栏代际（重新加载 +1），与其它三个列表分开记账
-    return StaggeredListScope(
-      generation: 'upowner.articles#$_artGen',
-      ledger: _artLedger,
-      child: ListView.builder(
-        controller: _scrollCtrl,
-        padding: const EdgeInsets.fromLTRB(
-          kPagePadH,
-          kSpace12,
-          kPagePadH,
-          kSpace12,
+    return _sectionScrollHost(
+      sectionKey: 'articles',
+      onNearBottom: () => _onNearBottom('articles'),
+      builder: (context, scrollCtrl) => StaggeredListScope(
+        generation: 'upowner.articles#$_artGen',
+        ledger: _artLedger,
+        child: ListView.builder(
+          controller: scrollCtrl,
+          padding: const EdgeInsets.fromLTRB(
+            kPagePadH,
+            kSpace12,
+            kPagePadH,
+            kSpace12,
+          ),
+          itemCount: _articles.length + extraSlots,
+          itemBuilder: (context, i) {
+            if (i >= _articles.length) {
+              return _buildListFooter(_artLoading, seed: 'upowner.articles');
+            }
+            final a = _articles[i];
+            final int rawIndex = i - _artBatchStart;
+            return StaggeredEntrance(
+              entryKey: 'cv:${a.cvid}',
+              index: rawIndex < 0 ? 0 : rawIndex,
+              step: appendBatch ? kStaggerStepAppend : kStaggerStep,
+              duration: appendBatch ? kDurEntranceAppend : kDurEntrance,
+              maxIndex: appendBatch ? kStaggerMaxIndexAppend : kStaggerMaxIndex,
+              child: _ArticleCard(item: a, onTap: () => _openArticle(a)),
+            );
+          },
         ),
-        itemCount: _articles.length + extraSlots,
-        itemBuilder: (context, i) {
-          if (i >= _articles.length) {
-            return _buildListFooter(_artLoading, seed: 'upowner.articles');
-          }
-          final a = _articles[i];
-          final int rawIndex = i - _artBatchStart;
-          return StaggeredEntrance(
-            entryKey: 'cv:${a.cvid}',
-            index: rawIndex < 0 ? 0 : rawIndex,
-            step: appendBatch ? kStaggerStepAppend : kStaggerStep,
-            duration: appendBatch ? kDurEntranceAppend : kDurEntrance,
-            maxIndex: appendBatch ? kStaggerMaxIndexAppend : kStaggerMaxIndex,
-            child: _ArticleCard(item: a, onTap: () => _openArticle(a)),
-          );
-        },
       ),
     );
   }
 
-  /// 视频列表。
+  /// 视频列表（分区 0）：搜索/排序按钮只对它生效，滚动位置也归它自己。
   Widget _buildVideoList() {
     if (_loadingMore && _videos.isEmpty) {
       // 首屏整页等待（不是转圈）：抽烟剪影 + 加载闲话
@@ -1524,79 +1637,89 @@ class _UpownerPageState extends State<UpownerPage> {
     final extraSlots = (_loadingMore || !_hasMore) ? 1 : 0;
     final appendBatch = _videoBatchStart > 0;
     // 交错入场：代次用已有的 [_listGen]（每次全新加载 +1）
-    return StaggeredListScope(
-      generation: 'upowner.videos#$_listGen',
-      ledger: _videoLedger,
-      child: ListView.separated(
-        controller: _scrollCtrl,
-        itemCount: _videos.length + extraSlots,
-        separatorBuilder: (_, __) => const Divider(height: 1, indent: 88),
-        itemBuilder: (context, i) {
-          if (i >= _videos.length) {
-            return _buildListFooter(_loadingMore, seed: 'upowner.videos');
-          }
-          final v = _videos[i];
-          final int rawIndex = i - _videoBatchStart;
-          return StaggeredEntrance(
-            entryKey: 'bvid:${v.bvid}',
-            index: rawIndex < 0 ? 0 : rawIndex,
-            step: appendBatch ? kStaggerStepAppend : kStaggerStep,
-            duration: appendBatch ? kDurEntranceAppend : kDurEntrance,
-            maxIndex: appendBatch ? kStaggerMaxIndexAppend : kStaggerMaxIndex,
-            child: _buildVideoTile(v),
-          );
-        },
+    return _sectionScrollHost(
+      sectionKey: 'videos',
+      onNearBottom: () => _onNearBottom('videos'),
+      builder: (context, scrollCtrl) => StaggeredListScope(
+        generation: 'upowner.videos#$_listGen',
+        ledger: _videoLedger,
+        child: ListView.separated(
+          controller: scrollCtrl,
+          itemCount: _videos.length + extraSlots,
+          separatorBuilder: (_, __) => const Divider(height: 1, indent: 88),
+          itemBuilder: (context, i) {
+            if (i >= _videos.length) {
+              return _buildListFooter(_loadingMore, seed: 'upowner.videos');
+            }
+            final v = _videos[i];
+            final int rawIndex = i - _videoBatchStart;
+            return StaggeredEntrance(
+              entryKey: 'bvid:${v.bvid}',
+              index: rawIndex < 0 ? 0 : rawIndex,
+              step: appendBatch ? kStaggerStepAppend : kStaggerStep,
+              duration: appendBatch ? kDurEntranceAppend : kDurEntrance,
+              maxIndex: appendBatch ? kStaggerMaxIndexAppend : kStaggerMaxIndex,
+              child: _buildVideoTile(v),
+            );
+          },
+        ),
       ),
     );
   }
 
-  /// 合集/列表视频视图（选中某合集后取代主列表）。
-  Widget _buildCollectionVideoList() {
-    if (_colLoadingMore && _colVideos.isEmpty) {
+  /// 合集/列表视频视图（分区 3+）：每个合集一页，数据/翻页/滚动位置都从
+  /// 该合集自己的 [_CollectionView] 取。
+  Widget _buildCollectionVideoList(_CollectionView view) {
+    if (view.loading && view.videos.isEmpty) {
       // 与「全部视频」首屏同一套整页等待（seed 不同 → 文案不同）
       return const AppLoadingHero(seed: 'upowner.seasons');
     }
-    if (_colError != null && _colVideos.isEmpty) {
+    if (view.error != null && view.videos.isEmpty) {
       return AppErrorView(
-        message: _colError!,
-        onRetry: () => _loadCollectionPage(1),
+        message: view.error!,
+        onRetry: () => _reloadCollectionPage(view),
         illustrationSeed: 'upowner.seasons',
       );
     }
-    if (_colVideos.isEmpty) {
+    if (view.videos.isEmpty) {
       // 合集（season）与列表（series）用不同 copyId / 插画种子
-      final isSeason = _activeCollection?.kind == UpownerCollectionKind.season;
+      final isSeason = view.collection.kind == UpownerCollectionKind.season;
       return AppStateView(
         kind: AppStateKind.empty,
         copyId: isSeason ? 'empty.upowner.season' : 'empty.upowner.list',
         illustrationSeed: isSeason ? 'upowner.season' : 'upowner.list',
       );
     }
-    final extraSlots = (_colLoadingMore || !_colHasMore) ? 1 : 0;
-    final appendBatch = _colBatchStart > 0;
-    // 交错入场：代次 = 当前合集（换合集自增）
-    return StaggeredListScope(
-      generation: 'upowner.seasons#$_colToken',
-      ledger: _colLedger,
-      child: ListView.separated(
-        controller: _scrollCtrl,
-        itemCount: _colVideos.length + extraSlots,
-        separatorBuilder: (_, __) => const Divider(height: 1, indent: 88),
-        itemBuilder: (context, i) {
-          if (i >= _colVideos.length) {
-            return _buildListFooter(_colLoadingMore, seed: 'upowner.seasons');
-          }
-          final v = _colVideos[i];
-          final int rawIndex = i - _colBatchStart;
-          return StaggeredEntrance(
-            entryKey: 'bvid:${v.bvid}',
-            index: rawIndex < 0 ? 0 : rawIndex,
-            step: appendBatch ? kStaggerStepAppend : kStaggerStep,
-            duration: appendBatch ? kDurEntranceAppend : kDurEntrance,
-            maxIndex: appendBatch ? kStaggerMaxIndexAppend : kStaggerMaxIndex,
-            child: _buildVideoTile(v),
-          );
-        },
+    final extraSlots = (view.loading || !view.hasMore) ? 1 : 0;
+    final appendBatch = view.batchStart > 0;
+    // 交错入场：代次 = 该合集的数据代次（重新加载自增）；账本也各合集一份，
+    // 滑回同一个合集不会重播已入场的那批
+    return _sectionScrollHost(
+      sectionKey: view.key,
+      onNearBottom: () => _onNearBottom(view.key),
+      builder: (context, scrollCtrl) => StaggeredListScope(
+        generation: 'upowner.seasons#${view.token}',
+        ledger: view.ledger,
+        child: ListView.separated(
+          controller: scrollCtrl,
+          itemCount: view.videos.length + extraSlots,
+          separatorBuilder: (_, __) => const Divider(height: 1, indent: 88),
+          itemBuilder: (context, i) {
+            if (i >= view.videos.length) {
+              return _buildListFooter(view.loading, seed: 'upowner.seasons');
+            }
+            final v = view.videos[i];
+            final int rawIndex = i - view.batchStart;
+            return StaggeredEntrance(
+              entryKey: 'bvid:${v.bvid}',
+              index: rawIndex < 0 ? 0 : rawIndex,
+              step: appendBatch ? kStaggerStepAppend : kStaggerStep,
+              duration: appendBatch ? kDurEntranceAppend : kDurEntrance,
+              maxIndex: appendBatch ? kStaggerMaxIndexAppend : kStaggerMaxIndex,
+              child: _buildVideoTile(v),
+            );
+          },
+        ),
       ),
     );
   }
@@ -1745,6 +1868,123 @@ class _UpownerPageState extends State<UpownerPage> {
       _showSnack('取消失败：${e.message}');
     }
   }
+}
+
+/// 一个合集/列表分区的视图状态（内容区可左右滑切分区后，每个合集 = 一页）。
+///
+/// 为什么不再共用一组 `_colXxx` 字段：滑到一个合集就是滑到一页，滑走再滑回来
+/// 时数据必须还在（不然每滑一次重拉一次接口，B 站 space 类接口还有风控）。
+/// 于是把「这个合集自己的列表 / 翻页 / 错误 / 入场账本」收进一个对象，
+/// 由 [_UpownerPageState._colViews] 按合集 key 持有。
+///
+/// 生命周期：合集清单到货时建（清单里没有的合集连视图一起丢掉）。
+class _CollectionView {
+  _CollectionView(this.collection);
+
+  /// 这个视图属于哪个合集/列表。
+  final UpownerCollection collection;
+
+  /// 已加载的视频（按 bvid 去重）。
+  final List<WhitelistVideo> videos = [];
+
+  /// 已加载到第几页。
+  int page = 1;
+
+  /// 是否还有下一页（接口 `has_more` / 页数与 total 的比较结果）。
+  bool hasMore = true;
+
+  /// 是否正在加载（首屏整页等待 / 翻页脚部转圈共用）。
+  bool loading = false;
+
+  /// 是否已成功拉过一页（懒加载判据：没拉过才在滑进来时请求）。
+  bool loadedOnce = false;
+
+  /// 首屏错误（非空且列表为空 → 整页错误态 + 重试）。
+  String? error;
+
+  /// 数据代次：重新加载 +1 —— 交错入场的 scope generation 用它，
+  /// 同一批视频能在重载后再演一次。
+  int token = 0;
+
+  /// 本批次起点（翻页追加时置为「追加前的条数」）：新增项按
+  /// `i - batchStart` 从 0 排队；0 = 首屏，直接用 i。
+  int batchStart = 0;
+
+  /// 本分区的入场账本（各合集一份：滑回同一个合集不重播）。
+  final EntranceLedger ledger = EntranceLedger();
+
+  /// 稳定标识（分区 key / 滚动位置 key 共用）：kind + id 唯一。
+  String get key => '${collection.kind.name}#${collection.id}';
+}
+
+/// 一个分区列表的滚动宿主：给这一「列表挂载期」一个滚动控制器。
+///
+/// 为什么不用 [PageStorageKey] 自动恢复位置：页内还有别的滚动容器（视频行 /
+/// 动态卡的 [ExpandableText] 里就有一个 `SingleChildScrollView`），框架按
+/// 「上下文往上遇到的 PageStorageKey 链」算存储 slot，内层容器没有自己的
+/// key 时会和外层列表算成**同一个 slot**，把它自己的滚动结束位置（往往是 0）
+/// 写给外层，外层重建后就回到顶部（实测：180 → 0）。
+///
+/// 所以改成自记账：控制器用上次离开时的位置起步（[initialOffset]），滚动过程中
+/// 把位置交回宿主（[onOffset]）、近底时回调翻页（[onNearBottom]）。控制器与
+/// 列表同生共死（一个挂载期一个），滑走时列表被 PageView 回收、位置留给下一次。
+class _SectionScrollHost extends StatefulWidget {
+  const _SectionScrollHost({
+    required this.initialOffset,
+    required this.onOffset,
+    required this.onNearBottom,
+    required this.builder,
+  });
+
+  /// 上次离开这个分区时的滚动位置（0 = 首次进入）。
+  final double initialOffset;
+
+  /// 滚动过程中回报当前位置（宿主记账，供下次恢复）。
+  final ValueChanged<double> onOffset;
+
+  /// 距底部 ≤ 200px 时回调（宿主决定翻哪一页）。
+  final VoidCallback onNearBottom;
+
+  /// 用这个控制器去建列表（宿主不能自己建：列表由页面按数据拼）。
+  final Widget Function(BuildContext context, ScrollController controller)
+      builder;
+
+  @override
+  State<_SectionScrollHost> createState() => _SectionScrollHostState();
+}
+
+class _SectionScrollHostState extends State<_SectionScrollHost> {
+  /// 距底部多少像素算「近底」（与改造前的触底阈值一致）。
+  static const double _kNearBottomPx = 200;
+
+  late final ScrollController _ctrl = ScrollController(
+    initialScrollOffset: widget.initialOffset,
+  );
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl.addListener(_onScroll);
+  }
+
+  @override
+  void dispose() {
+    _ctrl.removeListener(_onScroll);
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  void _onScroll() {
+    if (!_ctrl.hasClients) return;
+    widget.onOffset(_ctrl.offset);
+    final pos = _ctrl.position;
+    if (pos.pixels >= pos.maxScrollExtent - _kNearBottomPx) {
+      widget.onNearBottom();
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) => widget.builder(context, _ctrl);
 }
 
 /// 一条专栏卡（UP 主主页「专栏」区，v2.23.0+）。
