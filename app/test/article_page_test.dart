@@ -200,6 +200,56 @@ void main() {
     _drainImageErrors(tester);
   });
 
+  testWidgets('正文是 Quill Delta（新版专栏）→ 图片 + 文本上屏，不出现原始 JSON',
+      (tester) async {
+    final adapter = _GatedAdapter({
+      '/x/frontend/finger/spi': _spiBody,
+      _kViewPath: () => _viewBody(
+            content: '{"ops":['
+                '{"insert":"\\n","attributes":{"class":"normal-img"}},'
+                '{"insert":{"native-image":{"alt":"read-normal-img",'
+                '"url":"https://i0.hdslb.com/bfs/article/'
+                '32f43892ae504c833bc8b7783996851f1069246841.jpg'
+                '@progressive.webp","width":460,"height":215,'
+                '"size":64510,"status":"loaded"}}},'
+                '{"insert":"\\nRT，这个游戏是个好游戏，开放世界+黑客。"},'
+                '{"insert":"UP的讲解视频","attributes":{"link":'
+                '"https://www.bilibili.com/video/BV1pw411F7VA/"}},'
+                '{"insert":"\\n"}]}',
+          ),
+    });
+    await _pumpPage(tester, _api(adapter));
+
+    // 图片渲染出来了（不是被当文本）
+    expect(find.byType(Image), findsOneWidget);
+    expect(
+      tester.widget<Image>(find.byType(Image)).image,
+      isA<NetworkImage>()
+          .having((p) => p.url, 'url', contains('@progressive.webp')),
+    );
+    expect(
+      tester
+          .widgetList<AspectRatio>(find.byType(AspectRatio))
+          .map((w) => w.aspectRatio),
+      [460 / 215],
+      reason: 'Delta 给的 width/height 用来预留高度，防加载后跳动',
+    );
+
+    // 文本是文本
+    final screen = tester
+        .widgetList<Text>(find.byType(Text))
+        .map((t) => t.data ?? t.textSpan?.toPlainText() ?? '')
+        .join('\n');
+    expect(screen, contains('RT，这个游戏是个好游戏，开放世界+黑客。'));
+    expect(screen, contains('UP的讲解视频'));
+
+    // **界面上绝不出现原始 JSON**
+    for (final leak in <String>['insert', 'ops', 'native-image', 'attributes']) {
+      expect(screen.contains(leak), isFalse, reason: '泄漏了 $leak');
+    }
+    _drainImageErrors(tester);
+  });
+
   testWidgets('错误态：AppErrorView + 重试再请求', (tester) async {
     final adapter = _GatedAdapter({
       '/x/frontend/finger/spi': _spiBody,

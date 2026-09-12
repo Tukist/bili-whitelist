@@ -8,9 +8,14 @@
 ///   `publish_time` / `words` / `stats{...}`。注意 `count` **只在真有专栏时
 ///   返回**（0 篇时连 `articles` 都不给）→ [ArticleListPage.hasMore] 对缺失兜底。
 /// - 正文 `x/article/view?id=<cvid>`（⚠️ 参数名是 `id`，用 `cv` 会回 -400）→
-///   `data.content` 是 **HTML 字符串**（实测含 `<p>` / `<figure><img>` /
+///   `data.content` **有两种格式**：
+///   **老专栏是 HTML 字符串**（实测含 `<p>` / `<figure><img>` /
 ///   `<ul><li>` / `<strong>` / `<br>` / `<figcaption>` / `<span>`；也有整篇
-///   纯文本、一个标签都没有的），另有 `image_urls[]` /
+///   纯文本、一个标签都没有的）；
+///   **新版编辑器（opus/Quill）产出的专栏是 Quill Delta JSON**
+///   （`{"ops":[{"insert":…,"attributes":…}]}`，图片藏在
+///   `insert.native-image.url`）——判别与解析见 `lib/utils/bili_html.dart`
+///   的 [parseArticleContent]。另有 `image_urls[]` /
 ///   `origin_image_urls[]` / `banner_url` / `author{name,mid}` /
 ///   `publish_time` / `stats{view,favorite,like,reply,share,coin}`。
 /// - 该接口有**限频**（实测 `-509 请求过于频繁`，退避后重试即成功）——
@@ -21,6 +26,8 @@
 /// 解析一律宽松：字段缺失 / 类型异常都给安全默认（0 / 空串 / 空列表），
 /// 任一脏条目都不该让整页崩掉。
 library;
+
+import 'dart:convert';
 
 import 'dynamic_item.dart' show normalizeDynamicUrl;
 
@@ -159,7 +166,9 @@ class ArticleDetail {
   /// 标题。
   final String title;
 
-  /// 正文 **HTML 源码**（`content`）；纯文本专栏时就是纯文本。
+  /// 正文 **HTML 源码**（`content`）；也可能是 **Quill Delta JSON**
+  /// （新版编辑器产出的专栏）或纯文本专栏的纯文本——三种都由
+  /// `parseArticleContent` 自动判别后渲染，渲染侧不必区分。
   final String contentHtml;
 
   /// 作者名（`author.name`）。
@@ -218,7 +227,7 @@ class ArticleDetail {
     this.coin = 0,
   });
 
-  /// 正文是否为空（HTML 里只有空白也算空）。
+  /// 正文是否为空（HTML / Delta / 纯文本里只有空白也算空）。
   bool get hasContent => contentHtml.trim().isNotEmpty;
 
   factory ArticleDetail.fromJson(Map<String, dynamic> json) {
@@ -227,7 +236,7 @@ class ArticleDetail {
     return ArticleDetail(
       cvid: _int(json['id']),
       title: _str(json['title']),
-      contentHtml: _str(json['content']),
+      contentHtml: _contentOf(json['content']),
       authorName: _str(author['name']),
       authorFace: normalizeDynamicUrl(_str(author['face'])),
       authorMid: _int(author['mid']),
@@ -253,6 +262,24 @@ Map<String, dynamic> _map(dynamic raw) =>
 
 /// 宽松取字符串：非 String 一律空串。
 String _str(dynamic raw) => raw is String ? raw : '';
+
+/// 正文取值（`content`）：正常是字符串（HTML / Delta JSON / 纯文本）。
+///
+/// 兜底：万一服务端把正文给成**已经解析好的对象**（`{...}` / `[...]`），
+/// 用 [_str] 会得到空串 → 整篇正文被静默丢掉、阅读页显示「正文为空」。
+/// 所以对象形态一律**重新编码回 JSON 字符串**，交给
+/// `parseArticleContent` 的 Delta 分支去解析。
+String _contentOf(dynamic raw) {
+  if (raw is String) return raw;
+  if (raw is Map || raw is List) {
+    try {
+      return jsonEncode(raw);
+    } catch (_) {
+      return ''; // 编码不出来（循环引用之类）：当空正文，不抛
+    }
+  }
+  return '';
+}
 
 /// 宽松取整数：num 直接转、数字串容错解析，其余按 0。
 int _int(dynamic raw) {

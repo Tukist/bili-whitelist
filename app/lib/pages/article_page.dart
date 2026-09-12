@@ -9,8 +9,9 @@
 ///   UP 主页（[UpownerPage]；作者 mid 未知时不挂手势）
 /// - **统计行**：阅读 / 点赞 / 收藏（[kTypeNum]，图标省掉——mono-color 里
 ///   数字自己会说话，也少三个触摸目标）
-/// - **正文**：[BiliHtmlView] 渲染（`content` 是 HTML 源码，解析/降级规则
-///   见 `lib/utils/bili_html.dart`）；正文为空 → 一句「正文为空」
+/// - **正文**：[BiliHtmlView] 渲染（`content` 有两种格式：**老专栏是 HTML
+///   源码**，**新版编辑器产出的专栏是 Quill Delta JSON**——判别与降级规则见
+///   `lib/utils/bili_html.dart`）；正文为空 → 一句「正文为空」
 ///
 /// 与列表的分工：正文**只按 `content` 渲染**，`image_urls[]` 不额外补图
 /// （否则正文里的图会重复出现一遍）。图片点击走 [ImageViewerPage]，图集 =
@@ -273,7 +274,7 @@ class _ArticlePageState extends State<ArticlePage> {
         ),
       );
     }
-    return BiliHtmlView.fromHtml(
+    return BiliHtmlView.fromContent(
       detail.contentHtml,
       onImageTap: _openImages,
       onLinkTap: _onLinkTap,

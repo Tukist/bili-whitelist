@@ -341,6 +341,49 @@ void main() {
       expect(detail.hasContent, isFalse);
     });
 
+    test('content 是 Quill Delta JSON 字符串 → 原样带出（判别在渲染层）',
+        () async {
+      const delta = '{"ops":[{"insert":"正文\\n"}]}';
+      final adapter = _RecordingAdapter({
+        '/x/frontend/finger/spi': _spiBody,
+        _kViewPath: (_) => _viewBody(content: delta),
+      });
+      final detail = await _api(adapter).fetchArticleView(1);
+      expect(detail.contentHtml, delta);
+      expect(detail.hasContent, isTrue);
+    });
+
+    test('content 被给成已解析的对象 → 重新编码成 JSON，正文不丢', () async {
+      final adapter = _RecordingAdapter({
+        '/x/frontend/finger/spi': _spiBody,
+        _kViewPath: (_) => _viewBody(data: {
+          'id': 45123193,
+          'title': '专栏标题',
+          'content': {
+            'ops': [
+              {'insert': '正文\n'},
+            ]
+          },
+        }),
+      });
+      final detail = await _api(adapter).fetchArticleView(1);
+      expect(detail.hasContent, isTrue, reason: '对象形态不该被当成空正文');
+      expect(detail.contentHtml, contains('"ops"'));
+    });
+
+    test('content 是数字之类的脏类型 → 空正文（不抛、不崩）', () async {
+      final adapter = _RecordingAdapter({
+        '/x/frontend/finger/spi': _spiBody,
+        _kViewPath: (_) => _viewBody(data: {
+          'id': 45123193,
+          'content': 42,
+        }),
+      });
+      final detail = await _api(adapter).fetchArticleView(1);
+      expect(detail.contentHtml, '');
+      expect(detail.hasContent, isFalse);
+    });
+
     test('data 缺失 → 抛 BiliApiException（带可读文案）', () async {
       final adapter = _RecordingAdapter({
         '/x/frontend/finger/spi': _spiBody,

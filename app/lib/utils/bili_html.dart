@@ -1,10 +1,28 @@
-/// 专栏正文 HTML → Flutter widget 的**轻量**解析与渲染（v2.23.0+）。
+/// 专栏正文（HTML / Quill Delta）→ Flutter widget 的**轻量**解析与渲染
+/// （v2.23.0+）。
 ///
 /// 为什么自己写：B 站专栏正文是编辑器产出的 HTML 片段（2026-09 实测用到
 /// `<p>` / `<figure><img>` / `<ul><li>` / `<strong>` / `<br>` / `<figcaption>`
 /// / `<span>`；也有整篇纯文本、一个标签都没有的），而本 App **不引任何第三方
 /// HTML 渲染依赖**（`flutter_html` 会带进一整套 CSS 引擎，代价远超这里的
 /// 需要）。所以这里只做"够用"的一层：
+///
+/// ## 0. 两种正文格式与自动判别（[parseArticleContent]）
+/// 实测（2026-09，`x/article/view`，另见公开接口文档
+/// `docs/article/view.md` 的 `data.content` 小节）——`data.content` 有
+/// **两种形态**，由服务端的 `data.type` 决定：
+/// - `type == 0`（**老专栏**）→ **HTML 片段**（上面那些标签）；
+/// - `type == 3`（**新版编辑器产出的专栏**）→ **Quill Delta JSON**
+///   —— 正文是一段 `{"ops":[{"insert":…,"attributes":{…}}]}` 字符串，
+///   同时 `data.opus.content.paragraphs` 给一份结构化的等价信息。
+///   此前这类专栏被当纯文本整段渲染，界面上就会冒出 `"ops"` / `"insert"`
+///   字样，图片全丢（图片藏在 `insert.native-image.url` 里）。
+///
+/// [parseArticleContent] 是阅读页的统一入口，按
+/// [looksLikeBiliDelta]（`{` 开头 + 有 `"ops"` 键 —— 等价于 `type == 3`
+/// 的字符串特征，但不依赖模型多带一个字段）判别并分派到
+/// [parseBiliDelta] / [parseBiliHtml]；Delta 解析失败一律**退回 HTML
+/// 那条路**（即既有行为），坏数据不可能把 UI 打崩。
 ///
 /// ## 1. 解析（[parseBiliHtml]，纯函数、可单测）
 /// **手写 tokenizer + 标签栈**，不用正则硬解嵌套（正则处理不了嵌套，也容易
@@ -28,12 +46,17 @@
 ///   `noscript` / `head` / `template` / `svg`，见 [_kDropTags]）在**解析阶段
 ///   连内容一起丢弃** —— 既不会被渲染，也拿不到文本，脚本内容不可能上屏。
 ///
-/// ## 3. 设计语言
+/// ## 4. 设计语言
 /// 无阴影；颜色只用 [app_tokens.dart] 的 token（正文 [kInkBlack]、次要
 /// [kInkGray70]、描边 [kRule]、冷底 [kPaperCool]）；引用块走项目「块」的
 /// 语言（[AppBlock] 的 reply 规格：冷底 + 左侧竖条）；图片圆角 [kRadiusSm]
 /// + 1px 描边，点击由宿主打开全屏查看页；链接走主墨 + 下划线。
+///
+/// Delta 解析出的树**刻意复用同一套渲染**（段落/图片/行内富文本），不另起
+/// 一套视觉，免得两种格式的风格漂移。
 library;
+
+import 'dart:convert';
 
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
@@ -399,6 +422,331 @@ String? _decodeEntityBody(String body) {
 }
 
 // ---------------------------------------------------------------------------
+// 正文入口：HTML / Quill Delta 自动判别
+// ---------------------------------------------------------------------------
+
+/// 专栏正文的统一入口：**自动判别** HTML 与 Quill Delta 后分派。
+///
+/// - 像 Delta（[looksLikeBiliDelta]）且**解析成功** → 走 [parseBiliDelta]；
+/// - 其余（老 HTML、纯文本、`{` 开头但 JSON 畸形）→ 退回 [parseBiliHtml]，
+///   行为与没有 Delta 支持时完全一致。
+///
+/// 阅读页用这个（[BiliHtmlView.fromContent]）；只用 [parseBiliHtml] 的调用方
+/// 不受影响。
+@visibleForTesting
+List<HtmlNode> parseArticleContent(String raw) {
+  if (looksLikeBiliDelta(raw)) {
+    final nodes = parseBiliDelta(raw);
+    if (nodes != null) return nodes;
+  }
+  return parseBiliHtml(raw);
+}
+
+/// 这段正文是不是 **Quill Delta**（`{"ops":[…]}`）——只看两个最可靠的信号，
+/// **不解析 JSON**（正文可能有几十万字，判别要快）：
+/// 1. 去掉前导空白后第一个字符是 `{`（HTML 片段不以 `{` 开头；纯文本正文
+///    里的 `{` 也不在开头）；
+/// 2. 开头一小段里出现 `"ops"` 键（Delta 文档的固定外壳）。
+///
+/// 判别为 Delta 但 [parseBiliDelta] 返回 null（JSON 畸形）时，调用方会退回
+/// 纯文本，所以**误判也不会崩**。
+@visibleForTesting
+bool looksLikeBiliDelta(String raw) {
+  final t = raw.trimLeft();
+  if (t.length < 8 || t[0] != '{') return false;
+  final head = t.length > 96 ? t.substring(0, 96) : t;
+  return head.contains('"ops"');
+}
+
+// ---------------------------------------------------------------------------
+// Quill Delta 解析（新版专栏正文）
+// ---------------------------------------------------------------------------
+
+/// 解析 Quill Delta 正文 → 节点树；**不是可用的 Delta 一律返回 null**
+/// （调用方退回 [parseBiliHtml]，即既有行为）。
+///
+/// [raw] 两种入参都要兜住：
+/// - **JSON 字符串**（`data.content` 给的就是这个）→ 内部 `jsonDecode`；
+///   畸形 JSON → null（调用方按纯文本处理，**绝不抛到 UI**）；
+/// - **已经解码好的 `Map`**（宿主/测试可能已经解析过）→ 直接用。
+///
+/// 支持的 op 形态（B 站 Delta 契约见 `docs/article/view.md` 的
+/// `data.content` 小节；实现见 [_deltaOp]）：
+/// - `{"insert":"文本"}` → 文本，`\n` 是**分段符**（连续 `\n\n` 即段落之间
+///   的空行，不会多占一块）；
+/// - 行尾 `\n` 上挂的**块级**属性（`header` / `list` / `blockquote`）→
+///   标题 / 列表 / 引用块（Quill 约定：块级格式写在**行尾那个 `\n`** 上，
+///   不写在文本 op 上）；
+/// - `{"insert":{"native-image":{…}}}` / `{"insert":{"image":"url"}}` → 图片；
+/// - `{"attributes":{"link":…},"insert":"文字"}` → 链接；
+/// - `bold` / `italic` / `strike` / `underline` → 对应富文本；
+/// - 其它 embed（`cut-off` / 卡片 / `poi` / 未知键）→ 优雅降级，
+///   见 [_deltaEmbedNode]。
+///
+/// 已知取舍（都不影响"不崩、不露原始 JSON"）：
+/// - `align`（对齐）与 `color`（文字色）不还原——本 App 的颜色一律走 token，
+///   引入任意颜色会破坏设计语言；
+/// - 列表被图片/其它块打断时会分成两个列表（有序列表的序号会重新数）。
+@visibleForTesting
+List<HtmlNode>? parseBiliDelta(Object? raw) {
+  var decoded = raw;
+  if (raw is String) {
+    final t = raw.trim();
+    if (t.length < 2 || t[0] != '{') return null;
+    try {
+      decoded = jsonDecode(t);
+    } catch (_) {
+      return null; // 畸形 JSON：交给调用方按纯文本处理
+    }
+  }
+  if (decoded is! Map) return null;
+  final ops = decoded['ops'];
+  if (ops is! List) return null;
+
+  final builder = _DeltaBuilder();
+  for (final op in ops) {
+    if (op is Map) _deltaOp(builder, op);
+    // op 不是对象（脏数据）→ 跳过，不崩
+  }
+  builder.flushParagraph();
+  return builder.blocks;
+}
+
+/// 追加一个 op（`{"insert":…,"attributes":…}`）。
+void _deltaOp(_DeltaBuilder builder, Map op) {
+  final insert = op['insert'];
+  final rawAttrs = op['attributes'];
+  final attrs =
+      rawAttrs is Map ? rawAttrs : const <String, dynamic>{};
+
+  if (insert is String) {
+    // Quill 约定：**块级**格式（header / list / blockquote）挂在**行尾那个
+    // `\n`** 上，文本 op 上只有行内格式。所以结算段落时要带上这份块级属性。
+    final blockTag = _deltaBlockTag(attrs);
+    // `\n` 是 Delta 的分段符（不是普通换行）：每遇到一个就结算一段。
+    final parts = insert.split('\n');
+    for (var i = 0; i < parts.length; i++) {
+      builder.addText(parts[i], attrs);
+      if (i < parts.length - 1) builder.flushParagraph(blockTag);
+    }
+    return;
+  }
+  if (insert is Map) {
+    final node = _deltaEmbedNode(insert);
+    if (node == null) return; // 认不出来的 embed：整条跳过（绝不上屏原始 JSON）
+    // 图片 / 分割线独立成块（B 站 Delta 给的图前后都带 `\n`）；其余降级成
+    // 行内链接，塞进当前段落（Delta 里 embed 本来就是块内的行内原子）。
+    if (node.tag == 'img' || node.tag == 'hr') {
+      builder.addBlock(node);
+    } else {
+      builder.addInline(node);
+    }
+    return;
+  }
+  // `insert` 缺失 / 是数字之类的脏数据 → 跳过（不上屏、不崩）
+}
+
+/// 行尾 `\n` 上的块级属性 → 块标签。
+///
+/// 契约（B 站/Quill）：`blockquote` / `list`（`bullet` | `ordered`）/
+/// `header`（1-6）都写在**行尾那个 `\n`** 的 `attributes` 里。没有块级属性
+/// → 普通段落 `p`。
+String _deltaBlockTag(Map attrs) {
+  if (_truthy(attrs['blockquote'])) return 'blockquote';
+  final list = attrs['list'];
+  if (list is String) {
+    final v = list.trim().toLowerCase();
+    if (v == 'ordered') return 'ol';
+    if (v.isNotEmpty && v != 'false' && v != 'none') return 'ul';
+  }
+  final header = attrs['header'];
+  final level = header is num
+      ? header.toInt()
+      : (header is String ? int.tryParse(header.trim()) : null);
+  if (level != null && level >= 1) return 'h${level.clamp(1, 6)}';
+  return 'p';
+}
+
+/// embed op（`{"insert": {"<type>": <value>}}`）→ **块内节点**；认不出来 →
+/// null（整条跳过）。
+///
+/// 形态按 B 站契约（`docs/article/view.md` 的 `ops[].insert` 为对象时）来：
+/// - `native-image`（B 站自定义 blot）/ `image`（Quill 标准）→ `<img>`：
+///   取 `url` 与 `width`/`height`（渲染端拿它算 [AspectRatio]，防加载后跳动）；
+///   `alt` 存进属性（B 站常给的是 CSS 类名，UI 不直接用，留给调试/无障碍）。
+///   `@progressive.webp` 这类图床后缀**原样保留**——实测可直连（见
+///   [_imageBlock] 的防盗链请求头），不做任何改写。
+/// - `cut-off` → `<hr>`（复用既有分隔线样式；它的 `url` 是分割线贴图，
+///   不必要）。
+/// - `video-card` / `article-card` / `vote-card` / `live-card` → **跳过**：
+///   它们给的 `url` 是**卡片图片**而不是可点目标，本 App 也没有卡片视觉，
+///   渲染出来只会误导。
+/// - 其它不认识的键 → 带「可读文案 + 可点 URL」就降级成行内链接，否则跳过。
+///
+/// 无论走哪条路都**不会**把原始 JSON 打到界面上。
+HtmlElement? _deltaEmbedNode(Map embed) {
+  for (final entry in embed.entries) {
+    final type = entry.key;
+    final value = entry.value;
+    final fields = value is Map ? value : const <String, dynamic>{};
+
+    if (type == 'native-image' || type == 'image') {
+      // Quill 标准形态是 `{"image":"url"}`（值是字符串），B 站给的是对象
+      final raw = value is String ? value : _firstString(fields, _deltaUrlKeys);
+      final src = normalizeDynamicUrl(raw.trim());
+      if (src.isEmpty) return null;
+      final w = _positiveNum(fields['width']);
+      final h = _positiveNum(fields['height']);
+      final alt = _firstString(fields, const ['alt']);
+      return HtmlElement('img', attrs: {
+        'src': src,
+        if (w != null) 'width': _numAttr(w),
+        if (h != null) 'height': _numAttr(h),
+        if (alt.isNotEmpty) 'alt': alt,
+      });
+    }
+
+    if (type == 'cut-off') return HtmlElement('hr');
+
+    if (_kDeltaCardTypes.contains(type)) return null; // 卡片：跳过
+
+    // 不认识的 embed：有「可读文案 + 可点 URL」才降级成链接
+    final label = _firstString(fields, _kDeltaLabelKeys);
+    final url = normalizeDynamicUrl(_firstString(fields, _deltaUrlKeys));
+    if (label.isEmpty || url.isEmpty) return null;
+    return HtmlElement('a', attrs: {'href': url}, children: [HtmlText(label)]);
+  }
+  return null;
+}
+
+/// 取 URL 的候选键（B 站 Delta 用 `url`，标准 Quill 用 `src`）。
+const List<String> _deltaUrlKeys = ['url', 'src', 'origin_url', 'jump_url'];
+
+/// 判断降级链接「有没有可读文案」的候选键。
+const List<String> _kDeltaLabelKeys = ['alt', 'title', 'text', 'desc', 'name'];
+
+/// 卡片类 embed：`url` 是卡片**图片**而非可点目标 → 一律跳过。
+const Set<String> _kDeltaCardTypes = {
+  'video-card', 'article-card', 'vote-card', 'live-card',
+};
+
+/// Delta 的 ops 是**一条线性文本流**：块与块之间只有 `\n` 分隔，没有 HTML
+/// 那样的 `<p>` 外壳。所以这里维护一个「当前段落」缓冲——
+/// 文本 op 与降级链接拼进当前段、遇到 `\n` 按行尾带的块级属性结算成对应块
+/// （p / h1-h6 / ul / ol / blockquote）；图片与分割线先结算当前段再自己占一块。
+/// 产出的树与 HTML 分支**同构**，渲染完全复用。
+class _DeltaBuilder {
+  final List<HtmlNode> blocks = <HtmlNode>[];
+  final List<HtmlNode> _paragraph = <HtmlNode>[];
+
+  /// 结算当前段落为 [tag] 块（默认普通段落）。
+  ///
+  /// 空段直接丢：Delta 用连续的 `\n` 分隔段落，那些空段不该在界面上多占
+  /// 一块（[BiliHtmlView._blocks] 对空白文本也是同样处理）。
+  ///
+  /// `ul` / `ol` 有额外一步：连续的行尾 `\n` 各自成段，但它们在视觉上是
+  /// **同一个列表**——所以并进上一个同类列表，而不是各建一个（否则每个
+  /// 列表项都自成一个列表，有序列表的序号会全从 1 重数）。
+  void flushParagraph([String tag = 'p']) {
+    if (_paragraph.isEmpty) return;
+    final children = List<HtmlNode>.of(_paragraph);
+    _paragraph.clear();
+    if (tag == 'ul' || tag == 'ol') {
+      final li = HtmlElement('li', children: children);
+      final last = blocks.isEmpty ? null : blocks.last;
+      if (last is HtmlElement && last.tag == tag) {
+        last.children.add(li);
+        return;
+      }
+      blocks.add(HtmlElement(tag, children: [li]));
+      return;
+    }
+    blocks.add(HtmlElement(tag, children: children));
+  }
+
+  /// 追加一段文本（属性已折算成行内标签，见 [_deltaTextNode]）。
+  void addText(String text, Map attrs) {
+    if (text.isEmpty) return;
+    _paragraph.add(_deltaTextNode(text, attrs));
+  }
+
+  /// 追加一个**行内**节点（降级链接）。Delta 里 embed 是块内的行内原子，
+  /// 所以塞进当前段落；段落末尾的 `\n` 会把它一起结算成块。
+  void addInline(HtmlNode? node) {
+    if (node == null) return;
+    _paragraph.add(node);
+  }
+
+  /// 追加一个块级节点（图片 / 分割线）：先结算当前段落。
+  void addBlock(HtmlNode? node) {
+    if (node == null) return;
+    flushParagraph();
+    blocks.add(node);
+  }
+}
+
+/// 一段文本 + Quill 属性 → 节点：`link` 在最内层，外面依次套
+/// `s` / `u` / `em` / `strong`。套出来的都是**既有渲染器认识的行内标签**，
+/// 所以不需要为 Delta 新增任何渲染分支。
+HtmlNode _deltaTextNode(String text, Map attrs) {
+  HtmlNode node = HtmlText(text);
+  final link = _linkOf(attrs['link']);
+  if (link != null) {
+    node = HtmlElement('a', attrs: {'href': link}, children: [node]);
+  }
+  if (_truthy(attrs['strike'])) node = HtmlElement('s', children: [node]);
+  if (_truthy(attrs['underline'])) node = HtmlElement('u', children: [node]);
+  if (_truthy(attrs['italic'])) node = HtmlElement('em', children: [node]);
+  if (_truthy(attrs['bold'])) node = HtmlElement('strong', children: [node]);
+  return node;
+}
+
+/// `attributes.link` → URL：通常是字符串，也可能被包成 `{"url": …}`
+/// （编辑器版本不同给法不一致）→ 统一取字符串；取不到 → null（当普通文字）。
+String? _linkOf(Object? raw) {
+  if (raw is String) return raw.trim().isEmpty ? null : raw.trim();
+  if (raw is Map) {
+    final url = _firstString(raw, const ['url', 'href', 'link', 'jump_url']);
+    return url.isEmpty ? null : url;
+  }
+  return null;
+}
+
+/// Quill 的布尔属性在不同客户端可能是 `true` / `"true"` / `1` → 统一判真。
+bool _truthy(Object? raw) {
+  if (raw is bool) return raw;
+  if (raw is num) return raw != 0;
+  if (raw is String) {
+    final s = raw.trim().toLowerCase();
+    return s.isNotEmpty && s != '0' && s != 'false';
+  }
+  return false;
+}
+
+/// 按候选键顺序取第一个非空字符串（数字也转成字符串）。
+String _firstString(Map map, List<String> keys) {
+  for (final key in keys) {
+    final v = map[key];
+    if (v is String && v.trim().isNotEmpty) return v.trim();
+    if (v is num) return '$v';
+  }
+  return '';
+}
+
+/// 正数（图片宽高）→ double；缺失 / 非正 / 非有限值 → null。
+double? _positiveNum(Object? raw) {
+  final v = raw is num
+      ? raw.toDouble()
+      : (raw is String ? double.tryParse(raw.trim()) : null);
+  if (v == null || v <= 0 || !v.isFinite) return null;
+  return v;
+}
+
+/// 宽高写回 HTML 属性：整数不带小数尾巴（`460` 而不是 `460.0`）。
+String _numAttr(double v) =>
+    v == v.roundToDouble() ? '${v.toInt()}' : '$v';
+
+// ---------------------------------------------------------------------------
 // 图片收集（宿主用它建 ImageViewerPage 的图集）
 // ---------------------------------------------------------------------------
 
@@ -451,7 +799,7 @@ const double _kDefaultImageAspect = 16 / 9;
 
 /// 把专栏正文节点树渲染成一组块级 widget。
 ///
-/// - [nodes]：`parseBiliHtml(contentHtml)` 的结果；
+/// - [nodes]：`parseArticleContent(content)`（或 [parseBiliHtml]）的结果；
 /// - [onImageTap]：点图回调，参数是（[collectBiliHtmlImageUrls] 的完整图集,
 ///   被点那张的下标）——宿主据此打开全屏查看页；null = 图片不可点；
 /// - [onLinkTap]：点链接回调（原始 href）；null = 链接按普通文字渲染；
@@ -472,6 +820,10 @@ class BiliHtmlView extends StatelessWidget {
 
   /// 正文便捷构造：直接给 HTML 源码（内部解析，宿主不用自己调
   /// [parseBiliHtml]）。
+  ///
+  /// 注意：**只按 HTML 解析**。新版专栏正文可能是 Quill Delta，阅读页要用
+  /// [BiliHtmlView.fromContent]（自动判别）。这个方法保留给"内容确定是
+  /// HTML"的调用方（含既有单测）。
   factory BiliHtmlView.fromHtml(
     String html, {
     Key? key,
@@ -482,6 +834,23 @@ class BiliHtmlView extends StatelessWidget {
       BiliHtmlView(
         key: key,
         nodes: parseBiliHtml(html),
+        onImageTap: onImageTap,
+        onLinkTap: onLinkTap,
+        bodyStyle: bodyStyle,
+      );
+
+  /// 专栏正文便捷构造：**自动判别** HTML / Quill Delta（内部走
+  /// [parseArticleContent]）。专栏阅读页用这个。
+  factory BiliHtmlView.fromContent(
+    String content, {
+    Key? key,
+    void Function(List<String> urls, int index)? onImageTap,
+    ValueChanged<String>? onLinkTap,
+    TextStyle bodyStyle = kTypeBody,
+  }) =>
+      BiliHtmlView(
+        key: key,
+        nodes: parseArticleContent(content),
         onImageTap: onImageTap,
         onLinkTap: onLinkTap,
         bodyStyle: bodyStyle,
