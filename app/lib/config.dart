@@ -18,6 +18,13 @@ const String kBrowserUA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
 /// B 站 API 域名。
 const String kBiliApi = 'https://api.bilibili.com';
 
+/// B 站**直播** API 域名。
+///
+/// ⚠️ 直播接口（如 `room/v1/Room/getRoomInfoOld`）不在 [kBiliApi] 上：
+/// 打到 `api.bilibili.com` 会 404（返回 HTML 出错页），必须用
+/// `api.live.bilibili.com`（2026-09 实测：200 / code=0）。
+const String kLiveApi = 'https://api.live.bilibili.com';
+
 /// 防盗链 Referer：.bilivideo.com 流与 i*.hdslb.com 封面请求必须带。
 const String kBiliReferer = 'https://www.bilibili.com/';
 

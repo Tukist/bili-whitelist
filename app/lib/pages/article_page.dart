@@ -1,4 +1,4 @@
-/// 专栏阅读页（v2.23.0+）。
+/// 专栏阅读页（v2.23.0+；v2.25.2+ 加评论区）。
 ///
 /// 入口：UP 主主页「专栏」区（[UpownerPage]）点某条专栏 → 本页；
 /// 另外动态里引用专栏、专栏正文里的 `cv*` 站内链接也推本页。
@@ -12,13 +12,23 @@
 /// - **正文**：[BiliHtmlView] 渲染（`content` 有两种格式：**老专栏是 HTML
 ///   源码**，**新版编辑器产出的专栏是 Quill Delta JSON**——判别与降级规则见
 ///   `lib/utils/bili_html.dart`）；正文为空 → 一句「正文为空」
+/// - **评论区**（v2.25.2+）：上面这一整块作为 [CommentListView] 的 `header`
+///   （列表第 0 项），正文之下就是「评论 N」区头 + 评论列表 —— 正文与评论
+///   **共用一个 ListView**，所以整页一起滚、一起下拉刷新。
+///   ⚠️ **不要**改成「外层 ListView + 内层 shrinkWrap 评论区」：内层配
+///   `NeverScrollableScrollPhysics` 后**自己根本不滚**，触底翻页彻底失效
+///   （见 `comment_list.dart` 的 `header` 说明）。
+///   评论归属：`type=12` + `oid=<cvid>`（专栏评论与视频评论字段同构）；
+///   点评论里的视频链接 → 无宿主回调 → 列表兜底 push 新 PlayerPage
+///   （专栏页没有播放页宿主，这正是想要的语义）。
 ///
 /// 与列表的分工：正文**只按 `content` 渲染**，`image_urls[]` 不额外补图
 /// （否则正文里的图会重复出现一遍）。图片点击走 [ImageViewerPage]，图集 =
 /// 正文里按文档顺序收集的图片（与 `BiliHtmlView.onImageTap` 的下标一一对应）。
 ///
 /// 状态：首屏拉正文 = [AppLoadingHero]（整页等待）；失败 = [AppErrorView]
-/// （带重试）；加载完可下拉刷新（[RefreshIndicator]）。
+/// （带重试）；加载完可下拉刷新（[RefreshIndicator]，刷的是**正文**；评论区
+/// 自己有触底翻页与重试）。
 ///
 /// 设计语言：无阴影；颜色只用 token / `context.palette.*`；块间距 [kSpace12]。
 library;
@@ -35,6 +45,7 @@ import '../utils/bili_html.dart';
 import '../utils/comment_links.dart';
 import '../utils/relative_time.dart';
 import '../widgets/app_state_view.dart';
+import '../widgets/comment_list.dart';
 import 'image_viewer_page.dart';
 import 'upowner_page.dart';
 
@@ -156,21 +167,47 @@ class _ArticlePageState extends State<ArticlePage> {
     }
     return RefreshIndicator(
       onRefresh: _load,
-      child: ListView(
+      // 正文（[_buildArticleHeader]）作为列表第 0 项 → 正文与评论同一个滚动体。
+      // 不传 onOpenVideo：本页没有播放页宿主，评论里的视频链接由列表兜底
+      // push 新 PlayerPage（正是想要的语义）。
+      child: CommentListView(
+        api: _api, // 复用本页会话（buvid/Cookie），测试也继续走同一个 mock
+        oid: detail.cvid, // 专栏评论：oid = cvid
+        commentType: 12, // type 12 = 专栏（1 = 视频）
+        identityKey: 'cv${detail.cvid}', // 入场代次身份串（同 cvid 恒同）
+        footerSeed: 'cv${detail.cvid}#footer',
+        // 「评论 N」区头：先用正文统计里的评论数顶着，首屏到货后覆盖
+        initialTotal: detail.reply,
+        showCountHeader: true,
+        header: _buildArticleHeader(detail),
+        // 宿主是 RefreshIndicator：内容不足一屏时也要能下拉刷新
         physics: const AlwaysScrollableScrollPhysics(),
-        padding: const EdgeInsets.fromLTRB(kPagePadH, kSpace16, kPagePadH, 48),
-        children: [
-          Text(_title, style: kTypeTitleL.copyWith(color: kInkBlack)),
-          const SizedBox(height: kSpace12),
-          _buildAuthorRow(detail),
-          const SizedBox(height: kSpace8),
-          _buildStatsRow(detail),
-          const SizedBox(height: kSpace16),
-          const Divider(height: 1, thickness: 1, color: kRule),
-          const SizedBox(height: kSpace16),
-          _buildContent(detail),
-        ],
       ),
+    );
+  }
+
+  /// 正文整块（标题 + 作者行 + 统计行 + 分隔线 + 正文）：作为评论列表的
+  /// 第 0 项传入 —— 这一块永远可见，评论的加载/错误/空态只出现在它下方。
+  ///
+  /// 顶部留白 [kSpace16] 与左右留白由这里/列表内边距给（列表的水平内边距
+  /// 仍是 [kPagePadH]，与本页原布局一致）。
+  Widget _buildArticleHeader(ArticleDetail detail) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        const SizedBox(height: kSpace16),
+        Text(_title, style: kTypeTitleL.copyWith(color: kInkBlack)),
+        const SizedBox(height: kSpace12),
+        _buildAuthorRow(detail),
+        const SizedBox(height: kSpace8),
+        _buildStatsRow(detail),
+        const SizedBox(height: kSpace16),
+        const Divider(height: 1, thickness: 1, color: kRule),
+        const SizedBox(height: kSpace16),
+        _buildContent(detail),
+        // 正文与评论区之间的呼吸（紧跟其后就是「评论 N」区头）
+        const SizedBox(height: kSpace24),
+      ],
     );
   }
 

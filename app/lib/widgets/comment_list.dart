@@ -2,7 +2,10 @@
 ///
 /// - **独立评论页** [CommentPage]（comment_page.dart 现为薄壳）：整页只读评论；
 /// - **播放页竖屏内嵌评论区**（player_page.dart）：视频区下方直接内嵌本列表，
-///   视频切换（换源/选集）时由宿主按 bvid+分P 换 [key] 触发重新加载。
+///   视频切换（换源/选集）时由宿主按 bvid+分P 换 [key] 触发重新加载；
+/// - **专栏阅读页**（article_page.dart，v2.25.2+）：正文整块作为 [header]
+///   挂在列表第 0 项，正文之下就是评论区（同一个滚动体，不再 shrinkWrap）——
+///   此时走 [oid]（cvid）+ [commentType] = 12，[video] 传 null。
 ///
 /// 功能（与原独立评论页对齐）：
 /// - 主评论分页（`x/v2/reply/main`，mode=3 按热度；上拉加载更多，回传
@@ -28,12 +31,12 @@
 /// - 每条根评论 = [AppBlock]（`comment` 规格：纸底 + hairline 描边），
 ///   楼中楼预览/真回复 = [AppBlock]（`reply` 规格：冷底 + 左竖条）；
 ///   条目间靠块自身 margin([kListGap]) 留呼吸（原尾部 Divider 已删除）；
-/// - 入场：整个列表挂在 [StaggeredListScope] 下（代次 = bvid+cid+重载计数），
-///   每条根评论包 [StaggeredEntrance]（翻页追加用更短更密的节奏）——
-///   楼中楼**不参与** stagger（嵌套延迟不可预测）；
+/// - 入场：整个列表挂在 [StaggeredListScope] 下（代次 = 身份串 + 重载计数，
+///   见 [identityKey]），每条根评论包 [StaggeredEntrance]（翻页追加用更短
+///   更密的节奏）——楼中楼**不参与** stagger（嵌套延迟不可预测）；
 /// - 底部翻页加载态 = [SmokeSilhouette] + 一句 [kLoadingPoolFooter] 文案。
 ///
-/// 只读：本组件不做任何点赞/发评论等写操作。aid 解析失败 / 首屏失败均给
+/// 只读：本组件不做任何点赞/发评论等写操作。id 解析失败 / 首屏失败均给
 /// 重试入口。正文过长（v2.17.3+ 折叠）：超 5 行折叠省略 + 「展开」点击
 /// 看全文、「收起」复原（纯文本/链接混排都支持；无链接短评保持可直接
 /// 选择复制，见 _LinkifiedBody 说明）。
@@ -103,14 +106,65 @@ class _ChildrenState {
   });
 }
 
-/// 评论列表（数据加载 + 渲染 + 楼中楼 + 图片/链接跳转），供独立评论页与
-/// 播放页竖屏内嵌共用——避免两处各维护一份评论加载/条目代码。
+/// 评论列表（数据加载 + 渲染 + 楼中楼 + 图片/链接跳转），供独立评论页、
+/// 播放页竖屏内嵌、专栏阅读页共用——避免各维护一份评论加载/条目代码。
+///
+/// **归属（评论挂在谁名下）由 [oid] / [video] 二选一表达**：
+/// - 视频侧照旧只传 [video]（[oid] 为 null → 走老路：异步 view 反查 aid）；
+/// - 专栏侧传 `oid: cvid` + `commentType: 12`，[video] 传 null。
+/// 渲染层不认识视频语义，所以两种归属共用同一套列表/条目代码。
 class CommentListView extends StatefulWidget {
   /// 评论所属视频（aid 在本组件内异步解析；番剧 epId 等由 BiliApi 处理）。
-  final WhitelistVideo video;
+  ///
+  /// v2.25.2+ 起**可为 null**：只按 [oid] 取评论的场景（专栏阅读页）不需要
+  /// 视频对象；为 null 时不会再走 view 接口反查。
+  final WhitelistVideo? video;
 
   /// 可选：外部已解析好的 aid（如播放页已有 view 数据），省一次请求。
   final int? initialAid;
+
+  /// 评论归属 id（reply 接口的 `oid`）：视频传 aid、**专栏传 cvid**。
+  ///
+  /// 解析优先级 [initialAid] > [oid] > view 反查（见 [_init]）；给到它就不
+  /// 会再请求 view 接口。
+  final int? oid;
+
+  /// reply 接口的 `type`（oid 的类型）：**1 = 视频（默认）、12 = 专栏**。
+  ///
+  /// ⚠️ 传错**不会报错**，会静默拿到另一类内容 —— 必须与 [oid] 对齐。
+  final int commentType;
+
+  /// 入场动效的**代次身份串**（同一串视为同一数据源，重载计数才重演入场）。
+  ///
+  /// 为 null → 用 `'${video.bvid}#${video.cid}'`（视频侧老行为，逐字不变）；
+  /// 专栏侧传 `'cv<cvid>'`。
+  final String? identityKey;
+
+  /// 列表**第 0 项**的自定义头（如专栏正文整块）。
+  ///
+  /// 为 null → 列表结构/下标完全不变（视频侧零影响）。宿主把页面主体放进来，
+  /// 就能和评论共用**同一个滚动体**（**不要**改成把本列表 shrinkWrap 塞进
+  /// 外层 ListView —— `NeverScrollableScrollPhysics` 会让内层不再滚动，
+  /// 触底翻页彻底失效）。
+  ///
+  /// 注意：有 [header] 时，加载/错误/空态只在**头下方**显示一块状态（头部
+  /// 内容永远可见），不会把整页换成转圈。
+  final Widget? header;
+
+  /// 底部加载闲话的确定性种子；null → 视频侧仍是 `'${video.bvid}#footer'`。
+  final String? footerSeed;
+
+  /// 「评论 N」区头的计数初值（真值到货后被 cursor.all_count 覆盖）。
+  ///
+  /// 用途：专栏正文里已带 `stats.reply`，先用它顶着，避免区头先闪一下
+  /// 「评论 0」。默认 0 = 老行为。
+  final int initialTotal;
+
+  /// 列表物理特性；null → 用框架默认（视频侧老行为不变）。
+  ///
+  /// 专栏页传 [AlwaysScrollableScrollPhysics]：宿主的 [RefreshIndicator]
+  /// 需要可滚动区域（内容不足一屏时也能下拉刷新）。
+  final ScrollPhysics? physics;
 
   /// 评论内视频链接的回调（语义由调用方定义，接口 v2.17.1+ 起为「跳新播放
   /// 页」，v2.17.6+ 携带 ?p/?t 定位参数，见 [OpenCommentVideo]）。
@@ -142,15 +196,28 @@ class CommentListView extends StatefulWidget {
   /// Scrollable.ensureVisible 定位到评论区）。
   final GlobalKey? countHeaderKey;
 
+  /// 注入 B 站 API（widget 测试用 mock / 宿主复用自己那份会话）；缺省
+  /// 走真实实现（组件自建，行为与旧版一致）。宿主传自己的实例还有额外好处：
+  /// 复用 buvid 指纹、Cookie 与 WBI key，少一次 spi 请求。
+  final BiliApi? api;
+
   const CommentListView({
     super.key,
-    required this.video,
+    this.video,
     this.initialAid,
+    this.oid,
+    this.commentType = 1,
+    this.identityKey,
+    this.header,
+    this.footerSeed,
+    this.initialTotal = 0,
+    this.physics,
     this.onOpenVideo,
     this.onCountChanged,
     this.showCountHeader = false,
     this.controller,
     this.countHeaderKey,
+    this.api,
   });
 
   @override
@@ -158,7 +225,7 @@ class CommentListView extends StatefulWidget {
 }
 
 class _CommentListViewState extends State<CommentListView> {
-  final BiliApi _api = BiliApi();
+  late final BiliApi _api = widget.api ?? BiliApi();
 
   /// 滚动控制器：外部传入（[CommentListView.controller]）则复用（不释放），
   /// 否则自建。滚动监听统一挂在它上面（内嵌页滚动定位与上拉翻页共用）。
@@ -208,9 +275,19 @@ class _CommentListViewState extends State<CommentListView> {
   /// 的 generation 随之变化，配合清空的账本实现「换一批数据就重演一次」。
   int _reloadToken = 0;
 
-  /// 当前入场代次（bvid + cid + 代次）：同一条评论换视频后算不同数据源。
-  String get _entranceGeneration =>
-      '${widget.video.bvid}#${widget.video.cid}#$_reloadToken';
+  /// 当前入场代次（身份串 + 代次）：同一条评论换数据源后算不同来源。
+  ///
+  /// [CommentListView.identityKey] 给了就用它；否则回落到视频侧的
+  /// `bvid#cid`（老行为，逐字不变）；连视频都没有（专栏页且没给身份串）
+  /// 就用 `oid:<oid>` 兜底。
+  String get _entranceGeneration {
+    final video = widget.video;
+    final key = widget.identityKey ??
+        (video != null
+            ? '${video.bvid}#${video.cid}'
+            : 'oid:${widget.oid ?? 0}');
+    return '$key#$_reloadToken';
+  }
 
   @override
   void initState() {
@@ -235,8 +312,13 @@ class _CommentListViewState extends State<CommentListView> {
   @override
   void didUpdateWidget(CommentListView oldWidget) {
     super.didUpdateWidget(oldWidget);
-    // 宿主未换 key 但视频变了（防御：正常宿主用 ValueKey 换源）→ 重置重载。
-    if (oldWidget.video.bvid != widget.video.bvid ||
+    // 宿主未换 key 但归属变了（防御：正常宿主用 ValueKey 换源）→ 重置重载。
+    // 视频侧判据（bvid / initialAid）保持原样；新增的 oid / commentType /
+    // identityKey 对视频调用点恒等（null==null、1==1）→ 行为不变。
+    if (oldWidget.video?.bvid != widget.video?.bvid ||
+        oldWidget.oid != widget.oid ||
+        oldWidget.commentType != widget.commentType ||
+        oldWidget.identityKey != widget.identityKey ||
         oldWidget.initialAid != widget.initialAid) {
       _resetAndReload();
     }
@@ -254,7 +336,10 @@ class _CommentListViewState extends State<CommentListView> {
   // 数据加载
   // -------------------------------------------------------------------------
 
-  /// 进入：先解析 aid（用已给的 / 异步 view 接口），再拉第一页评论。
+  /// 进入：先解析归属 id（用已给的 / 异步 view 接口），再拉第一页评论。
+  ///
+  /// 解析优先级：[CommentListView.initialAid] > [CommentListView.oid] >
+  /// `fetchVideoAid(video)`（只有传了 [CommentListView.video] 才走最后这条）。
   Future<void> _init() async {
     if (!mounted) return;
     setState(() {
@@ -265,14 +350,18 @@ class _CommentListViewState extends State<CommentListView> {
       _roots.clear();
       _cursorNext = 0;
       _isEnd = false;
-      _total = 0;
+      // 区头计数先把宿主给的初值（如专栏 stats.reply）顶上去，真值到货覆盖
+      _total = widget.initialTotal;
       // 换数据源：代次 +1、批次归零、账本清空 → 新的 entryKey 重新排队入场
       _reloadToken++;
       _batchStart = 0;
       _entranceLedger.clear();
     });
-    var aid = widget.initialAid;
-    aid ??= await _api.fetchVideoAid(widget.video);
+    var aid = widget.initialAid ?? widget.oid;
+    final video = widget.video;
+    if (aid == null && video != null) {
+      aid = await _api.fetchVideoAid(video);
+    }
     if (!mounted) return;
     // 登录态探测（fire-and-forget：读不到按未登录处理，仅影响到底文案）
     try {
@@ -285,10 +374,15 @@ class _CommentListViewState extends State<CommentListView> {
     }
     if (!mounted) return;
     if (aid == null) {
-      debugPrint('[comment_list] aid 解析失败 bvid=${widget.video.bvid}');
+      // 视频侧文案保持逐字不变；无视频对象（专栏等）用中性文案
+      final message = video != null
+          ? '获取视频信息失败，无法打开评论区'
+          : '获取内容信息失败，无法打开评论区';
+      debugPrint('[comment_list] 归属 id 解析失败 '
+          'bvid=${video?.bvid ?? '-'} oid=${widget.oid}');
       setState(() {
         _loading = false;
-        _error = '获取视频信息失败，无法打开评论区';
+        _error = message;
       });
       return;
     }
@@ -320,6 +414,7 @@ class _CommentListViewState extends State<CommentListView> {
         aid: aid,
         mode: 3,
         next: reset ? 0 : _cursorNext,
+        type: widget.commentType,
       );
       if (!mounted) return;
       setState(() {
@@ -665,7 +760,12 @@ class _CommentListViewState extends State<CommentListView> {
     if (aid == null) return;
     setState(() => _childrenLoading[rpid] = true);
     try {
-      final page = await _api.fetchReplyChildren(aid: aid, root: rpid, pn: 1);
+      final page = await _api.fetchReplyChildren(
+        aid: aid,
+        root: rpid,
+        pn: 1,
+        type: widget.commentType,
+      );
       if (!mounted) return;
       setState(() {
         _childrenLoading.remove(rpid);
@@ -708,6 +808,7 @@ class _CommentListViewState extends State<CommentListView> {
         aid: aid,
         root: rpid,
         pn: nextPn,
+        type: widget.commentType,
       );
       if (!mounted) return;
       setState(() {
@@ -752,32 +853,55 @@ class _CommentListViewState extends State<CommentListView> {
     );
   }
 
-  @override
-  Widget build(BuildContext context) {
-    if (_loading) {
-      return _fitState(const CircularProgressIndicator());
-    }
+  /// 评论主体当前是否「整块状态」（加载 / 错误 / 空）——是则返回对应 widget，
+  /// 有内容则返回 null。
+  Widget? _bodyState() {
+    if (_loading) return const CircularProgressIndicator();
     final err = _error;
     if (err != null) {
-      // 评论区的错误/空态统一走 AppStateView（细线插画）；外层 _fitState
-      // 负责矮容器（横屏小窗）下仍可滚动、不溢出。
-      return _fitState(AppErrorView(
+      // 评论区的错误/空态统一走 AppStateView（细线插画）
+      return AppErrorView(
         message: err,
         onRetry: _errorRetry ? _retry : null,
         illustrationSeed: 'comment',
-      ));
+      );
     }
     if (_pinned.isEmpty && _roots.isEmpty) {
-      return _fitState(const AppStateView(
+      return const AppStateView(
         kind: AppStateKind.empty,
         copyId: 'empty.comment',
         subtitleCopyId: 'empty.comment.sub',
         illustrationSeed: 'comment',
-      ));
+      );
     }
+    return null;
+  }
+
+  /// 有 [CommentListView.header] 时，加载/错误/空态**只占头下方一块**。
+  ///
+  /// 不能复用 [_fitState]：那里的 `LayoutBuilder` 在 ListView 项里拿到的是
+  /// **无界高度**，`minHeight: infinity` 会直接断言失败。这里用自然高度
+  /// 居中（AppStateView 非 scrollable 形态本身就是「居中 + 自适应高度」）。
+  Widget _embeddedState(Widget state) => Padding(
+        padding: const EdgeInsets.symmetric(vertical: kSpace32),
+        child: Center(child: state),
+      );
+
+  @override
+  Widget build(BuildContext context) {
+    final pageHeader = widget.header;
+    final state = _bodyState();
+    // 无自定义头 → 老行为：状态视图直接占满整块（_fitState 兼容矮容器）
+    if (pageHeader == null) {
+      if (state != null) return _fitState(state);
+    }
+    final hasHeader = pageHeader != null;
+    // 有自定义头但评论还没内容/出错 → 列表只有「头 + 一块状态」
+    final bool onlyHeaderAndState = state != null;
     final pinnedCount = _pinned.length;
     final rootCount = _roots.length;
     final headerCount = widget.showCountHeader ? 1 : 0;
+    final headerSlot = hasHeader ? 1 : 0;
     // 翻页追加批次：本批条目用更短更密的入场节奏（见 app_motion.dart）
     final appendBatch = _batchStart > 0;
     return NotificationListener<ScrollNotification>(
@@ -796,18 +920,27 @@ class _CommentListViewState extends State<CommentListView> {
         ledger: _entranceLedger,
         child: ListView.builder(
           controller: _scrollCtrl,
+          physics: widget.physics,
           // 块与块之间的呼吸由页面内边距 + 每块的 margin(kListGap) 给
           // （删除了原先条目尾部的 Divider）
           padding: const EdgeInsets.fromLTRB(kPagePadH, 0, kPagePadH, kSpace12),
-          itemCount: headerCount + pinnedCount + rootCount + 1, // +1 脚部
+          itemCount: onlyHeaderAndState
+              ? headerSlot + 1 // 头 + 一块状态
+              : headerSlot + headerCount + pinnedCount + rootCount + 1, // +1 脚部
           itemBuilder: (context, index) {
-            if (index == headerCount + pinnedCount + rootCount) {
+            if (hasHeader) {
+              if (index == 0) return pageHeader;
+              if (onlyHeaderAndState) return _embeddedState(state);
+            }
+            // 去掉自定义头占用的下标（没有头时 headerSlot == 0，下标不变）
+            final at = index - headerSlot;
+            if (at == headerCount + pinnedCount + rootCount) {
               return _buildFooter();
             }
-            if (headerCount > 0 && index == 0) {
+            if (headerCount > 0 && at == 0) {
               return _buildCountHeader();
             }
-            final i = index - headerCount;
+            final i = at - headerCount;
             final bool pinned = i < pinnedCount;
             final reply = pinned ? _pinned[i] : _roots[i - pinnedCount];
             // 入场序号：
@@ -869,6 +1002,16 @@ class _CommentListViewState extends State<CommentListView> {
     );
   }
 
+  /// 底部加载闲话的确定性种子：宿主给了用宿主的（专栏传 `cv<n>#footer`），
+  /// 否则沿用视频侧老口径 `'<bvid>#footer'`（逐字不变）。
+  String get _footerSeed {
+    final given = widget.footerSeed;
+    if (given != null) return given;
+    final video = widget.video;
+    if (video != null) return '${video.bvid}#footer';
+    return 'comment#footer';
+  }
+
   Widget _buildFooter() {
     if (_loadingMore) {
       // 翻页加载：抽烟剪影 + 一句加载闲话（文案池确定性挑一句，同 bvid 恒同）。
@@ -883,7 +1026,7 @@ class _CommentListViewState extends State<CommentListView> {
             AnimatedCopyLine(
               text: loadingCopyFor(
                 pool: kLoadingPoolFooter,
-                seed: '${widget.video.bvid}#footer',
+                seed: _footerSeed,
               ),
               style: kTypeBodyS.copyWith(color: kInkGray70),
             ),

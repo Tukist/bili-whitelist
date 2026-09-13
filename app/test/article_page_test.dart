@@ -82,6 +82,22 @@ Map<String, dynamic> _spiBody() => {
       'data': {'b_3': 'buvid3test', 'b_4': 'buvid4test'},
     };
 
+/// 评论区路径（v2.25.2+ 专栏页底部有评论区）。
+const String _kReplyPath = '/x/v2/reply/main';
+
+/// 空评论页：只关心正文的用例用它把评论区垫成「暂无评论」——
+/// 不加这个 handler 的话，评论接口会 404 → 正文下方多出一块**评论**错误态
+/// （正文本身没错，但 `find.byType(AppErrorView)` 会命中那块），
+/// 与本文件「正文不该被错误态盖住」的断言互相干扰。
+Map<String, dynamic> _replyEmptyBody() => {
+      'code': 0,
+      'data': {
+        'replies': [],
+        'top_replies': [],
+        'cursor': {'next': 0, 'is_end': true, 'all_count': 0},
+      },
+    };
+
 /// 正文发布时间：相对「现在」4 小时 → 「4 小时前」。
 final int _pubTs =
     DateTime.now().subtract(const Duration(hours: 4)).millisecondsSinceEpoch ~/
@@ -191,6 +207,7 @@ void main() {
   testWidgets('正文为空（content 只有空白）→ 一句「正文为空」', (tester) async {
     final adapter = _GatedAdapter({
       '/x/frontend/finger/spi': _spiBody,
+      _kReplyPath: _replyEmptyBody,
       _kViewPath: () => _viewBody(content: '   \n '),
     });
     await _pumpPage(tester, _api(adapter));
@@ -305,6 +322,7 @@ void main() {
     var calls = 0;
     final adapter = _GatedAdapter({
       '/x/frontend/finger/spi': _spiBody,
+      _kReplyPath: _replyEmptyBody,
       _kViewPath: () {
         calls++;
         return calls == 1

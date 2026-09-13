@@ -61,11 +61,13 @@ import 'dart:async';
 
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../api/bilibili_api.dart';
 import '../api/github_api.dart';
 import '../models/article.dart';
 import '../models/dynamic_item.dart';
+import '../models/live_status.dart';
 import '../models/upowner.dart';
 import '../models/whitelist_video.dart';
 import '../services/followings_auto_sync.dart';
@@ -73,6 +75,7 @@ import '../services/loading_copy.dart';
 import '../services/upowner_writer.dart';
 import '../services/whitelist_writer.dart';
 import '../theme/app_motion.dart';
+import '../theme/app_palette.dart';
 import '../theme/app_tokens.dart';
 import '../utils/relative_time.dart';
 import '../widgets/animated_copy_line.dart';
@@ -252,6 +255,13 @@ class _UpownerPageState extends State<UpownerPage> {
   @visibleForTesting
   static void debugClearUpownerInfoCache() => _upInfoCache.clear();
 
+  /// 开播状态（v2.25.2+，「正在直播」标记用；null = 没在播 / 还没查到 /
+  /// 查失败——三种都不显示标记，与「没在播」同一个观感）。
+  ///
+  /// 只**会话内**缓存（在 [LiveStatusHub.instance] 里，不落盘、不写 Gist）；
+  /// 请求串行 + ≥1.5s 间隔 + 失败静默也都在那个 hub 里。
+  LiveStatus? _live;
+
   // -------------------------------------------------------------------------
   // 「合集·列表」区（v2.17.4+）：chips 选合集 → 下方列表显示该合集视频。
   // 合集视频列表独立于「全部视频」列表（搜索/排序不影响它）。
@@ -366,6 +376,8 @@ class _UpownerPageState extends State<UpownerPage> {
     _loadInfo();
     _loadFirstPage();
     _loadCollections();
+    // 开播标记（纯装饰：失败静默、串行节流都在 LiveStatusHub 里）
+    unawaited(_loadLive());
   }
 
   @override
@@ -603,6 +615,46 @@ class _UpownerPageState extends State<UpownerPage> {
       sign: profile.sign,
       fans: profile.fans ?? cur?.fans,
     );
+  }
+
+  /// 查「这位 UP 主是否正在直播」（白名单 UP 主的**最小形态**标记，v2.25.2+）。
+  ///
+  /// - 取数走 [LiveStatusHub.instance]：**会话内缓存 + 串行 + 相邻请求间隔
+  ///   ≥1.5s**（B 站对 live 接口风控很严，不可并发轰炸），**失败静默**——
+  ///   查不到就是没有标记，不影响页面任何其它内容；
+  /// - 只有**真的在播**（`liveStatus == 1`）才显示标记：**轮播（2）不显示**
+  ///   （轮播没有直播流，点进去看不到直播，装作「在播」是骗人）；
+  /// - 点标记去看直播是**跳出去**（系统浏览器 / B 站 App），App 内不播直播
+  ///   —— 本 App 的定位是「只看事先选好的内容」，直播是不可预选、无边界的
+  ///   信息流，不做站内入口（搜索页也不加直播入口）。
+  Future<void> _loadLive() async {
+    final status = await LiveStatusHub.instance
+        .statusOf(widget.mid, fetch: _api.fetchLiveStatusByMid);
+    if (!mounted) return;
+    setState(() => _live = status);
+  }
+
+  /// 点「正在直播」→ 打开 B 站直播间（外部应用；url_launcher 已在 pubspec）。
+  Future<void> _openLive(LiveStatus status) async {
+    final url = status.liveUrl;
+    if (url.isEmpty) return;
+    final uri = Uri.tryParse(url);
+    if (uri == null) return;
+    debugPrint('[upowner] 打开直播间 mid=${widget.mid} url=$url');
+    try {
+      final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
+      if (!ok) _toast('打开直播间失败');
+    } catch (_) {
+      _toast('打开直播间失败');
+    }
+  }
+
+  /// 轻提示（SnackBar）。
+  void _toast(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
   }
 
   /// 缓存命中但缺粉丝数时补拉一次 stat（单次、不重试，失败静默）。
@@ -1307,6 +1359,12 @@ class _UpownerPageState extends State<UpownerPage> {
                     color: theme.colorScheme.onSurfaceVariant,
                   ),
                 ),
+                // 「正在直播」标记（只在真的在播时出现；点它跳 B 站看直播）
+                if (_live?.isLive == true)
+                  LiveNowBadge(
+                    title: _live!.title,
+                    onTap: () => unawaited(_openLive(_live!)),
+                  ),
                 if (info != null && info.sign.isNotEmpty) ...[
                   const SizedBox(height: 6),
                   Text(
@@ -2078,6 +2136,104 @@ class _ArticleCard extends StatelessWidget {
                 child: InkWell(onTap: tap, child: body),
               ),
             ),
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 「正在直播」标记（v2.25.2+）
+// ---------------------------------------------------------------------------
+
+/// 「正在直播」标记（UP 主页顶部信息区 + 信箱顶卡共用）。
+///
+/// ## 为什么只有这么一点
+/// 本 App 的定位是**防短视频成瘾**——只能看用户事先在白名单里选好的内容；
+/// 直播是**不可预选、无边界**的信息流。所以这里只做「标记 + 跳出去看」：
+/// 不内嵌直播播放、不在搜索页加直播入口（那等于开一个无限内容池）。
+///
+/// ## 形态（mono-color）
+/// - 点缀墨系：**实心小圆点**（[AppPalette.accentFill]）表达「正在发生」，
+///   文字点缀加深色（[AppPalette.accentDeep]）压在点缀稀释底
+///   （[AppPalette.accentWash]）上——对比度由 palette 保证（≥4.5:1），
+///   换浅墨配方也不会糊；
+/// - 1px 描边 + [kRadiusSm]，**无阴影**，不抢正文的注意力；
+/// - 触摸目标 ≥48dp（外层 `SizedBox(height: 48)` + `Align`：视觉上仍是
+///   矮胶囊，但可点区域是 48 高）。
+/// - 标题过长 1 行截断（[LiveStatus.title]，空则只显示「正在直播」）。
+class LiveNowBadge extends StatelessWidget {
+  const LiveNowBadge({
+    super.key,
+    required this.onTap,
+    this.title = '',
+    this.maxWidth = 260,
+  });
+
+  /// 点击回调（宿主决定：打开 B 站直播间）。
+  final VoidCallback onTap;
+
+  /// 直播间标题（可空）。
+  final String title;
+
+  /// 标记最大宽度（信箱卡片上别铺满整张卡）。
+  final double maxWidth;
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = context.palette;
+    final t = title.trim();
+    final text = t.isEmpty ? '正在直播' : '正在直播 · $t';
+    return Semantics(
+      button: true,
+      label: '正在直播${t.isEmpty ? '' : '：$t'}，点击去 B 站观看',
+      child: SizedBox(
+        height: 48, // 触摸目标 ≥48dp（视觉是矮胶囊，热区是整行）
+        child: Align(
+          alignment: Alignment.centerLeft,
+          child: Material(
+            type: MaterialType.transparency,
+            child: InkWell(
+              onTap: onTap,
+              borderRadius: BorderRadius.circular(kRadiusSm),
+              child: Container(
+                constraints: BoxConstraints(maxWidth: maxWidth),
+                padding: const EdgeInsets.symmetric(
+                  horizontal: kSpace8,
+                  vertical: kSpace4,
+                ),
+                decoration: BoxDecoration(
+                  color: palette.accentWash,
+                  borderRadius: BorderRadius.circular(kRadiusSm),
+                  // 1px 描边（mono-color：形状靠线，不靠阴影）
+                  border: Border.all(color: palette.accent, width: 1),
+                ),
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    // 实心小圆点 = 「正在发生」，这一枚是整个标记的语义核心
+                    Container(
+                      width: 8,
+                      height: 8,
+                      decoration: BoxDecoration(
+                        color: palette.accentFill,
+                        shape: BoxShape.circle,
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    Flexible(
+                      child: Text(
+                        text,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: kTypeLabel.copyWith(color: palette.accentDeep),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
     );
   }
 }

@@ -8,6 +8,34 @@
 
 ---
 
+## v2.26.0 (2026-09-13)
+
+**专栏也有评论区了，白名单 UP 主会亮「正在直播」标记；修掉一个让直播标记永不显示的 P0 host 缺陷（接口请求打到错误域名返回 404 后被静默吞掉）；v2.26.0**
+
+**A. 专栏阅读页接入评论区（评论区当唯一滚动者）**
+
+- **接口层泛化**：`fetchVideoComments` / `fetchReplyChildren` 各加 `int type = 1` 形参（形参名仍叫 `aid`，语义是 reply 的 `oid`），把原来写死的 `'type': '1'` 参数化 → 视频传 `type=1` + `aid=<avid>`，专栏传 `type=12` + `oid=<cvid>`
+- **限流退避**：新增私有 `_getReplyApi` 给 reply 系列请求补上 `-509`（请求过于频繁）退避 1200ms；`_throwReplyError` 增 `-509` 分支给出可读错误
+- **`lib/widgets/comment_list.dart` 通用化**：新增可选参数 `oid` / `commentType` / `identityKey` / `header` / `footerSeed` / `initialTotal` / `physics` / `api`；`video` 由 `required` 改**可空**（老调用点行为不变）
+- **`lib/pages/article_page.dart` 用 header 方案**：**专栏正文整块作为评论区 `CommentListView` 的 `header`**，让评论区当**唯一滚动者**——正文与评论处在同一个滚动体内，保证「滚动到底自动加载下一页」真的有效（若做成正文在外层、评论内层两个滚动体，翻页永远触发不到）
+- **实测结论**：正文与评论同一滚动体（拖动评论时作者行与「评论 270」同步位移）、楼中楼展开正常、点头像进个人页正常、下拉刷新正常、`-509` 退避在真机上真实触发并成功恢复
+- **已知限制**：匿名会话下 B 站只返回热门评论且首屏即 `is_end=true`，**评论翻页无法在匿名态验证**——这是 **API 上限，不是代码缺陷**（登录态未测）
+
+**B. 白名单 UP 主「正在直播」标记（最小形态）**
+
+- **接口**：新增 `fetchLiveStatusByMid(mid)`（`lib/api/bilibili_api.dart`），请求 `https://api.live.bilibili.com/room/v1/Room/getRoomInfoOld`
+- **节流中枢**：新增 `lib/models/live_status.dart`（`LiveStatus` + `LiveStatusHub`）——**单条串行队列**保证相邻请求间隔 **≥1.5s**，**同 mid 在途请求共享**避免并发打同一个 UP，**会话内缓存**避免来回切页反复请求，**失败静默、不写缓存**（下次仍可重试），UI 永不因网络问题报错
+- **UI**：新增 `LiveNowBadge`（点缀墨系圆点 + accent 描边，**无阴影**，与 v2.18.0 起的 block 设计语言一致）——UP 主页插在「粉丝数」下方，信箱顶卡左上角叠一个
+- **语义**：`liveStatus == 2`（轮播）**不算在播**——轮播没有直播流，标了会误导
+- **P0 缺陷修复（本轮重点）**：`fetchLiveStatusByMid` 原先打在 `_dio` 的 baseUrl `https://api.bilibili.com` 上 → **HTTP 404**，而异常被 `catch` 静默吞掉 → **标记永不显示且不报错**。现改用**绝对 URL**，新增常量 `kLiveApi = 'https://api.live.bilibili.com'`（`lib/config.dart`）
+- **防回归**：`test/live_status_test.dart` 新增一条**断言 host** 的用例（**能证伪**：改回旧 host 必红）；mock adapter 同步做了最小改动——绝对 URL 下 dio 的 `RequestOptions.path` 是**完整 URL**，只按 path 匹配会让用例**假绿**；另外订正了四处把接口写成 `x/room/v1/...` 的**过时注释**
+- **已知限制（产品决策，有意为之）**：**只做「标记 + 点击跳站外浏览器」**，**不做 App 内播放直播、不在搜索页加直播入口**——本 App 的定位是「只看**事先选好**的内容」，直播是**不可预选、无边界的信息流**，给它站内入口会破坏防成瘾的定位
+- **未验边界**：模拟器没装 B 站 App，站外跳转只验到「拉起浏览器」这一步；轮播分支（`liveStatus==2`）未实测；信箱顶卡角标因当时该 UP 无直播间而未目击
+
+- 测试 / 验证：`flutter analyze` **0 issue**、全量 `flutter test` **1599 例全绿**；Android 模拟器实测——在播 UP（`白夕Seal` mid=1909499809）**UP 主页标记正常渲染**，logcat `[bili_api] fetchLiveStatusByMid mid=1909499809 → room=23336970 live=1 title="杀戮尖塔2—豹豹今天豹毙了吗？"`（**无 `失败:` 行**，即非 404 静默失败），**点击标记拉起 Chrome** 打开 `https://live.bilibili.com/23336970`；负向对照 `呼唤少女` mid=271924781 未在播 → 无标记，curl 交叉验证一致；**专栏评论区无回归**（同一滚动体、楼中楼、头像跳转、下拉刷新均正常）
+
+---
+
 ## v2.25.1 (2026-09-13)
 
 **安全与文档修正（无功能变化）：油猴脚本里两处明文真实 Gist ID 改为占位符语义、订正 `AndroidManifest.xml` 里关于通知权限的过时注释；全仓库已跟踪文件复核后仅剩 1 处真实 Gist ID（`app/lib/config.dart`，功能必需、有意保留）；v2.25.1**

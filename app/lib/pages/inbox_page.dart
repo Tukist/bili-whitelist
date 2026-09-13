@@ -80,9 +80,11 @@ import 'dart:math' as math;
 
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 import '../api/bilibili_api.dart';
 import '../api/github_api.dart';
+import '../models/live_status.dart';
 import '../services/inbox_card_style_store.dart';
 import '../services/inbox_service.dart';
 import '../services/service_locator.dart';
@@ -96,6 +98,7 @@ import '../widgets/inbox_card_styles.dart';
 import '../widgets/inbox_swipe_card.dart';
 import '../widgets/staggered_entrance.dart';
 import 'player_page.dart';
+import 'upowner_page.dart' show LiveNowBadge;
 
 /// 底部按钮行的高度（用于给卡片区留出高度预算）。
 ///
@@ -194,6 +197,10 @@ class _InboxPageState extends State<InboxPage>
   /// 交错入场的「已入场」账本：卡片被重建（换一张）时不重播。
   final EntranceLedger _entranceLedger = EntranceLedger();
 
+  /// 顶层卡片作者的「正在直播」状态（v2.25.2+；null = 没在播 / 还没查到 /
+  /// 查失败——都不显示标记）。只查**队首这一张**（见 [_loadTopLive]）。
+  LiveStatus? _live;
+
   /// 拖动位移（松手前实时跟随手指；松手后由动画接管）。
   Offset _drag = Offset.zero;
 
@@ -273,6 +280,46 @@ class _InboxPageState extends State<InboxPage>
       if (items.isNotEmpty) _loadedOnce = true;
       _items = _mergeChecked(items);
     });
+    unawaited(_loadTopLive());
+  }
+
+  /// 查**队首那张卡片**作者的「正在直播」状态（信箱上的开播角标，v2.25.2+）。
+  ///
+  /// 取舍（为什么只查队首这一张）：一叠卡片同一时刻只看得见顶卡，而 live
+  /// 接口风控很严——绝不为一整队未读逐张轰炸。用户每划走一张，顶卡换人，
+  /// 这里再补一次查询（见 [_commitExit] / [_undoLast] 的调用点）。
+  ///
+  /// 一律走 [LiveStatusHub.instance]：会话内缓存（同一 UP 主只查一次）+
+  /// **串行 + 相邻请求间隔 ≥1.5s** + **失败静默**（查不到就是没角标）。
+  /// 只有 `liveStatus == 1`（真的在播）才显示；**轮播（2）不显示**。
+  Future<void> _loadTopLive() async {
+    final item = _items.isEmpty ? null : _items.first;
+    if (item == null || item.upMid <= 0) {
+      if (mounted && _live != null) setState(() => _live = null);
+      return;
+    }
+    final status = await LiveStatusHub.instance
+        .statusOf(item.upMid, fetch: _api.fetchLiveStatusByMid);
+    if (!mounted) return;
+    // 等待期间卡片可能已被划走 / 撤销 → 只在「查的还是当前顶卡作者」时上屏
+    final cur = _items.isEmpty ? null : _items.first;
+    if (cur == null || cur.upMid != item.upMid) return;
+    setState(() => _live = status);
+  }
+
+  /// 点开播角标 → B 站直播间（外部应用）。App 内不播直播（见
+  /// `models/live_status.dart` 的定位说明）。
+  Future<void> _openLive(LiveStatus status) async {
+    final url = status.liveUrl;
+    if (url.isEmpty) return;
+    final uri = Uri.tryParse(url);
+    if (uri == null) return;
+    try {
+      final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
+      if (!ok) _showSnack('打开直播间失败');
+    } catch (_) {
+      _showSnack('打开直播间失败');
+    }
   }
 
   /// 把一份「服务端 / 缓存的队列」并进当前队列。
@@ -617,6 +664,9 @@ class _InboxPageState extends State<InboxPage>
       _likeProgress = 0;
       _skipProgress = 0;
     });
+    // 顶卡换人了（v2.25.2+）：新顶卡作者是否在播，重新看一眼（走会话缓存 +
+    // 串行节流，不额外轰炸 live 接口）
+    unawaited(_loadTopLive());
   }
 
   /// 刷新/离开前收尾：把正在飞出的那张按已完成结算（动作早已发出），
@@ -680,6 +730,8 @@ class _InboxPageState extends State<InboxPage>
       c.duration = kDurBase;
       c.forward(from: 0);
     }
+    // 顶卡换人（放回来的这张）：重新看一眼它的开播状态
+    unawaited(_loadTopLive());
     _showSnack(rec.liked
         ? '已撤销上一张（若已加入白名单，需到白名单里自行移除）'
         : '已撤销上一张');
@@ -842,7 +894,7 @@ class _InboxPageState extends State<InboxPage>
     );
   }
 
-  /// 顶层卡片：手势 + 跟随/旋转 + 浮层标记。
+  /// 顶层卡片：手势 + 跟随/旋转 + 浮层标记（+ 在播角标）。
   Widget _buildTopCard(InboxItem item, double cardW, InboxCardStyle style) {
     final card = InboxSwipeCard(
       item: item,
@@ -860,16 +912,37 @@ class _InboxPageState extends State<InboxPage>
       onHorizontalDragCancel: _springBack,
       child: card,
     );
+    // 「正在直播」角标（v2.25.2+）：叠在卡片左上角，**不改变卡片尺寸**（
+    // 只是 Stack 里的一层，卡片的自然高度仍是 Stack 的高度，卡片栈的几何
+    // 一点没动）。点它是自己的手势（内层 InkWell 在手势竞技场里胜出），
+    // → 跳 B 站直播间；点卡片其它地方照旧开播放页。
+    final live = _live;
+    final body = (live != null && live.isLive)
+        ? Stack(
+            children: [
+              gesture,
+              Positioned(
+                left: kSpace8,
+                top: kSpace8,
+                child: LiveNowBadge(
+                  title: live.title,
+                  maxWidth: math.max(cardW - kSpace24, 120),
+                  onTap: () => unawaited(_openLive(live)),
+                ),
+              ),
+            ],
+          )
+        : gesture;
     final c = _motion ? _fly : null;
     return StaggeredEntrance(
       entryKey: 'bvid:${item.bvid}',
       index: 0,
       child: c == null
-          ? _decorate(gesture, 1)
+          ? _decorate(body, 1)
           : AnimatedBuilder(
               animation: c,
               // ★ 必须传 child：飞出/弹回期间卡片子树不逐帧重建
-              child: gesture,
+              child: body,
               builder: (_, child) => _decorate(child!, c.value),
             ),
     );

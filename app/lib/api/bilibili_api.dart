@@ -10,6 +10,7 @@ import '../models/article.dart';
 import '../models/comment.dart';
 import '../models/danmaku.dart';
 import '../models/dynamic_item.dart';
+import '../models/live_status.dart';
 import '../models/media_search_result.dart';
 import '../models/search_result.dart';
 import '../models/subtitle.dart';
@@ -2462,8 +2463,9 @@ class BiliApi {
   // 专栏（B 站「文章」，v2.23.0+）
   // -------------------------------------------------------------------------
 
-  /// 专栏接口 `-509`（请求过于频繁）的退避时长（实测该接口有限频，等一会
-  /// 再打即成功）。页面层的退避重试（1s → 2s）会再兜一层。
+  /// `-509`（请求过于频繁）的退避时长：**专栏接口与评论接口共用**（两个接口
+  /// 实测都有限频，等一会再打即成功；同一量级，别为它拆成两个常量）。
+  /// 页面层的退避重试（1s → 2s）会再兜一层。
   static const Duration _articleFloodRetryDelay = Duration(milliseconds: 1200);
 
   /// 某用户的专栏列表（`x/space/article?mid=&pn=&ps=`，匿名可读）。
@@ -2762,25 +2764,31 @@ class BiliApi {
   // 评论区（v2.16.15+ 起）：x/v2/reply/main（主评论）+ x/v2/reply/reply（楼中楼）
   // -------------------------------------------------------------------------
 
-  /// 拉取视频/番剧的主评论一页（`x/v2/reply/main`）。
+  /// 拉取视频/番剧/**专栏**的主评论一页（`x/v2/reply/main`）。
   ///
   /// 2026-09 匿名实测结论：
   /// - **匿名可用**（带完整头 + [_injectAuth] 的 buvid 指纹/登录态更稳），
-  ///   **无需 WBI 签名**
-  /// - [aid] 必须传视频 aid（番剧集 ep 的 aid 与 view 接口一致；普通视频
-  ///   [resolveAidForVideo] / [fetchVideoAid] 拿）
+  ///   **无需 WBI 签名**（带 wbi 的 `x/v2/reply/wbi/main` 无签名一律 -403，
+  ///   **不要**换过去）
+  /// - [aid] 是 reply 接口的 **oid**：视频/番剧集传 aid（番剧集 ep 的 aid 与
+  ///   view 接口一致；普通视频 [resolveAidForVideo] / [fetchVideoAid] 拿）、
+  ///   **专栏传 cvid**（形参名保留 `aid`：调用点太多，改名得不偿失）
+  /// - [type] 是 oid 的类型：**1 = 视频 / 12 = 专栏**（⚠️ 传错**不报错**，
+  ///   会静默返回另一类内容，务必对齐；默认 1 = 视频，与旧行为逐字节一致）
   /// - [mode] 排序：3=按热度（默认，B 站网页端「最热」）
   /// - [next] 翻页游标：**从 0 起，回传上一响应 [ReplyMainPage.cursorNext]
   ///   原样**（不要手写 +1）
   /// - 响应 `data.replies[]`（根评论 root=0/parent=0，每条内嵌 `replies[]`
   ///   楼中楼预览至多 3 条）、`data.top_replies`（置顶）、
-  ///   `data.cursor{next,is_end,all_count}`
+  ///   `data.cursor{next,is_end,all_count}`（字段与视频评论**完全同构**）
   /// - 防御：`data.replies[]` 中 `oid != aid` 的脏条目直接丢弃
   ///
   /// 错误分类（UI 据此提示）：
   /// - code=12002 → [BiliApiException]「评论区已关闭」
   /// - code=-412 → [BiliApiException]「被风控拦截，请稍后再试」
   /// - code=-352 → [BiliApiException]「被限流，请稍后再试」
+  /// - code=-509 → 等 [_articleFloodRetryDelay] 退避重试一次；仍失败才抛
+  ///   （评论接口与专栏接口同样有限频，实测常见）
   /// - 其他业务码 → [BiliApiException]（带接口 message）
   /// - code=0 但无 data / replies 缺失 → 空页（isEnd=true，按「暂无/到底」处理）
   /// - 网络失败（[DioException]）→ 原样上抛
@@ -2788,15 +2796,20 @@ class BiliApi {
     required int aid,
     int mode = 3,
     int next = 0,
+    int type = 1,
   }) async {
     await _injectAuth();
-    final params = {'type': '1', 'oid': '$aid', 'mode': '$mode', 'next': '$next'};
+    final params = {
+      'type': '$type',
+      'oid': '$aid',
+      'mode': '$mode',
+      'next': '$next',
+    };
     debugPrint('[bili_api] fetchVideoComments aid=$aid mode=$mode next=$next');
-    final resp = await _dio.get<Map<String, dynamic>>(
+    final data = await _getReplyApi(
       '/x/v2/reply/main',
       queryParameters: params,
     );
-    final data = resp.data;
     _throwReplyError(data, '/x/v2/reply/main');
     final d = data?['data'] as Map<String, dynamic>?;
     if (d == null) {
@@ -2839,27 +2852,30 @@ class BiliApi {
   /// [ReplyChildrenPage.hasMore] = `pn × ps < page.count`——调用方据此继续
   /// 翻页，不要再请求空页。
   ///
-  /// 错误分类同 [fetchVideoComments]。
+  /// [aid] / [type] 语义与 [fetchVideoComments] 完全一致（专栏传
+  /// `oid=cvid` + `type=12`）；实测专栏楼中楼匿名同样可用。
+  ///
+  /// 错误分类同 [fetchVideoComments]（含 `-509` 退避重试一次）。
   Future<ReplyChildrenPage> fetchReplyChildren({
     required int aid,
     required int root,
     int pn = 1,
     int ps = 20,
+    int type = 1,
   }) async {
     await _injectAuth();
     final params = {
-      'type': '1',
+      'type': '$type',
       'oid': '$aid',
       'root': '$root',
       'pn': '$pn',
       'ps': '$ps',
     };
     debugPrint('[bili_api] fetchReplyChildren aid=$aid root=$root pn=$pn');
-    final resp = await _dio.get<Map<String, dynamic>>(
+    final data = await _getReplyApi(
       '/x/v2/reply/reply',
       queryParameters: params,
     );
-    final data = resp.data;
     _throwReplyError(data, '/x/v2/reply/reply');
     final d = data?['data'] as Map<String, dynamic>?;
     if (d == null) {
@@ -2915,6 +2931,36 @@ class BiliApi {
     return out;
   }
 
+  /// reply 系列接口的公共 GET：`-509`（请求过于频繁）退避重试一次。
+  ///
+  /// 返回响应体（业务码分类交给调用方的 [_throwReplyError]：那里要保住
+  /// 旧代码逐字一致的分支顺序，只有退避重试是新增的）；网络失败
+  /// （[DioException]）原样上抛。
+  ///
+  /// 为什么需要：评论接口（尤其**专栏评论** `type=12`）实测有限频，
+  /// 返回 `-509 请求过于频繁`；等 [_articleFloodRetryDelay]（1.2s）再打
+  /// 一次多数即成功——与专栏正文/列表接口同一套处理。
+  Future<Map<String, dynamic>?> _getReplyApi(
+    String path, {
+    required Map<String, String> queryParameters,
+  }) async {
+    for (var attempt = 0; attempt < 2; attempt++) {
+      final resp = await _dio.get<Map<String, dynamic>>(
+        path,
+        queryParameters: queryParameters,
+      );
+      final data = resp.data;
+      if (_looseInt(data?['code']) == -509 && attempt == 0) {
+        debugPrint('[bili_api] $path -509 请求过于频繁，'
+            '${_articleFloodRetryDelay.inMilliseconds}ms 后退避重试');
+        await Future<void>.delayed(_articleFloodRetryDelay);
+        continue;
+      }
+      return data;
+    }
+    return null; // 理论不可达：循环内每轮都有 return
+  }
+
   /// reply 系列接口的业务错误 → 抛 [BiliApiException]（12002/-412/-352 等）。
   /// code=0 或响应体不是 JSON map 时静默返回（由调用方按空处理）。
   void _throwReplyError(Map<String, dynamic>? data, String path) {
@@ -2939,12 +2985,77 @@ class BiliApi {
           message: '评论接口被限流，请稍后再试',
           path: path,
         );
+      case -509:
+        // 退避重试后仍是 -509（见 [_getReplyApi]）：给一句可读的提示
+        throw BiliApiException(
+          code: -509,
+          message: '评论请求过于频繁，请稍后再试',
+          path: path,
+        );
       default:
         throw BiliApiException(
           code: code,
           message: data?['message'] as String? ?? '评论获取失败',
           path: path,
         );
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 直播开播状态（v2.25.2+）：白名单 UP 主「正在直播」标记（最小形态）
+  // -------------------------------------------------------------------------
+
+  /// 按 UP 主 mid 查直播间开播状态
+  /// （`https://api.live.bilibili.com/room/v1/Room/getRoomInfoOld?mid=<mid>`）。
+  ///
+  /// ⚠️ **host 是 `api.live.bilibili.com`，与 `_dio` 的 [kBiliApi]
+  /// （`api.bilibili.com`）不同**：本接口走直播域名，打到 `api.bilibili.com`
+  /// 会 404（返回 HTML 出错页，被下面的 catch 静默吞掉，表现为「标记永不
+  /// 显示」）。故这里用**绝对 URL**（见 [kLiveApi]），不改 `_dio` 的 baseUrl
+  /// （那会波及全部接口）。
+  ///
+  /// 2026-09 匿名实测结论：
+  /// - **匿名可用**（仍先 [_injectAuth] 带上 buvid 指纹/登录态，更稳）；
+  /// - 白名单里只存 mid、**没有 room_id**，本接口是「mid → room_id + 开播
+  ///   状态」唯一的匿名可用入口；
+  /// - 响应 `data{roomStatus, liveStatus, roomid, url, title}`；
+  ///   `liveStatus` 三态 **0=未开播 / 1=直播中 / 2=轮播**——**2 是轮播，
+  ///   没有直播流，不能当「在播」展示**（见 [LiveStatus.isLive]）；
+  /// - ⚠️ 不要改用 `room/v1/Room/getInfoByRoom`（同样在直播域名下，匿名一律
+  ///   -352）。
+  ///
+  /// 返回语义（调用方据此走 UI）：
+  /// - 拿到房间信息 → 返回 [LiveStatus]（**未开播 / 轮播也返回**，宿主可据此
+  ///   记住「这台当前没在播」，不必反复打接口）；
+  /// - 任何失败（mid 非法 / 网络 / 风控 / 脏数据）→ **null，且不抛**——
+  ///   开播标记是纯装饰，静默即正确（调用方是 [LiveStatusHub]，见
+  ///   `lib/models/live_status.dart` 的会话缓存 + 串行节流）。
+  Future<LiveStatus?> fetchLiveStatusByMid(int mid) async {
+    if (mid <= 0) return null;
+    try {
+      await _injectAuth();
+      debugPrint('[bili_api] fetchLiveStatusByMid mid=$mid');
+      final resp = await _dio.get<Map<String, dynamic>>(
+        '$kLiveApi/room/v1/Room/getRoomInfoOld',
+        queryParameters: {'mid': '$mid'},
+      );
+      final data = resp.data;
+      if (_looseInt(data?['code']) != 0) {
+        debugPrint('[bili_api] fetchLiveStatusByMid mid=$mid 业务码失败 '
+            'code=${data?['code']} msg=${data?['message']}');
+        return null;
+      }
+      final d = data?['data'];
+      if (d is! Map<String, dynamic>) return null;
+      final status = LiveStatus.fromRoomInfoOld(mid, d);
+      debugPrint('[bili_api] fetchLiveStatusByMid mid=$mid → '
+          'room=${status.roomId} live=${status.liveStatus} '
+          'title="${status.title}"');
+      return status;
+    } catch (e) {
+      // 失败静默（含网络异常/脏数据）：标记是装饰，不能影响页面其它内容
+      debugPrint('[bili_api] fetchLiveStatusByMid mid=$mid 失败: $e');
+      return null;
     }
   }
 }
