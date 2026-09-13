@@ -42,8 +42,8 @@
  *   1. 浏览器安装 Tampermonkey（油猴），新建脚本粘贴保存
  *   2. 打开任意 B 站视频页，【双击】标题右侧按钮 → 弹出配置面板，填写：
  *        - github_token：GitHub Personal Access Token（需 gist 权限，最小授权即可）
- *        - gist_id：白名单 Gist 的 ID（用户 Tukist 的 secret gist：
- *          73a6e23f94d55dc7a1f88e4a2a7557d5）
+ *        - gist_id：白名单 Gist 的 ID（从自己的 gist 页面 URL 末尾复制，
+ *          形如 https://gist.github.com/<用户名>/<GIST_ID>）
  *   3. 之后【单击】按钮，即可把当前视频加入白名单
  *
  * 【配置存储与安全提示】
@@ -517,7 +517,7 @@
         const gistInput = document.createElement('input');
         gistInput.type = 'text';
         gistInput.value = getGistId();
-        gistInput.placeholder = 'Gist ID，如 73a6e23f94d55dc7a1f88e4a2a7557d5';
+        gistInput.placeholder = 'Gist ID（32 位十六进制，见自己 gist 页面 URL 末尾）';
         gistInput.style.cssText = [
             'width:100%',
             'box-sizing:border-box',

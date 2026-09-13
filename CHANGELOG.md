@@ -8,6 +8,35 @@
 
 ---
 
+## v2.25.1 (2026-09-13)
+
+**安全与文档修正（无功能变化）：油猴脚本里两处明文真实 Gist ID 改为占位符语义、订正 `AndroidManifest.xml` 里关于通知权限的过时注释；全仓库已跟踪文件复核后仅剩 1 处真实 Gist ID（`app/lib/config.dart`，功能必需、有意保留）；v2.25.1**
+
+**A. 脱敏：`amotv.user.js` 两处明文 Gist ID 改为占位符语义**
+
+- **头部注释里的示例**（原来直接写「用户 Tukist 的 secret gist：<真实 ID>」）→ 改为**说明性语义**：「从自己的 gist 页面 URL 末尾复制，形如 `https://gist.github.com/<用户名>/<GIST_ID>`」
+- **配置面板的 `placeholder`**（原来直接拿真实 ID 举例）→ 改为「Gist ID（32 位十六进制，见自己 gist 页面 URL 末尾）」
+- **不写假 ID**：占位符里**不留任何看起来像真 ID 的示例值**，避免用户误把它当成默认值照抄
+- **脚本功能不受影响**：脚本运行时 `gist_id` **只从 Tampermonkey 本地存储读**，**不内置任何默认值**；`placeholder` 只在输入框为空时作灰字提示，改文案**不改变任何行为**
+
+**B. 注释订正：`AndroidManifest.xml` 里 `POST_NOTIFICATIONS` 的说明与实现对齐**
+
+- 原注释声称「绑定 MediaSession 的媒体通知**本身豁免**该权限……即使被拒绝，媒体通知照常显示」——**与 v2.25.0-r2 的实际实现正好相反**，会误导后来人（以为该权限可有可无）→ 改为如实说明：
+  - v2.25.0-r2 起本通知**故意不绑** MediaSession token（绑了会被系统媒体卡片接管，App 自己的四个按钮一个都不渲染）
+  - 因此它按**普通通知**处理，**不享受**「绑定 MediaSession 的媒体通知豁免该权限」那条规则 → 这条权限是**必需**的
+  - 用户在系统设置里关掉本 App 的通知后**通知就不显示**（**播放本身不受影响**）
+
+**C. 安全排查结论（全仓库已跟踪文件）**
+
+- `git ls-files` 全量扫真实 Gist ID 的片段 → 命中**仅 1 处**：`app/lib/config.dart` 的 `AppConfig.gistUrl` 默认值
+- **这一处是有意保留的**：它是 App **免配置**读白名单的**唯一内置源**（`lanUrl` 默认为空、本地导入需手动放文件），**删掉等于功能不可用**
+- **未跟踪**的 `sync_config.json`、`whitelist.json`、`cookie*.txt`、`whitelist.json.gistbak*`、`app-release.keystore` / `key.properties` 均已被 `.gitignore` 覆盖（`git status --ignored` + `git check-ignore -v` 双证）；`.gitignore` 既有规则**未改动**
+- **无单文件 >50MB**
+
+- 测试 / 验证：`flutter analyze` **0 issue**、`node --check amotv.user.js` **通过**（本轮未动 `lib/`，故未跑全量测试）
+
+---
+
 ## v2.25.0 (2026-09-13)
 
 **UP 主页支持左右滑动切换分区（横滑切区 / 纵滑滚列表、chips 双向同步、每区独立状态与滚动位置）；接入 Android 媒体通知 + 耳机媒体键控制（封面缩略图、视频标题、`UP名 · 状态`，快退15s / 播放暂停 / 快进15s / 关闭）；并修掉快退语义、暂停态 seek 错报播放、通知封面 cleartext 被拦、重播 tick 停滞等问题；v2.25.0**

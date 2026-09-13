@@ -11,10 +11,13 @@
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28"/>
     <!-- 播放媒体通知（v2.25.x）：Android 13+ 的通知运行时权限。
-         绑定 MediaSession 的媒体通知**本身豁免**该权限（Android 官方
-         notification-permission#exemptions-media-sessions），这里声明 + 在
-         BiliDashPlayerPlugin 里主动请求，是为了少数忽略豁免的 OEM，以及让用户
-         能在系统设置里看到本 App 的通知开关；即使被拒绝，媒体通知照常显示。 -->
+         v2.25.0-r2 起本通知**故意不绑** MediaSession token（见 DashMediaNotification
+         .bind 的说明：绑了会被系统媒体卡片接管，App 自己的四个按钮一个都不渲染）→
+         它是**普通通知**，**不享受**「绑定 MediaSession 的媒体通知豁免该权限」那条
+         规则（Android 官方 notification-permission#exemptions-media-sessions），
+         所以这条权限是**必需**的：这里声明 + 在 BiliDashPlayerPlugin
+         .requestNotificationPermission() 里主动请求。
+         用户在系统设置里关掉本 App 通知后通知就不显示（播放本身不受影响）。 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <application
         android:label="amoTV"
