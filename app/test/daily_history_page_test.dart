@@ -20,6 +20,7 @@ HistoryEntry _entry(
   int cid = 100,
   int positionMs = 30000,
   int durationMs = 120000,
+  int? pubdate,
 }) => HistoryEntry(
       bvid: bvid,
       pageIndex: pageIndex,
@@ -30,6 +31,7 @@ HistoryEntry _entry(
       durationMs: durationMs,
       positionMs: positionMs,
       watchedAt: watchedAt,
+      pubdate: pubdate,
     );
 
 void main() {
@@ -109,12 +111,17 @@ void main() {
       );
     });
 
-    testWidgets('点击条目 → 跳播放页（构造视频 + initialPageIndex）',
+    testWidgets('点击条目 → 跳播放页（构造视频 + initialPageIndex + 发布时间）',
         (tester) async {
       SharedPreferences.setMockInitialValues({});
       final store = HistoryStore.instance;
+      const pubdate = 1715212800; // 2024-05-09
       await store.addOrUpdate(_entry('BV1a', day,
-          title: '多P视频', pageIndex: 2, cid: 777, positionMs: 45000));
+          title: '多P视频',
+          pageIndex: 2,
+          cid: 777,
+          positionMs: 45000,
+          pubdate: pubdate));
 
       await tester.pumpWidget(
         MaterialApp(home: DailyHistoryPage(date: day)),
@@ -133,6 +140,8 @@ void main() {
       expect(player.video.bvid, 'BV1a');
       expect(player.video.cid, 777);
       expect(player.initialPageIndex, 2);
+      // 该日历史页同样要把 pubdate 带进播放页（漏传则信息块无发布日期）
+      expect(player.video.pubdate, pubdate);
     });
   });
 }

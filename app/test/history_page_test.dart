@@ -134,12 +134,17 @@ void main() {
     expect(find.textContaining('发布 1970-01-01'), findsNothing);
   });
 
-  testWidgets('点击条目跳播放页（构造视频 + initialPageIndex）', (tester) async {
+  testWidgets('点击条目跳播放页（构造视频 + initialPageIndex + 发布时间）', (tester) async {
     SharedPreferences.setMockInitialValues({});
     final store = HistoryStore.instance;
+    const pubdate = 1715212800; // 2024-05-09
     await store.addOrUpdate(
       _entry('BV1a', 2, DateTime.now(),
-          title: '多P视频', cid: 777, positionMs: 45000, durationMs: 300000),
+          title: '多P视频',
+          cid: 777,
+          positionMs: 45000,
+          durationMs: 300000,
+          pubdate: pubdate),
     );
     await _pump(tester);
 
@@ -158,6 +163,9 @@ void main() {
     expect(player.video.cid, 777);
     expect(player.video.title, '多P视频');
     expect(player.initialPageIndex, 2);
+    // 历史条目的 pubdate 必须带进播放页——播放页信息块就渲染 `_video.pubdate`
+    // （那段由 player_info_block_test.dart 覆盖），漏传这里就看不到发布日期
+    expect(player.video.pubdate, pubdate);
   });
 
   testWidgets('删除按钮 → 确认后单条删除', (tester) async {

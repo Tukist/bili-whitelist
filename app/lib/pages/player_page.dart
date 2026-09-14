@@ -5255,6 +5255,9 @@ class _PlayerPageState extends State<PlayerPage>
     final durMs = _durationMs > 0
         ? _durationMs
         : (_video.duration > 0 ? _video.duration * 1000 : 0);
+    // 发布时间：旧数据/脏值（pubdate 为 null/0）→ 空串（见 [formatPubdate]），
+    // 下面据此整段不拼接。
+    final pubdateText = formatPubdate(_video.pubdate);
     // 简介（含换行原样；trim 去首尾空行——导入/接口常有结尾 \n）。
     // 多 P 视频简介是视频级：换分 P 不换简介（_video 不变）。
     final videoDesc = _video.desc.isNotEmpty ? _video.desc : _runtimeDesc;
@@ -5311,9 +5314,24 @@ class _PlayerPageState extends State<PlayerPage>
                   style: subStyle),
             ],
             const Spacer(),
-            // 时长：三级墨 + 等宽数字（与进度条两端时间同一套数字语汇）
-            Text(_fmtMs(durMs),
-                style: kTypeNum.copyWith(color: kInkGray50)),
+            // 发布时间 + 时长（v2.27.1）：三级墨 + 等宽数字（与进度条两端
+            // 时间同一套数字语汇），发布日期就接在时长左边、**同一行**——
+            //   ① **零额外高度**：横屏置顶模式屏高低，信息块每多一行都从
+            //      评论区抢地方，放简介区上方会多出一行；
+            //   ② 与列表卡的「元信息行」写法一致（video_tile 的
+            //      「时长 · UP主 · 发布日期」、upowner_page 的
+            //      「时长 · 发布日期」），日期走同一套等宽数字语汇（kTypeNum
+            //      + kInkGray50，与时长同级）；
+            //   ③ 无简介的视频（desc 空 → 简介区整块不构建）也照样看得到。
+            // 词序对齐 history_tile（「发布 xxx」在前、时长在后）。空串时
+            // 只拼时长：界面上连分隔符都不会出现，与改动前逐字符一致。
+            // 空间不够时让 UP 名（Flexible + 省略号）先让位，不挤掉这一段。
+            Text(
+              pubdateText.isEmpty
+                  ? _fmtMs(durMs)
+                  : '发布 $pubdateText · ${_fmtMs(durMs)}',
+              style: kTypeNum.copyWith(color: kInkGray50),
+            ),
           ],
         ),
         // 简介区：desc 空（无简介/番剧/拉取失败）不占位，避免空行喧宾夺主

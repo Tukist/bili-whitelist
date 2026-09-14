@@ -6,7 +6,11 @@
 //   3. 封面占位层（「封面放大变成播放界面」的假转场）：cover 为空 → 整层不
 //      构建（子树里连 CoverHero/Hero 都没有，也就不发图片请求）；cover 非空
 //      → CoverHero 落在与纹理同一个 AspectRatio 盒里、被 IgnorePointer 包住，
-//      并在播放器就绪（或 1200ms 兜底超时）后淡出卸载。
+//      并在播放器就绪（或 1200ms 兜底超时）后淡出卸载；
+//   4. 信息行发布时间（v2.27.1）：pubdate 非空 → 时长左侧**同一行**显示
+//      「发布 yyyy-MM-dd · 时长」（零额外高度，横屏紧凑形态同样成立）；
+//      pubdate 为空/脏值 → 整段不拼接（不残留分隔符，与改动前逐字符一致）；
+//      无简介（desc 空）时发布日期照样显示。
 //
 // 测试环境说明：
 // - mock 原生播放器 MethodChannel/EventChannel（create → textureId，
@@ -30,6 +34,7 @@ import 'package:bili_whitelist_app/theme/app_motion.dart';
 import 'package:bili_whitelist_app/theme/motion_control.dart';
 import 'package:bili_whitelist_app/widgets/app_block.dart';
 import 'package:bili_whitelist_app/widgets/cover_hero.dart';
+import 'package:bili_whitelist_app/widgets/expandable_text.dart';
 
 const String _kBvid = 'BV1INFO000001';
 const String _kCover = 'https://i0.hdslb.com/bfs/archive/fake-cover.jpg';
@@ -39,19 +44,23 @@ const Key _kInfoBar = ValueKey('player-info-bar');
 const Key _kComments = ValueKey('player-comments');
 
 WhitelistVideo _video({
+  String bvid = _kBvid,
   String cover = '',
   String desc = '一段用于占位的简介文本。',
   String title = '块化测试视频',
+  String upName = '测试UP主',
+  int? pubdate,
 }) =>
     WhitelistVideo(
-      bvid: _kBvid,
+      bvid: bvid,
       cid: 1001,
       title: title,
       cover: cover,
       duration: 200,
-      upName: '测试UP主',
+      upName: upName,
       addedAt: '2026-01-01',
       desc: desc,
+      pubdate: pubdate,
     );
 
 /// 超长标题：测试字体下（每字符宽 = fontSize）远超信息行的 2 行上限。
@@ -61,16 +70,23 @@ final String _kLongTitle = '很长的播放页标题' * 30;
 // mock HTTP：flutter_test 默认把所有请求 mock 成 400，这里换成合法 JSON，
 // 让 nav/spi/view/reply/playurl 都走通（封面图的 URL 也会落到这里 → 解码
 // 失败 → CoverImage 的 errorBuilder 兜住，不会打到真实网络）。
+//
+// 接口 `desc` 单独抽成可变变量：播放页在 `_video.desc` 为空时**回退到接口
+// desc**（见 _buildVideoInfoBar 的 _runtimeDesc），所以「无简介」用例必须
+// 把接口这一侧也置空，否则简介区照样有内容（这是实测踩到的坑）。
 // ---------------------------------------------------------------------------
 
-const String _mockBody = '{"code":0,"data":{'
+/// 接口返回的简介正文（setUp 每例复位）。
+String _mockDesc = '一段用于占位的简介文本。';
+
+String get _mockBody => '{"code":0,"data":{'
     '"bvid":"BV1INFO000001","aid":1001,"cid":1001,"duration":200,'
     '"quality":80,'
     '"wbi_img":{"img_url":"https://i0.hdslb.com/bfs/wbi/'
     'a2c2f919cb12ebdcf0fbc8a4e0a0f7f5.png","sub_url":"https://i0.hdslb.com/bfs/wbi/'
     'e6f5b9b4b8f3e6f5b9b4b8f3e6f5b9b4.png"},'
     '"owner":{"mid":1001,"name":"测试UP主","face":""},'
-    '"desc":"一段用于占位的简介文本。",'
+    '"desc":"$_mockDesc",'
     '"pages":[{"cid":1001,"part":"","duration":200}],'
     '"replies":[],"top_replies":[],"cursor":{"is_end":true},'
     '"dash":{"video":[{"baseUrl":"https://x.bilivideo.com/v.m4s"}],'
@@ -282,6 +298,8 @@ void main() {
 
   setUp(() {
     SharedPreferences.setMockInitialValues({});
+    // 接口 desc 复位（个别用例会临时置空 → 走「无简介」路径）
+    _mockDesc = '一段用于占位的简介文本。';
     final oldOverrides = HttpOverrides.current;
     HttpOverrides.global = _FakeHttpOverrides();
     addTearDown(() => HttpOverrides.global = oldOverrides);
@@ -479,6 +497,168 @@ void main() {
     await tester.tap(find.text('收起'));
     await tester.pump(const Duration(milliseconds: 600));
     expect(tester.widget<Text>(longInBar).maxLines, 2);
+    final videoRect = tester.getRect(find.byKey(_kVideoArea));
+    expect(tester.getRect(find.byKey(_kInfoBar)).top,
+        closeTo(videoRect.bottom, 0.5));
+  });
+
+  // 固定样本 1788000000（2026-09-02 前后）→ 期望文案用同一个 formatPubdate
+  // 现算，避免把本地时区硬编码进断言。
+  const int kPubdate = 1788000000;
+
+  testWidgets('信息行发布时间：pubdate 非空 → 时长左侧同行「发布 日期 · 时长」，不越界',
+      (tester) async {
+    tester.view.devicePixelRatio = 1.0;
+    tester.view.physicalSize = const Size(400, 800);
+    addTearDown(tester.view.reset);
+
+    final pubdateText = formatPubdate(kPubdate);
+    expect(pubdateText, isNotEmpty, reason: '前置：该样本是有效发布时间');
+    Finder metaInBar(String text) =>
+        find.descendant(of: find.byKey(_kInfoBar), matching: find.text(text));
+
+    // ① 旧数据（pubdate 空）基线：右端只有时长本身（200s → 3:20）
+    await _pumpPlayer(tester, _video());
+    await tester.pump(const Duration(milliseconds: 600));
+    expect(metaInBar('3:20'), findsOneWidget);
+
+    // ② 有 pubdate：日期与时长**合成同一段**（日期在左、时长在右），
+    //    单独那截「3:20」不复存在 → 不可能出现「只有日期没有时长」的碎样。
+    await _pumpPlayer(tester, _video(pubdate: kPubdate));
+    await tester.pump(const Duration(milliseconds: 600));
+    final metaFinder = metaInBar('发布 $pubdateText · 3:20');
+    expect(metaFinder, findsOneWidget);
+    expect(metaInBar('3:20'), findsNothing, reason: '时长已并入「发布 … · 时长」这一段');
+
+    // ③ 零额外高度的契约：这一段与 UP 徽章在同一行（Row 默认居中对齐 →
+    //    垂直中心基本重合；若另起一行，两者中心会相差一整行高）。
+    final metaRect = tester.getRect(metaFinder);
+    final badgeRect = tester.getRect(find.byKey(const ValueKey('upowner-badge')));
+    expect((metaRect.center.dy - badgeRect.center.dy).abs(), lessThan(4.0),
+        reason: '发布时间在 UP 徽章那一行上，不额外占高度');
+    expect(metaRect.left, greaterThan(badgeRect.right), reason: '日期在 UP 名右侧');
+
+    // ④ 谁都没被挤掉：测试字体近等宽（1 字符 ≈ 字号 12）→ 整段固有宽度
+    //    ≈ 字符数 × 12；渲染宽度贴着这个量级（±10% 吸收字体度量零头），
+    //    说明「发布 日期 · 时长」整串都铺开了。
+    final approxFullWidth = '发布 $pubdateText · 3:20'.length * 12.0;
+    expect(metaRect.width,
+        inInclusiveRange(approxFullWidth * 0.9, approxFullWidth * 1.1),
+        reason: '发布日期与时长都完整显示');
+
+    // ⑤ 不越界：整段右端仍在信息块内（含右内边距），不会溢出到块外
+    final barRect = tester.getRect(find.byKey(_kInfoBar));
+    expect(metaRect.right, lessThanOrEqualTo(barRect.right));
+    expect(metaRect.right, greaterThan(barRect.center.dx),
+        reason: '整段落在行右半边（Spacer 之后），不是被顶到左边');
+  });
+
+  testWidgets('信息行发布时间：pubdate 空/脏值 → 不显示、不残留分隔符（与改动前一致）',
+      (tester) async {
+    tester.view.devicePixelRatio = 1.0;
+    tester.view.physicalSize = const Size(400, 800);
+    addTearDown(tester.view.reset);
+
+    for (final dirty in <int?>[null, 0]) {
+      await _pumpPlayer(tester, _video(pubdate: dirty));
+      await tester.pump(const Duration(milliseconds: 600));
+
+      // 时长照旧单独在右端（逐字符与改动前一致）
+      expect(find.descendant(of: find.byKey(_kInfoBar), matching: find.text('3:20')),
+          findsOneWidget,
+          reason: 'pubdate=$dirty：时长文案不变');
+      // 没有发布日期段
+      expect(
+        find.descendant(
+            of: find.byKey(_kInfoBar), matching: find.textContaining('发布')),
+        findsNothing,
+        reason: 'pubdate=$dirty：不显示发布时间',
+      );
+      // 也没有残留分隔符（否则会出现「· 3:20」这种开头带点的脏样）
+      expect(
+        find.descendant(
+            of: find.byKey(_kInfoBar), matching: find.textContaining('·')),
+        findsNothing,
+        reason: 'pubdate=$dirty：不留分隔符',
+      );
+    }
+  });
+
+  testWidgets('信息行发布时间：desc 为空（无简介）时发布日期照样显示', (tester) async {
+    tester.view.devicePixelRatio = 1.0;
+    tester.view.physicalSize = const Size(400, 800);
+    addTearDown(tester.view.reset);
+
+    // 夹具 desc 空 + 接口 desc 也空 → 播放页真的没有简介可渲染。
+    // 用**另一个 bvid**：view 简介按 bvid 全局缓存在 _viewDescCache（同一
+    // 测试进程内跨用例存活），沿用同一 bvid 会命中前面用例缓存的非空简介。
+    _mockDesc = '';
+    final pubdateText = formatPubdate(kPubdate);
+    await _pumpPlayer(tester,
+        _video(bvid: 'BV1NODESC001', desc: '', pubdate: kPubdate));
+    await tester.pump(const Duration(milliseconds: 600));
+
+    expect(
+      find.descendant(
+          of: find.byKey(_kInfoBar),
+          matching: find.text('发布 $pubdateText · 3:20')),
+      findsOneWidget,
+      reason: '简介区不构建也不影响发布时间（这正是放在 meta 行的收益）',
+    );
+    expect(
+      find.descendant(
+          of: find.byKey(_kInfoBar),
+          matching: find.textContaining('一段用于占位的简介文本')),
+      findsNothing,
+      reason: '前置：本夹具确实没有简介正文',
+    );
+  });
+
+  testWidgets('信息行发布时间·横屏紧凑：日期与时长都在、UP 名让位省略不挤坏',
+      (tester) async {
+    // 横屏置顶模式：800x400（屏低 → 标题 1 行 / 简介 2 行的紧凑形态）
+    tester.view.devicePixelRatio = 1.0;
+    tester.view.physicalSize = const Size(800, 400);
+    addTearDown(tester.view.reset);
+
+    final pubdateText = formatPubdate(kPubdate);
+    // 超长 UP 名（测试字体每字符宽 = 字号 13 → 56 字 ≈ 728px）：空间不够时
+    // 应当由它省略号让位，而不是把日期/时长挤掉或整行溢出。
+    final longUpName = '超长UP主名字' * 8;
+    await _pumpPlayer(tester, _video(upName: longUpName, pubdate: kPubdate));
+    await tester.pump(const Duration(milliseconds: 600));
+
+    // 前置：确实走在横屏紧凑分支（标题折 1 行）
+    final titleBox = tester.widgetList<ExpandableText>(
+        find.descendant(of: find.byKey(_kInfoBar), matching: find.byType(ExpandableText)));
+    expect(titleBox.first.foldLines, 1, reason: '横屏 → 标题 1 行');
+
+    // ① 日期 + 时长完整在位：测试字体近等宽（1 字符 ≈ 字号 12）→ 整段固有
+    //    宽度 ≈ 字符数 × 12；渲染宽度贴着这个量级即「谁都没被省略」（被挤掉
+    //    或省略会远小于此，取 ±10% 容差吸收字体度量的零头）。
+    final metaFinder = find.descendant(
+        of: find.byKey(_kInfoBar),
+        matching: find.text('发布 $pubdateText · 3:20'));
+    expect(metaFinder, findsOneWidget);
+    final metaWidth = tester.getRect(metaFinder).width;
+    final approxFullWidth = '发布 $pubdateText · 3:20'.length * 12.0;
+    expect(metaWidth,
+        inInclusiveRange(approxFullWidth * 0.9, approxFullWidth * 1.1),
+        reason: '横屏紧凑形态下日期与时长都完整可见，没被压缩/省略');
+
+    // ② 让位的是 UP 名：渲染宽度被压到固有宽度以下（即真的走了省略号），
+    //    且没被压成 0（还留着可辨认的一截）
+    final nameSize =
+        tester.getSize(find.byKey(const ValueKey('upowner-badge-name')));
+    expect(nameSize.width, lessThan(longUpName.length * 13.0),
+        reason: 'UP 名被省略号截断（让位方）');
+    expect(nameSize.width, greaterThan(0));
+
+    // ③ 整行不越界：日期段右端仍在信息块内（无 RenderFlex overflow）
+    expect(tester.getRect(metaFinder).right,
+        lessThanOrEqualTo(tester.getRect(find.byKey(_kInfoBar)).right));
+
+    // ④ 几何契约不变：信息块仍紧贴视频区下沿
     final videoRect = tester.getRect(find.byKey(_kVideoArea));
     expect(tester.getRect(find.byKey(_kInfoBar)).top,
         closeTo(videoRect.bottom, 0.5));

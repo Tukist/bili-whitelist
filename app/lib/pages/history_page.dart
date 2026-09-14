@@ -64,6 +64,9 @@ class HistoryPageState extends State<HistoryPage> {
       upName: e.upName,
       addedAt: e.watchedAt.toIso8601String(),
       pages: e.pages,
+      // 历史里存过发布时间 → 带进播放页（信息块显示「发布 yyyy-MM-dd」）；
+      // 旧记录没存（null）→ 该段不显示
+      pubdate: e.pubdate,
     );
     Navigator.of(context)
         .push(MaterialPageRoute<void>(
