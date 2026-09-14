@@ -9,7 +9,8 @@ import '../models/media_search_result.dart';
 ///
 /// 原生侧负责：双流合并（MergingMediaSource）、防盗链请求头（Referer + UA）、
 /// 可自动恢复的数据源错误识别（流 URL 过期 / 瞬时网络错误 → onUrlExpired 事件）、
-/// 媒体通知 + 媒体会话（耳机媒体键控制播放，v2.25.x）。
+/// 媒体通知 + 媒体会话（耳机媒体键控制播放，v2.25.x）；**直播**（v2.27.0+）走
+/// 另一条源：[setDataSource] 的 `isLive: true` → 原生 `HlsMediaSource`。
 /// Dart 侧负责：取流、自动续播、UI 状态。
 ///
 /// 生命周期：
@@ -56,8 +57,15 @@ class BiliDashPlayer {
       .cast<BiliDashEvent>();
 
   /// 创建原生播放器并返回 Dart 封装（textureId 已可用于渲染）。
-  static Future<BiliDashPlayer> create() async {
-    final id = await _channel.invokeMethod<int>('create');
+  ///
+  /// [isLive] 只影响**原生构建期**的一个开关：直播不设 ExoPlayer 的
+  /// seekBack/ForwardIncrementMs（那两个只能在 `ExoPlayer.Builder` 上设，
+  /// 构建后改不了），于是 `COMMAND_SEEK_BACK/FORWARD` 从根源上不进可用命令集
+  /// —— 通知栏 / 锁屏 / 系统媒体卡片都不会出现 seek。VOD 传默认 false，
+  /// 行为与从前一字不差。
+  static Future<BiliDashPlayer> create({bool isLive = false}) async {
+    final id = await _channel
+        .invokeMethod<int>('create', {'isLive': isLive});
     if (id == null) {
       throw StateError('原生播放器创建失败（create 返回 null）');
     }
@@ -72,6 +80,10 @@ class BiliDashPlayer {
   /// `dumpsys media_session`）读到；不影响取流与解码。
   /// 本 App 自己那条通知的文案走 [updateNowPlaying]。
   /// （v2.25.0-r2 起通知不绑会话 token，系统媒体卡片不再参与显示。）
+  ///
+  /// [isLive]（v2.27.0+）= 直播：原生侧走 `HlsMediaSource`（B 站直播是 HLS），
+  /// 且关掉 seek（不上报 onSeeked、忽略 seekTo）；[positionMs] 在直播下无意义
+  /// （原生会用「窗口默认位置」≈ 最新处）。默认 false = 保持 VOD 行为。
   Future<void> setDataSource(
     String videoUrl, {
     String? audioUrl,
@@ -79,6 +91,7 @@ class BiliDashPlayer {
     String title = '',
     String artist = '',
     String coverUrl = '',
+    bool isLive = false,
   }) =>
       _channel.invokeMethod('setDataSource', {
         'textureId': textureId,
@@ -88,6 +101,7 @@ class BiliDashPlayer {
         'title': title,
         'artist': artist,
         'coverUrl': normalizeCoverUrl(coverUrl),
+        'isLive': isLive,
       });
 
   Future<void> play() =>

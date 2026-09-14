@@ -88,6 +88,7 @@ import '../widgets/smoke_silhouette.dart';
 import '../widgets/staggered_entrance.dart';
 import 'article_page.dart';
 import 'image_viewer_page.dart';
+import 'live_player_page.dart';
 import 'player_page.dart';
 
 /// UP 主视频列表排序选项（与 BiliApi.fetchUpownerVideos order 参数对应）。
@@ -624,9 +625,9 @@ class _UpownerPageState extends State<UpownerPage> {
   ///   查不到就是没有标记，不影响页面任何其它内容；
   /// - 只有**真的在播**（`liveStatus == 1`）才显示标记：**轮播（2）不显示**
   ///   （轮播没有直播流，点进去看不到直播，装作「在播」是骗人）；
-  /// - 点标记去看直播是**跳出去**（系统浏览器 / B 站 App），App 内不播直播
-  ///   —— 本 App 的定位是「只看事先选好的内容」，直播是不可预选、无边界的
-  ///   信息流，不做站内入口（搜索页也不加直播入口）。
+  /// - 点标记进**站内**直播播放页（v2.27.0+，[LivePlayerPage]）；长按标记跳
+  ///   站外（B 站 App / 系统浏览器）作为次级入口（见 [LiveNowBadge.onLongPress]）。
+  ///   搜索页仍不加直播入口——直播不可预选、无边界，不做无限内容池。
   Future<void> _loadLive() async {
     final status = await LiveStatusHub.instance
         .statusOf(widget.mid, fetch: _api.fetchLiveStatusByMid);
@@ -634,8 +635,36 @@ class _UpownerPageState extends State<UpownerPage> {
     setState(() => _live = status);
   }
 
-  /// 点「正在直播」→ 打开 B 站直播间（外部应用；url_launcher 已在 pubspec）。
+  /// 点「正在直播」→ **站内**直播播放页（v2.27.0+）。
+  ///
+  /// 早期版本是跳 B 站 App / 系统浏览器看直播（那时 App 内不播直播）；现在
+  /// 站内就能播，跳站外退化成**次级入口**（长按标记 → [_openLiveInBrowser]）
+  /// —— 外链一行没删，只是不再占主路径。
   Future<void> _openLive(LiveStatus status) async {
+    if (status.roomId <= 0) return;
+    debugPrint('[upowner] 站内看直播 mid=${widget.mid} room=${status.roomId}');
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        // 借用播放页的路由名：享受那套「快速淡入」转场（见 app_theme 按路由名
+        // 分流）。直播页同样是一屏视频，用同一转场观感一致。
+        settings: const RouteSettings(name: kPlayerRouteName),
+        builder: (_) => LivePlayerPage(
+          roomId: status.roomId,
+          title: status.title,
+          // UP 名优先用已加载的资料（与头部卡片同一取值口径）
+          upName: _info?.name ?? widget.initial?.name ?? '',
+          upMid: widget.mid,
+        ),
+      ),
+    );
+  }
+
+  /// 长按「正在直播」标记 → 用 B 站 App / 系统浏览器打开（次级入口，原行为）。
+  ///
+  /// 保留它是因为站内播放偶发连不上（风控 / 流地址取不到）时，用户仍有一条
+  /// 确定能看的路（url_launcher 已在 pubspec）；但它不再是主入口
+  /// （主入口见 [_openLive]）。
+  Future<void> _openLiveInBrowser(LiveStatus status) async {
     final url = status.liveUrl;
     if (url.isEmpty) return;
     final uri = Uri.tryParse(url);
@@ -1359,11 +1388,13 @@ class _UpownerPageState extends State<UpownerPage> {
                     color: theme.colorScheme.onSurfaceVariant,
                   ),
                 ),
-                // 「正在直播」标记（只在真的在播时出现；点它跳 B 站看直播）
+                // 「正在直播」标记（只在真的在播时出现；点它进站内直播页，
+                // 长按跳 B 站 / 系统浏览器）
                 if (_live?.isLive == true)
                   LiveNowBadge(
                     title: _live!.title,
                     onTap: () => unawaited(_openLive(_live!)),
+                    onLongPress: () => unawaited(_openLiveInBrowser(_live!)),
                   ),
                 if (info != null && info.sign.isNotEmpty) ...[
                   const SizedBox(height: 6),
@@ -2148,8 +2179,10 @@ class _ArticleCard extends StatelessWidget {
 ///
 /// ## 为什么只有这么一点
 /// 本 App 的定位是**防短视频成瘾**——只能看用户事先在白名单里选好的内容；
-/// 直播是**不可预选、无边界**的信息流。所以这里只做「标记 + 跳出去看」：
-/// 不内嵌直播播放、不在搜索页加直播入口（那等于开一个无限内容池）。
+/// 直播是**不可预选、无边界**的信息流 —— 但白名单 UP 主的直播是用户**已经
+/// 选过的人**在播，所以给它一个明确的站内入口（v2.27.0+）：点进 [LivePlayerPage]。
+/// 搜索页仍不加直播入口（那才是真正的无限内容池）。
+/// 长按 → 跳站外（B 站 App / 系统浏览器）看同一场直播。
 ///
 /// ## 形态（mono-color）
 /// - 点缀墨系：**实心小圆点**（[AppPalette.accentFill]）表达「正在发生」，
@@ -2166,10 +2199,14 @@ class LiveNowBadge extends StatelessWidget {
     required this.onTap,
     this.title = '',
     this.maxWidth = 260,
+    this.onLongPress,
   });
 
-  /// 点击回调（宿主决定：打开 B 站直播间）。
+  /// 点击回调（宿主决定：进站内直播播放页——v2.27.0+ 的主行为）。
   final VoidCallback onTap;
+
+  /// 长按回调（可空）：跳 B 站 App / 系统浏览器看同一场直播（次级入口）。
+  final VoidCallback? onLongPress;
 
   /// 直播间标题（可空）。
   final String title;
@@ -2184,7 +2221,7 @@ class LiveNowBadge extends StatelessWidget {
     final text = t.isEmpty ? '正在直播' : '正在直播 · $t';
     return Semantics(
       button: true,
-      label: '正在直播${t.isEmpty ? '' : '：$t'}，点击去 B 站观看',
+      label: '正在直播${t.isEmpty ? '' : '：$t'}，点击观看直播',
       child: SizedBox(
         height: 48, // 触摸目标 ≥48dp（视觉是矮胶囊，热区是整行）
         child: Align(
@@ -2193,6 +2230,7 @@ class LiveNowBadge extends StatelessWidget {
             type: MaterialType.transparency,
             child: InkWell(
               onTap: onTap,
+              onLongPress: onLongPress,
               borderRadius: BorderRadius.circular(kRadiusSm),
               child: Container(
                 constraints: BoxConstraints(maxWidth: maxWidth),

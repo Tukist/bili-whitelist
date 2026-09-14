@@ -92,4 +92,9 @@ dependencies {
     // 同为 1.5.1：与 media3-exoplayer 严格同版本，避免 media3 同库多版本共存。
     implementation("androidx.media3:media3-session:1.5.1")
     implementation("androidx.media3:media3-ui:1.5.1")
+    // 直播播放（v2.27.0+）：B 站直播取到的是 **HLS**（媒体播放列表 + .m4s 分片），
+    // ExoPlayer 原生的 ProgressiveMediaSource 只认 flv/mp4 这类单文件流，
+    // HLS 必须由 media3-exoplayer-hls 的 HlsMediaSource 解析。
+    // 同为 1.5.1：与上面三个严格同版本（media3 各库必须同版本）。
+    implementation("androidx.media3:media3-exoplayer-hls:1.5.1")
 }

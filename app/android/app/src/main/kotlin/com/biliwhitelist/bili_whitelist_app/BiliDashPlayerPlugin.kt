@@ -29,10 +29,14 @@ private const val kReqNotification = 9048
 /**
  * B 站 DASH 双流播放原生插件（MethodChannel: `bili_dash_player`）。
  *
- * - `create`：创建播放器 + TextureRegistry 纹理，返回 textureId（Dart 侧 Texture 渲染）
- * - `setDataSource(videoUrl, audioUrl, positionMs, title, artist, coverUrl)`：
- *   MergingMediaSource 组源后播放（后三个字段只写进 MediaItem 元信息，供会话侧
- *   消费者 / Android Auto 读；通知文案见 `updateNowPlaying`）
+ * - `create(isLive)`：创建播放器 + TextureRegistry 纹理，返回 textureId（Dart 侧
+ *   Texture 渲染）。`isLive`（v2.27.0+）必须在**创建期**告知：直播不设
+ *   seekBack/ForwardIncrementMs（那两个只能在 ExoPlayer.Builder 上设，见
+ *   [DashExoPlayer]），旧调用不带该参数 → 默认 false（VOD，行为不变）
+ * - `setDataSource(videoUrl, audioUrl, positionMs, title, artist, coverUrl, isLive)`：
+ *   VOD 走 MergingMediaSource 组源后播放；`isLive` = true 走 HlsMediaSource
+ *   （B 站直播是 HLS）。后三个字段只写进 MediaItem 元信息，供会话侧消费者 /
+ *   Android Auto 读；通知文案见 `updateNowPlaying`。`isLive` 缺省 false（容错旧调用）
  * - `play` / `pause` / `seekTo` / `setVolume` / `setPlaybackSpeed` / `getPosition` / `dispose`
  * - `updateNowPlaying(textureId, title, artist, coverUrl, status, playing, positionMs,
  *   durationMs)`：同步媒体通知内容（v2.25.x，见 [DashMediaNotification]）
@@ -111,19 +115,24 @@ class BiliDashPlayerPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
     override fun onMethodCall(call: MethodCall, result: Result) {
         try {
             when (call.method) {
-                "create" -> result.success(createPlayer())
+                "create" -> result.success(
+                    createPlayer(isLive = call.argument<Boolean>("isLive") ?: false)
+                )
                 "setDataSource" -> {
                     val id = call.argument<Number>("textureId")!!.toLong()
                     val videoUrl = call.argument<String>("videoUrl")!!
                     val audioUrl = call.argument<String>("audioUrl")
                     val positionMs = call.argument<Number>("positionMs")?.toLong() ?: 0L
+                    // 直播标记（v2.27.0+）：**容错**——旧 Dart 侧不带该参数时
+                    // 默认 false（保持 VOD 行为，旧测试也不会因此崩）
+                    val isLive = call.argument<Boolean>("isLive") ?: false
                     // 展示元信息（可空）：只影响 MediaItem 元数据，不影响取流/解码
                     val meta = DashExoPlayer.Meta(
                         title = call.argument<String>("title") ?: "",
                         artist = call.argument<String>("artist") ?: "",
                         coverUrl = call.argument<String>("coverUrl") ?: "",
                     )
-                    player(id).prepare(videoUrl, audioUrl, positionMs, meta)
+                    player(id).prepare(videoUrl, audioUrl, positionMs, meta, isLive)
                     result.success(null)
                 }
                 "play" -> {
@@ -190,6 +199,8 @@ class BiliDashPlayerPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
             playing = call.argument<Boolean>("playing") ?: false,
             positionMs = call.argument<Number>("positionMs")?.toLong() ?: 0L,
             durationMs = call.argument<Number>("durationMs")?.toLong() ?: 0L,
+            // 直播：通知层据此不挂快退/快进按钮、会话命令里也摘掉 seek
+            isLive = player.isLive,
         )
     }
 
@@ -241,7 +252,7 @@ class BiliDashPlayerPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
     private fun player(id: Long): DashExoPlayer =
         players[id] ?: throw IllegalStateException("播放器不存在（textureId=$id）")
 
-    private fun createPlayer(): Long {
+    private fun createPlayer(isLive: Boolean = false): Long {
         val registry = textureRegistry
             ?: throw IllegalStateException("插件尚未绑定 TextureRegistry")
         val entry = registry.createSurfaceTexture()
@@ -249,7 +260,7 @@ class BiliDashPlayerPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
         // 而非自增序号——否则 Texture 找不到对应纹理 → 有声音无画面（黑屏）。
         // 与 video_player_android 同源（surfaceTextureEntry.id()）。
         val id = entry.id()
-        Log.i(TAG, "createPlayer: Dart textureId=$id (engine surfaceTexture)")
+        Log.i(TAG, "createPlayer: Dart textureId=$id (engine surfaceTexture) isLive=$isLive")
 
         players[id] = DashExoPlayer(
             context!!,
@@ -319,6 +330,7 @@ class BiliDashPlayerPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
                     )
                 }
             },
+            isLive,
         )
         return id
     }

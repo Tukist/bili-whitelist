@@ -10,6 +10,8 @@ import '../models/article.dart';
 import '../models/comment.dart';
 import '../models/danmaku.dart';
 import '../models/dynamic_item.dart';
+import '../models/live_danmaku.dart';
+import '../models/live_play_info.dart';
 import '../models/live_status.dart';
 import '../models/media_search_result.dart';
 import '../models/search_result.dart';
@@ -3055,6 +3057,189 @@ class BiliApi {
     } catch (e) {
       // 失败静默（含网络异常/脏数据）：标记是装饰，不能影响页面其它内容
       debugPrint('[bili_api] fetchLiveStatusByMid mid=$mid 失败: $e');
+      return null;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 直播取流（v2.27.0+）：直播间播放地址（App 内直播播放）
+  // -------------------------------------------------------------------------
+
+  /// 取某直播间的**播放地址**（`xlive/web-room/v2/index/getRoomPlayInfo`）。
+  ///
+  /// ⚠️ host 同样是**直播域名** [kLiveApi]（`api.live.bilibili.com`），
+  /// 而 `_dio.baseUrl` 是 [kBiliApi]（`api.bilibili.com`）→ 这里必须用
+  /// **绝对 URL**（同 [fetchLiveStatusByMid] 的坑，别退化成相对路径）。
+  ///
+  /// 2026-09 实测结论（照抄即可，不要改参数）：
+  /// - **匿名可用**（`code=0`），不需要登录态；带完整浏览器头即可，
+  ///   [_injectAuth] 的 buvid 指纹/登录态只是更稳；
+  /// - 请求头必须带 `Referer: https://live.bilibili.com/<room_id>`（本方法
+  ///   用 per-request [Options] 覆盖，不动全局头）；
+  /// - `data.room_info` 实测为 **null**，开播状态读 **`data['live_status']`**
+  ///   （读 `room_info.live_status` 会空指针）；
+  /// - `data.playurl_info.playurl.stream[]` 里 `base_url` 在 **codec** 层
+  ///   （不在 `url_info` 里），完整地址 = `host + base_url + extra`；
+  /// - 地址约 58 分钟过期，**不可缓存/持久化**（见 [LivePlayInfo]）。
+  ///
+  /// 返回语义：
+  /// - 拿到 `data` → 返回 [LivePlayInfo]（**未开播 / 轮播 / 挑不出流也返回**，
+  ///   只是 `isLive == false`，页面据此显示「直播已结束」而不是「取流失败」）；
+  /// - `roomId` 非法 / 业务码非 0 / 网络异常 / 脏数据 → **null，且不抛**
+  ///   （调用方显示可重试的错误态）。失败原因一律 debugPrint（logcat 排障）。
+  Future<LivePlayInfo?> fetchLivePlayUrl(int roomId, {int qn = 10000}) async {
+    if (roomId <= 0) return null;
+    try {
+      await _injectAuth();
+      debugPrint('[bili_api] fetchLivePlayUrl room=$roomId qn=$qn');
+      final resp = await _dio.get<Map<String, dynamic>>(
+        '$kLiveApi/xlive/web-room/v2/index/getRoomPlayInfo',
+        queryParameters: {
+          'room_id': '$roomId',
+          'protocol': '0,1',
+          'format': '0,1,2',
+          'codec': '0,1',
+          'qn': '$qn',
+          'platform': 'web',
+          'ptype': '8',
+          'dolby': '5',
+          'panorama': '1',
+        },
+        options: Options(
+          headers: {'Referer': 'https://live.bilibili.com/$roomId'},
+        ),
+      );
+      final data = resp.data;
+      final code = _looseInt(data?['code']);
+      if (code != 0) {
+        debugPrint('[bili_api] fetchLivePlayUrl room=$roomId 业务码失败 '
+            'code=${data?['code']} msg=${data?['message']}');
+        return null;
+      }
+      final d = data?['data'];
+      if (d is! Map<String, dynamic>) {
+        debugPrint('[bili_api] fetchLivePlayUrl room=$roomId 响应缺少 data');
+        return null;
+      }
+      final info = pickLiveStream(roomId, d);
+      if (info == null) {
+        debugPrint('[bili_api] fetchLivePlayUrl room=$roomId 解析失败（脏数据）');
+        return null;
+      }
+      debugPrint('[bili_api] fetchLivePlayUrl room=$roomId → $info');
+      return info;
+    } catch (e) {
+      // 失败静默：网络/风控异常不抛，页面显示可重试的错误态
+      debugPrint('[bili_api] fetchLivePlayUrl room=$roomId 失败: $e');
+      return null;
+    }
+  }
+
+  /// 「选流 + 拼地址」的**纯函数**（不碰网络，可单测）：给定直播间号与
+  /// `getRoomPlayInfo` 响应的 `data`，返回挑中的流与完整地址。
+  ///
+  /// 抽出来的理由：这一段的规则最容易写错（优先级、`base_url` 在 codec 层、
+  /// `url_info` 长度 2 的兜底、`live_status` 的位置），单测直接喂样本 map
+  /// 就能锁住——见 `test/live_play_api_test.dart`。
+  /// 实现与详细规则见 [LivePlayInfo.fromPlayInfo]。
+  @visibleForTesting
+  static LivePlayInfo? pickLiveStream(int roomId, Map<String, dynamic> data) =>
+      LivePlayInfo.fromPlayInfo(roomId, data);
+
+  // -------------------------------------------------------------------------
+  // 直播弹幕（v2.27.0+）：弹幕服务器信息（WS 接入点）
+  // -------------------------------------------------------------------------
+
+  /// 我的 mid（**未登录/匿名 → 0，不抛**）。直播弹幕认证的 `uid` 用它
+  /// （实测填 0 也能收到真实弹幕，只是用户名被服务端打码）。
+  ///
+  /// 复用既有的 [._ensureMyMid]（nav 一次拿 mid，会话内缓存）；匿名态那个
+  /// 方法按设计抛 -101，这里吞掉换成 0——弹幕不该因为「没登录」而不可用。
+  Future<int> fetchMyMidOrZero() async {
+    try {
+      return await _ensureMyMid();
+    } catch (e) {
+      debugPrint('[bili_api] fetchMyMidOrZero 降级为 0（匿名/未登录）：$e');
+      return 0;
+    }
+  }
+
+  /// 取直播弹幕服务器信息（`xlive/web-room/v1/index/getDanmuInfo`）→
+  /// [LiveDanmuInfo]（token + host_list + 认证 uid）。
+  ///
+  /// ⚠️ 三处坑（2026-09 实测，照抄不要改）：
+  /// 1. **必须 WBI 签名**（`wts` + `w_rid`，参数带 `web_location=444.8`）：
+  ///    不加签名一律 `code=-352`。签名逻辑**复用** [WbiSigner] 与
+  ///    [._ensureWbiKeys]（nav 取 key），本方法不自己算 MD5；
+  /// 2. **host 是 [kLiveApi]**（`api.live.bilibili.com`），而 `_dio.baseUrl`
+  ///    是 [kBiliApi] → 必须用**绝对 URL**（同 [fetchLivePlayUrl] 踩过的坑）；
+  /// 3. 请求头要带 `Referer: https://live.bilibili.com/<room>` 与
+  ///    `Origin: https://live.bilibili.com`（本方法用 per-request `Options`
+  ///    覆盖，不动全局头）。
+  ///
+  /// 匿名（未登录）实测可用（uid=0 就能收到真实弹幕；登录态用户名不打码）。
+  /// 返回语义：拿到 data → [LiveDanmuInfo]；非法 roomId / 业务码非 0 / 网络
+  /// 异常 / 脏数据 → **null 且不抛**（弹幕是增强功能，调用方静默降级）。
+  Future<LiveDanmuInfo?> fetchLiveDanmuInfo(int roomId) async {
+    if (roomId <= 0) return null;
+    try {
+      await _injectAuth();
+      // 登录态带上自己的 mid 当认证 uid（匿名 → 0）
+      final uid = await fetchMyMidOrZero();
+      for (var attempt = 0; attempt < 2; attempt++) {
+        if (attempt > 0) await _refreshWbiKeys(); // 换 key 后重签（wts 同步刷新）
+        final (imgKey, subKey) = await _ensureWbiKeys();
+        final params = WbiSigner.encodeWbi(
+          {
+            'id': '$roomId',
+            'type': '0',
+            'web_location': '444.8',
+          },
+          imgKey: imgKey,
+          subKey: subKey,
+          // 只带业务参数（实测签名通过的最小集合）。dm_* 三个参数是 view 接口
+          // 绕 -412 用的伪装字段，与直播弹幕接口无关，故不带（withDm: false）。
+          withDm: false,
+        );
+        final resp = await _dio.get<Map<String, dynamic>>(
+          '$kLiveApi/xlive/web-room/v1/index/getDanmuInfo',
+          queryParameters: params,
+          options: Options(
+            headers: {
+              'Referer': 'https://live.bilibili.com/$roomId',
+              'Origin': 'https://live.bilibili.com',
+            },
+          ),
+        );
+        final data = resp.data;
+        final code = _looseInt(data?['code']);
+        if ((code == -352 || code == -412) && attempt == 0) {
+          debugPrint('[bili_api] fetchLiveDanmuInfo room=$roomId code=$code '
+              '→ 刷新 WBI key 重新签名重试');
+          continue;
+        }
+        if (code != 0) {
+          debugPrint('[bili_api] fetchLiveDanmuInfo room=$roomId 业务码失败 '
+              'code=${data?['code']} msg=${data?['message']}');
+          return null;
+        }
+        final d = data?['data'];
+        if (d is! Map<String, dynamic>) {
+          debugPrint('[bili_api] fetchLiveDanmuInfo room=$roomId 响应缺少 data');
+          return null;
+        }
+        final info = LiveDanmuInfo.fromJson(d, uid: uid);
+        if (info == null) {
+          debugPrint('[bili_api] fetchLiveDanmuInfo room=$roomId 解析失败（脏数据）');
+          return null;
+        }
+        debugPrint('[bili_api] fetchLiveDanmuInfo room=$roomId → $info');
+        return info;
+      }
+      return null;
+    } catch (e) {
+      // 失败静默：弹幕连不上不能影响播放（页面按空弹幕区处理）
+      debugPrint('[bili_api] fetchLiveDanmuInfo room=$roomId 失败: $e');
       return null;
     }
   }

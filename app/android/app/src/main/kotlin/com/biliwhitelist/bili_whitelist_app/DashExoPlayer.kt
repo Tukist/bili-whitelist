@@ -15,6 +15,7 @@ import androidx.media3.datasource.DefaultDataSource
 import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.HttpDataSource
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.hls.HlsMediaSource
 import androidx.media3.exoplayer.source.MergingMediaSource
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import io.flutter.view.TextureRegistry
@@ -36,6 +37,12 @@ import java.net.UnknownHostException
  * 媒体通知 / 耳机按键（v2.25.x）：本类不管通知，只把 `playWhenReady` 与 seek 事件
  * 通过 [Listener] 上报（见 [Listener.onPlayWhenReadyChanged] / [Listener.onSeeked]）；
  * 通知与会话由 [DashMediaNotification] 持有，通过 [mediaPlayer] 直接驱动播放器。
+ *
+ * 直播（v2.27.0+）：Dart 侧 `setDataSource(..., isLive: true)` → [prepare] 走
+ * `HlsMediaSource`（B 站直播是 HLS 媒体播放列表，见 [HlsMediaSource]），且
+ * **seek 全链路关掉**——构建期就不设 `seekBack/ForwardIncrementMs`（[liveMode]），
+ * 播放中也不上报 [Listener.onSeeked]（直播没有进度概念，地址约 58 分钟过期后
+ * 由 Dart 侧换新地址续播）。
  */
 private const val TAG = "DashExoPlayer"
 
@@ -47,6 +54,15 @@ class DashExoPlayer(
     private val surfaceTextureEntry: TextureRegistry.SurfaceTextureEntry,
     userAgent: String,
     private val listener: Listener,
+    /**
+     * 构建期的直播标记（Dart 侧 `create(isLive: true)`，见 [BiliDashPlayerPlugin]）。
+     *
+     * 为什么必须在**构建期**给：ExoPlayer 的 `seekBack/ForwardIncrementMs` 只在
+     * `ExoPlayer.Builder` 上可设（ExoPlayerImpl 里那两个是 final 字段，构建后
+     * 改不了），而「直播不设增量」正是让 `COMMAND_SEEK_BACK/FORWARD` 从根源上
+     * 不进可用命令集的手段（通知栏 / 锁屏 / 系统媒体卡片因此都没有 seek）。
+     */
+    private val liveMode: Boolean = false,
 ) {
     /** 保留 applicationContext 供本地数据源使用（构造参数只在属性初始化期可用）。 */
     private val appContext: Context = context
@@ -124,11 +140,25 @@ class DashExoPlayer(
     @Volatile
     private var speed: Float = 1f
 
+    /**
+     * 当前是否在播直播（[prepare] 按 Dart 侧的 `isLive` 写入）。
+     *
+     * 通知层（[DashMediaNotification.bind]）读它决定要不要挂「快退 / 快进」
+     * 按钮与会话命令——直播不能 seek（见 [liveMode] 的说明）。
+     */
+    var isLive: Boolean = liveMode
+        private set
+
     private val player: ExoPlayer = ExoPlayer.Builder(appContext).apply {
         // 通知栏「快退 15 秒 / 快进 15 秒」与耳机线控的 seekBack()/seekForward()
-        // 都按这个步长走（默认 5s/15s 不符合 B 站习惯，这里统一 15s）
-        setSeekBackIncrementMs(kSeekIncrementMs)
-        setSeekForwardIncrementMs(kSeekIncrementMs)
+        // 都按这个步长走（默认 5s/15s 不符合 B 站习惯，这里统一 15s）。
+        // ⚠️ 直播**不设**（见 [liveMode]）：设了就等于把
+        // COMMAND_SEEK_BACK/FORWARD/SEEK_TO_PREVIOUS 声明为可用，锁屏 / 车机 /
+        // 系统媒体卡片会据此渲染出快进快退按钮，点下去还会真的跳位置。
+        if (!liveMode) {
+            setSeekBackIncrementMs(kSeekIncrementMs)
+            setSeekForwardIncrementMs(kSeekIncrementMs)
+        }
     }.build().apply {
         setVideoSurface(surface)
         addListener(object : Player.Listener {
@@ -158,8 +188,10 @@ class DashExoPlayer(
                 reason: Int,
             ) {
                 // 只回传 seek（通知栏快退快进 / 拖动 / 断点恢复）：其他原因（自动
-                // 跳变、repeat）不是用户操作，不必让 Dart 侧刷新状态
-                if (reason == Player.DISCONTINUITY_REASON_SEEK) {
+                // 跳变、repeat）不是用户操作，不必让 Dart 侧刷新状态。
+                // 直播一律不上报：直播没有进度条，Dart 侧收到只会是噪声
+                // （换源 / 追直播窗口本身也会产生 SEEK 型的 discontinuity）。
+                if (reason == Player.DISCONTINUITY_REASON_SEEK && !isLive) {
                     listener.onSeeked(newPosition.positionMs)
                 }
             }
@@ -191,30 +223,58 @@ class DashExoPlayer(
      *
      * [meta] 非空时写进 video 源 MediaItem 的 MediaMetadata（标题 / UP 名 / 封面
      * URL）——系统媒体控件与「媒体续播」卡片据此显示，不影响解码与播放。
+     *
+     * [isLive] = true（v2.27.0+）：**直播分支**，只有一条 HLS 媒体播放列表
+     * （B 站直播是 HLS，**不是** Dashboard 双流）——
+     * - 用 [HlsMediaSource]（媒体3 的 HLS 解析器；需 media3-exoplayer-hls 依赖），
+     *   **不用** [MergingMediaSource]；
+     * - 片段的防盗链头复用同一个 [dataSourceFactory]（HLS 播放列表与 .m4s
+     *   分片同一个 CDN 域，Referer/UA 缺一不可）；
+     * - 定位用 `seekToDefaultPosition()`（直播窗口的默认位置 ≈ 最新处），
+     *   而不是 VOD 那套 `seekTo(positionMs)`：直播没有"上次看到哪"的语义，
+     *   续期换新地址后要回到最新，不能把旧位置带过去；
+     * - 直播的 `player.duration == C.TIME_UNSET` → [emitPrepared] 报
+     *   `durationMs = 0`，Dart 侧按「时长未知」处理（这是**预期**行为，
+     *   不要改 emitPrepared 的语义）。
      */
     fun prepare(
         videoUrl: String,
         audioUrl: String?,
         positionMs: Long,
         meta: Meta? = null,
+        isLive: Boolean = false,
     ) {
-        val videoFactory = if (isLocalUri(videoUrl)) localDataSourceFactory else dataSourceFactory
-        val videoSource = ProgressiveMediaSource.Factory(videoFactory)
-            .createMediaSource(buildMediaItem(videoUrl, meta))
-        val mediaSource = if (audioUrl.isNullOrEmpty()) {
-            videoSource
+        this.isLive = isLive
+        val mediaSource = if (isLive) {
+            // 直播：单条 HLS 源（网络流；直播不存在本地文件形态）
+            HlsMediaSource.Factory(dataSourceFactory)
+                .createMediaSource(buildMediaItem(videoUrl, meta))
         } else {
-            val audioFactory = if (isLocalUri(audioUrl)) localDataSourceFactory else dataSourceFactory
-            val audioSource = ProgressiveMediaSource.Factory(audioFactory)
-                .createMediaSource(MediaItem.fromUri(audioUrl))
-            MergingMediaSource(videoSource, audioSource)
+            val videoFactory =
+                if (isLocalUri(videoUrl)) localDataSourceFactory else dataSourceFactory
+            val videoSource = ProgressiveMediaSource.Factory(videoFactory)
+                .createMediaSource(buildMediaItem(videoUrl, meta))
+            if (audioUrl.isNullOrEmpty()) {
+                videoSource
+            } else {
+                val audioFactory =
+                    if (isLocalUri(audioUrl)) localDataSourceFactory else dataSourceFactory
+                val audioSource = ProgressiveMediaSource.Factory(audioFactory)
+                    .createMediaSource(MediaItem.fromUri(audioUrl))
+                MergingMediaSource(videoSource, audioSource)
+            }
         }
         // resetPosition=false：不重置位置，之后显式 seekTo（供 URL 过期续播）
         player.setMediaSource(mediaSource, /* resetPosition= */ false)
-        player.seekTo(positionMs)
+        if (isLive) {
+            player.seekToDefaultPosition() // 直播：落到窗口默认位置（≈ 最新）
+        } else {
+            player.seekTo(positionMs)
+        }
         player.prepare()
         player.play()
         // 兜底：换源（prepare）后按当前倍速重设，防被重置回 1x
+        // （直播页没有倍速入口，恒为 1x，这里也不用特判）
         if (speed != 1f) player.setPlaybackSpeed(speed)
     }
 
@@ -240,7 +300,11 @@ class DashExoPlayer(
 
     fun pause() = player.pause()
 
-    fun seekTo(positionMs: Long) = player.seekTo(positionMs)
+    /** 跳转定位。直播（[isLive]）下为**空操作**：直播没有进度可跳（见 [liveMode]）。 */
+    fun seekTo(positionMs: Long) {
+        if (isLive) return
+        player.seekTo(positionMs)
+    }
 
     /**
      * 设置播放倍速。ExoPlayer(Media3) 合法区间约 [0.25, 4.0]（PlaybackParameters），

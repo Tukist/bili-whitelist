@@ -61,13 +61,15 @@ private const val kCoverReadTimeoutMs = 15_000
  *   （KEYCODE_MEDIA_PLAY_PAUSE 等）由系统派发到当前活跃会话 → media3 直接驱动
  *   [`Player.play()`]/[`Player.pause()`]，无需我们写 BroadcastReceiver。
  * - 会话**自定义命令**（v2.25.0-r2）：`快退 15 秒 / 快进 15 秒 / 关闭` 三个动作由
- *   [callback] 的 `onCustomCommand` 实现、经 [customLayout] 暴露给 MediaController
+ *   [callback] 的 `onCustomCommand` 实现、经 [buildCustomLayout] 暴露给 MediaController
  *   类控制器（Android Auto / Wear / 车机的媒体浏览器、以及 `cmd media_session`
  *   这类可发送自定义命令的客户端）。见 [callback] 注释。
  * - [PlayerNotificationManager]（media3-ui）：生成通知——左侧封面、标题、副标题
  *   （`UP 名 · 状态`）、右侧 `快退15s / 播放暂停 / 快进15s / 关闭(✕)`。通知按钮由
  *   它自己的广播接收器处理（直接调 player.seekBack()/seekForward()/play()/
  *   pause()/stop()），播放/暂停图标由**播放器状态**驱动，不会与真实状态不符。
+ *   ⚠️ 直播（`bind(isLive = true)`）只留 `播放暂停 / 关闭(✕)`：直播不可 seek
+ *   （见 [NoSeekPlayer]）。
  *   ⚠️ 这条通知**不绑会话 token**（详见 [bind] 里的说明）：绑了就会被 Android 13+
  *   收进系统媒体卡片，而那张卡片只渲染系统自己的固定槽位（prev/play-pause/next），
  *   快退/快进/关闭在它上面永远点不到。
@@ -105,6 +107,13 @@ class DashMediaNotification(
     private var manager: PlayerNotificationManager? = null
     private var boundPlayer: Player? = null
 
+    /**
+     * 当前绑定的播放器是不是**直播**（`bind` 时由插件层从 [DashExoPlayer.isLive]
+     * 传入）：直播不挂快退/快进按钮、会话命令里也摘掉 seek（见 [buildCustomLayout]
+     * / [NoSeekPlayer]）。换绑到 VOD 播放器时会随之复位（[release]）。
+     */
+    private var liveMode = false
+
     /** 当前绑定的播放器 textureId（null = 没有绑定）。 */
     var boundTextureId: Long? = null
         private set
@@ -125,7 +134,7 @@ class DashMediaNotification(
     // 会话自定义命令（快退 15s / 快进 15s / 关闭）
     // -------------------------------------------------------------------------
 
-    /** 三个自定义命令（顺序与 [customLayout] 一致）。 */
+    /** 三个自定义命令（顺序与 [buildCustomLayout] 一致；直播只暴露最后一个）。 */
     private val customCommands = listOf(
         SessionCommand(kActionRewind15, Bundle.EMPTY),
         SessionCommand(kActionForward15, Bundle.EMPTY),
@@ -137,24 +146,45 @@ class DashMediaNotification(
      *
      * 槽位（[CommandButton.setSlots]）是 media3 给「带屏控制器」（Android Auto、
      * Wear OS）排布用的；SystemUI 的媒体卡片只按命令可用性渲染，两者都覆盖到。
+     *
+     * 直播（[liveMode]）只给「关闭」一个：直播不可 seek，挂上快退/快进等于
+     * 给锁屏/车机留了拖进度的入口（见 [NoSeekPlayer]）。
      */
-    private val customLayout = listOf(
-        CommandButton.Builder(CommandButton.ICON_SKIP_BACK_15)
-            .setSessionCommand(customCommands[0])
-            .setDisplayName("快退 15 秒")
-            .setSlots(CommandButton.SLOT_BACK)
-            .build(),
-        CommandButton.Builder(CommandButton.ICON_SKIP_FORWARD_15)
-            .setSessionCommand(customCommands[1])
-            .setDisplayName("快进 15 秒")
-            .setSlots(CommandButton.SLOT_FORWARD)
-            .build(),
-        CommandButton.Builder(CommandButton.ICON_STOP)
+    private fun buildCustomLayout(): List<CommandButton> {
+        val stop = CommandButton.Builder(CommandButton.ICON_STOP)
             .setSessionCommand(customCommands[2])
             .setDisplayName("关闭")
             .setSlots(CommandButton.SLOT_OVERFLOW)
-            .build(),
-    )
+            .build()
+        if (liveMode) return listOf(stop) // 直播：只有「关闭」，没有任何 seek
+        return listOf(
+            CommandButton.Builder(CommandButton.ICON_SKIP_BACK_15)
+                .setSessionCommand(customCommands[0])
+                .setDisplayName("快退 15 秒")
+                .setSlots(CommandButton.SLOT_BACK)
+                .build(),
+            CommandButton.Builder(CommandButton.ICON_SKIP_FORWARD_15)
+                .setSessionCommand(customCommands[1])
+                .setDisplayName("快进 15 秒")
+                .setSlots(CommandButton.SLOT_FORWARD)
+                .build(),
+            stop,
+        )
+    }
+
+    /**
+     * 本次会话对外开放的自定义命令：直播只有「关闭」。
+     *
+     * 为什么两个入口都要管（[onConnect] 与 [onCustomCommand]）：前者决定
+     * legacy 控制器（SystemUI / 蓝牙 / 车机）能**看到**哪些按钮，后者决定
+     * 即使有控制器缓存了旧布局、发来命令也**执行不了**。直播缺一不可。
+     */
+    private fun availableSessionCommands(): List<SessionCommand> =
+        if (liveMode) listOf(customCommands[2]) else customCommands
+
+    /** 直播时两个 seek 自定义命令一律拒绝执行（防御）。 */
+    private fun isLiveSeekCommand(customAction: String): Boolean =
+        liveMode && (customAction == kActionRewind15 || customAction == kActionForward15)
 
     /**
      * 会话回调：把自定义命令**真正执行掉**（通知只是入口，动作在这里落地）。
@@ -166,7 +196,7 @@ class DashMediaNotification(
      *   界面位置随之对齐，这里不重复回推。
      * - `关闭`：等同通知上的 ✕（停播 + 清媒体项 + 撤下通知 + 回推 Dart）。
      *
-     * `onConnect` 里把三个命令加进该控制器的**可用会话命令**：legacy 控制器
+     * `onConnect` 里把命令加进该控制器的**可用会话命令**：legacy 控制器
      * （SystemUI / 蓝牙 / 车机走的都是 legacy 通道）只有声明过才拿得到这些
      * 自定义 action，否则 `dumpsys media_session` 里 `custom actions=[]`、卡片上
      * 也就没有按钮可点。
@@ -179,10 +209,10 @@ class DashMediaNotification(
             MediaSession.ConnectionResult.AcceptedResultBuilder(session)
                 .setAvailableSessionCommands(
                     MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS.buildUpon()
-                        .addSessionCommands(customCommands)
+                        .addSessionCommands(availableSessionCommands())
                         .build()
                 )
-                .setCustomLayout(customLayout)
+                .setCustomLayout(buildCustomLayout())
                 .build()
 
         override fun onCustomCommand(
@@ -192,6 +222,8 @@ class DashMediaNotification(
             args: Bundle,
         ): ListenableFuture<SessionResult> {
             val player = boundPlayer ?: return notSupported()
+            // 直播：即使有控制器缓存了旧布局把 seek 命令发过来，也一律拒绝
+            if (isLiveSeekCommand(customCommand.customAction)) return notSupported()
             when (customCommand.customAction) {
                 kActionRewind15 -> seekBy(player, -kSeekStepMs)
                 kActionForward15 -> seekBy(player, kSeekStepMs)
@@ -236,6 +268,11 @@ class DashMediaNotification(
      * - [id]/[player] 与当前绑定不同 → 先释放旧的（会话 + 通知），再为新的建一套
      *   （播放页切换/换源会走到这条路径）；
      * - 同一播放器 → 只更新文案并刷新通知。
+     *
+     * [isLive]（v2.27.0+）= 直播：通知上**不挂**快退/快进（通知自带按钮 + 收起态
+     * 都不挂），会话只对外暴露「关闭」一条自定义命令，且会话看到的播放器换成
+     * [NoSeekPlayer]（把四个 seek 命令也摘掉）。否则锁屏 / 系统媒体卡片仍能拖
+     * 进度条 —— 直播地址 58 分钟过期、窗口还会向前滑动，拖动没有任何正确语义。
      */
     fun bind(
         id: Long,
@@ -247,14 +284,16 @@ class DashMediaNotification(
         playing: Boolean,
         positionMs: Long,
         durationMs: Long,
+        isLive: Boolean = false,
     ) {
-        if (boundTextureId == id && boundPlayer === player) {
+        if (boundTextureId == id && boundPlayer === player && liveMode == isLive) {
             update(title, artist, coverUrl, status, playing, positionMs, durationMs)
             return
         }
         release()
         // release() 里置过 tearingDown，新绑定必须复位（下次拆解才拦得住事件）
         tearingDown = false
+        liveMode = isLive
         this.title = title
         this.artist = artist
         this.status = status
@@ -265,11 +304,14 @@ class DashMediaNotification(
         boundTextureId = id
         boundPlayer = player
 
-        // 会话包住的是「摘掉上下集命令」的包装器（见 [NoPrevNextPlayer]）：单集
-        // 播放时 media3 仍会声明 COMMAND_SEEK_TO_PREVIOUS 可用，SystemUI 据此把
-        // 卡片按钮渲染成 `Previous track` 并调 seekToPrevious() → 实测**跳回开头**。
+        // 会话包住的是「摘掉不可用命令」的包装器（见 [NoPrevNextPlayer] /
+        // [NoSeekPlayer]）：单集播放时 media3 仍会声明 COMMAND_SEEK_TO_PREVIOUS
+        // 可用，SystemUI 据此把卡片按钮渲染成 `Previous track` 并调
+        // seekToPrevious() → 实测**跳回开头**；直播干脆连 seek 一起摘掉。
         // 播放本身与通知仍走真实播放器，只有会话看到的是这个包装器。
-        val newSession = MediaSession.Builder(context, NoPrevNextPlayer(player))
+        val sessionPlayer =
+            if (liveMode) NoSeekPlayer(player) else NoPrevNextPlayer(player)
+        val newSession = MediaSession.Builder(context, sessionPlayer)
             // 点通知回到 App（MainActivity 是 singleTop，不新建任务栈）
             .setSessionActivity(contentIntent())
             .setCallback(callback)
@@ -277,7 +319,7 @@ class DashMediaNotification(
             .apply {
                 // 自定义按钮（快退 15s / 快进 15s / 关闭）：Android 13+ 的系统媒体
                 // 卡片只按会话命令渲染，这是它们唯一能被点到的途径
-                setCustomLayout(customLayout)
+                setCustomLayout(buildCustomLayout())
             }
         val newManager = PlayerNotificationManager.Builder(
             context, kNotificationId, kChannelId,
@@ -309,11 +351,14 @@ class DashMediaNotification(
             .apply {
                 setUsePreviousAction(false) // 本 App 无播放列表，不出现上一/下一曲
                 setUseNextAction(false)
-                setUseRewindAction(true) // 快退 15 秒（ExoPlayer seekBackIncrementMs）
-                setUseFastForwardAction(true) // 快进 15 秒
+                // 直播：通知自带按钮也不给快退/快进（收起态同样不给）——
+                // 它们走 player.seekBack()/seekForward()，直播下这两个增量
+                // 根本没设（见 [DashExoPlayer.liveMode]），点了只会是空操作。
+                setUseRewindAction(!liveMode) // 快退 15 秒（ExoPlayer seekBackIncrementMs）
+                setUseFastForwardAction(!liveMode) // 快进 15 秒
                 // 收起态（compact）也显示快退/快进，与 B 站一致：`15 ◀ ▶ 15 ▶`
-                setUseRewindActionInCompactView(true)
-                setUseFastForwardActionInCompactView(true)
+                setUseRewindActionInCompactView(!liveMode)
+                setUseFastForwardActionInCompactView(!liveMode)
                 setUseStopAction(true) // ✕：停止播放 + 移除通知（media3 内部 player.stop()）
                 setPriority(NotificationCompat.PRIORITY_LOW)
                 setVisibility(NotificationCompat.VISIBILITY_PUBLIC) // 锁屏可见
@@ -366,6 +411,7 @@ class DashMediaNotification(
         session = null
         boundPlayer = null
         boundTextureId = null
+        liveMode = false // 下次 bind 重新判定（可能换成 VOD 播放器）
         coverBitmap = null
         coverBitmapUrl = null
     }
@@ -507,6 +553,37 @@ private class NoPrevNextPlayer(player: Player) : ForwardingPlayer(player) {
 
     /** [ForwardingPlayer] 的默认实现会把 [isCommandAvailable] 直接转发给原播放器，
      *  这里必须一并按「摘过命令」的集合回答，否则会话仍认为上下集可用。 */
+    override fun isCommandAvailable(command: Int): Boolean =
+        getAvailableCommands().contains(command)
+}
+
+/**
+ * 直播用的会话包装：在 [NoPrevNextPlayer] 的基础上**再摘掉所有 seek 命令**
+ * （v2.27.0+）。
+ *
+ * 为什么还要单独摘一遍（[DashExoPlayer.liveMode] 已经在构建期不设
+ * seekBack/ForwardIncrementMs）：那一手管的是「ExoPlayer 自己声明哪些命令
+ * 可用」，但 `COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM` / `COMMAND_SEEK_TO_DEFAULT_POSITION`
+ * 与增量无关，单集播放/直播时本来就是可用的 —— 只要它们在，
+ * 锁屏与系统媒体卡片的进度条就是可拖的（拖了会真的跳位置，而直播跳位置
+ * 没有任何正确语义：窗口在往前滑、地址 58 分钟过期）。
+ */
+private class NoSeekPlayer(player: Player) : ForwardingPlayer(player) {
+    override fun getAvailableCommands(): Player.Commands =
+        super.getAvailableCommands().buildUpon()
+            .removeAll(
+                Player.COMMAND_SEEK_TO_PREVIOUS,
+                Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM,
+                Player.COMMAND_SEEK_TO_NEXT,
+                Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM,
+                Player.COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM,
+                Player.COMMAND_SEEK_IN_CURRENT_WINDOW,
+                Player.COMMAND_SEEK_TO_DEFAULT_POSITION,
+                Player.COMMAND_SEEK_BACK,
+                Player.COMMAND_SEEK_FORWARD,
+            )
+            .build()
+
     override fun isCommandAvailable(command: Int): Boolean =
         getAvailableCommands().contains(command)
 }

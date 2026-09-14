@@ -80,7 +80,6 @@ import 'dart:math' as math;
 
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
-import 'package:url_launcher/url_launcher.dart';
 
 import '../api/bilibili_api.dart';
 import '../api/github_api.dart';
@@ -97,6 +96,7 @@ import '../widgets/inbox_card_stack.dart';
 import '../widgets/inbox_card_styles.dart';
 import '../widgets/inbox_swipe_card.dart';
 import '../widgets/staggered_entrance.dart';
+import 'live_player_page.dart';
 import 'player_page.dart';
 import 'upowner_page.dart' show LiveNowBadge;
 
@@ -307,19 +307,28 @@ class _InboxPageState extends State<InboxPage>
     setState(() => _live = status);
   }
 
-  /// 点开播角标 → B 站直播间（外部应用）。App 内不播直播（见
-  /// `models/live_status.dart` 的定位说明）。
+  /// 点开播角标 → **站内**直播播放页（v2.27.0+，[LivePlayerPage]）。
+  ///
+  /// 信箱是 Tinder 卡片：卡片本体已注册 onTap（开播放页）与 onHorizontalDrag*，
+  /// 内层角标的点击在手势竞技场里自己胜出（v2.25.2+ 实测可行）。**长按次级
+  /// 入口（跳站外浏览器）这里刻意不做**——长按与卡片拖拽/飞出的手势面重叠风险
+  /// 高，而信箱只是"顺手看一眼"，站内播不了还有 UP 主页那条路。
   Future<void> _openLive(LiveStatus status) async {
-    final url = status.liveUrl;
-    if (url.isEmpty) return;
-    final uri = Uri.tryParse(url);
-    if (uri == null) return;
-    try {
-      final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
-      if (!ok) _showSnack('打开直播间失败');
-    } catch (_) {
-      _showSnack('打开直播间失败');
-    }
+    if (status.roomId <= 0) return;
+    final item = _items.isEmpty ? null : _items.first;
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        // 借用播放页的路由名：享受那套「快速淡入」转场（见 app_theme 按路由名
+        // 分流）
+        settings: const RouteSettings(name: kPlayerRouteName),
+        builder: (_) => LivePlayerPage(
+          roomId: status.roomId,
+          title: status.title,
+          upName: item?.upName ?? '',
+          upMid: item?.upMid ?? 0,
+        ),
+      ),
+    );
   }
 
   /// 把一份「服务端 / 缓存的队列」并进当前队列。
@@ -915,7 +924,7 @@ class _InboxPageState extends State<InboxPage>
     // 「正在直播」角标（v2.25.2+）：叠在卡片左上角，**不改变卡片尺寸**（
     // 只是 Stack 里的一层，卡片的自然高度仍是 Stack 的高度，卡片栈的几何
     // 一点没动）。点它是自己的手势（内层 InkWell 在手势竞技场里胜出），
-    // → 跳 B 站直播间；点卡片其它地方照旧开播放页。
+    // → 进站内直播播放页（v2.27.0+）；点卡片其它地方照旧开播放页。
     final live = _live;
     final body = (live != null && live.isLive)
         ? Stack(
