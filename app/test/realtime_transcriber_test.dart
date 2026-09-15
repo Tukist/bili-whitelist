@@ -10,6 +10,7 @@
 library;
 
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -19,6 +20,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:bili_whitelist_app/api/sherpa_audio.dart';
 import 'package:bili_whitelist_app/api/sherpa_model.dart';
+import 'package:bili_whitelist_app/cache/download_manager.dart';
 import 'package:bili_whitelist_app/models/whitelist_video.dart';
 import 'package:bili_whitelist_app/services/realtime_transcriber.dart';
 import 'package:bili_whitelist_app/utils/sentence_splitter.dart';
@@ -440,6 +442,112 @@ void main() {
         throwsA(isA<SherpaAudioException>()
             .having((e) => e.message, 'message', contains('音频准备失败'))),
       );
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // SherpaAudioSource.cleanTmpAudio：中转音频清理（v2.29.0）
+  // -------------------------------------------------------------------------
+
+  group('SherpaAudioSource.cleanTmpAudio（中转音频清理）', () {
+    late Directory tmp;
+
+    setUp(() async {
+      tmp = await Directory.systemTemp.createTemp('sherpa_tmp_clean_test_');
+    });
+
+    tearDown(() async {
+      try {
+        await tmp.delete(recursive: true);
+      } catch (_) {}
+    });
+
+    test('删掉 audio_tmp 下全部文件（m4s + 16k wav）并返回合计', () async {
+      final tmpDir = Directory('${tmp.path}/${SherpaAudioSource.tmpDirName}');
+      await tmpDir.create(recursive: true);
+      await File('${tmpDir.path}/BV1TEST_0.m4s')
+          .writeAsBytes(List.filled(300, 1));
+      await File('${tmpDir.path}/BV1TEST_0${SherpaAudioPreparer.wavSuffix}')
+          .writeAsBytes(List.filled(500, 1));
+      // 媒体缓存目录里的东西一件都不能动（两条链路互不干涉）
+      final mediaDir = Directory('${tmp.path}/video_cache');
+      await mediaDir.create(recursive: true);
+      final kept = File('${mediaDir.path}/BV1TEST_p1.audio.m4s');
+      await kept.writeAsBytes(List.filled(111, 1));
+
+      final source = SherpaAudioSource(rootDir: tmp);
+      final result = await source.cleanTmpAudio();
+
+      expect(result.files, 2);
+      expect(result.bytes, 800);
+      expect(tmpDir.listSync(), isEmpty);
+      expect(await kept.exists(), isTrue, reason: '只清中转目录，不碰 video_cache');
+    });
+
+    test('目录不存在 / 已清空 → 返回 0，不抛（幂等）', () async {
+      final source = SherpaAudioSource(rootDir: tmp);
+      // 目录还没建：直接调用不应抛
+      final first = await source.cleanTmpAudio();
+      expect(first.files, 0);
+      expect(first.bytes, 0);
+
+      final tmpDir = Directory('${tmp.path}/${SherpaAudioSource.tmpDirName}');
+      await tmpDir.create(recursive: true);
+      await File('${tmpDir.path}/a.m4s').writeAsBytes(List.filled(10, 1));
+      final second = await source.cleanTmpAudio();
+      expect(second.files, 1);
+      final third = await source.cleanTmpAudio();
+      expect(third.files, 0, reason: '清第二次没有东西可清');
+    });
+
+    test('清理后「离线缓存音频复用」照旧（复用只看 video_cache）', () async {
+      // 离线缓存里已有该集音频 + 索引在册
+      final mediaDir = Directory('${tmp.path}/video_cache');
+      await mediaDir.create(recursive: true);
+      final cachedAudio = File('${mediaDir.path}/BV1TEST_p1.audio.m4s');
+      await cachedAudio.writeAsBytes(List.filled(50, 1));
+      await File('${tmp.path}/cache_index.json').writeAsString(jsonEncode({
+        'version': 1,
+        'items': [
+          {
+            'bvid': 'BV1TEST',
+            'title': '测试视频',
+            'cover': '',
+            'pageIndex': 0,
+            'partTitle': '',
+            'videoPath': '',
+            'audioPath': cachedAudio.path,
+            'sizeBytes': 50,
+            'cachedAt': '2026-01-01T00:00:00.000Z',
+            'upName': 'tester',
+            'cid': 100,
+            'durationMs': 60000,
+            'audioOnly': true,
+          },
+        ],
+      }));
+      final manager = DownloadManager(rootDir: tmp, betweenTasks: Duration.zero);
+      await manager.init();
+      var fetchCalls = 0;
+      final source = SherpaAudioSource(
+        downloadManager: manager,
+        rootDir: tmp,
+        fetchPlayUrl: ({required String bvid, required int cid}) async {
+          fetchCalls++;
+          throw StateError('命中离线缓存时不该取流');
+        },
+      );
+      // 中转目录里放一份「旧」中转音频，清理它
+      final tmpDir = Directory('${tmp.path}/${SherpaAudioSource.tmpDirName}');
+      await tmpDir.create(recursive: true);
+      await File('${tmpDir.path}/BV1TEST_0.m4s').writeAsBytes(List.filled(9, 1));
+
+      await source.cleanTmpAudio();
+      final path = await source.getAudioPath(_video, 0);
+
+      expect(path, cachedAudio.path,
+          reason: '清理中转音频不能破坏「离线缓存音频存在就复用」这条路');
+      expect(fetchCalls, 0, reason: '复用了缓存 → 不发取流请求');
     });
   });
 

@@ -447,6 +447,28 @@ void main() {
       expect(yOf['动画']!, lessThan(yOf['未分类']!)); // 未分类固定最后
     });
 
+    testWidgets('只重排顶层：子合集在数组里的位置不动（v2.30.0 嵌套）', (tester) async {
+      final ctx = await _pumpHomeWithGithub(
+        tester,
+        _dataWith(
+          [_video('BV1', '视频A', collection: '动画')],
+          collectionNames: ['动画', '动画/2024冬', '音乐'],
+        ),
+      );
+
+      // 首页只显示顶层卡（动画、音乐、未分类）→ 索引只在顶层里走动
+      await _longPressDrag(tester, find.text('动画'), find.text('未分类'));
+
+      expect(_savedCollectionNames(ctx.adapter), ['音乐', '动画/2024冬', '动画']);
+      // 子合集既没被拖走也没被改名（层级由路径决定）
+      final yOf = <String, double>{};
+      for (final name in ['音乐', '动画', '未分类']) {
+        yOf[name] = tester.getTopLeft(find.text(name)).dy;
+      }
+      expect(yOf['音乐']!, lessThan(yOf['动画']!));
+      expect(yOf['动画']!, lessThan(yOf['未分类']!));
+    });
+
     testWidgets('未分类卡片固定最后，长按拖动不触发保存', (tester) async {
       final ctx = await _pumpHomeWithGithub(
         tester,
@@ -809,7 +831,7 @@ void main() {
     });
   });
 
-  group('合集管理面板「移动到…」（并入另一个合集，v2.28.0+）', () {
+  group('合集管理面板「移动到…」（嵌套：源合集不被删除，v2.30.0+）', () {
     /// 与 [_pumpHomeWithGithub] 同一套注入，但先设好 SharedPreferences mock：
     /// 「个人」页要读本地观看历史，不设 mock 会走原生插件（测试环境没有）。
     Future<({_FakeAdapter adapter, GithubApi github})> pumpForMove(
@@ -854,7 +876,7 @@ void main() {
           matching: find.text(text),
         );
 
-    testWidgets('管理面板「移动到…」→ 选目标 → 确认框写清后果 → 落库并入',
+    testWidgets('管理面板「移动到…」→ 选目标 → 确认框写清「不删源合集」→ 落库嵌套',
         (tester) async {
       final ctx = await pumpForMove(
         tester,
@@ -868,38 +890,40 @@ void main() {
       );
       await openManageSheet(tester);
 
-      // 每个合集一个「移动到其他合集」入口（图标 + tooltip）
+      // 每个**顶层**合集一个「移动到其他合集」入口（图标 + tooltip）
       expect(find.byTooltip('移动到其他合集'), findsNWidgets(2));
 
-      // 把「动画」并入「音乐」：点它那一行的入口
+      // 把「动画」移动到「音乐」下面：点它那一行的入口
       await tester.tap(find.byTooltip('移动到其他合集').first);
       await tester.pumpAndSettle();
 
-      // 目标选择器：只列除自己以外的合集，**不提供「未分类」**
+      // 目标选择器：只列可嵌套进去的合集（自己不能选，也不提供「未分类」）
       expect(find.text('移动到合集'), findsOneWidget);
-      expect(find.text('把「动画」并入…'), findsOneWidget);
+      expect(find.text('把「动画」移动到…'), findsOneWidget);
       expect(find.text('未分类'), findsNothing,
-          reason: '「未分类」是「删除合集」的语义，不给重复入口');
+          reason: '「未分类」不是合集，不能当目标');
       expect(pickerText('音乐'), findsOneWidget);
       expect(pickerText('动画'), findsNothing, reason: '自己不能作为目标');
 
-      // 选目标「音乐」→ 确认框（写清「视频去哪 + 源合集消失 + 不可撤销」）
+      // 选目标「音乐」→ 确认框（写清「源合集还在 + 视频与子合集都跟着走」）
       await tester.tap(pickerText('音乐'));
       await tester.pumpAndSettle();
       expect(find.text('移动合集「动画」'), findsOneWidget);
-      expect(find.textContaining('把「动画」里的 1 个视频移到「音乐」'),
-          findsOneWidget);
-      expect(find.textContaining('并删除「动画」这个合集'), findsOneWidget);
-      expect(find.textContaining('无法在 App 内撤销'), findsOneWidget);
+      expect(find.textContaining('把「动画」移动到「音乐」下面'), findsOneWidget);
+      expect(find.textContaining('它的 1 个视频和 0 个子合集都不会变'), findsOneWidget);
+      expect(find.textContaining('之后可以在目标合集里打开它'), findsOneWidget);
+      // 旧「并入」文案（会删掉源合集）必须彻底消失
+      expect(find.textContaining('并删除「动画」这个合集'), findsNothing);
 
       await tester.tap(find.text('移动'));
       await tester.pumpAndSettle();
 
-      // 落库：源合集定义没了、视频改挂目标、目标原有在前 + 并入的接末尾
-      expect(_savedCollectionNames(ctx.adapter), ['音乐']);
-      expect(_savedOrders(ctx.adapter, '音乐'), {'BV2': 0, 'BV1': 1});
-      // 页面提示 + 管理面板列表已刷新（只剩一个合集）
-      expect(find.textContaining('已把「动画」并入「音乐」'), findsOneWidget);
+      // 落库：源合集**没有被删除**，只是路径变成「音乐/动画」；视频跟着挂过去
+      expect(_savedCollectionNames(ctx.adapter), ['音乐/动画', '音乐']);
+      expect(_savedOrders(ctx.adapter, '音乐/动画'), {'BV1': 0});
+      expect(_savedOrders(ctx.adapter, '音乐'), {'BV2': 0});
+      // 页面提示 + 首页管理面板只剩顶层那一个（动画 已变成子合集）
+      expect(find.textContaining('已把「动画」移动到「音乐」下面'), findsOneWidget);
       expect(find.byTooltip('移动到其他合集'), findsOneWidget);
     });
 
@@ -923,6 +947,42 @@ void main() {
       expect(ctx.adapter.requests.length, before, reason: '取消不该产生 PATCH');
     });
 
+    testWidgets('管理面板只列顶层合集；目标选择器能选任意层级的合集（含子合集全路径）',
+        (tester) async {
+      final ctx = await _pumpHomeWithGithub(
+        tester,
+        _dataWith(
+          [_video('BV1', '视频A', collection: '音乐/2024冬')],
+          collectionNames: ['动画', '音乐', '音乐/2024冬'],
+        ),
+      );
+      await openManageSheet(tester);
+
+      // 只列顶层：动画 / 音乐（子合集 2024冬 不在管理面板里，它在音乐页里管）
+      expect(find.byTooltip('移动到其他合集'), findsNWidgets(2));
+
+      await tester.tap(find.byTooltip('移动到其他合集').first); // 动画 那一行
+      await tester.pumpAndSettle();
+
+      // 目标是**全量**合集：音乐（顶层）+ 音乐/2024冬（子合集，按层级缩进 + 全路径）
+      expect(pickerText('音乐'), findsOneWidget);
+      expect(pickerText('音乐 / 2024冬'), findsOneWidget);
+      expect(pickerText('动画'), findsNothing, reason: '自己不能作为目标');
+
+      // 可以直接嵌到子合集下面（任意深度）
+      await tester.tap(pickerText('音乐 / 2024冬'));
+      await tester.pumpAndSettle();
+      expect(find.textContaining('把「动画」移动到「音乐 / 2024冬」下面'),
+          findsOneWidget);
+      await tester.tap(find.text('移动'));
+      await tester.pumpAndSettle();
+
+      expect(_savedCollectionNames(ctx.adapter),
+          ['音乐/2024冬/动画', '音乐', '音乐/2024冬']);
+      expect(_savedOrders(ctx.adapter, '音乐/2024冬'), {'BV1': 0},
+          reason: '原有视频不受影响');
+    });
+
     testWidgets('只有自己的合集时：给一句提示，不弹空列表', (tester) async {
       await _pumpHomeWithGithub(
         tester,
@@ -935,8 +995,325 @@ void main() {
       await tester.tap(find.byTooltip('移动到其他合集'));
       await tester.pumpAndSettle();
 
-      expect(find.text('没有其它合集可以并入，请先新建一个合集'), findsOneWidget);
+      expect(find.text('没有其它合集可以作为目标，请先新建一个合集'), findsOneWidget);
       expect(find.text('移动到合集'), findsNothing, reason: '不该弹一个空的目标列表');
+    });
+  });
+
+  group('合集页多层嵌套（v2.30.0：子合集卡片 / 面包屑 / 页内新建 / 页内管理）', () {
+    /// 进某张顶层合集卡（首页 → 合集页）。
+    Future<void> openCollection(WidgetTester tester, String name) async {
+      await tester.tap(find.text(name));
+      await tester.pumpAndSettle();
+    }
+
+    /// 目标选择器是**后开**的那层 BottomSheet（tree 里排在后面）。
+    Finder pickerText(String text) => find.descendant(
+          of: find.byType(BottomSheet).last,
+          matching: find.text(text),
+        );
+
+    testWidgets('首页只列顶层合集；卡片副信息行提示「含 N 个子合集」', (tester) async {
+      await _pumpHome(
+        tester,
+        _dataWith(
+          [_video('BV1', '视频A', collection: '动画')],
+          collectionNames: ['动画', '动画/2024冬', '音乐'],
+        ),
+      );
+
+      expect(find.text('动画'), findsOneWidget);
+      expect(find.text('音乐'), findsOneWidget);
+      expect(find.text('未分类'), findsOneWidget);
+      // 子合集不在首页平铺（它在「动画」里面）
+      expect(find.text('2024冬'), findsNothing);
+      // 「动画」卡提示自己里面有子合集；「音乐」没有子合集 → 不显示这句
+      expect(find.text('含 1 个子合集'), findsOneWidget);
+    });
+
+    testWidgets('合集页列出子合集卡片：局部名 + 视频数 · 含 N 个子合集', (tester) async {
+      await _pumpHome(
+        tester,
+        _dataWith(
+          [
+            _video('BV1', '视频A', collection: '动画'),
+            _video('BV2', '视频B', collection: '动画/2024冬'),
+            _video('BV3', '视频C', collection: '动画/2024冬/合集A'),
+            _video('BV4', '视频D'),
+          ],
+          collectionNames: ['动画', '动画/2024冬', '动画/2024冬/合集A'],
+        ),
+      );
+      await openCollection(tester, '动画');
+
+      // 子合集卡片：显示**局部名**（不是全路径），副信息是它自己的视频数与子合集数
+      expect(find.text('2024冬'), findsOneWidget);
+      expect(find.text('1 个视频 · 含 1 个子合集'), findsOneWidget);
+      // 父合集只列**直属**视频：子孙合集的视频不混进来（否则 order 会打架）
+      expect(find.text('视频A'), findsOneWidget);
+      expect(find.text('视频B'), findsNothing);
+      expect(find.text('视频C'), findsNothing);
+      expect(find.text('未分类'), findsNothing, reason: '未分类不是它的子合集');
+    });
+
+    testWidgets('点子合集卡片 → 进入子合集页；面包屑可点回上级', (tester) async {
+      await _pumpHome(
+        tester,
+        _dataWith(
+          [
+            _video('BV1', '视频A', collection: '动画'),
+            _video('BV2', '视频B', collection: '动画/2024冬'),
+          ],
+          collectionNames: ['动画', '动画/2024冬'],
+        ),
+      );
+      await openCollection(tester, '动画');
+      await tester.tap(find.text('2024冬'));
+      await tester.pumpAndSettle();
+
+      // 子合集页：标题 = 局部名；下面一行是**可点**的上级路径
+      expect(find.text('2024冬'), findsOneWidget);
+      expect(find.text('返回上级：动画'), findsOneWidget);
+      expect(find.text('视频B'), findsOneWidget);
+      expect(find.text('视频A'), findsNothing, reason: '父合集的视频不在子合集里');
+
+      // 点上级路径 → 回到父合集页
+      await tester.tap(find.text('返回上级：动画'));
+      await tester.pumpAndSettle();
+      expect(find.text('动画'), findsOneWidget); // 父合集 AppBar 标题
+      expect(find.text('视频A'), findsOneWidget);
+      expect(find.text('返回上级：动画'), findsNothing);
+    });
+
+    testWidgets('顶层合集页不显示上级（面包屑只在子合集页出现）', (tester) async {
+      await _pumpHome(
+        tester,
+        _dataWith(
+          [_video('BV1', '视频A', collection: '动画')],
+          collectionNames: ['动画', '动画/2024冬'],
+        ),
+      );
+      await openCollection(tester, '动画');
+
+      expect(find.text('动画'), findsOneWidget);
+      expect(find.textContaining('返回上级：'), findsNothing);
+    });
+
+    testWidgets('多级下钻：A/B/C 逐层进入，面包屑是直接上级的全路径', (tester) async {
+      await _pumpHome(
+        tester,
+        _dataWith(
+          [_video('BV1', '视频A', collection: '甲/乙/丙')],
+          collectionNames: ['甲', '甲/乙', '甲/乙/丙'],
+        ),
+      );
+      await openCollection(tester, '甲');
+      await tester.tap(find.text('乙'));
+      await tester.pumpAndSettle();
+      expect(find.text('返回上级：甲'), findsOneWidget);
+
+      await tester.tap(find.text('丙'));
+      await tester.pumpAndSettle();
+      expect(find.text('丙'), findsOneWidget);
+      expect(find.text('返回上级：甲 / 乙'), findsOneWidget,
+          reason: '上级是「甲/乙」这一整条路径（展示成 甲 / 乙）');
+      expect(find.text('视频A'), findsOneWidget);
+    });
+
+    testWidgets('合集页 AppBar「新建子合集」→ 路径 = 父/子，落库并刷新', (tester) async {
+      final ctx = await _pumpHomeWithGithub(
+        tester,
+        _dataWith(
+          [_video('BV1', '视频A', collection: '动画')],
+          collectionNames: ['动画'],
+        ),
+      );
+      await openCollection(tester, '动画');
+
+      await tester.tap(find.byTooltip('新建子合集'));
+      await tester.pumpAndSettle();
+      expect(find.text('新建子合集'), findsOneWidget, reason: '对话框标题');
+      await tester.enterText(find.byType(TextField).last, '2024冬');
+      await tester.tap(find.text('创建'));
+      await tester.pumpAndSettle();
+
+      expect(ctx.adapter.requests.last.method, 'PATCH');
+      expect(_savedCollectionNames(ctx.adapter), ['动画', '动画/2024冬']);
+      // 新子合集卡片出现在当前页（不用退出去重进）
+      expect(find.text('2024冬'), findsOneWidget);
+      expect(find.text('0 个视频'), findsOneWidget);
+    });
+
+    testWidgets('未分类页没有「新建子合集」入口（它不是容器）', (tester) async {
+      await _pumpHome(
+        tester,
+        _dataWith([_video('BV1', '视频A')], collectionNames: ['动画']),
+      );
+      await openCollection(tester, '未分类');
+
+      expect(find.byTooltip('新建子合集'), findsNothing);
+    });
+
+    testWidgets('子合集卡片左滑：移动 / 重命名 / 删除三个入口', (tester) async {
+      await _pumpHome(
+        tester,
+        _dataWith(
+          [
+            _video('BV1', '视频A', collection: '动画'),
+            _video('BV2', '视频B', collection: '动画/2024冬'),
+          ],
+          collectionNames: ['动画', '动画/2024冬', '音乐'],
+        ),
+      );
+      await openCollection(tester, '动画');
+      await _swipeCardLeft(tester, find.text('2024冬'));
+
+      expect(find.text('移动'), findsOneWidget);
+      expect(find.text('重命名'), findsOneWidget);
+      expect(find.text('删除'), findsOneWidget);
+    });
+
+    testWidgets('子合集左滑「重命名」→ 只换最后一段，级联改路径与视频引用',
+        (tester) async {
+      final ctx = await _pumpHomeWithGithub(
+        tester,
+        _dataWith(
+          [
+            _video('BV1', '视频A', collection: '动画/2024冬'),
+            _video('BV2', '视频B', collection: '动画/2024冬/合集A'),
+          ],
+          collectionNames: ['动画', '动画/2024冬', '动画/2024冬/合集A'],
+        ),
+      );
+      await openCollection(tester, '动画');
+      await _swipeCardLeft(tester, find.text('2024冬'));
+      await tester.tap(find.text('重命名'));
+      await tester.pumpAndSettle();
+
+      // 对话框显示全路径，输入框预填**最后一段**
+      expect(find.text('重命名合集「动画 / 2024冬」'), findsOneWidget);
+      expect(tester.widget<TextField>(find.byType(TextField).last).controller!.text,
+          '2024冬');
+      await tester.enterText(find.byType(TextField).last, '2025春');
+      await tester.tap(find.text('确定'));
+      await tester.pumpAndSettle();
+
+      // 路径级联：自己换名、子孙跟着换前缀、视频引用一起改
+      expect(_savedCollectionNames(ctx.adapter),
+          ['动画', '动画/2025春', '动画/2025春/合集A']);
+      expect(_savedOrders(ctx.adapter, '动画/2025春/合集A'), {'BV2': 0});
+      expect(find.text('2025春'), findsOneWidget); // 列表已刷新
+    });
+
+    testWidgets('子合集左滑「移动」→ 选目标 → 嵌套（源合集不删，子孙跟着走）',
+        (tester) async {
+      final ctx = await _pumpHomeWithGithub(
+        tester,
+        _dataWith(
+          [
+            _video('BV1', '视频A', collection: '动画/2024冬'),
+            _video('BV2', '视频B', collection: '动画/2024冬/合集A'),
+            _video('BV3', '视频C', collection: '音乐'),
+          ],
+          collectionNames: ['动画', '动画/2024冬', '动画/2024冬/合集A', '音乐'],
+        ),
+      );
+      await openCollection(tester, '动画');
+      await _swipeCardLeft(tester, find.text('2024冬'));
+      await tester.tap(find.text('移动'));
+      await tester.pumpAndSettle();
+
+      // 目标选择器：可移到顶层；排除自己、自己的子孙（防环）与当前父级
+      expect(find.text('把「动画 / 2024冬」移动到…'), findsOneWidget);
+      expect(find.text('移到顶层（首页）'), findsOneWidget);
+      expect(pickerText('音乐'), findsOneWidget);
+      expect(pickerText('动画 / 2024冬'), findsNothing, reason: '不能移到自己下面');
+      expect(pickerText('动画 / 2024冬 / 合集A'), findsNothing,
+          reason: '不能移进自己的子孙（防环）');
+      expect(pickerText('动画'), findsNothing,
+          reason: '当前的父级 = 原地不动，不列出来');
+
+      await tester.tap(pickerText('音乐'));
+      await tester.pumpAndSettle();
+      expect(find.text('移动合集「动画 / 2024冬」'), findsOneWidget);
+      expect(find.textContaining('把「动画 / 2024冬」移动到「音乐」下面'), findsOneWidget);
+      expect(find.textContaining('它的 1 个视频和 1 个子合集都不会变'), findsOneWidget);
+      await tester.tap(find.text('移动'));
+      await tester.pumpAndSettle();
+
+      // 源合集还在（换了前缀），子孙与视频一起跟着换
+      expect(_savedCollectionNames(ctx.adapter),
+          ['动画', '音乐/2024冬', '音乐/2024冬/合集A', '音乐']);
+      expect(_savedOrders(ctx.adapter, '音乐/2024冬'), {'BV1': 0});
+      expect(_savedOrders(ctx.adapter, '音乐/2024冬/合集A'), {'BV2': 0});
+      expect(find.textContaining('已把「动画 / 2024冬」移动到「音乐」下面'),
+          findsOneWidget);
+      // 本页（动画）里它已经不在子合集列表中了
+      expect(find.text('2024冬'), findsNothing);
+    });
+
+    testWidgets('子合集左滑「删除」→ 子合集上提一级、它的视频跟着走（不删）',
+        (tester) async {
+      final ctx = await _pumpHomeWithGithub(
+        tester,
+        _dataWith(
+          [
+            _video('BV1', '视频A', collection: '动画/2024冬'),
+            _video('BV2', '视频B', collection: '动画/2024冬/合集A'),
+          ],
+          collectionNames: ['动画', '动画/2024冬', '动画/2024冬/合集A', '音乐'],
+        ),
+      );
+      await openCollection(tester, '动画');
+      await _swipeCardLeft(tester, find.text('2024冬'));
+      await tester.tap(find.text('删除'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('删除合集「动画 / 2024冬」'), findsOneWidget);
+      expect(find.textContaining('该合集下 1 个视频将移回未分类'), findsOneWidget);
+      expect(find.textContaining('它的 1 个子合集会移到上一级'), findsOneWidget);
+      await tester.tap(find.widgetWithText(TextButton, '删除'));
+      await tester.pumpAndSettle();
+
+      expect(_savedCollectionNames(ctx.adapter),
+          ['动画', '动画/合集A', '音乐']);
+      expect(_savedOrders(ctx.adapter, '动画/合集A'), {'BV2': 0});
+      expect(_savedOrders(ctx.adapter, ''), {'BV1': 0},
+          reason: '被删合集的直属视频回未分类');
+      expect(find.text('合集A'), findsOneWidget, reason: '子孙上提一级后仍在本页');
+    });
+
+    testWidgets('视频「移动到合集」的目标选择器按层级列出全部合集（含子合集全路径）',
+        (tester) async {
+      final ctx = await _pumpHomeWithGithub(
+        tester,
+        _dataWith(
+          [
+            _video('BV1', '视频A', collection: '动画/2024冬'),
+            _video('BV2', '视频B'),
+          ],
+          collectionNames: ['动画', '动画/2024冬'],
+        ),
+      );
+      await openCollection(tester, '未分类');
+
+      // 长按进入多选 → 底部「移动到合集」→ 选择器
+      await tester.longPress(find.text('视频B'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('移动到合集'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('批量移动到合集'), findsOneWidget);
+      expect(find.text('未分类'), findsOneWidget);
+      expect(find.text('动画'), findsOneWidget);
+      // 子合集按层级缩进 + 全路径展示（不再只列顶层）
+      expect(find.text('动画 / 2024冬'), findsOneWidget);
+
+      await tester.tap(find.text('动画 / 2024冬'));
+      await tester.pumpAndSettle();
+
+      expect(_savedOrders(ctx.adapter, '动画/2024冬'), {'BV1': 0, 'BV2': 0});
+      expect(find.textContaining('已移动 1 个视频到「动画 / 2024冬」'), findsOneWidget);
     });
   });
 }

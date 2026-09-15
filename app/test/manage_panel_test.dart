@@ -5,12 +5,17 @@
 // - 保存 GitHub 配置走真实 GithubApi（secure storage channel mock）
 // - 已登录（模拟 SESSDATA 有效）显示「重新登录」文案
 // - 「新建合集」已移到合集页（v2.19.0）→ 面板内不再有该分区
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:bili_whitelist_app/api/github_api.dart';
+import 'package:bili_whitelist_app/cache/download_manager.dart';
+import 'package:bili_whitelist_app/main.dart';
+import 'package:bili_whitelist_app/pages/offline_page.dart';
 import 'package:bili_whitelist_app/services/theme_store.dart';
 import 'package:bili_whitelist_app/widgets/app_state_view.dart';
 import 'package:bili_whitelist_app/widgets/dot_illustration.dart';
@@ -57,6 +62,62 @@ class _Spy {
   int checkUpdateCalls = 0;
   int manageCollectionsCalls = 0;
 }
+
+/// 内存版 DownloadManager：只提供入口概要要的「已缓存列表」，
+/// **不做任何真实文件 IO**（理由见「缓存入口文案」用例的注释）。
+class _MemoryManager extends DownloadManager {
+  _MemoryManager(List<CachedVideo> items) : _items = items {
+    // 面板不会调 init()，构造时就发布（让它看起来像「索引已加载」）
+    cached.value = _items;
+  }
+
+  final List<CachedVideo> _items;
+
+  @override
+  Future<void> init() async {
+    if (!identical(cached.value, _items)) cached.value = _items;
+  }
+}
+
+/// **懒加载版**内存 DownloadManager：构造时**不发布**，只有 [init] 被调用过
+/// 才把列表发出来——复刻真实 [DownloadManager] 的行为（索引要等有人 `init()`
+/// 才进内存，`getCachedList()` 在此之前是空的）。
+///
+/// 「缓存入口文案」那两条用例必须用这个版本才测得到东西：`_MemoryManager`
+/// 构造即发布，即使 **没有人**预热索引，入口也照样显示计数（掩盖缺陷）。
+class _LazyManager extends DownloadManager {
+  _LazyManager(this._items);
+
+  final List<CachedVideo> _items;
+
+  /// `init()` 被调用了几次（断言启动预热真的跑过、且只跑一次）。
+  int initCalls = 0;
+
+  @override
+  Future<void> init() async {
+    initCalls++;
+    // 真实 init 是异步读盘（不是同步就能拿到）：这里也过一趟事件循环
+    await Future<void>.delayed(Duration.zero);
+    cached.value = _items;
+  }
+}
+
+/// 入口概要用的单条缓存记录（audioOnly：2 KB 音频）。
+CachedVideo _cachedEntry() => CachedVideo(
+      bvid: 'BV1entry',
+      title: '入口概要测试',
+      cover: '',
+      pageIndex: 0,
+      partTitle: '',
+      videoPath: '',
+      audioPath: '/fake/BV1entry_p1.audio.m4s',
+      sizeBytes: 2048,
+      cachedAt: DateTime.now().toUtc(),
+      upName: 'up主',
+      cid: 1,
+      durationMs: 1000,
+      audioOnly: true,
+    );
 
 Future<void> _pumpPanel(
   WidgetTester tester,
@@ -220,7 +281,7 @@ void main() {
       expect(find.text('配色：钴蓝 · 陶土'), findsOneWidget);
     });
 
-    testWidgets('缓存管理弹层：无缓存 → 空态统一走 AppStateView（seed = cache）',
+    testWidgets('点「缓存管理」→ 进独立「离线缓存」页（不再开弹层，v2.29.0）',
         (tester) async {
       final spy = _Spy();
       await _pumpPanel(tester, _panel(spy));
@@ -231,22 +292,91 @@ void main() {
       await tester.tap(button);
       await tester.pumpAndSettle();
 
-      // 弹层标题 + 页头说明（文案锚点不动）
-      expect(find.text('缓存管理'), findsNWidgets(2));
-      expect(
-        find.text('暂无缓存视频（在播放页点「下载」即可离线观看）'),
-        findsOneWidget,
-      );
-      // 列表区空态：AppStateView + 细线插画
+      // 入口从弹层改成整页（两套并存会漂移，见 offline_page.dart 顶部说明）
+      expect(find.byType(OfflinePage), findsOneWidget);
+      expect(find.text('离线缓存'), findsOneWidget); // 页面 AppBar 标题
+      // 无缓存 → 空态统一走 AppStateView（seed = cache）
       expect(find.text('暂无缓存'), findsOneWidget);
       final state = tester.widget<AppStateView>(find.byType(AppStateView));
       expect(state.kind, AppStateKind.empty);
       expect(state.copyId, 'empty.cache');
-      expect(state.scrollable, isFalse, reason: '弹层内已有界高度，无需自带滚动');
+      expect(state.subtitleCopyId, 'empty.cache.sub');
+      // 独立页自带滚动（不在弹层的有界高度里）
+      expect(state.scrollable, isTrue);
       expect(
         tester.widget<DotIllustration>(find.byType(DotIllustration)).seed,
         'cache',
       );
+    });
+
+    testWidgets('缓存入口文案带实时概要（N 个视频 · X）', (tester) async {
+      // 注入内存版 DownloadManager（**不做真实文件 IO**：flutter_test 的
+      // FakeAsync 时区里 dart:io 异步永不完成，页面/入口的 IO 会卡死用例）
+      final manager = _MemoryManager([
+        CachedVideo(
+          bvid: 'BV1entry',
+          title: '入口概要测试',
+          cover: '',
+          pageIndex: 0,
+          partTitle: '',
+          videoPath: '',
+          audioPath: '/fake/BV1entry_p1.audio.m4s',
+          sizeBytes: 2048,
+          cachedAt: DateTime.now().toUtc(),
+          upName: 'up主',
+          cid: 1,
+          durationMs: 1000,
+          audioOnly: true,
+        ),
+      ]);
+      DownloadManager.debugOverride(manager);
+      addTearDown(DownloadManager.debugReset);
+
+      final spy = _Spy();
+      await _pumpPanel(tester, _panel(spy));
+
+      expect(find.textContaining('缓存管理（1 个视频 · 2.0 KB）'), findsOneWidget);
+    });
+
+    testWidgets('冷启动预热：没访问过任何缓存页，入口概况就是正确计数（v2.29.0）',
+        (tester) async {
+      // 懒加载版 fake（构造时不发布列表）：只有「启动预热过一次」入口才有计数
+      // —— 对齐真机现象（冷启动直奔「个人」页，合集页/离线页/播放页都没进过）
+      final manager = _LazyManager([_cachedEntry()]);
+      DownloadManager.debugOverride(manager);
+      addTearDown(DownloadManager.debugReset);
+
+      // 复刻 main() 的启动预热：**不 await**（不阻塞首帧），只让它异步落地
+      unawaited(preheatCacheIndex());
+      expect(manager.initCalls, 1, reason: '启动流程应预热一次缓存索引');
+
+      final spy = _Spy();
+      // 预热在飞的同时面板照常渲染（预热不卡首帧）
+      await _pumpPanel(tester, _panel(spy));
+
+      expect(
+        find.textContaining('缓存管理（1 个视频 · 2.0 KB）'),
+        findsOneWidget,
+        reason: '冷启动后入口概况就该带计数（修复前这里只有「缓存管理」四个字）',
+      );
+      // 预热只此一次：面板/入口自己不重复碰盘（避免每次 build 都触发 IO）
+      expect(manager.initCalls, 1);
+    });
+
+    testWidgets('反证：没预热时入口概况确实没有计数（懒加载索引没进内存）',
+        (tester) async {
+      // 这条是上面那条的「诚实性」护栏：证明 _LazyManager 真的懒（没人 init
+      // 列表就没进内存）。否则上面那条即使去掉预热也会假绿。
+      final manager = _LazyManager([_cachedEntry()]);
+      DownloadManager.debugOverride(manager);
+      addTearDown(DownloadManager.debugReset);
+
+      final spy = _Spy();
+      await _pumpPanel(tester, _panel(spy));
+
+      expect(find.text('缓存管理'), findsOneWidget);
+      expect(find.textContaining('缓存管理（'), findsNothing);
+      expect(manager.initCalls, 0, reason: '预热在启动流程，面板自身不该碰索引');
     });
   });
 }

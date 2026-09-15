@@ -6,13 +6,13 @@ import '../api/bilibili_api.dart';
 import '../api/github_api.dart';
 import '../api/translate_api.dart';
 import '../cache/download_manager.dart';
+import '../pages/offline_page.dart';
 import '../services/inbox_card_style_store.dart';
 import '../services/theme_store.dart';
 import '../services/ui_copy_store.dart';
 import '../theme/app_palette.dart';
 import '../theme/app_tokens.dart';
 import '../theme/ink_recipes.dart';
-import 'app_state_view.dart';
 import 'inbox_card_styles.dart';
 
 /// 管理面板内容组件（v2.17.10+ 抽取自首页 _ManageSheet；v2.19.0 起由
@@ -367,8 +367,11 @@ class _ManagePanelState extends State<ManagePanel> {
         Text('合集管理', style: theme.textTheme.titleMedium),
         const SizedBox(height: 4),
         Text(
-          '重命名会同步更新该合集下所有视频；移动到其他合集会把视频整体并入并'
-          '删除源合集；删除会把视频移回未分类（以上都不删视频）。',
+          // v2.30.0：「移动到其他合集」的语义是**嵌套**（源合集不被删除），
+          // 这里一句话说清三个动作的后果，与合集管理面板里的说明同一口径
+          '重命名会同步更新它的子合集与所有视频；移动到其他合集会把它整个'
+          '（含视频与子合集）挪到目标下面，不会删除它；删除会把视频移回未分类、'
+          '子合集上提一级（以上都不删视频）。',
           style: theme.textTheme.bodySmall?.copyWith(
             color: theme.colorScheme.onSurfaceVariant,
           ),
@@ -385,11 +388,12 @@ class _ManagePanelState extends State<ManagePanel> {
         const SizedBox(height: 16),
         const Divider(height: 1),
         const SizedBox(height: 16),
-        // ---- 离线缓存管理 ----
+        // ---- 离线缓存（v2.29.0：弹层升级成独立页，见 offline_page.dart）----
         Text('离线缓存', style: theme.textTheme.titleMedium),
         const SizedBox(height: 4),
         Text(
-          '下载过的视频缓存在本机，断网也能播放；大小只受手机存储限制。',
+          '下载过的视频缓存在本机，断网也能播放；大小只受手机存储限制。'
+          '「仅缓存音频」可把占用压到十分之一（无画面）。',
           style: theme.textTheme.bodySmall?.copyWith(
             color: theme.colorScheme.onSurfaceVariant,
           ),
@@ -400,7 +404,17 @@ class _ManagePanelState extends State<ManagePanel> {
           child: OutlinedButton.icon(
             onPressed: () => _openCacheManage(context),
             icon: const Icon(Icons.video_library_outlined, size: 18),
-            label: const Text('缓存管理'),
+            // 文案带实时概要（N 个视频 · X）：不用点进去就知道占了多少
+            label: ListenableBuilder(
+              listenable: DownloadManager.instance.cached,
+              builder: (context, _) {
+                final items = DownloadManager.instance.getCachedList();
+                return Text(items.isEmpty
+                    ? '缓存管理'
+                    : '缓存管理（${items.length} 个视频'
+                        ' · ${fmtBytes(DownloadManager.instance.totalCacheSize())}）');
+              },
+            ),
           ),
         ),
         const SizedBox(height: 16),
@@ -506,12 +520,13 @@ class _ManagePanelState extends State<ManagePanel> {
     );
   }
 
+  /// 打开离线缓存页（v2.29.0：原来是弹层 [_CacheManageSheet]，现为独立页）。
+  ///
+  /// 页面自带 Scaffold（可滚动、分组、分项占用），不再需要弹层包裹；
+  /// 弹层的其余逻辑已全部搬进 `pages/offline_page.dart`，不并存两套。
   void _openCacheManage(BuildContext context) {
-    showModalBottomSheet<void>(
-      context: context,
-      isScrollControlled: true,
-      useSafeArea: true,
-      builder: (_) => const _CacheManageSheet(),
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(builder: (_) => const OfflinePage()),
     );
   }
 
@@ -684,197 +699,6 @@ class _TranslateConfigDialogState extends State<_TranslateConfigDialog> {
           child: Text(_saving ? '保存中…' : '保存'),
         ),
       ],
-    );
-  }
-}
-
-/// 缓存管理面板（BottomSheet）：列出已缓存视频（标题 + 集 + 大小）、
-/// 删除单个、总大小显示、清空缓存（确认）。
-///
-/// - 监听 [DownloadManager.cached]，下载完成/删除后即时刷新
-/// - 删除单集/清空缓存交回 DownloadManager（删文件 + 索引）
-class _CacheManageSheet extends StatefulWidget {
-  const _CacheManageSheet();
-
-  @override
-  State<_CacheManageSheet> createState() => _CacheManageSheetState();
-}
-
-class _CacheManageSheetState extends State<_CacheManageSheet> {
-  final DownloadManager _downloads = DownloadManager.instance;
-
-  @override
-  void initState() {
-    super.initState();
-    _downloads.cached.addListener(_onChanged);
-  }
-
-  @override
-  void dispose() {
-    _downloads.cached.removeListener(_onChanged);
-    super.dispose();
-  }
-
-  void _onChanged() {
-    if (mounted) setState(() {});
-  }
-
-  void _showSnack(String message) {
-    if (!mounted) return;
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(message)));
-  }
-
-  /// 删除单个缓存（确认对话框）。
-  Future<void> _deleteOne(CachedVideo c) async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (dialogCtx) => AlertDialog(
-        title: const Text('删除缓存'),
-        content: Text('确定删除《${c.title}》${_partLabel(c)}的缓存吗？'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogCtx, false),
-            child: const Text('取消'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(dialogCtx, true),
-            child: const Text('删除', style: TextStyle(color: kError)),
-          ),
-        ],
-      ),
-    );
-    if (confirmed != true || !mounted) return;
-    await _downloads.deleteCache(c.bvid, c.pageIndex);
-    _showSnack('已删除缓存');
-  }
-
-  /// 清空全部缓存（确认对话框）。
-  Future<void> _clearAll() async {
-    final total = _downloads.getCachedList().length;
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (dialogCtx) => AlertDialog(
-        title: const Text('清空缓存'),
-        content: Text(
-          '确定清空全部 $total 个视频的缓存吗？'
-          '将删除所有已下载的视频文件（${fmtBytes(_downloads.totalCacheSize())}），'
-          '离线将无法播放。',
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogCtx, false),
-            child: const Text('取消'),
-          ),
-          TextButton(
-            onPressed: () => Navigator.pop(dialogCtx, true),
-            child: const Text('清空', style: TextStyle(color: kError)),
-          ),
-        ],
-      ),
-    );
-    if (confirmed != true || !mounted) return;
-    await _downloads.cleanAllCache();
-    _showSnack('已清空缓存');
-  }
-
-  /// 缓存条目副标题：`第 N 集 · part标题 · 大小`；单 P 简化为 `大小`。
-  String _partLabel(CachedVideo c) {
-    final label = c.partTitle.isEmpty ? '' : '· ${c.partTitle}';
-    return c.pageIndex > 0 ? '第 ${c.pageIndex + 1} 集$label' : label;
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    final theme = Theme.of(context);
-    final items = _downloads.getCachedList();
-    final total = _downloads.totalCacheSize();
-    return DraggableScrollableSheet(
-      expand: false,
-      initialChildSize: .6,
-      minChildSize: .35,
-      maxChildSize: .9,
-      builder: (_, scrollCtrl) => Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(20, 16, 20, 4),
-            child: Text('缓存管理', style: theme.textTheme.titleLarge),
-          ),
-          Padding(
-            padding: const EdgeInsets.fromLTRB(20, 0, 20, 8),
-            child: Text(
-              items.isEmpty
-                  ? '暂无缓存视频（在播放页点「下载」即可离线观看）'
-                  : '共 ${items.length} 个视频 · ${fmtBytes(total)}'
-                        '（下载中的任务不会显示在列表里）',
-              style: theme.textTheme.bodySmall?.copyWith(
-                color: theme.colorScheme.onSurfaceVariant,
-              ),
-            ),
-          ),
-          const Divider(height: 1),
-          Expanded(
-            child: items.isEmpty
-                // 空态：细线插画 + 文案（文案走 UiCopyStore，可在设置页改写）
-                ? const AppStateView(
-                    kind: AppStateKind.empty,
-                    copyId: 'empty.cache',
-                    illustrationSeed: 'cache',
-                  )
-                : ListView(
-                    controller: scrollCtrl,
-                    padding: const EdgeInsets.only(bottom: 24),
-                    children: [
-                      for (final c in items)
-                        ListTile(
-                          leading: const Icon(
-                            Icons.check_circle_outline,
-                            color: kSuccess,
-                          ),
-                          title: Text(
-                            c.title,
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                          subtitle: Text(
-                            _partLabel(c).isEmpty
-                                ? fmtBytes(c.sizeBytes)
-                                : '${_partLabel(c)} · ${fmtBytes(c.sizeBytes)}',
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                          ),
-                          trailing: IconButton(
-                            tooltip: '删除缓存',
-                            icon: Icon(
-                              Icons.delete_outline,
-                              size: 20,
-                              color: theme.colorScheme.error,
-                            ),
-                            onPressed: () => _deleteOne(c),
-                          ),
-                        ),
-                    ],
-                  ),
-          ),
-          if (items.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.fromLTRB(20, 4, 20, 16),
-              child: SizedBox(
-                width: double.infinity,
-                child: OutlinedButton.icon(
-                  onPressed: _clearAll,
-                  style: OutlinedButton.styleFrom(
-                    foregroundColor: theme.colorScheme.error,
-                  ),
-                  icon: const Icon(Icons.delete_sweep_outlined, size: 18),
-                  label: const Text('清空缓存'),
-                ),
-              ),
-            ),
-        ],
-      ),
     );
   }
 }
@@ -1261,7 +1085,7 @@ const Map<String, String> _kCopyNotes = <String, String>{
   // 缓存
   'empty.cache': '缓存列表为空',
   'empty.cache.sub': '缓存为空的副文案',
-  'empty.cache.desc': '缓存管理弹层里的空态',
+  'empty.cache.desc': '缓存页空态的长说明',
   // 关注导入
   'empty.followings': '关注列表为空',
   // UP 主主页

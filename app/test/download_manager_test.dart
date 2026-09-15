@@ -3,6 +3,7 @@
 // - 不访问真实网络：取流与下载都注入 fake（内存写文件）
 // - 用临时目录作根目录，不依赖 path_provider 原生插件
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
@@ -60,6 +61,38 @@ PlayUrlFetcher _mp4Fetcher() {
     return const PlayUrlResult(
       quality: 32,
       mp4Url: 'http://fake.bilivideo.com/video.mp4',
+    );
+  };
+}
+
+/// 多档音频的取流 fake：**高档在前**（与 B 站实测的顺序不稳定一致），
+/// 第三条没有码率信息（验证「缺码率不参与比较」）。
+PlayUrlFetcher _multiAudioFetcher() {
+  return ({required String bvid, required int cid}) async {
+    return const PlayUrlResult(
+      quality: 80,
+      dashVideoUrls: ['http://fake.bilivideo.com/video.m4s'],
+      dashAudioUrls: [
+        'http://fake.bilivideo.com/a134.m4s',
+        'http://fake.bilivideo.com/a64.m4s',
+        'http://fake.bilivideo.com/a-unknown.m4s',
+      ],
+      dashAudioIds: [30232, 30216, 30280],
+      dashAudioBandwidths: [134000, 64000, 0],
+    );
+  };
+}
+
+/// 没有任何码率信息的取流 fake（旧解析/第三方响应）：退回第一条。
+PlayUrlFetcher _noBandwidthFetcher() {
+  return ({required String bvid, required int cid}) async {
+    return const PlayUrlResult(
+      quality: 80,
+      dashVideoUrls: ['http://fake.bilivideo.com/video.m4s'],
+      dashAudioUrls: [
+        'http://fake.bilivideo.com/first.m4s',
+        'http://fake.bilivideo.com/second.m4s',
+      ],
     );
   };
 }
@@ -312,5 +345,295 @@ void main() {
 
     expect(manager.isCached('BV1test', 0), isTrue);
     expect(manager.getCached('BV1test', 0)!.videoPath, oldPath);
+  });
+
+  // ---------------------------------------------------------------------------
+  // v2.29.0：仅音频缓存 / 音频档位选择 / 旧索引兼容 / 占用与回收
+  // ---------------------------------------------------------------------------
+
+  group('仅缓存音频（audioOnly）', () {
+    test('只请求音频流、不写视频文件，索引 videoPath 空 + audioOnly true', () async {
+      final dl = _FakeDownloader();
+      final m = buildManager(dl: dl);
+
+      await m.downloadVideo(_video(bvid: 'BV1audio'), 0, audioOnly: true);
+
+      expect(dl.urls, ['http://fake.bilivideo.com/audio.m4s'],
+          reason: '仅音频：一次请求，只要音频流');
+      final c = m.getCached('BV1audio', 0)!;
+      expect(c.audioOnly, isTrue);
+      expect(c.videoPath, isEmpty, reason: '仅音频缓存不存在视频文件');
+      expect(c.audioPath, endsWith('BV1audio_p1.audio.m4s'));
+      expect(c.sizeBytes, 1000, reason: '只算音频大小');
+      expect(await File(c.audioPath).exists(), isTrue);
+      // 目录里只能有音频那一个文件（没有视频、没有 .part）
+      final files = Directory('${tmp.path}/video_cache')
+          .listSync()
+          .map((e) => e.path.split(RegExp(r'[/\\]')).last)
+          .toList();
+      expect(files, ['BV1audio_p1.audio.m4s']);
+      // cid / 时长也落进索引（离线页构造 WhitelistVideo 要用）
+      expect(c.cid, 100);
+      expect(c.durationMs, 60000);
+    });
+
+    test('音频档位挑 bandwidth 最小的一条（顺序不可信）', () async {
+      final dl = _FakeDownloader();
+      final m = buildManager(fetcher: _multiAudioFetcher(), dl: dl);
+
+      await m.downloadVideo(_video(), 0, audioOnly: true);
+
+      expect(dl.urls, ['http://fake.bilivideo.com/a64.m4s'],
+          reason: '134kbps 在列表首位，但 64kbps 才是最小档');
+    });
+
+    test('音频码率信息缺失 → 退回第一条（与改动前一致）', () async {
+      final dl = _FakeDownloader();
+      final m = buildManager(fetcher: _noBandwidthFetcher(), dl: dl);
+
+      await m.downloadVideo(_video(), 0, audioOnly: true);
+
+      expect(dl.urls, ['http://fake.bilivideo.com/first.m4s']);
+    });
+
+    test('下载全部 P 也可以只要音频', () async {
+      final dl = _FakeDownloader();
+      final m = buildManager(dl: dl);
+
+      await m.downloadAllPages(_multiPageVideo(), audioOnly: true);
+
+      expect(m.cachedCount('BV1multi'), 3);
+      expect(m.getCachedList().every((c) => c.audioOnly), isTrue);
+      expect(dl.urls.length, 3, reason: '3 集 × 1 条音频流');
+      // 只请求音频流（注意宿主名 bilivideo.com 里也含 "video"，
+      // 不能用 contains('video') 判定）
+      expect(dl.urls.toSet(), {'http://fake.bilivideo.com/audio.m4s'});
+    });
+
+    test('视频没有音频流 → 仅音频下载失败且不写索引', () async {
+      final m = buildManager(fetcher: _mp4Fetcher());
+
+      await expectLater(
+        m.downloadVideo(_video(), 0, audioOnly: true),
+        throwsA(isA<StateError>()),
+      );
+      expect(m.isCached('BV1test', 0), isFalse);
+      expect(m.tasks.value['BV1test#0']!.status, DownloadStatus.failed);
+    });
+
+    test('整段缓存过的集改成仅音频：旧的 .video.m4s 当场删掉', () async {
+      final m = buildManager();
+      await m.downloadVideo(_video(), 0);
+      final videoPath = m.getCached('BV1test', 0)!.videoPath;
+      expect(await File(videoPath).exists(), isTrue);
+
+      await m.downloadVideo(_video(), 0, audioOnly: true);
+
+      final c = m.getCached('BV1test', 0)!;
+      expect(c.audioOnly, isTrue);
+      expect(await File(videoPath).exists(), isFalse,
+          reason: '覆盖式重下：不再被索引引用的视频文件必须清掉');
+      expect(c.sizeBytes, 1000);
+    });
+
+    test('删除仅音频缓存不报错（videoPath 为空是正常态）', () async {
+      final m = buildManager();
+      await m.downloadVideo(_video(), 0, audioOnly: true);
+      final audioPath = m.getCached('BV1test', 0)!.audioPath;
+
+      await m.deleteCache('BV1test', 0);
+
+      expect(m.getCached('BV1test', 0), isNull);
+      expect(await File(audioPath).exists(), isFalse);
+      expect(m.totalCacheSize(), 0);
+    });
+
+    test('混合状态（整段 + 仅音频）：总大小 / 单删 / 全清都正确', () async {
+      final m = buildManager();
+      await m.downloadVideo(_video(bvid: 'BV1full'), 0); // 1000 + 1000
+      await m.downloadVideo(_video(bvid: 'BV1only'), 0, audioOnly: true); // 1000
+
+      expect(m.totalCacheSize(), 3000);
+      final onlyAudio = m.getCached('BV1only', 0)!;
+      expect(m.cachedAllAudioOnly('BV1only'), isTrue);
+      expect(m.cachedAllAudioOnly('BV1full'), isFalse);
+      expect(m.cachedAllAudioOnly('BV1missing'), isFalse);
+
+      await m.deleteCache('BV1only', 0);
+      expect(m.totalCacheSize(), 2000);
+      expect(await File(onlyAudio.audioPath).exists(), isFalse);
+
+      await m.cleanAllCache();
+      expect(m.getCachedList(), isEmpty);
+      expect(m.totalCacheSize(), 0);
+      final leftover = Directory('${tmp.path}/video_cache').listSync();
+      expect(leftover, isEmpty, reason: '全清后媒体目录不应残留文件');
+    });
+  });
+
+  group('旧索引兼容（v2.28 及以前没有 audioOnly/cid/durationMs）', () {
+    test('缺字段按默认值读：audioOnly false / cid 0 / durationMs 0', () async {
+      // 手工写一份旧格式索引（只有 v2.28 及以前的字段）
+      final mediaDir = Directory('${tmp.path}/video_cache');
+      await mediaDir.create(recursive: true);
+      final video = File('${mediaDir.path}/BV1legacy_p1.video.m4s');
+      final audio = File('${mediaDir.path}/BV1legacy_p1.audio.m4s');
+      await video.writeAsBytes(List.filled(10, 1));
+      await audio.writeAsBytes(List.filled(10, 1));
+      await File('${tmp.path}/cache_index.json').writeAsString(jsonEncode({
+        'version': 1,
+        'items': [
+          {
+            'bvid': 'BV1legacy',
+            'title': '旧索引',
+            'cover': '',
+            'pageIndex': 0,
+            'partTitle': '',
+            'videoPath': video.path,
+            'audioPath': audio.path,
+            'sizeBytes': 20,
+            'cachedAt': '2026-01-01T00:00:00.000Z',
+            'upName': 'up主',
+          },
+        ],
+      }));
+
+      final m = buildManager();
+      await m.init();
+
+      final c = m.getCached('BV1legacy', 0)!;
+      expect(c.audioOnly, isFalse, reason: '旧索引没有该字段 → 默认 false（有画面）');
+      expect(c.cid, 0);
+      expect(c.durationMs, 0);
+      expect(m.isCached('BV1legacy', 0), isTrue);
+      expect(c.playablePath, video.path, reason: '非仅音频 → 离线源就是视频文件');
+      // 旧索引条目照常可删（v2.29 的清理路径不会回退）
+      await m.deleteCache('BV1legacy', 0);
+      expect(m.getCachedList(), isEmpty);
+    });
+
+    test('索引里的 sizeBytes 记 0（旧脏数据）也不影响展示兜底', () async {
+      final c = CachedVideo.fromJson({
+        'bvid': 'BV1x',
+        'videoPath': '/tmp/v.m4s',
+        'audioPath': '',
+        'cachedAt': 'not-a-date',
+      });
+      expect(c.sizeBytes, 0);
+      expect(c.pageIndex, 0);
+      expect(c.audioOnly, isFalse);
+      // cachedAt 解析失败 → 退回 now（不抛），照旧可读
+      expect(c.cachedAt.year, greaterThan(2000));
+    });
+  });
+
+  group('占用统计与回收（diskUsage / reclaimOrphans）', () {
+    test('分项占用：媒体（索引内）+ 中转音频 + 残留，各自独立计数', () async {
+      final m = buildManager();
+      await m.downloadVideo(_video(), 0); // video_cache 1000 + 1000
+      final mediaDir = Directory('${tmp.path}/video_cache');
+      // 残留：一个孤儿文件 + 一个 .part
+      await File('${mediaDir.path}/BV1ghost_p1.video.m4s')
+          .writeAsBytes(List.filled(300, 1));
+      await File('${mediaDir.path}/BV1half_p1.audio.m4s.part')
+          .writeAsBytes(List.filled(100, 1));
+      // 中转音频（audio_tmp：转写的临时 m4s + 16k wav）
+      final tmpDir = Directory('${tmp.path}/audio_tmp');
+      await tmpDir.create(recursive: true);
+      await File('${tmpDir.path}/BV1test_0.m4s').writeAsBytes(List.filled(200, 1));
+      await File('${tmpDir.path}/BV1test_0_16k.wav')
+          .writeAsBytes(List.filled(600, 1));
+
+      final usage = await m.diskUsage();
+
+      expect(usage.mediaBytes, 2000);
+      expect(usage.tmpAudioBytes, 800);
+      expect(usage.orphanBytes, 400);
+      expect(usage.orphanCount, 2);
+      expect(usage.totalBytes, 3200);
+      expect(usage.hasOrphans, isTrue);
+      expect(usage.hasTmpAudio, isTrue);
+    });
+
+    test('reclaimOrphans：删孤儿与 .part，不删索引内文件、不动 audio_tmp', () async {
+      final m = buildManager();
+      await m.downloadVideo(_video(), 0);
+      final c = m.getCached('BV1test', 0)!;
+      final mediaDir = Directory('${tmp.path}/video_cache');
+      final ghost = File('${mediaDir.path}/BV1ghost_p1.video.m4s');
+      final part = File('${mediaDir.path}/BV1half_p1.audio.m4s.part');
+      await ghost.writeAsBytes(List.filled(300, 1));
+      await part.writeAsBytes(List.filled(100, 1));
+      final tmpDir = Directory('${tmp.path}/audio_tmp');
+      await tmpDir.create(recursive: true);
+      final tmpAudio = File('${tmpDir.path}/BV1test_0.m4s');
+      await tmpAudio.writeAsBytes(List.filled(200, 1));
+
+      final result = await m.reclaimOrphans();
+
+      expect(result.files, 2);
+      expect(result.bytes, 400);
+      expect(await ghost.exists(), isFalse);
+      expect(await part.exists(), isFalse, reason: '崩溃留下的 .part 必须能回收');
+      expect(await File(c.videoPath).exists(), isTrue, reason: '索引内文件不能删');
+      expect(await File(c.audioPath).exists(), isTrue);
+      expect(await tmpAudio.exists(), isTrue, reason: 'audio_tmp 不归它管');
+      expect(m.getCachedList().length, 1, reason: '索引不受影响');
+
+      // 幂等：没有残留时返回 0，不误删任何东西
+      final again = await m.reclaimOrphans();
+      expect(again.files, 0);
+      expect(await File(c.videoPath).exists(), isTrue);
+    });
+
+    test('仅音频条目（videoPath 空）不产生「假孤儿」', () async {
+      final m = buildManager();
+      await m.downloadVideo(_video(), 0, audioOnly: true);
+
+      final usage = await m.diskUsage();
+
+      expect(usage.mediaBytes, 1000);
+      expect(usage.orphanCount, 0, reason: '空 videoPath 不能被当成孤儿路径');
+      final result = await m.reclaimOrphans();
+      expect(result.files, 0);
+      expect(m.isCached('BV1test', 0), isTrue);
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // v2.29.0：启动预热（main() 里 unawaited 调一次 init）——幂等 + 失败静默
+  // ---------------------------------------------------------------------------
+
+  group('init() 供启动预热复用：幂等 + 失败静默', () {
+    test('幂等：重复 init 只读一次盘（预热先跑过，页面再 init 不会重读）', () async {
+      await manager.downloadVideo(_video(), 0); // 落一份索引到磁盘
+
+      final fresh = buildManager(); // 同根目录的新实例（索引还没进内存）
+      await fresh.init();
+      expect(fresh.getCachedList(), hasLength(1), reason: '第一次 init 读到索引');
+
+      // 把盘上的索引改成「空的/坏掉的」：第二次 init 若真的重读，列表就会变空
+      await File('${tmp.path}/cache_index.json').writeAsString('{"items": []}');
+      await fresh.init();
+
+      expect(fresh.getCachedList(), hasLength(1),
+          reason: '第二次 init 应直接返回（幂等），以内存为准');
+    });
+
+    test('失败静默：索引损坏 / 读不到都不抛，按空索引处理', () async {
+      // 索引文件内容不是合法 JSON（写坏/断电截断的现场）
+      await File('${tmp.path}/cache_index.json').writeAsString('{这不是 JSON');
+      await expectLater(manager.init(), completes);
+      expect(manager.getCachedList(), isEmpty);
+
+      // 根目录指向一个不存在的路径（取不到应用目录的等价现场）：同样不抛
+      final broken = DownloadManager(
+        rootDir: Directory('${tmp.path}/nope/deeper'),
+        betweenTasks: Duration.zero,
+        retryDelay: Duration.zero,
+      );
+      await expectLater(broken.init(), completes);
+      expect(broken.getCachedList(), isEmpty);
+    });
   });
 }

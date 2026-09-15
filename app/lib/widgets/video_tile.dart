@@ -43,6 +43,13 @@ String fmtDuration(int seconds) {
 class VideoTile extends StatelessWidget {
   final WhitelistVideo video;
   final int cachedCount; // 该视频已缓存的集数（0 = 未缓存）
+
+  /// 已缓存的集是否**全部**是「仅音频」缓存（[DownloadManager.cachedAllAudioOnly]）。
+  ///
+  /// 角标要区分（「已缓存音频」）：仅音频缓存点进去没有画面，只写「已缓存」
+  /// 会让用户以为播放器坏了。默认 false = 与旧版逐字符一致。
+  final bool cachedAudioOnly;
+
   final bool selectMode;
   final bool selected;
   final VoidCallback? onTap;
@@ -54,6 +61,7 @@ class VideoTile extends StatelessWidget {
     super.key,
     required this.video,
     this.cachedCount = 0,
+    this.cachedAudioOnly = false,
     this.selectMode = false,
     this.selected = false,
     this.onTap,
@@ -75,7 +83,8 @@ class VideoTile extends StatelessWidget {
           children: [
             CoverImage(cover: video.cover),
             // 已缓存角标（封面左上角，与右下角「共 N 集」角标风格一致）：
-            // 多 P 部分缓存显示 `已缓存 n/m`，全部/单 P 显示 `已缓存`
+            // 多 P 部分缓存显示 `已缓存 n/m`，全部/单 P 显示 `已缓存`；
+            // 缓存全是仅音频时前缀换成「已缓存音频」（点进去没有画面）
             if (cachedCount > 0)
               Positioned(
                 left: 4,
@@ -90,8 +99,9 @@ class VideoTile extends StatelessWidget {
                   ),
                   child: Text(
                     video.isMultiPage && cachedCount < video.pageCount
-                        ? '已缓存 $cachedCount/${video.pageCount}'
-                        : '已缓存',
+                        ? '${cachedAudioOnly ? '已缓存音频' : '已缓存'}'
+                            ' $cachedCount/${video.pageCount}'
+                        : (cachedAudioOnly ? '已缓存音频' : '已缓存'),
                     style: const TextStyle(color: kPaper, fontSize: 10),
                   ),
                 ),

@@ -77,17 +77,61 @@ class PlayUrlResult {
   final List<String> dashVideoUrls;
 
   /// DASH 音频流地址列表（fnval=16 时存在）。
+  ///
+  /// ⚠️ **顺序不稳定**（2026-09 实测：有时 30216/64kbps 在前，有时
+  /// 30232/134kbps 在前）→ 需要确定档位时按 [dashAudioBandwidths] 挑，
+  /// 不要直接取 `.first`。
   final List<String> dashAudioUrls;
+
+  /// DASH 音频流的档位 id（`dash.audio[].id`，如 30216/30232/30280）；
+  /// 与 [dashAudioUrls] 一一对应，缺 id 时该位填 0。
+  ///
+  /// 只做展示/排查用（App 里没有「按档位选音频」的需求，选档按码率走）。
+  final List<int> dashAudioIds;
+
+  /// DASH 音频流的码率（`dash.audio[].bandwidth`，单位 bps）；
+  /// 与 [dashAudioUrls] 一一对应，缺值时该位填 0。
+  ///
+  /// 「仅缓存音频」按它挑最低档（实测 30 分钟：64kbps ≈15MB vs
+  /// 134kbps ≈30MB），见 [pickLowestBandwidthAudio]。
+  final List<int> dashAudioBandwidths;
 
   const PlayUrlResult({
     required this.quality,
     this.mp4Url,
     this.dashVideoUrls = const [],
     this.dashAudioUrls = const [],
+    this.dashAudioIds = const [],
+    this.dashAudioBandwidths = const [],
   });
 
   /// 是否拿到至少一条可播放的流。
   bool get hasStream => mp4Url != null || dashVideoUrls.isNotEmpty;
+}
+
+/// 从 DASH 音频流里挑**码率最低**的那条的 URL（没有音频流 → null）。
+///
+/// 为什么需要它：同一视频的 `dash.audio` 常有多档（实测 30216/64kbps 与
+/// 30232/134kbps 并存），而**列表顺序不稳定**（有时低档在前、有时高档在前）
+/// ——「仅缓存音频」直接取 `.first` 等于把省空间交给运气（30 分钟视频
+/// 15MB 还是 30MB）。码率信息全都缺失（旧解析 / 测试构造的样本）时退回
+/// 第一条，与改动前的行为一致。
+String? pickLowestBandwidthAudio(PlayUrlResult result) {
+  final urls = result.dashAudioUrls;
+  if (urls.isEmpty) return null;
+  final bandwidths = result.dashAudioBandwidths;
+  var bestIndex = 0;
+  var bestBandwidth = 0;
+  for (var i = 0; i < urls.length; i++) {
+    // 缺码率（0）的条目不参与比较，避免「未知名」被当成最小档
+    final bw = i < bandwidths.length ? bandwidths[i] : 0;
+    if (bw <= 0) continue;
+    if (bestBandwidth == 0 || bw < bestBandwidth) {
+      bestBandwidth = bw;
+      bestIndex = i;
+    }
+  }
+  return urls[bestIndex];
 }
 
 /// 番剧/电影（pgc）取流接口（`pgc/player/web/playurl`）的解析结果。
@@ -104,6 +148,8 @@ class PgcPlayUrlResult extends PlayUrlResult {
     super.mp4Url,
     super.dashVideoUrls = const [],
     super.dashAudioUrls = const [],
+    super.dashAudioIds = const [],
+    super.dashAudioBandwidths = const [],
     required this.isPreview,
   });
 }
@@ -1573,14 +1619,22 @@ class BiliApi {
     final dash = d['dash'] as Map<String, dynamic>?;
     final videoUrls = <String>[];
     final audioUrls = <String>[];
+    final audioIds = <int>[];
+    final audioBandwidths = <int>[];
     if (dash != null) {
       for (final v in (dash['video'] as List? ?? const [])) {
         final url = (v as Map<String, dynamic>)['baseUrl'] as String?;
         if (url != null && url.isNotEmpty) videoUrls.add(url);
       }
       for (final a in (dash['audio'] as List? ?? const [])) {
-        final url = (a as Map<String, dynamic>)['baseUrl'] as String?;
-        if (url != null && url.isNotEmpty) audioUrls.add(url);
+        final m = a as Map<String, dynamic>;
+        final url = m['baseUrl'] as String?;
+        if (url == null || url.isEmpty) continue;
+        audioUrls.add(url);
+        // 档位 id / 码率与 url 一一对应（缺字段填 0）——「仅缓存音频」靠
+        // 码率挑最低档，顺序不可信（见 PlayUrlResult.dashAudioUrls 注释）
+        audioIds.add((m['id'] as num?)?.toInt() ?? 0);
+        audioBandwidths.add((m['bandwidth'] as num?)?.toInt() ?? 0);
       }
     }
     return PlayUrlResult(
@@ -1588,6 +1642,8 @@ class BiliApi {
       mp4Url: mp4Url,
       dashVideoUrls: videoUrls,
       dashAudioUrls: audioUrls,
+      dashAudioIds: audioIds,
+      dashAudioBandwidths: audioBandwidths,
     );
   }
 
@@ -1683,6 +1739,8 @@ class BiliApi {
       mp4Url: result.mp4Url,
       dashVideoUrls: result.dashVideoUrls,
       dashAudioUrls: result.dashAudioUrls,
+      dashAudioIds: result.dashAudioIds,
+      dashAudioBandwidths: result.dashAudioBandwidths,
       isPreview: isPreview,
     );
   }

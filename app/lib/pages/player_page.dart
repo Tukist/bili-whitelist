@@ -843,6 +843,23 @@ class _PlayerPageState extends State<PlayerPage>
   // 听视频（纯音频）模式：隐藏画面，音频继续
   bool _listenMode = false;
 
+  /// 本次播放的源是「仅音频缓存」（只缓存了音频 → 没有画面可渲染）。
+  ///
+  /// 与 [_listenMode] 的区别：听视频是**用户主动**隐藏画面（源本来有画面）；
+  /// 这个是**源本身没有视频轨**——不提示的话用户会以为播放器坏了（黑屏有声）。
+  /// 网络取流 / 整段缓存的路径一律复位 false（见 [_setAudioOnlyPlayback]）。
+  bool _audioOnlyPlayback = false;
+
+  /// 置位/复位「仅音频缓存播放」标记（值不变则不动，避免多余重建）。
+  void _setAudioOnlyPlayback(bool value) {
+    if (_audioOnlyPlayback == value) return;
+    if (!mounted) {
+      _audioOnlyPlayback = value;
+      return;
+    }
+    setState(() => _audioOnlyPlayback = value);
+  }
+
   // 媒体通知（v2.25.x：B 站式播放通知 + 耳机按键控制）
   // ---------------------------------------------------------------------
   // 播放状态变化时调 _syncNowPlaying 把标题/UP/封面/状态推给原生媒体通知；原生侧
@@ -1073,8 +1090,16 @@ class _PlayerPageState extends State<PlayerPage>
     _videoShot = widget.videoShotService ?? VideoShotService();
     // 历史记录续播：初始定位到对应分 P（越界 / 单 P 回落第 0 集）。
     // 必须在 _init 之前设置，_maybeRestoreProgress 按 _currentPageIndex 取进度。
+    //
+    // v2.29.0：**没有分 P 信息时不夹取**（原实现恒夹到 0）。离线缓存页只有
+    // `CachedVideo`（bvid/cid/pageIndex），拿不到整条 pages 列表 → 现场构造的
+    // [WhitelistVideo.pages] 为 null；若夹到 0，缓存查找键会变成 (bvid, 0)，
+    // 点「第 3 集」却播第 1 集的缓存。缓存键本来就是 (bvid, pageIndex)，
+    // 无 pages 时按传入下标原样使用才是对的（|>0 只可能来自离线缓存页）。
     final pages = _video.pages;
-    final maxIdx = (pages == null || pages.isEmpty) ? 0 : pages.length - 1;
+    final maxIdx = (pages == null || pages.isEmpty)
+        ? widget.initialPageIndex
+        : pages.length - 1;
     _currentPageIndex = widget.initialPageIndex < 0
         ? 0
         : (widget.initialPageIndex > maxIdx ? maxIdx : widget.initialPageIndex);
@@ -1424,13 +1449,27 @@ class _PlayerPageState extends State<PlayerPage>
     final cached =
         _downloads.getCached(_video.bvid, _currentPageIndex);
     if (cached != null) {
-      debugPrint('[player_page] 本地缓存播放 video=${cached.videoPath} '
+      // 仅音频缓存（videoPath 为空）：**把音频文件当 videoUrl 传**。
+      //
+      // 为什么走这条通道而不是 audioUrl：播放器原生侧 `prepare` 在 audioUrl
+      // 为空时只用 videoUrl 建一个 ProgressiveMediaSource；Dart 侧 videoUrl
+      // 又是必填位置参数。音频 m4s 是合法单流（AAC），当 videoUrl 传进去 →
+      // 走同一个单流分支，有声音、能 seek，原生一行不用改（v2.29.0 已在
+      // 模拟器上实测：有声、可拖动进度、不留错误）。
+      final asAudioOnly = cached.audioOnly &&
+          cached.videoPath.isEmpty &&
+          cached.audioPath.isNotEmpty;
+      final mediaPath = asAudioOnly ? cached.audioPath : cached.videoPath;
+      final sideAudio = asAudioOnly || cached.audioPath.isEmpty
+          ? null
+          : Uri.file(cached.audioPath).toString();
+      debugPrint('[player_page] 本地缓存播放'
+          '${asAudioOnly ? '（仅音频）' : ''} video=$mediaPath '
           'audio=${cached.audioPath}');
+      _setAudioOnlyPlayback(asAudioOnly);
       await player.setDataSource(
-        Uri.file(cached.videoPath).toString(),
-        audioUrl: cached.audioPath.isEmpty
-            ? null
-            : Uri.file(cached.audioPath).toString(),
+        Uri.file(mediaPath).toString(),
+        audioUrl: sideAudio,
         positionMs: positionMs,
         title: _video.title,
         artist: _video.upName,
@@ -1441,6 +1480,8 @@ class _PlayerPageState extends State<PlayerPage>
       _netStreamDeadlineMs = null;
       return;
     }
+    // 走网络流：一定不是「仅音频缓存」播放（换源/新集/未缓存），复位标记
+    _setAudioOnlyPlayback(false);
     final epId = _video.epId; // 番剧集 ep_id（普通视频/旧番剧数据 = null）
     debugPrint(
         '[player_page] 取流 bvid=${_video.bvid} cid=$_currentCid epId=$epId');
@@ -4121,6 +4162,10 @@ class _PlayerPageState extends State<PlayerPage>
       CachedVideo.keyOf(_video.bvid, _currentPageIndex)];
 
   /// 点击下载按钮：未缓存 → 下载菜单；已缓存 → 缓存操作菜单；下载中不响应。
+  ///
+  /// v2.29.0 起菜单里多了「仅缓存音频」（省空间：30 分钟视频 15~36MB vs
+  /// 整段 200~500MB）；已缓存时也给这一项——已整段缓存过的视频可以重下成
+  /// 仅音频把空间收回来（覆盖式重下，旧的视频文件会被清掉）。
   void _onDownloadTap() {
     final task = _currentTask;
     if (task != null &&
@@ -4130,6 +4175,11 @@ class _PlayerPageState extends State<PlayerPage>
     }
     final cached = _currentCached;
     final partTitle = _currentPartTitle;
+    // 已缓存时把缓存形态写进副标题：「仅缓存音频」的集点进来没有画面，
+    // 这里先说清楚，别让用户以为是播放器坏了
+    final subtitle = cached != null && cached.audioOnly
+        ? '${partTitle.isEmpty ? _video.title : partTitle} · 仅缓存音频'
+        : partTitle;
     showModalBottomSheet<void>(
       context: context,
       backgroundColor: const Color(0xFF202023),
@@ -4142,7 +4192,7 @@ class _PlayerPageState extends State<PlayerPage>
               title: Text(cached != null ? '缓存操作' : '离线下载',
                   style: const TextStyle(color: kPlayerOn, fontSize: 15)),
               subtitle: Text(
-                partTitle,
+                subtitle,
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
                 style: const TextStyle(color: kPlayerOnDim, fontSize: 12),
@@ -4160,6 +4210,16 @@ class _PlayerPageState extends State<PlayerPage>
                   _confirmDownloadPage(_currentPageIndex);
                 },
               ),
+              ListTile(
+                leading: const Icon(Icons.audiotrack_outlined,
+                    color: kPlayerOn),
+                title: const Text('仅缓存音频（省空间，无画面）',
+                    style: TextStyle(color: kPlayerOn, fontSize: 15)),
+                onTap: () {
+                  Navigator.pop(sheetCtx);
+                  _confirmDownloadPage(_currentPageIndex, audioOnly: true);
+                },
+              ),
               if (_video.isMultiPage)
                 ListTile(
                   leading: const Icon(Icons.download_done,
@@ -4172,16 +4232,39 @@ class _PlayerPageState extends State<PlayerPage>
                     _confirmDownloadAll();
                   },
                 ),
+              if (_video.isMultiPage)
+                ListTile(
+                  leading: const Icon(Icons.audiotrack_outlined,
+                      color: kPlayerOn),
+                  title: Text('仅缓存音频（全部 ${_video.pageCount} 集）',
+                      style:
+                          const TextStyle(color: kPlayerOn, fontSize: 15)),
+                  onTap: () {
+                    Navigator.pop(sheetCtx);
+                    _confirmDownloadAll(audioOnly: true);
+                  },
+                ),
             ] else ...[
               ListTile(
                 leading: const Icon(Icons.refresh, color: kPlayerOn),
-                title: const Text('重新下载',
+                title: const Text('重新下载（视频+音频）',
                     style: TextStyle(color: kPlayerOn, fontSize: 15)),
                 onTap: () {
                   Navigator.pop(sheetCtx);
                   _confirmDownloadPage(_currentPageIndex);
                 },
               ),
+              if (!cached.audioOnly)
+                ListTile(
+                  leading: const Icon(Icons.audiotrack_outlined,
+                      color: kPlayerOn),
+                  title: const Text('改为仅缓存音频（省空间，无画面）',
+                      style: TextStyle(color: kPlayerOn, fontSize: 15)),
+                  onTap: () {
+                    Navigator.pop(sheetCtx);
+                    _confirmDownloadPage(_currentPageIndex, audioOnly: true);
+                  },
+                ),
               ListTile(
                 leading: Icon(Icons.delete_outline,
                     color: Theme.of(context).colorScheme.error),
@@ -4202,17 +4285,23 @@ class _PlayerPageState extends State<PlayerPage>
   }
 
   /// 确认下载本集（提示消耗流量）→ 入队。
-  Future<void> _confirmDownloadPage(int pageIndex) async {
+  ///
+  /// [audioOnly] = true：只下音频（文案标明「无画面」，别让用户事后才发现）。
+  Future<void> _confirmDownloadPage(int pageIndex, {bool audioOnly = false}) async {
     final pages = _pages;
     final partTitle = pages != null && pageIndex < pages.length
         ? pages[pageIndex].part
         : _currentPartTitle;
+    final name = partTitle.isEmpty ? _video.title : partTitle;
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogCtx) => AlertDialog(
         title: const Text('离线下载'),
-        content: Text('将下载《${partTitle.isEmpty ? _video.title : partTitle}》'
-            '到本地缓存（约需网络流量），之后可在无网时离线播放。'),
+        content: Text(audioOnly
+            ? '将只下载《$name》的「音频」到本地缓存（体积小得多，'
+                '离线播放时没有画面）。'
+            : '将下载《$name》'
+                '到本地缓存（约需网络流量），之后可在无网时离线播放。'),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx, false),
@@ -4226,18 +4315,21 @@ class _PlayerPageState extends State<PlayerPage>
       ),
     );
     if (confirmed != true || !mounted) return;
-    _startDownloadPage(pageIndex);
+    _startDownloadPage(pageIndex, audioOnly: audioOnly);
   }
 
   /// 确认下载全部 P（提示流量）→ 逐集入队。
-  Future<void> _confirmDownloadAll() async {
+  Future<void> _confirmDownloadAll({bool audioOnly = false}) async {
     final n = _video.pageCount;
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (dialogCtx) => AlertDialog(
         title: const Text('离线下载'),
-        content: Text('将依次下载全部 $n 集到本地缓存'
-            '（${n > 1 ? '流量较大，' : ''}完成后可在无网时离线播放）。'),
+        content: Text(audioOnly
+            ? '将依次只下载全部 $n 集的「音频」到本地缓存'
+                '（体积小得多，离线播放时没有画面）。'
+            : '将依次下载全部 $n 集到本地缓存'
+                '（${n > 1 ? '流量较大，' : ''}完成后可在无网时离线播放）。'),
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx, false),
@@ -4251,17 +4343,19 @@ class _PlayerPageState extends State<PlayerPage>
       ),
     );
     if (confirmed != true || !mounted) return;
-    _startDownloadAll();
+    _startDownloadAll(audioOnly: audioOnly);
   }
 
   /// 启动单集下载（入队后立即返回；完成/失败用 SnackBar 反馈）。
-  void _startDownloadPage(int pageIndex) {
-    final future = _downloads.downloadVideo(_video, pageIndex);
+  void _startDownloadPage(int pageIndex, {bool audioOnly = false}) {
+    final future =
+        _downloads.downloadVideo(_video, pageIndex, audioOnly: audioOnly);
     future.then((_) {
       final cached =
           _downloads.getCached(_video.bvid, pageIndex);
       if (mounted) {
-        _showSnack('已缓存：${cached?.partTitle ?? '第 ${pageIndex + 1} 集'}');
+        _showSnack('已缓存：${cached?.partTitle ?? '第 ${pageIndex + 1} 集'}'
+            '${audioOnly ? '（仅音频）' : ''}');
       }
     }).catchError((Object e) {
       if (mounted) _showSnack('下载失败：${_shortErr(e)}');
@@ -4269,9 +4363,12 @@ class _PlayerPageState extends State<PlayerPage>
   }
 
   /// 启动全部 P 下载（逐集入队，内部串行执行）。
-  void _startDownloadAll() {
-    _downloads.downloadAllPages(_video).then((_) {
-      if (mounted) _showSnack('全部 ${_video.pageCount} 集已缓存');
+  void _startDownloadAll({bool audioOnly = false}) {
+    _downloads.downloadAllPages(_video, audioOnly: audioOnly).then((_) {
+      if (mounted) {
+        _showSnack('全部 ${_video.pageCount} 集已缓存'
+            '${audioOnly ? '（仅音频）' : ''}');
+      }
     }).catchError((Object e) {
       if (mounted) _showSnack('下载未完成：${_shortErr(e)}');
     });
@@ -4864,6 +4961,45 @@ class _PlayerPageState extends State<PlayerPage>
             ),
           // 2. 听视频占位界面（封面 + 标题 + 提示，点按恢复画面）
           if (_listenMode) _buildListenPlaceholder(),
+          // 2.05 仅音频缓存占位界面：本次源**本身没有视频轨**（缓存时只下载
+          //      了音频），纹理永远出不来画面 → 用封面 + 一句说明顶住，
+          //      否则用户只看到黑屏，以为播放器坏了。不拦点按（手势/控制层
+          //      要照常可用），所以套 IgnorePointer。
+          if (_audioOnlyPlayback && !_listenMode)
+            Positioned.fill(
+              child: IgnorePointer(
+                child: Center(
+                  child: AspectRatio(
+                    aspectRatio: _aspectRatio,
+                    child: Stack(
+                      fit: StackFit.expand,
+                      children: [
+                        const ColoredBox(color: Colors.black),
+                        // 封面为空则不构建图片（零请求，与封面占位层同约定），
+                        // 只剩底部的说明文字
+                        if (_video.cover.isNotEmpty)
+                          CoverImage(cover: _video.cover),
+                        // 底部压一层黑雾 + 说明，保证封面再花也读得清
+                        Align(
+                          alignment: Alignment.bottomCenter,
+                          child: Container(
+                            width: double.infinity,
+                            padding: const EdgeInsets.symmetric(
+                                horizontal: 12, vertical: 8),
+                            color: kInkBlack.withValues(alpha: .6),
+                            child: const Text(
+                              '仅缓存了音频：无画面，可正常听声音',
+                              textAlign: TextAlign.center,
+                              style: TextStyle(color: kPaper, fontSize: 12),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
           // 2.1 封面占位层（「封面放大变成播放界面」的假转场）
           //     ───────────────────────────────────────────────────────
           //     为什么是「假」：播放画面是原生纹理（BiliDashTexture），Hero

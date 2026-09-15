@@ -54,6 +54,14 @@ class SherpaAudioSource {
   /// 临时音频目录名（应用支持目录下）。
   static const String tmpDirName = 'audio_tmp';
 
+  /// 解析中转音频目录路径（纯函数，不创建目录）。
+  ///
+  /// **全 App 唯一**的 `audio_tmp/` 路径来源：实例方法 [_audioTmpDir] 与
+  /// 缓存占用统计（[DownloadManager.diskUsage] / [DownloadManager.reclaimOrphans]
+  /// 所在的 download_manager.dart）都走这里，避免两处各拼一个路径后不一致。
+  static Future<Directory> tmpAudioDir(Directory root) async =>
+      Directory('${root.path}/$tmpDirName');
+
   final DownloadManager _manager;
   final PlayUrlFetcher? _fetchOverride;
   final FileDownloader? _downloadOverride;
@@ -65,9 +73,49 @@ class SherpaAudioSource {
       _rootDirOverride ?? await getApplicationSupportDirectory();
 
   Future<Directory> _audioTmpDir() async {
-    final dir = Directory('${(await _rootDir()).path}/$tmpDirName');
+    final dir = await tmpAudioDir(await _rootDir());
     await dir.create(recursive: true);
     return dir;
+  }
+
+  /// 清理中转音频：删掉 `audio_tmp/` 下的全部文件（临时 m4s + 16k wav），
+  /// 返回 `(files, bytes)`。
+  ///
+  /// 为什么需要：这个目录此前**全项目没有任何删除代码**，而 16k 单声道
+  /// PCM = 32 kB/s，30 分钟一集的 wav 就约 57MB（比音频流本体还大）。
+  ///
+  /// 代价（可接受）：删掉后下次实时转写要重新下载 + 重新转码（几秒~十几秒）。
+  /// **不动** [getAudioPath] 里「离线缓存 audioPath 存在就复用」的判断——
+  /// 那条复用的是 `video_cache/` 里的音频，不属于本目录，删这里不影响它；
+  /// 本目录内「已下载过就复用」的幂等逻辑照旧（只是复用对象被清掉了）。
+  Future<({int files, int bytes})> cleanTmpAudio() async {
+    final root = await _rootDir();
+    final dir = await tmpAudioDir(root);
+    var files = 0;
+    var bytes = 0;
+    try {
+      if (await dir.exists()) {
+        await for (final e in dir.list()) {
+          if (e is! File) continue; // 子目录不动（本目录只放文件）
+          var length = 0;
+          try {
+            length = await e.length();
+          } catch (_) {
+            length = 0;
+          }
+          try {
+            await e.delete();
+            files++;
+            bytes += length;
+          } catch (_) {
+            // 单个文件占用中删不掉：跳过，不阻断其余
+          }
+        }
+      }
+    } catch (_) {
+      // 目录不可读（权限/并发删除）：按已知结果返回
+    }
+    return (files: files, bytes: bytes);
   }
 
   /// 当前集音频文件路径：

@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
+import 'cache/download_manager.dart';
 import 'pages/playlist_page.dart';
 import 'services/inbox_card_style_store.dart';
 import 'services/theme_store.dart';
@@ -25,8 +26,29 @@ void main() {
   // 读已保存的**信箱卡片样式**（v2.21.0+）：同上，首帧即用用户选的版式，
   // 不先闪一下默认版式。store 内部读失败静默（回退默认）。
   unawaited(InboxCardStyleStore.instance.ensureLoaded());
+  // 预热离线缓存索引（v2.29.0 修复「冷启动入口缺计数」）：索引是**懒加载**的（[DownloadManager.init]
+  // 原先只由合集页 / 离线缓存页 / 播放页触发），而「个人」页设置区的
+  // 「缓存管理」入口文案直接读 [DownloadManager.cached]
+  // （`缓存管理（N 个视频 · X）`）——冷启动直奔「个人」页时索引还没进内存，
+  // 入口只剩「缓存管理」四个字，得先绕去别的页面才补上。启动预热一次就
+  // 没这个空窗（幂等 + 失败静默 + 不阻塞首帧，见 [preheatCacheIndex]）。
+  unawaited(preheatCacheIndex());
   runApp(const BiliWhitelistApp());
 }
+
+/// 冷启动预热：把离线缓存索引（`cache_index.json`）读进 [DownloadManager]。
+///
+/// 为什么选「启动时预热一次」而不是「入口自己加载一次」：索引只是一份
+/// 几十 KB 的 JSON，读盘代价远小于让用户先看到一次错误的空计数；而且入口
+/// 的任何宿主（「个人」页 / 弹层 / 将来的页面）都自动受益，不必各自记得 init。
+///
+/// 三条硬要求都落在被调用的 [DownloadManager.init] 上：
+/// - **幂等**：内部 `_indexLoaded` 标记保证只读一次盘，各页面后续的 `init()`
+///   直接返回（预热先跑过也不会让它们多读一遍）
+/// - **失败静默**：文件不存在 / 索引损坏 / 目录读不到，都在 DownloadManager
+///   内部被 catch 掉（视为空索引），这里不会抛
+/// - **不阻塞首帧**：调用方用 `unawaited(...)` 不 await，它自己异步落地
+Future<void> preheatCacheIndex() => DownloadManager.instance.init();
 
 /// amoTV —— B 站白名单点播 App。
 ///

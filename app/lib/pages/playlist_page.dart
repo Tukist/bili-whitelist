@@ -26,6 +26,7 @@ import '../utils/relative_time.dart';
 import '../widgets/add_success_button.dart';
 import '../widgets/app_block.dart';
 import '../widgets/app_state_view.dart';
+import '../widgets/collection_dialogs.dart';
 import '../widgets/favorites_import_dialog.dart';
 import '../widgets/manage_panel.dart';
 import '../widgets/pgc_import_dialog.dart';
@@ -586,28 +587,23 @@ class _PlaylistPageState extends State<PlaylistPage> {
     }
   }
 
-  /// 新建合集：去重后写入 collections → 持久化。
-  Future<void> _createCollection(String name) async {
-    name = name.trim();
-    if (name.isEmpty) {
-      _showSnack('请输入合集名称');
+  /// 新建合集：校验后写入 collections → 持久化。
+  ///
+  /// 首页建的永远是**顶层**合集（[parentPath] 留空）；建子合集在合集页里做
+  /// （[CollectionPage] 传自己的路径进来）。路径拼接与同名/保留名校验都集中在
+  /// 模型层的 [createSubCollection]，这里只管提示与落库。
+  Future<void> _createCollection(String name, {String parentPath = ''}) async {
+    final isSub = normalizeCollectionPath(parentPath).isNotEmpty;
+    if (name.trim().isEmpty) {
+      _showSnack(isSub ? '请输入子合集名称' : '请输入合集名称');
       return;
     }
-    if (name == kUncategorizedLabel) {
-      _showSnack('合集名不能为「$kUncategorizedLabel」');
-      return;
+    try {
+      final next = createSubCollection(_data, parentPath, name);
+      await _saveAndRefresh(next);
+    } on CollectionException catch (e) {
+      _showSnack(e.message);
     }
-    if (_data.collections.any((c) => c.name == name)) {
-      _showSnack('合集「$name」已存在');
-      return;
-    }
-    final next = _data.copyWith(
-      collections: [
-        ..._data.collections,
-        CollectionInfo(name: name, createdAt: DateTime.now().toIso8601String()),
-      ],
-    );
-    await _saveAndRefresh(next);
   }
 
   /// 打开收藏夹总览页（v2.17.7+ 首页固定「收藏夹」卡）。
@@ -819,41 +815,19 @@ class _PlaylistPageState extends State<PlaylistPage> {
   /// 弹输入框收名字，再交给 [_createCollection] 走原来的创建流程
   /// （去重 → 写 Gist → 写本地缓存 → 刷新列表，逻辑与设置页时代完全一致）。
   ///
-  /// 校验失败（空名 / 重名 / 保留名）仍由 [_createCollection] 弹提示；
+  /// 校验失败（空名 / 重名 / 保留名 / 带 `/`）仍由 [_createCollection] 弹提示；
   /// 此时对话框已关闭，用户重新点入口填一次即可（与重命名对话框同风格）。
+  /// 对话框本体在 [collection_dialogs.dart]（与合集页的「新建子合集」同一份）。
   Future<void> _showCreateCollectionDialog() async {
-    final ctrl = TextEditingController();
-    final name = await showDialog<String>(
-      context: context,
-      builder: (dialogCtx) => AlertDialog(
-        title: const Text('新建合集'),
-        content: TextField(
-          controller: ctrl,
-          autofocus: true,
-          decoration: const InputDecoration(
-            labelText: '合集名称',
-            border: OutlineInputBorder(),
-            isDense: true,
-          ),
-          onSubmitted: (v) => Navigator.pop(dialogCtx, v),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(dialogCtx),
-            child: const Text('取消'),
-          ),
-          FilledButton(
-            onPressed: () => Navigator.pop(dialogCtx, ctrl.text),
-            child: const Text('创建'),
-          ),
-        ],
-      ),
-    );
+    final name = await showCreateCollectionDialog(context);
     if (name == null) return;
     await _createCollection(name);
   }
 
-  /// 打开合集管理面板（列出合集 + 重命名/删除）。
+  /// 打开合集管理面板（列出**顶层**合集 + 移动到其他合集/重命名/删除）。
+  ///
+  /// 只列顶层：子合集在各自所属的合集页里管理（[CollectionPage] 的子合集卡
+  /// 左滑），首页在这里铺开整棵树只会让人看不出「谁在谁下面」。
   void _openCollectionManage() {
     showModalBottomSheet<void>(
       context: context,
@@ -861,75 +835,90 @@ class _PlaylistPageState extends State<PlaylistPage> {
       useSafeArea: true,
       builder: (_) => _CollectionManageSheet(
         // 每次 setState 时重新从页面拉取最新合集列表（操作成功后即时刷新）
-        collectionsOf: () => _data.collections,
-        countOf: (name) =>
-            _data.videos.where((v) => v.collection == name).length,
+        pathsOf: () => [
+          for (final c in _data.collections)
+            if (c.depth == 0) c.name,
+        ],
+        // 移动目标可以是任意层级的合集（含子合集）→ 面板里另外拉一份全量
+        allPathsOf: () => [for (final c in _data.collections) c.name],
+        countOf: (path) =>
+            _data.videos.where((v) => v.collection == path).length,
+        childCountOf: (path) =>
+            collectionChildrenOf(_data, path).length,
         onRename: _renameCollection,
         onDelete: _deleteCollection,
-        onMove: _moveCollectionInto,
+        onMove: _moveCollectionUnder,
       ),
     );
   }
 
-  /// 重命名合集：校验（保留名/重名）→ 同步引用 → 落库刷新。
-  Future<void> _renameCollection(String oldName, String newName) async {
+  /// 重命名合集：校验（保留名/同级重名）→ 级联同步子孙与视频引用 → 落库刷新。
+  ///
+  /// [newName] 是**单段新名**，模型层只替换路径最后一段（层级不变）。
+  Future<void> _renameCollection(String path, String newName) async {
     final neu = newName.trim();
-    if (neu == oldName) {
+    if (neu == collectionLocalName(path)) {
       _showSnack('新旧名相同，未改动');
       return;
     }
-    if (neu == kUncategorizedLabel) {
-      _showSnack('合集名不能为「$kUncategorizedLabel」');
-      return;
-    }
     try {
-      final next = renameCollection(_data, oldName, neu);
+      final next = renameCollection(_data, path, neu);
       await _saveAndRefresh(next);
     } on CollectionException catch (e) {
       _showSnack(e.message);
     }
   }
 
-  /// 删除合集：定义移除 + 视频回未分类（不删视频）→ 落库刷新。
-  Future<void> _deleteCollection(String name) async {
+  /// 删除合集：定义移除 + 直属视频回未分类 + 直属子合集上提一级（都不删）→
+  /// 落库刷新。
+  Future<void> _deleteCollection(String path) async {
     try {
-      final next = deleteCollection(_data, name);
+      final next = deleteCollection(_data, path);
       await _saveAndRefresh(next);
     } on CollectionException catch (e) {
       _showSnack(e.message);
     }
   }
 
-  /// 把源合集整体并入目标合集（管理面板「移动到…」）→ 落库刷新。
+  /// 把源合集**嵌套**到目标合集下面（管理面板「移动到…」）→ 落库刷新。
   ///
-  /// 语义见 [moveCollectionInto]：源合集视频改挂目标、源合集定义删除、目标
-  /// 合集内顺序重排（并入的排到末尾）。校验失败（源/目标不存在）走同一套
-  /// SnackBar 提示，与 rename/delete 一致。
-  Future<void> _moveCollectionInto(String source, String target) async {
+  /// 语义见 [moveCollectionUnder]：源合集**不被删除**，它自己、它的视频、它的
+  /// 子孙结构整体挪到目标下面（只换路径前缀）；[target] 为空串 = 移回顶层。
+  /// 校验失败（不存在 / 防环 / 同名冲突）走同一套 SnackBar 提示，与 rename /
+  /// delete 一致。
+  Future<void> _moveCollectionUnder(String source, String target) async {
     try {
-      final next = moveCollectionInto(_data, source, target);
+      final next = moveCollectionUnder(_data, source, target);
       await _saveAndRefresh(next);
-      _showSnack('已把「$source」并入「$target」');
+      _showSnack(target.isEmpty
+          ? '已把「${collectionDisplay(source)}」移到顶层'
+          : '已把「${collectionDisplay(source)}」移动到'
+              '「${collectionDisplay(target)}」下面');
     } on CollectionException catch (e) {
       _showSnack(e.message);
     }
   }
 
   /// 合集卡左滑「重命名」：弹与管理面板**同一个**对话框，再走
-  /// [_renameCollection]（校验 → 同步引用 → 写 Gist → 刷新）。
-  Future<void> _renameCollectionFromCard(String name) async {
-    final newName = await _showRenameCollectionDialog(context, name);
+  /// [_renameCollection]（校验 → 级联同步引用 → 写 Gist → 刷新）。
+  Future<void> _renameCollectionFromCard(String path) async {
+    final newName = await showRenameCollectionDialog(context, path);
     if (newName == null) return;
-    await _renameCollection(name, newName);
+    await _renameCollection(path, newName);
   }
 
   /// 合集卡左滑「删除」：弹与管理面板**同一个**确认框，再走
   /// [_deleteCollection]。视频数口径与 [_openCollectionManage] 的 `countOf` 一致。
-  Future<void> _deleteCollectionFromCard(String name) async {
-    final count = _data.videos.where((v) => v.collection == name).length;
-    final confirmed = await _showDeleteCollectionDialog(context, name, count);
+  Future<void> _deleteCollectionFromCard(String path) async {
+    final count = _data.videos.where((v) => v.collection == path).length;
+    final confirmed = await showDeleteCollectionDialog(
+      context,
+      path,
+      count,
+      childCount: collectionChildrenOf(_data, path).length,
+    );
     if (confirmed != true) return;
-    await _deleteCollection(name);
+    await _deleteCollection(path);
   }
 
   // ---------------------------------------------------------------------------
@@ -942,26 +931,39 @@ class _PlaylistPageState extends State<PlaylistPage> {
   /// key 用空串 `''`，与 [WhitelistData.sortedVideos] / [CollectionPage]
   /// 的口径一致（统计表里也是空串）。统计还没加载完时取到 null →
   /// 卡片只少一个「N 天前更新」角标和一条进度条，不影响列表渲染。
+  ///
+  /// v2.30.0 起首页**只列顶层合集**（`depth == 0`）：子合集在自己的父合集
+  /// 页面里展示（两级导航 → 多层导航），否则深层合集会在首页平铺成一片，
+  /// 看不出层级。视频数只算**直属视频**（与 [WhitelistData.sortedVideos]
+  /// 的精确匹配一致），子合集数另算一行提示。
   List<_CollectionCardData> _cards() {
     final cards = <_CollectionCardData>[];
-    void addCard(String name, List<WhitelistVideo> vids) {
+    void addCard(String name, List<WhitelistVideo> vids, {int childCount = 0}) {
       cards.add((
         name: name,
         count: vids.length,
         cover: vids.isNotEmpty ? vids.first.cover : '',
         stat: _stats[name == kUncategorizedLabel ? '' : name],
+        childCount: childCount,
       ));
     }
 
+    // 只列顶层（c.depth == 0）；子合集卡片在自己的父合集页里展示
     for (final c in _data.collections) {
-      addCard(c.name, _data.sortedVideos(c.name));
+      if (c.depth != 0) continue;
+      addCard(
+        c.name,
+        _data.sortedVideos(c.name),
+        childCount: collectionChildrenOf(_data, c.name).length,
+      );
     }
     // 「未分类」固定卡片：始终显示（含 0 个），让用户知道新导入视频的默认归处
+    // （未分类不是路径，不能有子合集 → childCount 恒 0）
     addCard(kUncategorizedLabel, _data.sortedVideos(''));
     return cards;
   }
 
-  /// 打开合集视频列表页（两级导航第二级）。
+  /// 打开合集视频列表页（多层导航的任意一层）。
   void _openCollection(String name) {
     Navigator.of(context).push(
       MaterialPageRoute<void>(
@@ -1016,19 +1018,31 @@ class _PlaylistPageState extends State<PlaylistPage> {
     _rememberManualUpownerRemoval(up.mid);
   }
 
-  /// 合集拖动排序：重排 collections（未分类固定最后、不可拖）→ 落库。
+  /// 合集拖动排序：重排 collections 里的**顶层**合集（未分类固定最后、不可拖）
+  /// → 落库。
   ///
-  /// 拖拽只影响 [WhitelistData.collections] 顺序，视频归属不变。
+  /// 拖拽只影响 [WhitelistData.collections] 顺序，视频归属不变；子合集的顺序
+  /// 在各自的合集页里拖（本函数只重排顶层，非顶层的项位置原样保留）。
   /// 保存失败时不 setState：ReorderableListView 的显示顺序由数据驱动，
   /// 数据未变 → 列表视觉自动回弹原顺序（失败回滚，不破坏数据）。
   void _onReorderCollections(int oldIndex, int newIndex) {
-    final total = _data.collections.length; // 卡片总长 = total + 1（未分类最后）
+    // 首页卡片 = 顶层合集（可拖）+ 未分类（固定最后），索引只在顶层里走动
+    final topNames = [
+      for (final c in _data.collections)
+        if (c.depth == 0) c.name,
+    ];
+    final total = topNames.length;
     if (oldIndex < 0 || oldIndex >= total) return; // 未分类不可拖
     if (newIndex > total) newIndex = total; // 最多拖到未分类之前
     if (newIndex > oldIndex) newIndex -= 1;
-    final names = [for (final c in _data.collections) c.name];
-    final moved = names.removeAt(oldIndex);
-    names.insert(newIndex, moved);
+    final moved = topNames.removeAt(oldIndex);
+    topNames.insert(newIndex, moved);
+    // 把重排后的顶层名字按原数组里顶层项的位置写回去（非顶层项原地不动）
+    var ti = 0;
+    final names = [
+      for (final c in _data.collections)
+        c.depth == 0 ? topNames[ti++] : c.name,
+    ];
     final next = reorderCollections(_data, names);
     if (identical(next.collections, _data.collections)) return; // 拖回原位
     unawaited(_saveAndRefresh(next));
@@ -1276,6 +1290,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
                           count: card.count,
                           cover: card.cover,
                           stat: card.stat,
+                          childCount: card.childCount,
                           draggable: !isUncategorized,
                           onTap: () => _openCollection(card.name),
                           // 「未分类」不可重命名/删除 → 不传回调 → 不启用左滑
@@ -1583,11 +1598,14 @@ String _trimNumber(double v) =>
 /// 前三项是卡片原有内容；[stat] 是 P3 新增的观看统计（已看集数 / 总集数 /
 /// 最近更新时间）。统计没加载完（或加载失败）时是 null → 卡片只少一个
 /// 更新时间角标和一条观看进度条，其余照常渲染。
+/// [childCount] 是 v2.30.0 加的**直属子合集数**（嵌套后卡片要能看出「里面
+/// 还有子合集」）；0 → 不显示那句提示（顶层平面结构的老数据看起来不变）。
 typedef _CollectionCardData = ({
   String name,
   int count,
   String cover,
   CollectionStat? stat,
+  int childCount,
 });
 
 /// 合集卡底部观看进度条的高度（3px 细条：只表达「推进到哪儿了」）。
@@ -1642,6 +1660,9 @@ class _CollectionCard extends StatelessWidget {
   final bool draggable; // 是否可拖动（未分类固定最后，不可拖）
   final VoidCallback onTap;
 
+  /// 直属子合集数（v2.30.0 嵌套）：> 0 时副信息行加一句「含 N 个子合集」。
+  final int childCount;
+
   /// 左滑「重命名」回调；null → 不启用左滑操作块（「未分类」固定卡）。
   final VoidCallback? onRename;
 
@@ -1657,6 +1678,7 @@ class _CollectionCard extends StatelessWidget {
     required this.cover,
     required this.draggable,
     required this.onTap,
+    this.childCount = 0,
     this.stat,
     this.onRename,
     this.onDelete,
@@ -1743,7 +1765,8 @@ class _CollectionCard extends StatelessWidget {
                             ],
                           ),
                           const SizedBox(height: 4),
-                          // 副信息行：既有「N 个视频」+ 新增「已看 X/Y」
+                          // 副信息行：既有「N 个视频」+ 新增「已看 X/Y」+
+                          // 嵌套后新增「含 N 个子合集」（0 个时不显示）
                           Row(
                             children: [
                               Text(
@@ -1752,6 +1775,20 @@ class _CollectionCard extends StatelessWidget {
                                   color: theme.colorScheme.onSurfaceVariant,
                                 ),
                               ),
+                              if (childCount > 0) ...[
+                                const SizedBox(width: kSpace8),
+                                Flexible(
+                                  child: Text(
+                                    '含 $childCount 个子合集',
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: theme.textTheme.bodySmall?.copyWith(
+                                      color:
+                                          theme.colorScheme.onSurfaceVariant,
+                                    ),
+                                  ),
+                                ),
+                              ],
                               if (showProgress) ...[
                                 const SizedBox(width: kSpace8),
                                 Flexible(
@@ -2190,176 +2227,33 @@ class _EmptyView extends StatelessWidget {
   }
 }
 
-/// 重命名对话框（合集卡左滑 + 管理面板**共用同一入口**）。
+/// 合集管理面板（BottomSheet）：列出**本层**合集（路径名 + 视频数 / 子合集数），
+/// 每个合集可 移动到其他合集 / 重命名 / 删除。
 ///
-/// 只负责收名字：返回用户输入（null = 取消）；校验 / 同步引用 / 落库一律
-/// 交给 [_PlaylistPageState._renameCollection]。文案逐字保留（既有测试锚点）。
-Future<String?> _showRenameCollectionDialog(
-  BuildContext context,
-  String oldName,
-) async {
-  final ctrl = TextEditingController(text: oldName);
-  final newName = await showDialog<String>(
-    context: context,
-    builder: (dialogCtx) => AlertDialog(
-      title: Text('重命名合集「$oldName」'),
-      content: TextField(
-        controller: ctrl,
-        autofocus: true,
-        decoration: const InputDecoration(
-          labelText: '新合集名称',
-          border: OutlineInputBorder(),
-          isDense: true,
-        ),
-        onSubmitted: (v) => Navigator.pop(dialogCtx, v),
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(dialogCtx),
-          child: const Text('取消'),
-        ),
-        FilledButton(
-          onPressed: () => Navigator.pop(dialogCtx, ctrl.text),
-          child: const Text('确定'),
-        ),
-      ],
-    ),
-  );
-  return newName;
-}
-
-/// 删除确认对话框（合集卡左滑 + 管理面板共用）：提示该合集下 N 个视频将
-/// 移回未分类。返回 true = 用户确认（null = 取消/点外部关掉）。
-Future<bool?> _showDeleteCollectionDialog(
-  BuildContext context,
-  String name,
-  int count,
-) {
-  return showDialog<bool>(
-    context: context,
-    builder: (dialogCtx) => AlertDialog(
-      title: Text('删除合集「$name」'),
-      content: Text(
-        '确定删除合集「$name」吗？\n'
-        '该合集下 $count 个视频将移回未分类（视频本身不会被删除）。',
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(dialogCtx, false),
-          child: const Text('取消'),
-        ),
-        TextButton(
-          onPressed: () => Navigator.pop(dialogCtx, true),
-          child: const Text('删除', style: TextStyle(color: kError)),
-        ),
-      ],
-    ),
-  );
-}
-
-/// 选择「并入目标」合集的底部选择器：返回目标合集名（null = 取消/点外部关掉）。
-///
-/// 只列**除自己以外**的合集：刻意**不提供「未分类」**——那正是「删除合集」
-/// 的语义（视频回未分类），同一个动作给两个入口只会让人猜「我到底该点哪个」。
-/// 合集多时列表会超出屏幕：isScrollControlled + constraints 限高 70% 屏高 +
-/// useSafeArea + Flexible+ListView 兜底滚动（与单视频「移动到合集」同款）。
-Future<String?> _showMoveCollectionSheet(
-  BuildContext context,
-  String sourceName,
-  List<String> targets,
-) {
-  return showModalBottomSheet<String>(
-    context: context,
-    isScrollControlled: true,
-    useSafeArea: true,
-    constraints: BoxConstraints(
-      maxHeight: MediaQuery.sizeOf(context).height * 0.7,
-    ),
-    builder: (sheetCtx) => SafeArea(
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          ListTile(
-            title: const Text('移动到合集'),
-            subtitle: Text(
-              '把「$sourceName」并入…',
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-            ),
-            dense: true,
-          ),
-          const Divider(height: 1),
-          Flexible(
-            child: ListView.builder(
-              shrinkWrap: true,
-              itemCount: targets.length,
-              itemBuilder: (context, i) => ListTile(
-                leading: const Icon(Icons.folder_outlined),
-                title: Text(targets[i]),
-                onTap: () => Navigator.pop(sheetCtx, targets[i]),
-              ),
-            ),
-          ),
-        ],
-      ),
-    ),
-  );
-}
-
-/// 并入确认对话框：返回 true = 用户确认（null = 取消/点外部关掉）。
-///
-/// 文案必须写清**两件事同时发生**——视频换了归属 + 源合集定义消失；只说
-/// 「移动到 B」用户会以为源合集还在（像复制）。不可撤销的措辞对齐
-/// [_showDeleteCollectionDialog]（同样会同步到 Gist）。
-Future<bool?> _showMoveCollectionConfirmDialog(
-  BuildContext context,
-  String source,
-  String target,
-  int count,
-) {
-  return showDialog<bool>(
-    context: context,
-    builder: (dialogCtx) => AlertDialog(
-      title: Text('移动合集「$source」'),
-      content: Text(
-        '把「$source」里的 $count 个视频移到「$target」，'
-        '并删除「$source」这个合集（视频本身不会被删除）。\n'
-        '此操作会同步到 Gist，且无法在 App 内撤销。',
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.pop(dialogCtx, false),
-          child: const Text('取消'),
-        ),
-        // 并入不丢数据（视频都还在），故用主色 FilledButton 而非删除那样的
-        // 破坏性红字
-        FilledButton(
-          onPressed: () => Navigator.pop(dialogCtx, true),
-          child: const Text('移动'),
-        ),
-      ],
-    ),
-  );
-}
-
-/// 合集管理面板（BottomSheet）：列出所有合集（名字 + 视频数），
-/// 每个合集可重命名 / 移动到其他合集 / 删除。
-///
-/// - 数据不持有快照：通过 [collectionsOf] / [countOf] 每次从页面拉取最新值，
-///   操作成功后内部 setState 重拉，列表即时反映页面 `_data`
+/// - 首页传的 [pathsOf] 只有顶层（子合集在自己的父合集页里管理）；合集页若复用
+///   也传自己那一层的路径 —— 面板只负责展示给它的那一层
+/// - [allPathsOf] 是**全量**路径，只用于「移动到…」的目标选择器（目标可以是任意
+///   层级的合集，但要排除自己与自己的子孙，见 [_move]）
+/// - 数据不持有快照：通过 [pathsOf] / [countOf] / [childCountOf] 每次从页面拉取
+///   最新值，操作成功后内部 setState 重拉，列表即时反映页面 `_data`
 /// - [onRename] / [onDelete] / [onMove] 交回页面统一走「写 Gist → 缓存 → 刷新」
 class _CollectionManageSheet extends StatefulWidget {
-  final List<CollectionInfo> Function() collectionsOf;
-  final int Function(String name) countOf;
-  final Future<void> Function(String oldName, String newName) onRename;
-  final Future<void> Function(String name) onDelete;
+  final List<String> Function() pathsOf;
+  final List<String> Function() allPathsOf;
+  final int Function(String path) countOf;
+  final int Function(String path) childCountOf;
+  final Future<void> Function(String path, String newName) onRename;
+  final Future<void> Function(String path) onDelete;
 
-  /// 把 [source] 整体并入 [target]（源合集定义随之删除）。
+  /// 把 [source] **嵌套**到 [target] 下面（[target] 空串 = 移到顶层）；
+  /// 源合集不被删除，视频与子孙跟着走（见模型层 `moveCollectionUnder`）。
   final Future<void> Function(String source, String target) onMove;
 
   const _CollectionManageSheet({
-    required this.collectionsOf,
+    required this.pathsOf,
+    required this.allPathsOf,
     required this.countOf,
+    required this.childCountOf,
     required this.onRename,
     required this.onDelete,
     required this.onMove,
@@ -2370,58 +2264,69 @@ class _CollectionManageSheet extends StatefulWidget {
 }
 
 class _CollectionManageSheetState extends State<_CollectionManageSheet> {
+  /// 「移动到…」的可选目标（排除自己 / 子孙 / 当前父级，见
+  /// [collectionMoveTargetsFor]）。
+  List<String> _moveTargetsFor(String source) =>
+      collectionMoveTargetsFor(source, widget.allPathsOf());
+
   /// 重命名对话框：预填旧名 → 确定后回调页面。
-  Future<void> _rename(CollectionInfo collection) async {
-    final newName = await _showRenameCollectionDialog(context, collection.name);
+  Future<void> _rename(String path) async {
+    final newName = await showRenameCollectionDialog(context, path);
     if (newName == null || !mounted) return;
-    await widget.onRename(collection.name, newName);
+    await widget.onRename(path, newName);
     if (mounted) setState(() {}); // 重拉合集列表（页面 _data 已更新）
   }
 
   /// 移动到其他合集：选目标 → 确认 → 回调页面。
   ///
-  /// 只有一个合集时没有目标可选：给一句提示而不是弹空列表（入口按钮本身
-  /// 不禁用——灰按钮没有说明文字，用户只会困惑，提示能直接告诉他下一步
-  /// 该干什么：先新建一个合集）。
-  Future<void> _move(CollectionInfo collection) async {
-    final targets = [
-      for (final c in widget.collectionsOf())
-        if (c.name != collection.name) c.name,
-    ];
+  /// 没有任何目标可选（顶层且只有自己一个合集）：给一句提示而不是弹空列表
+  /// （入口按钮本身不禁用——灰按钮没有说明文字，用户只会困惑，提示能直接
+  /// 告诉他下一步该干什么：先新建一个合集）。
+  Future<void> _move(String path) async {
+    final targets = _moveTargetsFor(path);
     if (targets.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('没有其它合集可以并入，请先新建一个合集')),
+        const SnackBar(content: Text('没有其它合集可以作为目标，请先新建一个合集')),
       );
       return;
     }
-    final count = widget.countOf(collection.name);
-    final target = await _showMoveCollectionSheet(context, collection.name, targets);
-    if (target == null || !mounted) return;
-    final confirmed = await _showMoveCollectionConfirmDialog(
+    final target = await showCollectionMoveTargetSheet(
       context,
-      collection.name,
-      target,
-      count,
+      source: path,
+      targets: targets,
+    );
+    if (target == null || !mounted) return;
+    final confirmed = await showMoveCollectionConfirmDialog(
+      context,
+      source: path,
+      target: target,
+      videoCount: widget.countOf(path),
+      childCount: widget.childCountOf(path),
     );
     if (confirmed != true || !mounted) return;
-    await widget.onMove(collection.name, target);
+    await widget.onMove(path, target);
     if (mounted) setState(() {}); // 重拉合集列表
   }
 
-  /// 删除确认对话框：提示该合集下 N 个视频将移回未分类。
-  Future<void> _delete(CollectionInfo collection) async {
-    final count = widget.countOf(collection.name);
-    final confirmed =
-        await _showDeleteCollectionDialog(context, collection.name, count);
+  /// 删除确认对话框：提示该合集下 N 个视频将移回未分类、M 个子合集上提一级。
+  Future<void> _delete(String path) async {
+    final count = widget.countOf(path);
+    final childCount = widget.childCountOf(path);
+    final confirmed = await showDeleteCollectionDialog(
+      context,
+      path,
+      count,
+      childCount: childCount,
+    );
     if (confirmed != true || !mounted) return;
-    await widget.onDelete(collection.name);
+    await widget.onDelete(path);
     if (mounted) setState(() {}); // 重拉合集列表
   }
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final collections = widget.collectionsOf();
+    final paths = widget.pathsOf();
     return DraggableScrollableSheet(
       expand: false,
       initialChildSize: .55,
@@ -2437,8 +2342,9 @@ class _CollectionManageSheetState extends State<_CollectionManageSheet> {
           Padding(
             padding: const EdgeInsets.fromLTRB(20, 0, 20, 8),
             child: Text(
-              '重命名会同步更新该合集下所有视频；移动到其他合集会把视频整体并入'
-              '并删除源合集；删除会把视频移回未分类（以上都不删视频）。',
+              '重命名会同步更新它的子合集与所有视频；移动到其他合集会把它整个'
+              '（含视频与子合集）挪到目标下面，不会删除它；删除会把视频移回'
+              '未分类、子合集上提一级（以上都不删视频）。',
               style: theme.textTheme.bodySmall?.copyWith(
                 color: theme.colorScheme.onSurfaceVariant,
               ),
@@ -2450,16 +2356,20 @@ class _CollectionManageSheetState extends State<_CollectionManageSheet> {
               controller: scrollCtrl,
               padding: const EdgeInsets.only(bottom: 24),
               children: [
-                if (collections.isEmpty)
+                if (paths.isEmpty)
                   const Padding(
                     padding: EdgeInsets.all(24),
                     child: Center(child: Text('暂无合集')),
                   ),
-                for (final c in collections)
+                for (final path in paths)
                   ListTile(
                     leading: const Icon(Icons.folder_outlined),
-                    title: Text(c.name),
-                    subtitle: Text('${widget.countOf(c.name)} 个视频'),
+                    title: Text(collectionDisplay(path)),
+                    subtitle: Text(
+                      '${widget.countOf(path)} 个视频'
+                      '${widget.childCountOf(path) > 0 ? ' · '
+                          '含 ${widget.childCountOf(path)} 个子合集' : ''}',
+                    ),
                     trailing: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
@@ -2467,12 +2377,12 @@ class _CollectionManageSheetState extends State<_CollectionManageSheet> {
                           tooltip: '移动到其他合集',
                           icon: const Icon(Icons.drive_file_move_outlined,
                               size: 20),
-                          onPressed: () => _move(c),
+                          onPressed: () => _move(path),
                         ),
                         IconButton(
                           tooltip: '重命名',
                           icon: const Icon(Icons.edit_outlined, size: 20),
-                          onPressed: () => _rename(c),
+                          onPressed: () => _rename(path),
                         ),
                         IconButton(
                           tooltip: '删除',
@@ -2481,7 +2391,7 @@ class _CollectionManageSheetState extends State<_CollectionManageSheet> {
                             size: 20,
                             color: theme.colorScheme.error,
                           ),
-                          onPressed: () => _delete(c),
+                          onPressed: () => _delete(path),
                         ),
                       ],
                     ),

@@ -113,8 +113,19 @@ Map<String, dynamic> _playurlBody() => {
           'video': [
             {'baseUrl': 'https://upos.bilivideo.com/video_1080p.m4s'},
           ],
+          // 两档音频，**高档在前**（2026-09 实测顺序不稳定）：
+          // 「仅缓存音频」必须按 bandwidth 挑最低档，不能靠顺序
           'audio': [
-            {'baseUrl': 'https://upos.bilivideo.com/audio_64k.m4s'},
+            {
+              'baseUrl': 'https://upos.bilivideo.com/audio_134k.m4s',
+              'id': 30232,
+              'bandwidth': 134000,
+            },
+            {
+              'baseUrl': 'https://upos.bilivideo.com/audio_64k.m4s',
+              'id': 30216,
+              'bandwidth': 64000,
+            },
           ],
         },
       },
@@ -201,6 +212,71 @@ void main() {
       expect(_store.containsKey('bili_sessdata'), isFalse);
       expect(_store.containsKey('bili_jct'), isFalse);
       expect(req.queryParameters['qn'], '80');
+    });
+  });
+
+  // ---------------------------------------------------------------------------
+  // 音频档位（v2.29.0）：「仅缓存音频」靠 bandwidth 挑最低档
+  // ---------------------------------------------------------------------------
+
+  group('DASH 音频档位解析与选择', () {
+    test('dash.audio 的 id/bandwidth 按序解析，与 url 一一对应', () async {
+      final adapter = _RoutingAdapter({
+        '/x/frontend/finger/spi': _spiBody,
+        '/x/web-interface/nav': _navBody,
+        playurlPath: _playurlBody,
+      });
+
+      final r = await _api(adapter).fetchPlayUrl(bvid: 'BV1xx', cid: 1, qn: 80);
+
+      expect(r.dashAudioUrls, hasLength(2));
+      expect(r.dashAudioIds, [30232, 30216]);
+      expect(r.dashAudioBandwidths, [134000, 64000]);
+      // 顺序不可信（高档在前）→ 「仅缓存音频」必须挑最小档
+      expect(pickLowestBandwidthAudio(r), endsWith('audio_64k.m4s'));
+      // 既有行为不变：整段缓存取第一条（高档）
+      expect(r.dashAudioUrls.first, endsWith('audio_134k.m4s'));
+    });
+
+    test('缺 bandwidth / 全缺 → 退回第一条（与改动前一致）', () {
+      const noBandwidth = PlayUrlResult(
+        quality: 80,
+        dashAudioUrls: ['a.m4s', 'b.m4s'],
+      );
+      expect(pickLowestBandwidthAudio(noBandwidth), 'a.m4s');
+
+      const partial = PlayUrlResult(
+        quality: 80,
+        dashAudioUrls: ['unknown.m4s', 'known.m4s'],
+        dashAudioBandwidths: [0, 128000],
+      );
+      expect(pickLowestBandwidthAudio(partial), 'known.m4s',
+          reason: '缺码率的条目不参与比较，但不能挡住有码率的');
+
+      const bandwidthsLongerThanUrls = PlayUrlResult(
+        quality: 80,
+        dashAudioUrls: ['only.m4s'],
+        dashAudioBandwidths: [64000, 128000],
+      );
+      expect(pickLowestBandwidthAudio(bandwidthsLongerThanUrls), 'only.m4s',
+          reason: '两个列表长度不一致时不越界');
+    });
+
+    test('没有音频流 → null（仅音频下载据此报「没有可下载的音频流」）', () {
+      const mp4Only = PlayUrlResult(
+        quality: 32,
+        mp4Url: 'https://x.bilivideo.com/v.mp4',
+      );
+      expect(pickLowestBandwidthAudio(mp4Only), isNull);
+    });
+
+    test('多条同码率 → 取先出现的那条（稳定，不吃列表顺序）', () {
+      const tie = PlayUrlResult(
+        quality: 80,
+        dashAudioUrls: ['first.m4s', 'second.m4s'],
+        dashAudioBandwidths: [64000, 64000],
+      );
+      expect(pickLowestBandwidthAudio(tie), 'first.m4s');
     });
   });
 }

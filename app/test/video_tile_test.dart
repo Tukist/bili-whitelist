@@ -28,6 +28,7 @@ WhitelistVideo _video({
   int? pubdate,
   String bvid = 'BV1',
   String title = '测试视频标题',
+  List<PageInfo>? pages,
 }) =>
     WhitelistVideo(
       bvid: bvid,
@@ -38,6 +39,7 @@ WhitelistVideo _video({
       upName: 'UP主',
       addedAt: '2026-01-01T00:00:00Z',
       pubdate: pubdate,
+      pages: pages,
     );
 
 /// 超长标题：测试字体下（每字符宽 = fontSize = 14）必然超过 2 行。
@@ -123,6 +125,56 @@ void main() {
     // 多选态结构照旧：勾选框在
     expect(find.byType(Checkbox), findsOneWidget);
     expect(find.byType(ListTile), findsOneWidget);
+  });
+
+  group('已缓存角标（v2.29.0：区分仅音频缓存）', () {
+    testWidgets('未缓存 → 不显示角标', (tester) async {
+      await tester.pumpWidget(_wrap(VideoTile(video: _video())));
+      expect(find.text('已缓存'), findsNothing);
+      expect(find.text('已缓存音频'), findsNothing);
+    });
+
+    testWidgets('整段缓存 → 「已缓存」', (tester) async {
+      await tester.pumpWidget(_wrap(VideoTile(
+        video: _video(),
+        cachedCount: 1,
+      )));
+      expect(find.text('已缓存'), findsOneWidget);
+      expect(find.text('已缓存音频'), findsNothing);
+    });
+
+    testWidgets('全是仅音频缓存 → 「已缓存音频」（点进去没画面，先说清楚）',
+        (tester) async {
+      await tester.pumpWidget(_wrap(VideoTile(
+        video: _video(),
+        cachedCount: 1,
+        cachedAudioOnly: true,
+      )));
+      expect(find.text('已缓存音频'), findsOneWidget);
+      expect(find.text('已缓存'), findsNothing);
+    });
+
+    testWidgets('多 P 部分缓存 → 计数与「音频」前缀都带上', (tester) async {
+      final multi = _video(
+        pages: const [
+          PageInfo(cid: 1, part: 'p1', duration: 60),
+          PageInfo(cid: 2, part: 'p2', duration: 60),
+          PageInfo(cid: 3, part: 'p3', duration: 60),
+        ],
+      );
+      await tester.pumpWidget(_wrap(VideoTile(
+        video: multi,
+        cachedCount: 1,
+        cachedAudioOnly: true,
+      )));
+      expect(find.text('已缓存音频 1/3'), findsOneWidget);
+
+      await tester.pumpWidget(_wrap(VideoTile(
+        video: multi,
+        cachedCount: 2,
+      )));
+      expect(find.text('已缓存 2/3'), findsOneWidget);
+    });
   });
 
   group('标题过长 → 展开/收起', () {
