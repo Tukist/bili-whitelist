@@ -15,11 +15,14 @@
 ///   TextPainter 测量与 Text.rich 渲染：painter 只布局不命中，识别器安全）。
 ///
 /// 取舍与辅助参数：
-/// - [copyTip] 非空 → 给「不可直接选择的正文」（折叠态纯文本 / 富文本整段）
-///   包长按整段复制兜底（评论正文用「已复制评论内容」）；为空则不包
-///   （播放页简介用：无链接、展开后可选择，折叠态短按展开即可，无需兜底）。
+/// - [copyTip] 非空 → 给「不可直接选择的正文」（**不可选择的完整态纯文本** /
+///   折叠态纯文本 / 富文本整段）包长按整段复制兜底（评论正文用「已复制评论
+///   内容」）；为空则不包（播放页简介用：无链接、展开后可选择，折叠态短按展开
+///   即可，无需兜底）。
 /// - [selectable]=false → 纯文本完整态也用 Text（播放页简介用：完整态要套
-///   [maxExpandedHeight] 内部滚动，SelectableText 的选择手势会与滚动打架）。
+///   [maxExpandedHeight] 内部滚动，SelectableText 的选择手势会与滚动打架；
+///   视频卡/动态卡用：宿主整卡可点，正文不能把点按吃掉）。此时若 [copyTip]
+///   非空，完整态同样走长按复制兜底——「不可选择」的正文一律有复制退路。
 /// - [maxExpandedHeight] 非空 → 展开态正文封顶该高度、超高内部滚动（防超长
 ///   简介把播放页固定信息行撑爆布局）；「收起」按钮始终在滚动区外可见。
 /// - [animated] = true → 展开/收起时正文本体走 [AnimatedSize] 高度过渡
@@ -155,6 +158,10 @@ class _ExpandableTextState extends State<ExpandableText> {
     } else if (full) {
       final t = widget.text;
       body = widget.selectable ? SelectableText(t, style: widget.style) : Text(t, style: widget.style);
+      // 不可选择 = 选择/复制能力不在，靠长按整段复制兜底（有 copyTip 才包）。
+      // 注意：只挂 onLongPress 不抢短按 —— 宿主（视频卡/动态卡）的整卡点按
+      // 仍然吃得到正文上的点击。
+      if (!widget.selectable) body = _wrapCopy(body);
     } else {
       // 折叠态：SelectableText 不支持省略号，退化为 Text + ellipsis
       //（长按整段复制由 _wrapCopy 按 copyTip 兜底）

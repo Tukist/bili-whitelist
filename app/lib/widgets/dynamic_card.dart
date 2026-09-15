@@ -2,15 +2,23 @@
 ///
 /// 结构（按 [DynamicItem] 的宽松解析结果自适应）：
 /// - **作者行**：头像 + 名字 + 相对时间（[fmtRelativeTime]，24h 内文案与
-///   历史/评论一致）
+///   历史/评论一致）——[DynamicAuthorRow]，与动态详情页共用同一行
 /// - **正文**：多行可折叠（复用 [ExpandableText]，与评论正文同一套折叠逻辑）
-/// - **图文**：1/2/3/4 图布局（4 图以上只画 4 张，第 4 张压「+N」）；点图由
-///   宿主打开全屏查看页
-/// - **视频投稿**：封面 + 标题（超 2 行可展开）+ 「视频投稿 · 相对时间」
-///   （投递自身的发布日期接口不返回，用动态的 pub_ts 兜底），点击由宿主
-///   取流后进播放页
+/// - **图文**：[DynamicImages]（1/2/3/4 图布局，4 图以上只画 4 张，第 4 张
+///   压「+N」）；点图由宿主打开全屏查看页
+/// - **视频投稿**：[DynamicVideo]（封面 + 标题（超 2 行可展开）+ 「视频投稿 ·
+///   相对时间」，投递自身的发布日期接口不返回，用动态的 pub_ts 兜底），点击
+///   由宿主取流后进播放页
 /// - **转发**：正文下方挂一块「原文」引用块（[AppBlockVariant.reply]：冷底 +
-///   左竖条 + 缩进，与评论区楼中楼同一套「块」语言）
+///   左竖条 + 缩进，与评论区楼中楼同一套「块」语言）——**本卡只画原文的作者
+///   与正文**；原文自己的图片/视频只在详情页展开（列表里展开会把卡片撑得很长，
+///   而列表的价值在「扫一眼有哪些动态」）
+/// - **整卡点击**（v2.31.0+）：[onTap] → 宿主推动态详情页；不传 = 与改动前
+///   逐像素一致（点正文/空白没有任何反应）
+///
+/// [DynamicImages] / [DynamicVideo] / [DynamicAuthorRow] 是**公开**的：动态
+/// 详情页要复用同一套渲染（同一份布局规格只留一处真相），所以它们不是私有的
+/// `_Xxx`。
 ///
 /// 设计语言：无阴影；1px 描边（[kRule]）；圆角 [kRadiusSm]/[kRadiusMd]；
 /// 底材/描边/竖条全部走 [AppBlock] 的统一规格表（卡片外形 = comment 规格：
@@ -50,6 +58,14 @@ class DynamicCard extends StatelessWidget {
   /// null = 不挂手势。
   final VoidCallback? onVideoTap;
 
+  /// 点整卡（正文/空白处）→ 宿主推动态详情页（v2.31.0+）；null = 整卡不挂
+  /// 手势（点正文没有任何反应，与改动前一致）。
+  ///
+  /// 命中优先级：配图与视频投稿块各自是**更深**的手势识别器，Flutter 的
+  /// 手势竞技场里更深者胜 → 点图仍进大图、点视频卡仍进播放页，本回调只吃到
+  /// 它们的**外面**那圈（正文、作者行、留白）。
+  final VoidCallback? onTap;
+
   const DynamicCard({
     super.key,
     required this.item,
@@ -57,56 +73,109 @@ class DynamicCard extends StatelessWidget {
     this.fallbackAuthorFace = '',
     this.onImageTap,
     this.onVideoTap,
+    this.onTap,
   });
 
   @override
   Widget build(BuildContext context) {
+    final body = Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        DynamicAuthorRow(
+          name: item.authorName.isNotEmpty
+              ? item.authorName
+              : fallbackAuthorName,
+          face: item.authorFace.isNotEmpty
+              ? item.authorFace
+              : fallbackAuthorFace,
+          pubTs: item.pubTs,
+        ),
+        if (item.text.isNotEmpty)
+          Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: ExpandableText(
+              text: item.text,
+              style: kTypeBody,
+              // selectable=false：完整态也用 Text，**不引入选择手势抢整卡点按**
+              // （v2.31.0+ 整卡可点进详情页；SelectableText 会把正文上的点击
+              // 吃掉，只剩四周留白可点，那就等于「点动态没反应」）。
+              // 复制退路仍在：长按整段复制由 copyTip 兜底（完整态与折叠态都包）。
+              selectable: false,
+              copyTip: '已复制动态内容',
+            ),
+          ),
+        if (item.hasImages)
+          Padding(
+            padding: const EdgeInsets.only(top: kSpace8),
+            child: DynamicImages(
+              urls: item.imageUrls,
+              onTap: onImageTap,
+            ),
+          ),
+        if (item.hasVideo)
+          Padding(
+            padding: const EdgeInsets.only(top: kSpace8),
+            child: DynamicVideo(
+              cover: item.videoCover ?? '',
+              title: item.videoTitle ?? '视频投稿',
+              pubTs: item.pubTs,
+              onTap: onVideoTap,
+            ),
+          ),
+        if (item.isForward)
+          Padding(
+            padding: const EdgeInsets.only(top: kSpace8),
+            child: _OriginalBlock(item: item),
+          ),
+      ],
+    );
+    final tap = onTap;
     return AppBlock(
       variant: AppBlockVariant.comment,
       margin: const EdgeInsets.only(bottom: kListGap),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          _buildAuthorRow(context),
-          if (item.text.isNotEmpty)
-            Padding(
-              padding: const EdgeInsets.only(top: 6),
-              child: ExpandableText(
-                text: item.text,
-                style: kTypeBody,
-                copyTip: '已复制动态内容',
+      child: tap == null
+          ? body
+          : Semantics(
+              button: true,
+              label: '动态，点击查看详情',
+              // 透明 Material 承载水波纹（同 DynamicVideo；AppBlock 的纸底会
+              // 盖住更外层的 Material 水波纹）
+              child: Material(
+                type: MaterialType.transparency,
+                child: InkWell(
+                  onTap: tap,
+                  // 触达整卡的触摸目标（比只有正文可点大得多）
+                  child: body,
+                ),
               ),
             ),
-          if (item.hasImages)
-            Padding(
-              padding: const EdgeInsets.only(top: kSpace8),
-              child: _DynamicImages(
-                urls: item.imageUrls,
-                onTap: onImageTap,
-              ),
-            ),
-          if (item.hasVideo)
-            Padding(
-              padding: const EdgeInsets.only(top: kSpace8),
-              child: _DynamicVideo(item: item, onTap: onVideoTap),
-            ),
-          if (item.isForward)
-            Padding(
-              padding: const EdgeInsets.only(top: kSpace8),
-              child: _OriginalBlock(item: item),
-            ),
-        ],
-      ),
     );
   }
+}
 
-  /// 作者行：小圆头像 + 名字 + 相对时间（时间未知时省略，不占位）。
-  Widget _buildAuthorRow(BuildContext context) {
-    final name =
-        item.authorName.isNotEmpty ? item.authorName : fallbackAuthorName;
-    final face =
-        item.authorFace.isNotEmpty ? item.authorFace : fallbackAuthorFace;
-    final ts = item.pubTs;
+/// 动态作者行：小圆头像 + 名字 + 相对时间（时间未知时省略，不占位）。
+///
+/// 与动态卡同一个视觉规格；动态详情页直接复用（同一行只留一处真相）。
+class DynamicAuthorRow extends StatelessWidget {
+  /// 作者名；空 → 「未知作者」。
+  final String name;
+
+  /// 作者头像 URL；空 → 人形占位。
+  final String face;
+
+  /// 发布时间（Unix 秒）；≤ 0 → 不显示时间（不占位）。
+  final int pubTs;
+
+  const DynamicAuthorRow({
+    super.key,
+    required this.name,
+    required this.face,
+    required this.pubTs,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final ts = pubTs;
     final time = ts > 0
         ? fmtRelativeTime(DateTime.fromMillisecondsSinceEpoch(ts * 1000))
         : '';
@@ -156,14 +225,16 @@ class DynamicCard extends StatelessWidget {
 ///
 /// 动态图片不带宽高比信息 → 统一近似 4:3；列数按张数定，缩略图宽度按可用
 /// 宽度均分后夹在 [80, 200]（窄屏不出横向滚动、宽屏不把一张图拉得过大）。
-class _DynamicImages extends StatelessWidget {
+///
+/// v2.31.0+ 起**公开**：动态详情页复用同一套布局（原文的图也走它）。
+class DynamicImages extends StatelessWidget {
   final List<String> urls;
   final void Function(List<String> urls, int index)? onTap;
 
   static const double _gap = 4;
   static const int _maxShown = 4;
 
-  const _DynamicImages({required this.urls, this.onTap});
+  const DynamicImages({super.key, required this.urls, this.onTap});
 
   @override
   Widget build(BuildContext context) {
@@ -265,11 +336,30 @@ class _DynamicImages extends StatelessWidget {
 
 /// 视频投稿：封面 + 标题 + 「视频投稿 · 相对时间」（1px 描边小卡；点击交给
 /// 宿主进播放页）。标题超过 2 行时多出「展开/收起」入口（[ExpandableText]）。
-class _DynamicVideo extends StatelessWidget {
-  final DynamicItem item;
+///
+/// 数据**显式传入**（v2.31.0+ 起收 `cover/title/pubTs`，原先直接吃
+/// [DynamicItem]）：动态详情页要画的「转发原文里的视频」不是本条动态自己的
+/// 视频字段，收显式参数两边才能共用同一个卡片；也**公开**了。
+class DynamicVideo extends StatelessWidget {
+  /// 封面 URL（空 → [CoverImage] 自己的占位）。
+  final String cover;
+
+  /// 标题（空 → 「视频投稿」）。
+  final String title;
+
+  /// 时间（Unix 秒，用**本条动态**的 pub_ts 兜底，见 [_labelWithTime]）；
+  /// ≤ 0 → 标签只写「视频投稿」。
+  final int pubTs;
+
   final VoidCallback? onTap;
 
-  const _DynamicVideo({required this.item, this.onTap});
+  const DynamicVideo({
+    super.key,
+    required this.cover,
+    required this.title,
+    required this.pubTs,
+    this.onTap,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -279,7 +369,7 @@ class _DynamicVideo extends StatelessWidget {
         ClipRRect(
           borderRadius: BorderRadius.circular(kRadiusSm),
           child: CoverImage(
-            cover: item.videoCover ?? '',
+            cover: cover,
             width: 120,
             height: 68,
           ),
@@ -290,7 +380,7 @@ class _DynamicVideo extends StatelessWidget {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
               ExpandableText(
-                text: item.videoTitle ?? '视频投稿',
+                text: title.isEmpty ? '视频投稿' : title,
                 // 投稿标题 2 行截断；超行才有「展开/收起」（未超行不增子树，
                 // 点标题照旧传给整块 InkWell → 仍进播放页）
                 style: kTypeTitleS,
@@ -352,9 +442,9 @@ class _DynamicVideo extends StatelessWidget {
   /// 时间」，与本卡作者行的时间同一套语汇（[fmtRelativeTime]），投递自身的
   /// 发布日期接口取不到（见 build 内注释）。
   String _labelWithTime() {
-    if (item.pubTs <= 0) return '视频投稿';
+    if (pubTs <= 0) return '视频投稿';
     final t =
-        fmtRelativeTime(DateTime.fromMillisecondsSinceEpoch(item.pubTs * 1000));
+        fmtRelativeTime(DateTime.fromMillisecondsSinceEpoch(pubTs * 1000));
     return '视频投稿 · $t';
   }
 }

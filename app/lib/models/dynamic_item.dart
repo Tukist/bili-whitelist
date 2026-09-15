@@ -1,6 +1,8 @@
-/// 用户动态模型（B 站 `x/polymer/web-dynamic/v1/feed/space`，v2.22.0+）。
+/// 用户动态模型（B 站 `x/polymer/web-dynamic/v1/feed/space`，v2.22.0+；
+/// 详情 `x/polymer/web-dynamic/v1/detail`，v2.31.0+）。
 ///
-/// 用途：UP 主主页「动态」区（入口：评论区头像 → 个人页）。
+/// 用途：UP 主主页「动态」区（入口：评论区头像 → 个人页）+ 动态详情页
+/// （[BiliApi.fetchDynamicDetail]）。
 ///
 /// 实测要点（2026-09，匿名可读）：
 /// - 需要 WBI 签名 + buvid3/buvid4 Cookie（签名/注入见
@@ -15,7 +17,13 @@
 ///     `major.opus.title` / `major.opus.summary.text`
 ///   - 视频投稿（`DYNAMIC_TYPE_AV`）：`major.archive.{bvid, title, cover}`
 ///   - 转发（`DYNAMIC_TYPE_FORWARD`）：被转发的原文在同构的 `orig` 里
-///     （只取作者名 + 正文；原文里的图片/视频本版本不展开）
+///     （作者名 + 正文 + **原文自己的图片/视频**，见 [DynamicItem.origImageUrls]
+///     等字段）
+///   - 互动数据：`modules.module_stat.{like, comment, forward}.count`
+///   - **评论归属**：`basic.{comment_type, comment_id_str}`（服务端权威值；
+///     相册型动态是 `11` + **rid**，不是 17 + dyn id —— 见 [DynamicItem.commentType]）
+/// - **`detail` 的 `data.item` 与 feed 的 `items[]` 条目同构**（同一套
+///   `{basic, id_str, modules, orig, type}`），所以两边共用本类的解析
 /// - **各动态类型字段差异极大 → 一律宽松解析**：缺字段/脏类型给安全默认
 ///   （空串 / 空列表 / null），任何一条脏动态都不该让整页崩掉。
 library;
@@ -35,6 +43,51 @@ class DynamicType {
 
   /// 纯文字
   static const String word = 'DYNAMIC_TYPE_WORD';
+}
+
+/// 单条动态的互动数据（`modules.module_stat`，v2.31.0+）。
+///
+/// 结构（键与服务端同名，方便对照原始响应）：
+/// ```json
+/// "module_stat": {
+///   "comment": {"count": 34, "forbidden": false},
+///   "forward": {"count": 2,  "forbidden": false},
+///   "like":    {"count": 65, "forbidden": false, "status": true}
+/// }
+/// ```
+/// 三个数**只读展示**（本项目评论区/动态区不做任何写操作）；任一缺失 →
+/// 0（`forbidden` / `status` 这类开关字段不用，不解析）。
+class DynamicStat {
+  /// 点赞数（`module_stat.like.count`）；缺失 → 0。
+  final int like;
+
+  /// 评论数（`module_stat.comment.count`）；缺失 → 0。
+  final int comment;
+
+  /// 转发数（`module_stat.forward.count`）；缺失 → 0。
+  final int forward;
+
+  const DynamicStat({this.like = 0, this.comment = 0, this.forward = 0});
+
+  /// 全零（缺 `module_stat` 时用它——「三个 0」与「没有数据」在**展示层**
+  /// 是同一个意思：整行不渲染，见 [isEmpty]）。
+  static const DynamicStat empty = DynamicStat();
+
+  /// 三个数都是 0（含缺失）：详情页据此整行不渲染，不放「点赞 0 · 评论 0」。
+  bool get isEmpty => like == 0 && comment == 0 && forward == 0;
+
+  /// 宽松解析 `modules.module_stat`：每个子对象取 `count`，脏类型一律 0。
+  factory DynamicStat.fromJson(dynamic raw) {
+    final stat = DynamicItem._map(raw);
+    int countOf(String key) => DynamicItem._int(
+          DynamicItem._map(stat[key])['count'],
+        );
+    return DynamicStat(
+      like: countOf('like'),
+      comment: countOf('comment'),
+      forward: countOf('forward'),
+    );
+  }
 }
 
 /// 单条动态（宽松解析，见文件头）。
@@ -77,6 +130,39 @@ class DynamicItem {
   /// 转发的原文作者名（`orig.module_author.name`）；非转发/原文已删 → null。
   final String? origAuthor;
 
+  /// 转发的原文配图（`orig.module_dynamic.major`，与主条目同一套解析）；
+  /// 非转发/原文无图 → 空列表。
+  final List<String> origImageUrls;
+
+  /// 转发的原文视频投稿 bvid（`orig.module_dynamic.major.archive.bvid`）。
+  final String? origVideoBvid;
+
+  /// 转发的原文视频投稿标题。
+  final String? origVideoTitle;
+
+  /// 转发的原文视频投稿封面（已归一化）。
+  final String? origVideoCover;
+
+  /// 互动数据（点赞 / 评论 / 转发，`modules.module_stat`）；缺失 → 全零。
+  final DynamicStat stat;
+
+  /// 评论归属**类型**（`basic.comment_type`）——服务端权威值，**不能想当然**。
+  ///
+  /// 2026-09 匿名实测（dyn `967717348014293017`，`DYNAMIC_TYPE_DRAW`）：
+  /// - `basic = {comment_type: 11, comment_id_str: "326122895", rid_str: "326122895"}`
+  /// - 用它取评论 → `type=11&oid=326122895` **code=0**（3 条，all_count=43）；
+  /// - 反过来 `type=17&oid=<dyn id>` → **code=-404 啥都木有**（另测
+  ///   `type=17&oid=326122895` 与 `type=11&oid=<dyn id>` 同样 -404）。
+  ///
+  /// 所以「动态评论一律 type=17 + oid=dyn id」是错的（那条路只对部分动态成立，
+  /// 相册型动态的评论挂在 **rid** 上）；有 `basic` 就用它，缺失（0）才回退
+  /// 默认口径（见 [DynamicDetailPage]）。
+  final int commentType;
+
+  /// 评论归属 **id**（`basic.comment_id_str`，缺失回退 `basic.rid_str`）；
+  /// 空串 = 未知（调用方回退到动态 id 本身）。
+  final String commentId;
+
   const DynamicItem({
     required this.id,
     required this.type,
@@ -90,6 +176,13 @@ class DynamicItem {
     this.videoCover,
     this.origText,
     this.origAuthor,
+    this.origImageUrls = const [],
+    this.origVideoBvid,
+    this.origVideoTitle,
+    this.origVideoCover,
+    this.stat = DynamicStat.empty,
+    this.commentType = 0,
+    this.commentId = '',
   });
 
   /// 是否转发动态（类型标记；`orig` 结构存在时也兼容视为转发——异常响应里
@@ -103,6 +196,12 @@ class DynamicItem {
   /// 是否带配图。
   bool get hasImages => imageUrls.isNotEmpty;
 
+  /// 原文是否带视频投稿。
+  bool get origHasVideo => (origVideoBvid ?? '').isNotEmpty;
+
+  /// 原文是否带配图。
+  bool get origHasImages => origImageUrls.isNotEmpty;
+
   /// 是否有可展示的正文（转发动态正文在 [origText] 里）。
   bool get hasText => text.isNotEmpty || (origText ?? '').isNotEmpty;
 
@@ -112,6 +211,7 @@ class DynamicItem {
     final dynamicModule = _map(modules['module_dynamic']);
     final desc = _map(dynamicModule['desc']);
     final major = _map(dynamicModule['major']);
+    final basic = _map(json['basic']);
     final video = _videoOf(major);
     final orig = _origOf(json['orig']);
 
@@ -126,8 +226,18 @@ class DynamicItem {
       videoBvid: video.bvid,
       videoTitle: video.title,
       videoCover: video.cover,
+      stat: DynamicStat.fromJson(modules['module_stat']),
+      commentType: _int(basic['comment_type']),
+      // comment_id_str 优先、rid_str 兜底（实测两值同值，但字段新旧版本有别）
+      commentId: _str(basic['comment_id_str']).isNotEmpty
+          ? _str(basic['comment_id_str'])
+          : _str(basic['rid_str']),
       origText: orig.text,
       origAuthor: orig.author,
+      origImageUrls: orig.images,
+      origVideoBvid: orig.videoBvid,
+      origVideoTitle: orig.videoTitle,
+      origVideoCover: orig.videoCover,
     );
   }
 
@@ -213,22 +323,47 @@ class DynamicItem {
     );
   }
 
-  /// 转发原文（`orig`，与主条目同构，但只取「作者名 + 正文」）。
-  static ({String? text, String? author}) _origOf(dynamic rawOrig) {
+  /// 转发原文（`orig`，与主条目**同构**：作者 + 正文 + 它自己的配图/视频）。
+  ///
+  /// v2.31.0+ 起连原文的 `major` 一起解析（原先只取作者名 + 正文，把原文的
+  /// 图片/视频整块丢掉）——详情页要完整还原「被转发的那条动态」，所以原文的
+  /// 图文/视频投稿必须能画出来。列表卡片仍只画作者 + 正文（不放图，见
+  /// `dynamic_card.dart`），解析在模型层统一做，渲染侧各取所需。
+  static ({
+    String? text,
+    String? author,
+    List<String> images,
+    String? videoBvid,
+    String? videoTitle,
+    String? videoCover,
+  }) _origOf(dynamic rawOrig) {
     if (rawOrig is! Map<String, dynamic>) {
-      return (text: null, author: null);
+      return (
+        text: null,
+        author: null,
+        images: const [],
+        videoBvid: null,
+        videoTitle: null,
+        videoCover: null,
+      );
     }
     final modules = _map(rawOrig['modules']);
     final author = _map(modules['module_author']);
     final dynamicModule = _map(modules['module_dynamic']);
+    final major = _map(dynamicModule['major']);
+    final video = _videoOf(major);
     final text = _textOf(
       _map(dynamicModule['desc']),
-      _map(dynamicModule['major']),
+      major,
     );
     final name = _str(author['name']);
     return (
       text: text.trim().isEmpty ? null : text,
       author: name.trim().isEmpty ? null : name,
+      images: _imagesOf(major),
+      videoBvid: video.bvid,
+      videoTitle: video.title,
+      videoCover: video.cover,
     );
   }
 }

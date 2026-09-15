@@ -143,6 +143,23 @@ const String _kUserDeltaSample = '{"ops":['
     '"https://www.bilibili.com/video/BV1pw411F7VA/"}},'
     '{"insert":"\\n"}]}';
 
+/// 用户报告里那种**坏掉的 Delta**：结构被截断、字符串没闭合。
+///
+/// 关键点：它是"看起来像 Delta（`{` 开头 + 有 `"ops"`）但严格解析必失败"的
+/// 形态 —— 以前这种正文会被 HTML 分支当纯文本画上屏（整篇 JSON 上屏、图全丢），
+/// 现在走 [parseBiliDeltaFallback]。
+const String _kBrokenDelta = '{"ops":['
+    '{"insert":"\\n","attributes":{"class":"normal-img"}},'
+    '{"insert":{"native-image":{"alt":"read-normal-img",'
+    '"url":"https://i0.hdslb.com/bfs/article/'
+    '32f43892ae504c833bc8b7783996851f1069246841.jpg@progressive.webp",'
+    '"width":460,"height":215,"size":64510,"status":"loaded"}}},'
+    '{"insert":"\\n这里是一段被截断的正文…（insert"';
+
+/// 当前渲染中的图片地址（`_ArticleImage` 会按需换 URL，断言要能看见"换过"）。
+String _imgUrl(WidgetTester tester) =>
+    (tester.widget<Image>(find.byType(Image)).image as NetworkImage).url;
+
 void main() {
   group('parseBiliHtml：标签结构', () {
     test('p / h1-h3 / blockquote / ul-li / figure-figcaption / img / br', () {
@@ -830,11 +847,16 @@ void main() {
       expect(_tags(nodes), ['img', 'p'], reason: '不再是"整段 JSON 文本"');
     });
 
-    test('`{` 开头但 JSON 畸形 → 退回纯文本（不抛、不崩）', () {
+    test('`{` 开头但 JSON 畸形 → 不抛、不崩，且**绝不**退回纯文本', () {
+      // ⚠️ v2.31.0 起这条断言是**反向**的：以前这里断言"原文当纯文本上屏"
+      // （即 `contains('broken')`），那正是用户看到的"漏一屏 JSON + 图片全丢"。
+      // 现在畸形 JSON 走 parseBiliDeltaFallback（提示 + 尽力捞图），
+      // 详细用例见下面的「坏 JSON 的兜底」分组。
       final raw = '{"ops": broken, 这不是 JSON}';
       final nodes = parseArticleContent(raw);
       expect(nodes, isNotEmpty);
-      expect(_allText(nodes), contains('broken'));
+      expect(_allText(nodes), '正文解析失败，请稍后重试。');
+      expect(_allText(nodes), isNot(contains('broken')));
     });
   });
 
@@ -1014,6 +1036,196 @@ void main() {
       final provider = image.image as NetworkImage;
       expect(provider.headers?['Referer'], 'https://www.bilibili.com/');
       _drainImageErrors(tester);
+    });
+
+    testWidgets('图片带 @ 后缀加载失败 → 剥掉后缀重试一次（正常路径不改写 URL）',
+        (tester) async {
+      const suffixed = 'https://i0.hdslb.com/bfs/article/a.jpg@progressive.webp';
+      await _pumpContent(
+        tester,
+        jsonEncode({
+          'ops': [
+            {
+              'insert': {
+                'native-image': {'url': suffixed, 'width': 460, 'height': 215},
+              }
+            },
+          ]
+        }),
+      );
+      // 首次请求：URL 原样（一个字节都没改写）
+      expect(_imgUrl(tester), suffixed);
+
+      // 图床在测试环境一律 400 → 失败 → 下一帧换成"去掉后缀"的 URL 再试
+      await tester.pumpAndSettle();
+      _drainImageErrors(tester);
+      expect(_imgUrl(tester), 'https://i0.hdslb.com/bfs/article/a.jpg');
+
+      // 第二次仍失败 → 落到失败占位（说明重试**只有一次**，没有打转：
+      // 真打转的话 pumpAndSettle 会超时）
+      await tester.pumpAndSettle();
+      _drainImageErrors(tester);
+      expect(_imgUrl(tester), 'https://i0.hdslb.com/bfs/article/a.jpg');
+      expect(find.text('图片加载失败'), findsOneWidget);
+    });
+
+    testWidgets('图片没有 @ 后缀 → 失败后不重试（照旧一次失败占位）', (tester) async {
+      await _pumpContent(
+        tester,
+        jsonEncode({
+          'ops': [
+            {
+              'insert': {
+                'native-image': {'url': 'https://i0.hdslb.com/bfs/a.jpg'},
+              }
+            },
+          ]
+        }),
+      );
+      await tester.pumpAndSettle();
+      _drainImageErrors(tester);
+      expect(_imgUrl(tester), 'https://i0.hdslb.com/bfs/a.jpg');
+      expect(find.text('图片加载失败'), findsOneWidget);
+    });
+  });
+
+  group('parseArticleContent：坏 JSON 的兜底（v2.31.0）', () {
+    test('坏 JSON 的 Delta → 给提示 + 从原文里捞图，**绝不**当纯文本画', () {
+      final nodes = parseArticleContent(_kBrokenDelta, source: 'cv1');
+      expect(nodes, isNotEmpty);
+      expect(_tags(nodes), ['p', 'img'], reason: '提示一段 + 捞到的图片');
+      expect(collectBiliHtmlImageUrls(nodes), [
+        'https://i0.hdslb.com/bfs/article/'
+            '32f43892ae504c833bc8b7783996851f1069246841.jpg@progressive.webp',
+      ]);
+      final text = _allText(nodes);
+      expect(text, contains('正文解析失败'));
+      for (final leak in <String>['ops', 'insert', 'native-image', 'status']) {
+        expect(text.contains(leak), isFalse, reason: '泄漏了 $leak');
+      }
+    });
+
+    test('坏 JSON 里一张图都捞不到 → 只给一句失败提示（不截断原文、不露 JSON）', () {
+      final nodes = parseArticleContent('{"ops": broken, 这不是 JSON}');
+      expect(_tags(nodes), ['p']);
+      expect(_allText(nodes), '正文解析失败，请稍后重试。');
+    });
+
+    test('extractBiliJsonImageUrls：只认图片后缀、顺序保留、去重、认 \\/ 转义', () {
+      final raw = '{"a":"https:\\/\\/i0.hdslb.com\\/bfs\\/a.jpg",'
+          '"b":"https://i0.hdslb.com/bfs/b.png@460w_240h_1c_!web-article.avif",'
+          '"c":"https://www.bilibili.com/video/BV1pw411F7VA/",'
+          '"d":"https://i0.hdslb.com/bfs/a.jpg",'
+          '"e":"https://i0.hdslb.com/bfs/c.webp。"}';
+      expect(extractBiliJsonImageUrls(raw), [
+        'https://i0.hdslb.com/bfs/a.jpg',
+        'https://i0.hdslb.com/bfs/b.png@460w_240h_1c_!web-article.avif',
+        'https://i0.hdslb.com/bfs/c.webp',
+      ], reason: '视频页地址被排掉、重复地址去重、中文句号被削掉');
+    });
+
+    test('宽容修复：字符串里的裸换行 / 非法转义 → 修完能正常解析', () {
+      // Dart 源码里的 `\n` 是**真换行**：它出现在 JSON 字符串内部 = 裸控制字符
+      final withNewline = '{"ops":[{"insert":"第一行\n第二行"},{"insert":"\n"}]}';
+      expect(() => jsonDecode(withNewline), throwsFormatException,
+          reason: '先钉住夹具本身确实是严格解析器拒绝的坏 JSON');
+      final nodes = parseBiliDelta(withNewline)!;
+      expect(_allText(nodes), contains('第一行'));
+      expect(_allText(nodes), contains('第二行'));
+
+      // `C:\Users` 里的 `\U` 是非法转义（JSON 只认 " \ / b f n r t u）
+      final badEscape =
+          '{"ops":[{"insert":"路径 C:\\Users 里\\太乱了"},{"insert":"\n"}]}';
+      expect(() => jsonDecode(badEscape), throwsFormatException,
+          reason: '先钉住夹具本身确实是严格解析器拒绝的坏 JSON');
+      expect(_allText(parseBiliDelta(badEscape)!), '路径 C:\\Users 里\\太乱了');
+    });
+
+    test('repairBiliDeltaJson：正常 JSON 一个字节都不改（返回 null）', () {
+      expect(repairBiliDeltaJson('{"ops":[{"insert":"a\\nb"}]}'), isNull);
+      expect(repairBiliDeltaJson('{"a":"引号 \\" 与反斜杠 \\\\ 都合法"}'), isNull);
+      expect(repairBiliDeltaJson('{"a":"tab\\t合法"}'), isNull);
+      expect(repairBiliDeltaJson('{"a":"裸\n换行"}'), isNotNull);
+      expect(repairBiliDeltaJson('{"a":"坏\\转义"}'), isNotNull);
+      // 字符串**外面**的裸控制字符（如换行/缩进）本来就是合法 JSON 的排版，
+      // 不该被"修"
+      expect(repairBiliDeltaJson('{"a":1,\n  "b":2}'), isNull);
+    });
+
+    test('宽容修复修不好的仍然走兜底（截断的 JSON 不会被"修"成半个正文）', () {
+      expect(repairBiliDeltaJson(_kBrokenDelta), isNull);
+      expect(parseBiliDelta(_kBrokenDelta), isNull);
+      expect(_allText(parseArticleContent(_kBrokenDelta)), contains('正文解析失败'));
+    });
+  });
+
+  group('biliImageSrc / stripBiliImageSuffix（v2.31.0）', () {
+    test('src 是 data: 占位 → 改用 data-src；没有 data-src 时才退回 src', () {
+      expect(
+        biliImageSrc(HtmlElement('img', attrs: {
+          'src': 'data:image/gif;base64,R0lGODlhAQABAAAAACw=',
+          'data-src': '//i0.hdslb.com/bfs/article/real.jpg',
+        })),
+        'https://i0.hdslb.com/bfs/article/real.jpg',
+      );
+      expect(
+        biliImageSrc(HtmlElement('img', attrs: {
+          'src': 'data:image/gif;base64,R0lGODlhAQABAAAAACw=',
+        })),
+        'data:image/gif;base64,R0lGODlhAQABAAAAACw=',
+        reason: '连 data-src 都没有时，返回占位图好过返回空串（整块消失）',
+      );
+    });
+
+    test('src 正常时仍然 src 优先（既有行为不变）', () {
+      expect(
+        biliImageSrc(HtmlElement('img', attrs: {
+          'src': 'https://i0.hdslb.com/bfs/a.jpg@progressive.webp',
+          'data-src': 'https://i0.hdslb.com/bfs/b.jpg',
+        })),
+        'https://i0.hdslb.com/bfs/a.jpg@progressive.webp',
+      );
+      expect(
+        biliImageSrc(HtmlElement('img', attrs: {
+          'data-src': '//i0.hdslb.com/bfs/lazy.jpg',
+        })),
+        'https://i0.hdslb.com/bfs/lazy.jpg',
+      );
+    });
+
+    test('站内相对路径补图床域名', () {
+      expect(
+        biliImageSrc(HtmlElement('img', attrs: {'src': '/bfs/article/x.jpg'})),
+        'https://i0.hdslb.com/bfs/article/x.jpg',
+      );
+      expect(
+        biliImageSrc(HtmlElement('img', attrs: {'src': 'images/a.jpg'})),
+        'images/a.jpg',
+        reason: '没有前导斜杠的形态无法判定是不是站内路径，不动它',
+      );
+    });
+
+    test('stripBiliImageSuffix：只剥"最后一段文件名@后缀"', () {
+      expect(
+        stripBiliImageSuffix('https://i0.hdslb.com/bfs/a.jpg@progressive.webp'),
+        'https://i0.hdslb.com/bfs/a.jpg',
+      );
+      expect(
+        stripBiliImageSuffix('https://i0.hdslb.com/bfs/a.jpg@x?y=1'),
+        'https://i0.hdslb.com/bfs/a.jpg',
+      );
+      expect(stripBiliImageSuffix('https://i0.hdslb.com/bfs/a.jpg'), isNull);
+      expect(
+        stripBiliImageSuffix('https://i0.hdslb.com/bfs/a.jpg?q=1@2'),
+        isNull,
+        reason: '`@` 在 query 里，不是图床后缀',
+      );
+      expect(
+        stripBiliImageSuffix('https://user@i0.hdslb.com/a.jpg'),
+        isNull,
+        reason: '`@` 在 host 段（userinfo），不能动',
+      );
+      expect(stripBiliImageSuffix('https://i0.hdslb.com/@x'), isNull);
     });
   });
 }

@@ -22,9 +22,10 @@
 ///   点评论里的视频链接 → 无宿主回调 → 列表兜底 push 新 PlayerPage
 ///   （专栏页没有播放页宿主，这正是想要的语义）。
 ///
-/// 与列表的分工：正文**只按 `content` 渲染**，`image_urls[]` 不额外补图
-/// （否则正文里的图会重复出现一遍）。图片点击走 [ImageViewerPage]，图集 =
-/// 正文里按文档顺序收集的图片（与 `BiliHtmlView.onImageTap` 的下标一一对应）。
+/// 与列表的分工：正文按 `content` 渲染；`image_urls[]` 只在**正文里一张图都
+/// 没有**时用来补一个图集（正文有图就不补，否则同一张图会重复出现一遍）。
+/// 图片点击走 [ImageViewerPage]，图集 = 正文里按文档顺序收集的图片
+/// （与 `BiliHtmlView.onImageTap` 的下标一一对应）。
 ///
 /// 状态：首屏拉正文 = [AppLoadingHero]（整页等待）；失败 = [AppErrorView]
 /// （带重试）；加载完可下拉刷新（[RefreshIndicator]，刷的是**正文**；评论区
@@ -311,11 +312,47 @@ class _ArticlePageState extends State<ArticlePage> {
         ),
       );
     }
-    return BiliHtmlView.fromContent(
-      detail.contentHtml,
-      onImageTap: _openImages,
-      onLinkTap: _onLinkTap,
+    // 正文（自己解析：图集兜底要先知道"正文里有没有图"）
+    final nodes =
+        parseArticleContent(detail.contentHtml, source: 'cv${detail.cvid}');
+    // 正文里**一张图都没有**、而接口另外给了配图列表 → 在正文后补一个图集。
+    // 这是 `ArticleDetail.imageUrls` 注释里承诺过的"宿主兜底"（正文有图时
+    // **不补**，否则同一张图会重复出现一遍）。合成一组 `<img>` 节点再交给
+    // 同一个 [BiliHtmlView] 渲染，图片的加载态/失败态/去后缀重试/点击开大图
+    // 全部复用正文那一条路，不另写一套。
+    final gallery = collectBiliHtmlImageUrls(nodes).isEmpty
+        ? _galleryNodes(detail.imageUrls)
+        : const <HtmlNode>[];
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        BiliHtmlView(
+          nodes: nodes,
+          onImageTap: _openImages,
+          onLinkTap: _onLinkTap,
+        ),
+        if (gallery.isNotEmpty)
+          BiliHtmlView(
+            nodes: gallery,
+            onImageTap: _openImages,
+            onLinkTap: _onLinkTap,
+          ),
+      ],
     );
+  }
+
+  /// 正文无图时的配图兜底节点：一句说明 + 一串 `<img>`。
+  ///
+  /// 加那句说明是刻意的——图出现在正文之后而正文里没提过它们，不解释一句
+  /// 会被当成"排版错乱"；说明里也如实讲了这些不是从正文里读出来的。
+  List<HtmlNode> _galleryNodes(List<String> urls) {
+    if (urls.isEmpty) return const [];
+    return <HtmlNode>[
+      HtmlElement('p', children: [
+        const HtmlText('正文中没有图片，以下是本专栏的配图。'),
+      ]),
+      for (final u in urls) HtmlElement('img', attrs: {'src': u}),
+    ];
   }
 
   /// 正文配图 → 全屏查看（与评论图、动态图共用同一个查看页）。

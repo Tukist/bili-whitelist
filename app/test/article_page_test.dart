@@ -21,6 +21,7 @@ import 'package:bili_whitelist_app/api/bilibili_api.dart';
 import 'package:bili_whitelist_app/config.dart';
 import 'package:bili_whitelist_app/pages/article_page.dart';
 import 'package:bili_whitelist_app/pages/image_viewer_page.dart';
+import 'package:bili_whitelist_app/utils/bili_html.dart';
 import 'package:bili_whitelist_app/widgets/app_block.dart';
 import 'package:bili_whitelist_app/widgets/app_state_view.dart';
 
@@ -108,6 +109,7 @@ Map<String, dynamic> _viewBody({
   String content = '<p>正文</p>',
   int code = 0,
   String? message,
+  List<String> imageUrls = const ['//i0.hdslb.com/bfs/article/a.jpg'],
 }) =>
     {
       'code': code,
@@ -118,7 +120,7 @@ Map<String, dynamic> _viewBody({
         'content': content,
         'publish_time': _pubTs,
         'author': {'mid': 946974, 'name': '测试作者', 'face': ''},
-        'image_urls': ['//i0.hdslb.com/bfs/article/a.jpg'],
+        'image_urls': imageUrls,
         'stats': {'view': 1932290, 'like': 9765, 'favorite': 485},
       },
     };
@@ -219,30 +221,46 @@ void main() {
 
   testWidgets('正文是 Quill Delta（新版专栏）→ 图片 + 文本上屏，不出现原始 JSON',
       (tester) async {
+    const delta = '{"ops":['
+        '{"insert":"\\n","attributes":{"class":"normal-img"}},'
+        '{"insert":{"native-image":{"alt":"read-normal-img",'
+        '"url":"https://i0.hdslb.com/bfs/article/'
+        '32f43892ae504c833bc8b7783996851f1069246841.jpg'
+        '@progressive.webp","width":460,"height":215,'
+        '"size":64510,"status":"loaded"}}},'
+        '{"insert":"\\nRT，这个游戏是个好游戏，开放世界+黑客。"},'
+        '{"insert":"UP的讲解视频","attributes":{"link":'
+        '"https://www.bilibili.com/video/BV1pw411F7VA/"}},'
+        '{"insert":"\\n"}]}';
     final adapter = _GatedAdapter({
       '/x/frontend/finger/spi': _spiBody,
-      _kViewPath: () => _viewBody(
-            content: '{"ops":['
-                '{"insert":"\\n","attributes":{"class":"normal-img"}},'
-                '{"insert":{"native-image":{"alt":"read-normal-img",'
-                '"url":"https://i0.hdslb.com/bfs/article/'
-                '32f43892ae504c833bc8b7783996851f1069246841.jpg'
-                '@progressive.webp","width":460,"height":215,'
-                '"size":64510,"status":"loaded"}}},'
-                '{"insert":"\\nRT，这个游戏是个好游戏，开放世界+黑客。"},'
-                '{"insert":"UP的讲解视频","attributes":{"link":'
-                '"https://www.bilibili.com/video/BV1pw411F7VA/"}},'
-                '{"insert":"\\n"}]}',
-          ),
+      _kViewPath: () => _viewBody(content: delta),
     });
     await _pumpPage(tester, _api(adapter));
 
     // 图片渲染出来了（不是被当文本）
     expect(find.byType(Image), findsOneWidget);
+    // `@` 后缀**原样保留**（不改写 URL 的主决策）在解析层钉住：图集收集用的
+    // 就是这个原样地址（全屏查看页拿它请求）
+    expect(
+      collectBiliHtmlImageUrls(parseArticleContent(delta)),
+      [
+        'https://i0.hdslb.com/bfs/article/'
+            '32f43892ae504c833bc8b7783996851f1069246841.jpg@progressive.webp',
+      ],
+    );
+    // 页面上那张图：测试环境图床一律 400 → 首帧失败后已"去掉 @ 后缀重试一次"
+    // （见 `_ArticleImage`），所以这里是去后缀的地址。**能走到这个地址**本身
+    // 就说明首帧用的是带 `@progressive.webp` 的原样 URL（剥后缀只从带后缀的
+    // 地址上发生）。
     expect(
       tester.widget<Image>(find.byType(Image)).image,
-      isA<NetworkImage>()
-          .having((p) => p.url, 'url', contains('@progressive.webp')),
+      isA<NetworkImage>().having(
+        (p) => p.url,
+        'url',
+        'https://i0.hdslb.com/bfs/article/'
+            '32f43892ae504c833bc8b7783996851f1069246841.jpg',
+      ),
     );
     expect(
       tester
@@ -315,6 +333,105 @@ void main() {
       'https://i0.hdslb.com/bfs/article/two.jpg',
     ]);
     expect(viewer.initialIndex, 1);
+    _drainImageErrors(tester);
+  });
+
+  testWidgets('正文一张图都没有 + image_urls 非空 → 正文后补图集（可点开大图）',
+      (tester) async {
+    final adapter = _GatedAdapter({
+      '/x/frontend/finger/spi': _spiBody,
+      _kReplyPath: _replyEmptyBody,
+      _kViewPath: () => _viewBody(
+            content: '<p>整篇只有文字，没有任何图片标签</p>',
+            imageUrls: const [
+              '//i0.hdslb.com/bfs/article/g1.jpg',
+              '//i0.hdslb.com/bfs/article/g2.jpg',
+            ],
+          ),
+    });
+    await _pumpPage(tester, _api(adapter));
+
+    expect(find.text('正文中没有图片，以下是本专栏的配图。'), findsOneWidget);
+    expect(find.byType(Image), findsNWidgets(2));
+    expect(
+      tester
+          .widgetList<Image>(find.byType(Image))
+          .map((w) => (w.image as NetworkImage).url),
+      [
+        'https://i0.hdslb.com/bfs/article/g1.jpg',
+        'https://i0.hdslb.com/bfs/article/g2.jpg',
+      ],
+    );
+
+    // 补出来的图与正文图走同一条路：点击开查看页，图集 = 补出来的两张
+    final images = find.bySemanticsLabel(RegExp('正文图片，点击查看大图'));
+    expect(images, findsNWidgets(2));
+    await tester.ensureVisible(images.last);
+    await tester.pumpAndSettle();
+    await tester.tap(images.last, warnIfMissed: false);
+    await tester.pumpAndSettle();
+    _drainImageErrors(tester);
+
+    final viewer = tester.widget<ImageViewerPage>(find.byType(ImageViewerPage));
+    expect(viewer.urls, [
+      'https://i0.hdslb.com/bfs/article/g1.jpg',
+      'https://i0.hdslb.com/bfs/article/g2.jpg',
+    ]);
+    expect(viewer.initialIndex, 1);
+    _drainImageErrors(tester);
+  });
+
+  testWidgets('正文里有图 → 不重复补图集（image_urls 只在补了才看得见时才用）',
+      (tester) async {
+    final adapter = _GatedAdapter({
+      '/x/frontend/finger/spi': _spiBody,
+      _kReplyPath: _replyEmptyBody,
+      _kViewPath: () => _viewBody(
+            content:
+                '<p>图文</p><img src="//i0.hdslb.com/bfs/article/one.jpg">',
+            imageUrls: const ['//i0.hdslb.com/bfs/article/a.jpg'],
+          ),
+    });
+    await _pumpPage(tester, _api(adapter));
+
+    expect(find.textContaining('以下是本专栏的配图'), findsNothing);
+    expect(find.byType(Image), findsOneWidget, reason: '只有正文里那一张');
+    expect(
+      (tester.widget<Image>(find.byType(Image)).image as NetworkImage).url,
+      'https://i0.hdslb.com/bfs/article/one.jpg',
+    );
+    _drainImageErrors(tester);
+  });
+
+  testWidgets('正文是坏掉的新版专栏（坏 JSON）→ 界面不出现原始 JSON，图片尽力恢复',
+      (tester) async {
+    final adapter = _GatedAdapter({
+      '/x/frontend/finger/spi': _spiBody,
+      _kReplyPath: _replyEmptyBody,
+      _kViewPath: () => _viewBody(
+            // 新版专栏的 Delta 正文被截断（结构不闭合）→ 严格解析必失败
+            content: '{"ops":[{"insert":{"native-image":{"url":'
+                '"https://i0.hdslb.com/bfs/article/rec.jpg@progressive.webp",'
+                '"width":460,"height":215}}},{"insert":"被截断的正文',
+            imageUrls: const [],
+          ),
+    });
+    await _pumpPage(tester, _api(adapter));
+
+    final screen = tester
+        .widgetList<Text>(find.byType(Text))
+        .map((t) => t.data ?? t.textSpan?.toPlainText() ?? '')
+        .join('\n');
+    for (final leak in <String>['ops', 'insert', 'native-image', 'width']) {
+      expect(screen.contains(leak), isFalse, reason: '泄漏了 $leak');
+    }
+    expect(screen, contains('正文解析失败'));
+    expect(
+      (tester.widget<Image>(find.byType(Image)).image as NetworkImage).url,
+      'https://i0.hdslb.com/bfs/article/rec.jpg',
+      reason: '图片地址还能从原文里捞出来（首帧是带 @ 后缀的原样地址，'
+          '测试环境 400 后已去后缀重试过一次），不能让整篇一张图都没有',
+    );
     _drainImageErrors(tester);
   });
 

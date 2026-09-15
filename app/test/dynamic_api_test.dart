@@ -8,6 +8,12 @@
 // - -412 → 刷新 WBI key 后重签重试一次；两次都 -412 → BiliApiException(风控)
 // - -352 → BiliApiException(限流)；其它业务码 → 带 message 的 BiliApiException
 // - 脏 data（null / items 非 List / 空 id 条目）不崩，按空页处理
+//
+// 外加 BiliApi.fetchDynamicDetail（v2.31.0+，动态详情页的「装饰性补全」）：
+// - 请求构造：`id` + WBI 签名；解析 data.item（与 feed 条目同构）
+// - 互动数据（module_stat）与转发原文的图片/视频一起解析出来
+// - **失败一律 null，不抛**：业务码非 0 / 脏响应 / 网络失败都一样
+// - 空 id 直接 null（不发请求）；-412 → 换 key 重签重试一次
 import 'dart:convert';
 
 import 'package:dio/dio.dart';
@@ -19,6 +25,7 @@ import 'package:bili_whitelist_app/config.dart';
 import 'package:bili_whitelist_app/models/dynamic_item.dart';
 
 const String _kFeedPath = '/x/polymer/web-dynamic/v1/feed/space';
+const String _kDetailPath = '/x/polymer/web-dynamic/v1/detail';
 
 void _mockSecureStorage() {
   const channel = MethodChannel('plugins.it_nomads.com/flutter_secure_storage');
@@ -348,5 +355,176 @@ void main() {
 
     expect(page.isEmpty, isTrue);
     expect(page.hasMore, isFalse);
+  });
+
+  // -------------------------------------------------------------------------
+  // fetchDynamicDetail（v2.31.0+）
+  // -------------------------------------------------------------------------
+
+  group('fetchDynamicDetail', () {
+    test('请求构造：id + WBI 签名；解析互动数据与转发原文的图片/视频', () async {
+      final adapter = _RecordingAdapter({
+        '/x/frontend/finger/spi': _spiBody,
+        '/x/web-interface/nav': _navBody,
+        _kDetailPath: () => {
+              'code': 0,
+              'message': '0',
+              'data': {
+                'item': {
+                  'id_str': '967717348014293017',
+                  'type': DynamicType.draw,
+                  'modules': {
+                    'module_author': {
+                      'name': '测试UP',
+                      'face': '//i0.hdslb.com/bfs/face/f.jpg',
+                      'pub_ts': 1730000000,
+                    },
+                    'module_dynamic': {
+                      'desc': {'text': '详情正文'},
+                      'major': {
+                        'draw': {
+                          'items': [
+                            {'src': '//i0.hdslb.com/d.jpg'},
+                          ],
+                        },
+                      },
+                    },
+                    'module_stat': {
+                      'comment': {'count': 34, 'forbidden': false},
+                      'forward': {'count': 2, 'forbidden': false},
+                      'like': {'count': 65, 'forbidden': false, 'status': true},
+                    },
+                  },
+                  'orig': {
+                    'id_str': '111',
+                    'modules': {
+                      'module_author': {'name': '原PO'},
+                      'module_dynamic': {
+                        'desc': {'text': '原文正文'},
+                        'major': {
+                          'draw': {
+                            'items': [
+                              {'src': '//i0.hdslb.com/orig.jpg'},
+                            ],
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+              },
+            },
+      });
+      final api = _api(adapter);
+
+      final item = await api.fetchDynamicDetail('967717348014293017');
+
+      expect(item, isNotNull);
+      expect(item!.id, '967717348014293017');
+      expect(item.text, '详情正文');
+      expect(item.imageUrls, ['https://i0.hdslb.com/d.jpg']);
+      // 互动数据
+      expect(item.stat.like, 65);
+      expect(item.stat.comment, 34);
+      expect(item.stat.forward, 2);
+      // 转发原文的媒体（详情页要画出来）
+      expect(item.origAuthor, '原PO');
+      expect(item.origText, '原文正文');
+      expect(item.origImageUrls, ['https://i0.hdslb.com/orig.jpg']);
+
+      final req = adapter.forPath(_kDetailPath).single;
+      expect(req.queryParameters['id'], '967717348014293017');
+      expect(req.queryParameters['w_rid'], isNotEmpty);
+      expect(req.queryParameters['wts'], isNotEmpty);
+      final cookie = req.headers['Cookie'] as String? ?? '';
+      expect(cookie, contains('buvid3=buvid3test'));
+    });
+
+    test('业务码非 0 → null（不抛）', () async {
+      final adapter = _RecordingAdapter({
+        '/x/frontend/finger/spi': _spiBody,
+        '/x/web-interface/nav': _navBody,
+        _kDetailPath: () => {'code': -352, 'message': '被限流'},
+      });
+      final api = _api(adapter);
+
+      expect(await api.fetchDynamicDetail('123'), isNull);
+    });
+
+    test('-412 → 换 key 重签重试一次，成功返回', () async {
+      var calls = 0;
+      final adapter = _RecordingAdapter({
+        '/x/frontend/finger/spi': _spiBody,
+        '/x/web-interface/nav': _navBody,
+        _kDetailPath: () {
+          calls++;
+          return calls == 1
+              ? {'code': -412, 'message': '风控'}
+              : {
+                  'code': 0,
+                  'data': {
+                    'item': {'id_str': '123', 'type': DynamicType.word},
+                  },
+                };
+        },
+      });
+      final api = _api(adapter);
+
+      final item = await api.fetchDynamicDetail('123');
+
+      expect(item?.id, '123');
+      expect(adapter.forPath(_kDetailPath), hasLength(2));
+      expect(adapter.forPath('/x/web-interface/nav'), hasLength(2),
+          reason: '首次取 key + -412 后刷新 key 各一次');
+    });
+
+    test('脏响应（无 data / 无 item / item 解析后 id 为空）→ null', () async {
+      var mode = 0;
+      final adapter = _RecordingAdapter({
+        '/x/frontend/finger/spi': _spiBody,
+        '/x/web-interface/nav': _navBody,
+        _kDetailPath: () {
+          mode++;
+          if (mode == 1) return {'code': 0};
+          if (mode == 2) return {'code': 0, 'data': {'item': 'nope'}};
+          return {
+            'code': 0,
+            'data': {
+              'item': {'id_str': '', 'type': DynamicType.word},
+            },
+          };
+        },
+      });
+      final api = _api(adapter);
+
+      expect(await api.fetchDynamicDetail('1'), isNull);
+      expect(await api.fetchDynamicDetail('2'), isNull);
+      expect(await api.fetchDynamicDetail('3'), isNull);
+    });
+
+    test('网络失败（404）→ null，不抛（且只重试一次）', () async {
+      // 不注册 detail handler → 适配器回 404 → DioException（默认 validateStatus）
+      final adapter = _RecordingAdapter({
+        '/x/frontend/finger/spi': _spiBody,
+        '/x/web-interface/nav': _navBody,
+      });
+      final api = _api(adapter);
+
+      expect(await api.fetchDynamicDetail('123'), isNull);
+      expect(adapter.forPath(_kDetailPath), hasLength(2),
+          reason: '第 1 次网络失败后换 key 再试一次，仍失败即收手');
+    });
+
+    test('空 id / 纯空白 → null，且一个请求都不发', () async {
+      final adapter = _RecordingAdapter({
+        '/x/frontend/finger/spi': _spiBody,
+        '/x/web-interface/nav': _navBody,
+      });
+      final api = _api(adapter);
+
+      expect(await api.fetchDynamicDetail(''), isNull);
+      expect(await api.fetchDynamicDetail('   '), isNull);
+      expect(adapter.forPath(_kDetailPath), isEmpty);
+    });
   });
 }

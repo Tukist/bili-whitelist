@@ -188,8 +188,9 @@ class ArticleDetail {
 
   /// 正文配图（`image_urls[]`，已归一化）。
   ///
-  /// 说明：阅读页**只按 [contentHtml] 渲染**，不额外补图（避免与正文里的
-  /// 图片重复）；这个列表留给宿主做兜底（如正文里一张图都没有时）。
+  /// 说明：阅读页按 [contentHtml] 渲染；本列表只在**正文里一张图都没有**时由
+  /// 宿主补一个图集（v2.31.0 起在 `article_page.dart` 落地），正文有图时
+  /// **不补**，避免同一张图重复出现一遍。
   final List<String> imageUrls;
 
   /// 阅读数（`stats.view`）。

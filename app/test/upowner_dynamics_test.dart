@@ -23,6 +23,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:bili_whitelist_app/api/bilibili_api.dart';
 import 'package:bili_whitelist_app/config.dart';
 import 'package:bili_whitelist_app/models/dynamic_item.dart';
+import 'package:bili_whitelist_app/pages/dynamic_detail_page.dart';
 import 'package:bili_whitelist_app/pages/image_viewer_page.dart';
 import 'package:bili_whitelist_app/pages/upowner_page.dart';
 import 'package:bili_whitelist_app/widgets/app_state_view.dart';
@@ -474,13 +475,16 @@ void main() {
     await _pumpPage(tester, _fakeApi(adapter));
     await _switchToDynamics(tester);
 
-    // 图片本体加载失败（测试环境无图床）→ 占位仍在，点击照常命中
+    // 图片本体加载失败（测试环境无图床）→ 占位仍在，点击照常命中。
+    // 注意：v2.31.0+ 整卡可点（onTap），卡片自己也带一个 GestureDetector ——
+    // `.first` 会是**整卡**那个（它是图片的祖先），点它的中心落在哪张图上取决于
+    // 布局。所以这里显式取 DynamicImages 里的缩略图（下标 1 = 第二张）。
     final tap = find.descendant(
-      of: find.byType(DynamicCard),
+      of: find.byType(DynamicImages),
       matching: find.byType(GestureDetector),
     );
-    expect(tap, findsWidgets);
-    await tester.tap(tap.first, warnIfMissed: false);
+    expect(tap, findsNWidgets(2));
+    await tester.tap(tap.last, warnIfMissed: false);
     await tester.pumpAndSettle();
 
     expect(find.byType(ImageViewerPage), findsOneWidget);
@@ -489,7 +493,41 @@ void main() {
       'https://i0.hdslb.com/1.jpg',
       'https://i0.hdslb.com/2.jpg',
     ]);
+    expect(viewer.initialIndex, 1, reason: '被点的是第二张');
     // 图床在测试环境必然 400 → 图片异常（占位已兜住渲染）取走即可
+    _drainImageErrors(tester);
+  });
+
+  testWidgets('点动态卡 → 动态详情页（带列表里那条 initial，首帧就有正文）',
+      (tester) async {
+    final adapter = _RoutingAdapter({
+      ..._baseHandlers(),
+      _kFeedPath: (_) => _feedBody(
+            items: [
+              _dynItem('1', text: '动态正文一'),
+            ],
+          ),
+    });
+    await _pumpPage(tester, _fakeApi(adapter));
+    await _switchToDynamics(tester);
+
+    // 接线：整卡 onTap 已挂上，既有两个回调语义不变
+    final card = tester.widget<DynamicCard>(find.byType(DynamicCard));
+    expect(card.onTap, isNotNull, reason: '整卡点击已接线');
+    expect(card.onImageTap, isNotNull);
+    expect(card.onVideoTap, isNotNull);
+
+    await tester.tap(find.text('动态正文一'));
+    await tester.pumpAndSettle();
+
+    expect(find.byType(DynamicDetailPage), findsOneWidget);
+    final page =
+        tester.widget<DynamicDetailPage>(find.byType(DynamicDetailPage));
+    expect(page.id, '1');
+    expect(page.initial?.text, '动态正文一',
+        reason: '把列表里那条一起带下去（首帧就有内容）');
+    // 详情页首帧就渲染（列表页在 opaque 路由下方，这里找到的就是详情页那份）
+    expect(find.text('动态正文一'), findsOneWidget);
     _drainImageErrors(tester);
   });
 

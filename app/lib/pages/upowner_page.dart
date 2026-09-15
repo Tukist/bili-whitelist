@@ -88,6 +88,7 @@ import '../widgets/expandable_text.dart';
 import '../widgets/smoke_silhouette.dart';
 import '../widgets/staggered_entrance.dart';
 import 'article_page.dart';
+import 'dynamic_detail_page.dart';
 import 'image_viewer_page.dart';
 import 'live_player_page.dart';
 import 'player_page.dart';
@@ -1170,6 +1171,30 @@ class _UpownerPageState extends State<UpownerPage> {
     ));
   }
 
+  /// 点动态卡 → 动态详情页（[DynamicDetailPage]，v2.31.0+）。
+  ///
+  /// 把列表里**已经拿到的那条**（[DynamicItem]）一起带下去 —— 首帧就有正文/
+  /// 作者/图片，不会先闪一下转圈；详情接口（互动数据 + 转发原文的图片/视频）
+  /// 在新页面里后台补，失败静默（页面照常可读）。
+  ///
+  /// 路由**不套** [kPlayerRouteName]：那个名字是「播放页」，`app_theme` 按它
+  /// 分流成快速淡入，播放页链路（通知栏、RouteAware 暂停旧页）也认这个名字。
+  /// 动态详情不是播放页，借用这个名字拿到的只是一次转场，语义上却是错的 ——
+  /// 直接用普通 push（默认转场），与「点专栏卡进专栏页」同一处理。
+  ///
+  /// 同样复用本页的 [_api]（buvid 指纹 / 会话 Cookie，少一次握手；测试也能
+  /// 继续吃注入的 mock）。
+  void _openDynamicDetail(DynamicItem d) {
+    debugPrint('[upowner] 打开动态详情 id=${d.id}');
+    Navigator.of(context).push(MaterialPageRoute<void>(
+      builder: (_) => DynamicDetailPage(
+        id: d.id,
+        initial: d,
+        api: _api,
+      ),
+    ));
+  }
+
   /// 「全部视频」列表的播放上下文（v2.30.0+ 同 UP 主上下集）。
   ///
   /// 只有「全部视频」分区（`_section == 0`）**点单条视频**那条路用它；动态投稿
@@ -1682,6 +1707,9 @@ class _UpownerPageState extends State<UpownerPage> {
                 fallbackAuthorFace: _info?.face ?? '',
                 onImageTap: _openDynamicImage,
                 onVideoTap: () => _openDynamicVideo(d),
+                // 整卡点击 → 动态详情页（v2.31.0+）；点图/点视频卡仍各走上面
+                // 两个回调（它们的手势识别器更深，手势竞技场里更深者胜）
+                onTap: () => _openDynamicDetail(d),
               ),
             );
           },

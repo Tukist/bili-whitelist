@@ -2625,6 +2625,70 @@ class BiliApi {
     );
   }
 
+  /// 单条动态详情（`x/polymer/web-dynamic/v1/detail?id=<dyn id>`，v2.31.0+）。
+  ///
+  /// 用例：动态详情页进入时补全「互动数据 + 转发原文的图片/视频」（列表页
+  /// 带过来的那条只是 feed 的切片，见 [DynamicDetailPage]）。签名/指纹与
+  /// [fetchUserDynamics] 完全同一套（WBI + buvid；`-412` 换 key 重签再试一次）。
+  ///
+  /// **失败一律返回 null，不抛**：本方法是「装饰性补全」——正文、作者、图片
+  /// 已经由列表带过来并可读，详情接口只是把互动数据与原文媒体补齐。与
+  /// [fetchUserDynamics]（页面主体，失败要落错误态）的取舍不同：这里抛出去
+  /// 只会让一次后台补全把一个可读的页面变成错误页。原因用 `debugPrint` 留痕。
+  ///
+  /// [id] 是 [DynamicItem.id]（`id_str`，19 位数字串）。非空即可调；空串直接
+  /// 返回 null（不发请求）。
+  Future<DynamicItem?> fetchDynamicDetail(String id) async {
+    final dynId = id.trim();
+    if (dynId.isEmpty) return null;
+    debugPrint('[bili_api] fetchDynamicDetail id=$dynId');
+    for (var attempt = 0; attempt < 2; attempt++) {
+      try {
+        if (attempt > 0) await _refreshWbiKeys(); // 换 key 后重签（wts 同步刷新）
+        await _injectAuth();
+        final (imgKey, subKey) = await _ensureWbiKeys();
+        final resp = await _dio.get<Map<String, dynamic>>(
+          '/x/polymer/web-dynamic/v1/detail',
+          queryParameters: WbiSigner.encodeWbi(
+            {'id': dynId},
+            imgKey: imgKey,
+            subKey: subKey,
+          ),
+        );
+        final data = resp.data;
+        final code = data?['code'] as int?;
+        if (code == -412 && attempt == 0) {
+          debugPrint('[bili_api] fetchDynamicDetail -412 风控，刷新 WBI key 重试');
+          continue;
+        }
+        if (code != 0) {
+          debugPrint('[bili_api] fetchDynamicDetail id=$dynId 失败：'
+              'code=$code message=${data?['message']}');
+          return null;
+        }
+        // detail 的 data.item 与 feed 的 items[] 条目**同构** → 同一个解析器
+        final item = (data?['data'] as Map<String, dynamic>?)?['item'];
+        if (item is! Map<String, dynamic>) {
+          debugPrint('[bili_api] fetchDynamicDetail id=$dynId 无 item（脏响应）');
+          return null;
+        }
+        final parsed = DynamicItem.fromJson(item);
+        if (parsed.id.isEmpty) {
+          debugPrint('[bili_api] fetchDynamicDetail id=$dynId 解析后 id 为空');
+          return null;
+        }
+        debugPrint('[bili_api] fetchDynamicDetail id=$dynId → '
+            '赞${parsed.stat.like} 评${parsed.stat.comment} '
+            '转${parsed.stat.forward} 图${parsed.imageUrls.length}');
+        return parsed;
+      } catch (e) {
+        // 网络失败 / nav 拿不到 key / 解析异常：都按「补全失败」处理
+        debugPrint('[bili_api] fetchDynamicDetail id=$dynId 第 ${attempt + 1} 次失败：$e');
+      }
+    }
+    return null;
+  }
+
   // -------------------------------------------------------------------------
   // 专栏（B 站「文章」，v2.23.0+）
   // -------------------------------------------------------------------------

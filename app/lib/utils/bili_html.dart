@@ -428,16 +428,27 @@ String? _decodeEntityBody(String body) {
 /// 专栏正文的统一入口：**自动判别** HTML 与 Quill Delta 后分派。
 ///
 /// - 像 Delta（[looksLikeBiliDelta]）且**解析成功** → 走 [parseBiliDelta]；
-/// - 其余（老 HTML、纯文本、`{` 开头但 JSON 畸形）→ 退回 [parseBiliHtml]，
-///   行为与没有 Delta 支持时完全一致。
+/// - 像 Delta 但 **JSON 畸形**（坏转义 / 裸控制字符 / 被截断）→ 走
+///   [parseBiliDeltaFallback]，**不再退回 [parseBiliHtml]**。理由：那段原文
+///   本来就是一坨 JSON，交给 HTML 分支等于把整篇 `{"ops":[…` 当纯文本画到
+///   屏幕上（用户报告里能贴出"可复制的原始 JSON 文本"，说明这件事真的发生过），
+///   而他要看的图片全在 JSON 里、一张都出不来——"漏一屏 JSON + 丢全部图"是
+///   双输，比"退化成图片墙"差得多；
+/// - 其余（老 HTML、纯文本）→ [parseBiliHtml]，行为与没有 Delta 支持时
+///   完全一致。
 ///
-/// 阅读页用这个（[BiliHtmlView.fromContent]）；只用 [parseBiliHtml] 的调用方
-/// 不受影响。
-@visibleForTesting
-List<HtmlNode> parseArticleContent(String raw) {
+/// [source] 只进日志（如 `cv123456`），回报问题时能对上"是哪一篇"。
+///
+/// 阅读页用这个（[BiliHtmlView.fromContent] 内部也调它）；只用
+/// [parseBiliHtml] 的调用方不受影响。
+///
+/// 公开（非 `@visibleForTesting`）：阅读页要在渲染前先问一句"正文里到底有没有
+/// 图"，才能决定要不要用 `image_urls[]` 补图集 —— 见 `article_page.dart`。
+List<HtmlNode> parseArticleContent(String raw, {String source = ''}) {
   if (looksLikeBiliDelta(raw)) {
-    final nodes = parseBiliDelta(raw);
+    final nodes = parseBiliDelta(raw, source: source);
     if (nodes != null) return nodes;
+    return parseBiliDeltaFallback(raw);
   }
   return parseBiliHtml(raw);
 }
@@ -448,8 +459,9 @@ List<HtmlNode> parseArticleContent(String raw) {
 ///    里的 `{` 也不在开头）；
 /// 2. 开头一小段里出现 `"ops"` 键（Delta 文档的固定外壳）。
 ///
-/// 判别为 Delta 但 [parseBiliDelta] 返回 null（JSON 畸形）时，调用方会退回
-/// 纯文本，所以**误判也不会崩**。
+/// 判别为 Delta 但 [parseBiliDelta] 返回 null（JSON 畸形）时，调用方会退到
+/// [parseBiliDeltaFallback]（**绝不**把原始 JSON 当纯文本画上屏），所以
+/// **误判也不会崩、更不会漏一屏 JSON**。
 @visibleForTesting
 bool looksLikeBiliDelta(String raw) {
   final t = raw.trimLeft();
@@ -463,11 +475,13 @@ bool looksLikeBiliDelta(String raw) {
 // ---------------------------------------------------------------------------
 
 /// 解析 Quill Delta 正文 → 节点树；**不是可用的 Delta 一律返回 null**
-/// （调用方退回 [parseBiliHtml]，即既有行为）。
+/// （调用方走 [parseBiliDeltaFallback]，**不是**退回 [parseBiliHtml]）。
 ///
 /// [raw] 两种入参都要兜住：
 /// - **JSON 字符串**（`data.content` 给的就是这个）→ 内部 `jsonDecode`；
-///   畸形 JSON → null（调用方按纯文本处理，**绝不抛到 UI**）；
+///   严格解析失败时先试一次保守的转义修补（[repairBiliDeltaJson]），
+///   仍失败 → null（调用方退到图片兜底，**绝不抛到 UI、也绝不把 JSON
+///   当纯文本画**）；
 /// - **已经解码好的 `Map`**（宿主/测试可能已经解析过）→ 直接用。
 ///
 /// 支持的 op 形态（B 站 Delta 契约见 `docs/article/view.md` 的
@@ -487,16 +501,40 @@ bool looksLikeBiliDelta(String raw) {
 /// - `align`（对齐）与 `color`（文字色）不还原——本 App 的颜色一律走 token，
 ///   引入任意颜色会破坏设计语言；
 /// - 列表被图片/其它块打断时会分成两个列表（有序列表的序号会重新数）。
+/// [source] 只用于日志（哪一篇专栏），不影响解析结果。
 @visibleForTesting
-List<HtmlNode>? parseBiliDelta(Object? raw) {
+List<HtmlNode>? parseBiliDelta(Object? raw, {String source = ''}) {
   var decoded = raw;
   if (raw is String) {
     final t = raw.trim();
     if (t.length < 2 || t[0] != '{') return null;
     try {
       decoded = jsonDecode(t);
-    } catch (_) {
-      return null; // 畸形 JSON：交给调用方按纯文本处理
+    } catch (e) {
+      // ⚠️ 这里以前是"静默 return null"。后果有两层：① 整篇专栏就此掉进
+      // HTML 分支、把原始 JSON 当纯文本画上屏；② **现场一点证据都不留**，
+      // 用户说"图片不显示"时无从判断到底是不是这条路径。现在补两件事：
+      // 先试一次保守的转义修补（坏转义是上游拼接/截断的高频形态），
+      // 无论成不成都把异常类型 + 长度 + 篇号打出来。
+      final repaired = repairBiliDeltaJson(t);
+      Object? retried;
+      var ok = false;
+      if (repaired != null) {
+        try {
+          retried = jsonDecode(repaired);
+          ok = true;
+        } catch (_) {
+          ok = false; // 修完还是坏的 → 当作没修
+        }
+      }
+      final why = e is FormatException ? e.message : '$e';
+      debugPrint('[bili_html] Delta JSON 解析失败'
+          '（${e.runtimeType}${source.isEmpty ? '' : '，$source'}，'
+          '${t.length} 字符）：'
+          '${why.length > 120 ? '${why.substring(0, 120)}…' : why} '
+          '→ ${ok ? '宽容修复后解析成功' : (repaired == null ? '无可修补的坏转义' : '宽容修复后仍失败')}');
+      if (!ok) return null; // 畸形 JSON：调用方走 parseBiliDeltaFallback
+      decoded = retried;
     }
   }
   if (decoded is! Map) return null;
@@ -511,6 +549,149 @@ List<HtmlNode>? parseBiliDelta(Object? raw) {
   builder.flushParagraph();
   return builder.blocks;
 }
+
+/// 对**已经解析失败**的 Delta 原文做一次保守的「修补转义」。
+///
+/// 为什么需要：正文 JSON 是服务端/编辑器拼出来的，实测会夹带**严格解析器
+/// 必然拒绝**的东西，最高频的两类：
+/// 1. 字符串里的**裸控制字符**（U+0000–U+001F）——正文里的换行 / Tab 忘了
+///    转义，"上游把一段带换行的文本直接拼进 JSON"是典型事故；
+/// 2. 字符串里的**非法转义**（`\` 后面跟着 `"`、`\`、`/`、`b`、`f`、`n`、
+///    `r`、`t`、`u` 之外的字符，例如断掉一半的 `\` 或 Windows 路径 `C:\Users`）。
+///
+/// 为什么这么写才叫"保守"（不误伤正常正文）：
+/// - 修补只发生在**双引号字符串内部**（合法 JSON 的字符串外不允许出现裸
+///   控制字符，所以不碰字符串外的任何字节）；
+/// - 只处理上面两类——**合法 JSON 里根本不可能出现、`jsonDecode` 必定报错**
+///   的形态。正常正文不可能走到这里（它第一次就解析成功了）；
+/// - 返回值还要被 `jsonDecode` 再验一次，验不过就当没修（见 [parseBiliDelta]）。
+///
+/// `\` 后跟非法字符时，做法是把**反斜杠本身转义**、后面的字符原样保留：
+/// 这样既让 JSON 合法，又不会改变那个字符的可见语义（例如 `C:\Users` 修完
+/// 仍是 `C:\Users`）。返回 null = 一个字节都没改。
+@visibleForTesting
+String? repairBiliDeltaJson(String raw) {
+  final out = StringBuffer();
+  var inString = false;
+  var changed = false;
+  for (var i = 0; i < raw.length; i++) {
+    final c = raw.codeUnitAt(i);
+    if (!inString) {
+      if (c == 0x22 /* " */) inString = true;
+      out.writeCharCode(c);
+      continue;
+    }
+    if (c == 0x5C /* \ */) {
+      if (i + 1 >= raw.length) {
+        out.write('\\\\'); // 结尾孤零零的 `\`：转义成字面反斜杠
+        changed = true;
+        continue;
+      }
+      final n = raw.codeUnitAt(i + 1);
+      if (_kJsonEscapeChars.contains(n)) {
+        out.writeCharCode(c);
+        out.writeCharCode(n);
+        i++; // 合法转义：两个字符一起放行
+        continue;
+      }
+      out.write('\\\\'); // 非法转义：只转义反斜杠，下一个字符留到下一轮
+      changed = true;
+      continue;
+    }
+    if (c == 0x22 /* " */) {
+      inString = false;
+      out.writeCharCode(c);
+      continue;
+    }
+    if (c < 0x20) {
+      // 裸控制字符 → 转义（换行/Tab 给可读形态，其余走 \u00XX）
+      switch (c) {
+        case 0x0A:
+          out.write('\\n');
+        case 0x0D:
+          out.write('\\r');
+        case 0x09:
+          out.write('\\t');
+        default:
+          out.write('\\u${c.toRadixString(16).padLeft(4, '0')}');
+      }
+      changed = true;
+      continue;
+    }
+    out.writeCharCode(c);
+  }
+  return changed ? out.toString() : null;
+}
+
+/// 合法 JSON 转义字符（`\uXXXX` 里的 `u` 也算）。
+const Set<int> _kJsonEscapeChars = {
+  0x22, 0x5C, 0x2F, 0x62, 0x66, 0x6E, 0x72, 0x74, 0x75, //
+}; // " \ / b f n r t u
+
+/// Delta 判别成立、但 JSON 解析失败时的**保底渲染**。
+///
+/// 为什么不能退回 [parseBiliHtml]：原文是 JSON，HTML 解析器只会把它当纯文本，
+/// 于是屏幕上是一大片 `{"ops":[…`（用户会直接判定"App 坏了"），而图片地址
+/// 明明就在这坨文本里、一张也没渲染出来。两害相权：**把能捞到的图片捞出来
+/// 排成图片墙 + 一句失败提示**，比"漏一屏 JSON + 全丢图"好得多。
+///
+/// 取舍：**不做文字抢救**。结构已经不可信，切不出可信的段落边界，硬切出来的
+/// 半句话 / 半截链接比一句明确的提示更容易误导；图片是"只要地址对就一定对的
+/// 原子内容"，所以只救它。
+@visibleForTesting
+List<HtmlNode> parseBiliDeltaFallback(String raw) {
+  final urls = extractBiliJsonImageUrls(raw);
+  return <HtmlNode>[
+    HtmlElement('p', children: [
+      HtmlText(urls.isEmpty
+          ? '正文解析失败，请稍后重试。'
+          : '正文解析失败，以下是从原文中恢复的图片。'),
+    ]),
+    for (final u in urls) HtmlElement('img', attrs: {'src': u}),
+  ];
+}
+
+/// 从**畸形的 Delta 原文**里尽力捞出图片地址。
+///
+/// 只用一条宽松的 URL 正则 + 图片后缀白名单，**不试图修复 JSON 结构**：结构
+/// 已经不可信，能确定的只有"这里出现了一个像图床图片的绝对地址"。顺序保留、
+/// 去重；数量封顶 [_kDeltaFallbackMaxImages]（畸形数据可能几十万字，不能让
+/// 一次渲染把内存和请求数打爆）。
+@visibleForTesting
+List<String> extractBiliJsonImageUrls(String raw) {
+  final out = <String>[];
+  final seen = <String>{};
+  for (final m in _kJsonUrlRe.allMatches(raw)) {
+    if (out.length >= _kDeltaFallbackMaxImages) break;
+    var candidate = m.group(0)!;
+    // JSON 里斜杠常被写成 `\/`（甚至 `\u002F`）→ 先还原成真斜杠
+    candidate = candidate
+        .replaceAll(r'\/', '/')
+        .replaceAll(RegExp(r'\\u002[fF]'), '/');
+    // 尾部可能粘着中文标点 / 引号（正则只排掉 ASCII 分隔符）→ 削掉非 ASCII 尾巴
+    candidate = candidate.replaceAll(RegExp(r'[^\x21-\x7E]+$'), '');
+    if (!_kBiliImageExtRe.hasMatch(candidate)) continue;
+    final url = normalizeBiliImageUrl(candidate);
+    if (url.isEmpty || !seen.add(url)) continue;
+    out.add(url);
+  }
+  return out;
+}
+
+/// 畸形正文里的 URL 形态：`http(s)://` 起，到空白 / JSON 分隔符为止；
+/// 路径里允许出现 JSON 转义的 `\/`。
+final RegExp _kJsonUrlRe =
+    RegExp(r'https?:(?:\\?/){2}(?:[^\s"\\,{}()\[\]]|\\/)+');
+
+/// 图片后缀白名单（判"这个地址是不是图"）：结尾是常见图片扩展名，可带 B 站
+/// 图床的 `@…` 处理后缀（`@progressive.webp` / `@460w_240h_1c_!web-…`）。
+final RegExp _kBiliImageExtRe = RegExp(
+  r'\.(?:jpe?g|png|webp|gif|bmp|avif)(?:@[\w\-.!]+)?$',
+  caseSensitive: false,
+);
+
+/// 兜底图集最多渲染多少张（防畸形数据把版面/请求数打爆）。
+const int _kDeltaFallbackMaxImages = 100;
 
 /// 追加一个 op（`{"insert":…,"attributes":…}`）。
 void _deltaOp(_DeltaBuilder builder, Map op) {
@@ -575,7 +756,9 @@ String _deltaBlockTag(Map attrs) {
 ///   取 `url` 与 `width`/`height`（渲染端拿它算 [AspectRatio]，防加载后跳动）；
 ///   `alt` 存进属性（B 站常给的是 CSS 类名，UI 不直接用，留给调试/无障碍）。
 ///   `@progressive.webp` 这类图床后缀**原样保留**——实测可直连（见
-///   [_imageBlock] 的防盗链请求头），不做任何改写。
+///   [_imageBlock] 的防盗链请求头），这里不做任何改写。（唯一会碰后缀的地方
+///   是 [_ArticleImage]：**该图加载失败之后**才剥掉后缀重试一次，正常路径
+///   依旧原样请求。）
 /// - `cut-off` → `<hr>`（复用既有分隔线样式；它的 `url` 是分割线贴图，
 ///   不必要）。
 /// - `video-card` / `article-card` / `vote-card` / `live-card` → **跳过**：
@@ -753,9 +936,10 @@ String _numAttr(double v) =>
 /// 按**文档顺序**收集正文里的图片 URL（[img] 的 `src`，已归一化）。
 ///
 /// 不去重：同一张图出现两次就占两个位置——[BiliHtmlView.onImageTap] 给的
-/// 下标与这里一一对应。`<img>` 用 `data-src`（懒加载占位）时优先取 `src`
-/// 之外的那个（实测 B 站专栏给的是可直接加载的 `src`，此处只是兜底）。
-@visibleForTesting
+/// 下标与这里一一对应。取址规则见 [biliImageSrc]。
+///
+/// 公开（非 `@visibleForTesting`）：阅读页要用它判断"正文里有没有图"，
+/// 从而决定要不要用 `image_urls[]` 补图集（见 `article_page.dart`）。
 List<String> collectBiliHtmlImageUrls(List<HtmlNode> nodes) {
   final urls = <String>[];
   void walk(List<HtmlNode> list) {
@@ -774,14 +958,59 @@ List<String> collectBiliHtmlImageUrls(List<HtmlNode> nodes) {
   return urls;
 }
 
-/// `<img>` 的取址：`src` 优先，`data-src`（懒加载）兜底；归一化为 https。
+/// `<img>` 的取址；`src` 优先，以下两种情形改用 `data-src`（懒加载真址）：
+/// 1. `src` 为空 —— 既有的懒加载兜底；
+/// 2. `src` 是 `data:` URI 之类的**内联占位**——懒加载模板的惯例是先塞一张
+///    1×1 透明图、真址放 `data-src`。此前这种标签会取到占位图，界面上就是
+///    一块"永远加载不出来"的白板，而真图地址明明就在同一个标签里。
 ///
-/// 公开以便单测直接断言（`//` → `https:` 这一步在 reader 里最容易出错）。
+/// 最后统一走 [normalizeBiliImageUrl]（`//` → `https:`、相对路径补域名）。
+///
+/// 公开以便单测直接断言（这几步在 reader 里最容易出错）。
 String biliImageSrc(HtmlElement img) {
-  final raw = (img.attrs['src'] ?? '').trim().isNotEmpty
-      ? img.attrs['src']!.trim()
-      : (img.attrs['data-src'] ?? '').trim();
-  return normalizeDynamicUrl(raw);
+  final src = (img.attrs['src'] ?? '').trim();
+  final dataSrc = (img.attrs['data-src'] ?? '').trim();
+  if (src.isNotEmpty && !_isInlinePlaceholderUrl(src)) {
+    return normalizeBiliImageUrl(src);
+  }
+  // `data-src` 也没有 → 仍用原 `src`（返回占位图总比返回空串好：空串会被
+  // 渲染层判成"没有地址"而整块消失，连"这里本该有张图"都看不出来）
+  return normalizeBiliImageUrl(dataSrc.isNotEmpty ? dataSrc : src);
+}
+
+/// 图片地址归一化：`//` → `https:`、`http://` 升 https（[normalizeDynamicUrl]），
+/// 再补一项**站内相对路径**——B 站 HTML 片段里 `<img src="/bfs/article/x.jpg">`
+/// 是常见形态，原样丢给 `Image.network` 没有 host，必定加载失败。图床域名固定
+/// 用 `i0.hdslb.com`（图片 CDN，直接给 host 即可，不必走 `//` 那套）。
+String normalizeBiliImageUrl(String raw) {
+  final u = normalizeDynamicUrl(raw);
+  if (u.startsWith('/')) return 'https://i0.hdslb.com$u';
+  return u;
+}
+
+/// 内联占位图（`data:` URI 开头）：它不是"真图"，只是懒加载模板占的位。
+bool _isInlinePlaceholderUrl(String url) =>
+    url.length >= 5 && url.substring(0, 5).toLowerCase() == 'data:';
+
+/// 剥掉 B 站图床的 `@…` 处理后缀（`a.jpg@progressive.webp` → `a.jpg`）；
+/// 没有后缀 / `@` 落在 host 段（userinfo）/ 末段不像文件名 → null（URL 不动）。
+///
+/// **只服务"加载失败后的兜底重试"**（见 [_ArticleImage]）：正常路径一个字节
+/// 都不改写（`@` 后缀实测可直连，见 [_deltaEmbedNode] 的说明），只有失败之后
+/// 才把后缀当成可疑变量排除掉再试**一次**。
+@visibleForTesting
+String? stripBiliImageSuffix(String url) {
+  final at = url.lastIndexOf('@');
+  if (at <= 0) return null;
+  final query = url.indexOf('?');
+  if (query >= 0 && at > query) return null; // 在 query 里，不是图床后缀
+  final slash = url.lastIndexOf('/', at);
+  final schemeEnd = url.indexOf('://');
+  if (slash <= schemeEnd + 2) return null; // `@` 在 host 段 → 是 userinfo
+  final base = url.substring(0, at);
+  final seg = url.substring(slash + 1, at);
+  if (!seg.contains('.')) return null; // 末段不像"文件名@后缀" → 不动
+  return base.length > slash + 1 ? base : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -841,16 +1070,20 @@ class BiliHtmlView extends StatelessWidget {
 
   /// 专栏正文便捷构造：**自动判别** HTML / Quill Delta（内部走
   /// [parseArticleContent]）。专栏阅读页用这个。
+  ///
+  /// [source] 只进日志（如 `cv123456`），解析失败时 `debugPrint` 里能看出
+  /// "是哪一篇"，回报问题时不用猜。
   factory BiliHtmlView.fromContent(
     String content, {
     Key? key,
     void Function(List<String> urls, int index)? onImageTap,
     ValueChanged<String>? onLinkTap,
     TextStyle bodyStyle = kTypeBody,
+    String source = '',
   }) =>
       BiliHtmlView(
         key: key,
-        nodes: parseArticleContent(content),
+        nodes: parseArticleContent(content, source: source),
         onImageTap: onImageTap,
         onLinkTap: onLinkTap,
         bodyStyle: bodyStyle,
@@ -1221,6 +1454,9 @@ class BiliHtmlView extends StatelessWidget {
     // - 加载中：灰底 + 一个中性的图片图标（"这里将来是一张图"）；
     // - 失败：换图标 + 一行小字，明确说"加载失败"，不再让人等。
     // 两块都只用墨色与 token（无阴影、无第二个色相）。
+    // ⚠️ 失败态之前还会先有一次"去 `@…` 后缀重试"（见 [_ArticleImage]）：
+    // 重试在途时仍按加载态显示，所以"加载失败"这四个字只在**真的没救**时
+    // 才出现。
     final loading = Container(
       color: kPaperCool,
       alignment: Alignment.center,
@@ -1253,14 +1489,11 @@ class BiliHtmlView extends StatelessWidget {
         ),
       ),
     );
-    final image = Image.network(
-      src,
-      fit: BoxFit.contain,
+    final image = _ArticleImage(
+      src: src,
       headers: _imgHeaders,
-      gaplessPlayback: true,
-      errorBuilder: (_, __, ___) => failed,
-      loadingBuilder: (context, child, progress) =>
-          progress == null ? child : loading,
+      loading: loading,
+      failed: failed,
     );
     final box = ClipRRect(
       borderRadius: BorderRadius.circular(kRadiusSm),
@@ -1303,6 +1536,86 @@ class BiliHtmlView extends StatelessWidget {
       return _kDefaultImageAspect;
     }
     return (w / h).clamp(0.4, 3.0);
+  }
+}
+
+/// 正文图片：在 [Image.network] 外面包一层**一次性的失败重试**。
+///
+/// 为什么加：B 站图床 URL 常带 `@…` 处理后缀（`@progressive.webp` /
+/// `@460w_240h_1c_!web-article-pic.avif`）。后缀一旦不被接受就是 404，而**去掉
+/// 后缀的原图往往还在**——用户看到的就是"这张图显示不出来"。
+/// 正常路径**一个字节都不改写**（`@` 后缀原样请求，这条主决策不变）；
+/// 只有**加载失败之后**才把后缀剥掉再试**一次**，还不成照旧显示失败占位。
+///
+/// 为什么要有状态：换 URL = 换 provider，只能 rebuild，而 `errorBuilder` 是在
+/// build 期间被调用的、不能直接 setState。所以这一帧先按"加载中"显示（不闪一下
+/// "加载失败"），把换址动作排到下一帧。`_retried` 保证**最多重试一次**，
+/// `_pendingRetry` 防同一帧重复排队 → 不可能无限循环。
+class _ArticleImage extends StatefulWidget {
+  const _ArticleImage({
+    required this.src,
+    required this.headers,
+    required this.loading,
+    required this.failed,
+  });
+
+  final String src;
+  final Map<String, String> headers;
+  final Widget loading;
+  final Widget failed;
+
+  @override
+  State<_ArticleImage> createState() => _ArticleImageState();
+}
+
+class _ArticleImageState extends State<_ArticleImage> {
+  late String _src = widget.src;
+  bool _retried = false;
+  bool _pendingRetry = false;
+
+  @override
+  void didUpdateWidget(covariant _ArticleImage oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // 宿主换了地址（下拉刷新拿到新正文）→ 重试状态跟着重置
+    if (oldWidget.src != widget.src) {
+      _src = widget.src;
+      _retried = false;
+      _pendingRetry = false;
+    }
+  }
+
+  /// 这一帧要不要开始一次"去后缀重试"；true = 正在等重试（先按加载态显示）。
+  bool _retryWithoutSuffix() {
+    if (_retried) return false;
+    if (_pendingRetry) return true;
+    final stripped = stripBiliImageSuffix(_src);
+    if (stripped == null) return false;
+    _pendingRetry = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      debugPrint('[bili_html] 图片带 @ 后缀加载失败，去掉后缀重试一次：'
+          '$_src → $stripped');
+      setState(() {
+        _src = stripped;
+        _retried = true;
+        _pendingRetry = false;
+      });
+    });
+    return true;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Image.network(
+      _src,
+      fit: BoxFit.contain,
+      headers: widget.headers,
+      gaplessPlayback: true,
+      errorBuilder: (_, __, ___) =>
+          _retryWithoutSuffix() ? widget.loading : widget.failed,
+      loadingBuilder: (context, child, progress) =>
+          progress == null ? child : widget.loading,
+    );
   }
 }
 
