@@ -1,26 +1,33 @@
 /// 搜索页：三个 Tab ——
 /// - 「全部 B 站」：搜 B 站全网（[BiliApi.searchVideo] 视频 / [BiliApi.searchMedia]
-///   番剧·电影·电视剧，v2.16.5+），结果可一键「加入/整季导入」白名单
+///   番剧·电影·电视剧，v2.16.5+ / [BiliApi.searchLive] 直播间，v2.28.0+），
+///   视频与剧集结果可一键「加入/整季导入」白名单，直播结果点进站内直播间
 /// - 「我的白名单」：对当前白名单数据本地过滤（标题 / UP 主包含关键词）
 /// - 「搜索 UP 主」（v2.13.0+）：搜 B 站全网用户（[BiliApi.searchUpowner]），
 ///   结果可一键「关注」（= 加入白名单 UP 主，v2.17.12+ 统一文案）
 ///
 /// 防风控：输入防抖 600ms 自动搜 + 手动搜索按钮；搜索失败分类提示
 /// （-412 风控 / -352 限流 / -1200 降级 / 网络失败），返回空数组时显示「无结果」。
+/// **切 Tab 也自动搜**（v2.28.0+）：切到「全部 B 站」/「搜索 UP 主」且关键词
+/// 非空就立刻搜一次——用户抱怨过「切了类别还得再点一下搜索键」；同一个
+/// Tab + 同一个关键词只打一次接口（见 [_searchedKeyword]），「我的白名单」
+/// Tab 是本地过滤、永不发请求。
 ///
 /// 搜索历史（v2.17.16+）：本地关键词列表（[SearchHistoryStore]，去重置顶 /
 /// 上限 20 / 单删 / 清空）——输入框为空且在「全部 B 站 / 搜索 UP 主」Tab 时
 /// 显示「搜索历史」面板：每条可点 = 直接填入并搜索，行尾 X 或长按单删，
 /// 标题行「清空」一键清空。键盘搜索键 / 点搜索按钮 / 点历史词会记录
-/// （防抖自动搜索、切范围/排序自动重查不记录，避免中间词污染历史）。
+/// （防抖自动搜索、切范围/排序/切 Tab 的自动重查不记录，避免中间词污染历史）。
 /// 切 Tab / 切类型不影响历史（三个 Tab 共用一份）。
 ///
 /// 翻页与排序（v2.12.1 / v2.16.5）：
-/// - 搜索范围 chip 行：视频 / 番剧 / 电影 / 电视剧；切换取消防抖、重置分页
-///   状态并重新执行 page=1 搜索（media 范围时隐藏排序行——media 接口不支持排序）
+/// - 搜索范围 chip 行：视频 / 番剧 / 电影 / 电视剧 / 直播；切换取消防抖、
+///   重置分页状态并重新执行 page=1 搜索（media 与直播范围时隐藏排序行——
+///   这两类接口都不支持排序）
 /// - 排序 chip 行（仅视频范围）：综合 / 最多播放 / 最新发布 / 最多收藏
 /// - 上拉加载更多：结果列表底部 ≤200px 触发，自动请求 page+1；按 bvid /
 ///   season_id 去重追加；`hasMore` 为 false 时显示「没有更多了」
+/// - **直播结果不翻页**（v2.28.0+）：只展示第 1 页，见 [_loadMore]
 /// - media（番剧/电影/电视剧）结果右侧「导入」= 整季逐集导入
 ///   （fetchPgcSeason → 逐集写白名单，与首页「粘贴链接导入」共用
 ///   [runPgcSeasonImport]；已在白名单的集自动跳过）
@@ -28,8 +35,13 @@
 /// UP 主 Tab：复用同一套防抖逻辑（不分页排序 chip，因为 search_type=bili_user
 /// 接口只支持默认排序），结果列表用 [UpownerTile] 展示，点整行跳 [UpownerPage]。
 ///
+/// 代次守卫（v2.28.0+）：[_searchGen] 每次发起新搜索自增，三个 `_do*Search`
+/// 与三个 `_loadMore*` 拿到响应时先比对——不相等就丢弃。范围/排序 chip 一点
+/// 就重查，来回快速切时旧响应会晚到并覆盖新结果（此前完全没有守卫）。
+///
 /// 块化与动效（批次 4）：
-/// - 三套结果列表（视频 / 番剧媒体 / UP 主）各自挂在 [StaggeredListScope] 下，
+/// - 四套结果列表（视频 / 番剧媒体 / 直播 / UP 主）各自挂在
+///   [StaggeredListScope] 下，
 ///   每条结果包 [StaggeredEntrance]：首屏逐条推入，翻页追加用更短更密的节奏；
 ///   代次串为 `search.<kind>#<代次>`，每次「重新搜索」自增（换关键词 / 重搜 /
 ///   切范围 / 切排序都会重演一次）；
@@ -50,6 +62,7 @@ import 'package:flutter/material.dart';
 
 import '../api/bilibili_api.dart';
 import '../api/github_api.dart';
+import '../models/live_search_result.dart';
 import '../models/media_search_result.dart';
 import '../models/search_result.dart';
 import '../models/upowner.dart';
@@ -71,18 +84,21 @@ import '../widgets/pgc_import_dialog.dart';
 import '../widgets/smoke_silhouette.dart';
 import '../widgets/staggered_entrance.dart';
 import '../widgets/upowner_tile.dart';
+import 'live_player_page.dart';
 import 'player_page.dart';
 import 'upowner_page.dart';
 
 /// 「全部 B 站」Tab 的搜索范围（对应 wbi/search/type 的 search_type）。
 ///
-/// 排序 chip 只对 [video] 有意义（media 接口不支持 order），media 范围时
-/// 结果走 [MediaSearchResult] 列表并可整季导入。
+/// 排序 chip 只对 [video] 有意义（media 与直播接口都不支持 order），
+/// media 范围的结果走 [MediaSearchResult]（可整季导入），
+/// [live] 范围的结果走 [LiveSearchResult]（点进站内直播间）。
 enum _SearchScope {
   video('video', '视频'),
   bangumi(MediaSearchTypes.bangumi, '番剧'),
   film(MediaSearchTypes.film, '电影'),
-  tv(MediaSearchTypes.tv, '电视剧');
+  tv(MediaSearchTypes.tv, '电视剧'),
+  live(kLiveSearchType, '直播');
 
   final String searchType;
   final String label;
@@ -90,10 +106,23 @@ enum _SearchScope {
   const _SearchScope(this.searchType, this.label);
 
   /// 是否为 media（番剧/电影/电视剧）范围：结果可整季导入。
-  bool get isMedia => this != video;
+  ///
+  /// 显式穷举而不是 `this != video`：加了 [live] 之后后者会把直播误判成 media，
+  /// 一路走错分支（media 结果区 + 整季导入）。
+  bool get isMedia => switch (this) {
+        bangumi || film || tv => true,
+        video || live => false,
+      };
 
-  /// media 范围结果空态提示里的内容词（「没有找到相关番剧」等）。
-  String get emptyMessage => isMedia ? label : '视频';
+  /// 是否为直播范围（v2.28.0+）：结果点进站内直播间，不可导入白名单。
+  bool get isLive => this == live;
+
+  /// 结果空态提示里的内容词（「没有找到相关番剧」等）。
+  String get emptyMessage => switch (this) {
+        video => '视频',
+        live => '直播间',
+        bangumi || film || tv => label,
+      };
 }
 
 /// B 站搜索排序选项（与 [BiliApi.searchVideo] order 参数对应）。
@@ -222,20 +251,44 @@ class _SearchPageState extends State<SearchPage>
   bool _upownerHasMore = true;
   bool _upownerLoadingMore = false;
 
+  /// 直播搜索状态（v2.28.0+）：与视频/media 搜索互相独立。
+  ///
+  /// **没有分页字段**：直播结果只取第 1 页（产品边界，见 [_loadMore]），
+  /// 不维护 page/hasMore/loadingMore。
+  List<LiveSearchResult>? _liveResults;
+  bool _liveSearching = false;
+  String? _liveError;
+
+  /// 搜索代次（v2.28.0+）：每次**发起**新搜索自增。三个 `_do*Search` 与
+  /// 三个 `_loadMore*` 在拿到响应后比对——不一致说明这次响应属于已经被
+  /// 取代的搜索（换了关键词 / 切了范围 / 切了排序），必须丢弃。
+  ///
+  /// 加它的直接原因：范围 chip 与排序 chip 都是一点就重查，快速来回切时
+  /// 先发的请求可能后到，此前的代码无条件 setState → 旧结果覆盖新结果。
+  int _searchGen = 0;
+
+  /// 「本 Tab + 本关键词已搜过」的记账（v2.28.0+，key = Tab 下标）。
+  ///
+  /// 切 Tab 会自动补搜一次（见 [_onTabChanged]），但**不能**变成「来回切 Tab
+  /// 就反复打接口」：只要这个 Tab 已经为当前关键词发过请求，切回来就只展示
+  /// 已有结果（含错误态——失败有「重试」按钮，不需要靠切 Tab 重试）。
+  final Map<int, String> _searchedKeyword = {};
+
   /// 正在「加入」的 bvid / mid 集合（防止连点重复提交）。
   final Set<String> _joining = {};
   final Set<int> _joiningUpowners = {};
 
   // ---- 交错入场（批次 4）---------------------------------------------------
 
-  /// 三套结果列表各一本「已入场」账本：活在列表项之外（State 持有），
+  /// 四套结果列表各一本「已入场」账本：活在列表项之外（State 持有），
   /// ListView 回收元素再出现时不重播。
   final EntranceLedger _videoLedger = EntranceLedger();
   final EntranceLedger _mediaLedger = EntranceLedger();
+  final EntranceLedger _liveLedger = EntranceLedger();
   final EntranceLedger _upownerLedger = EntranceLedger();
 
   /// 数据代次：每次「重新搜索」（换关键词 / 手动重搜 / 切范围 / 切排序）
-  /// 自增 —— 三套列表的代次串里都带上它，配合清空的账本重演一次。
+  /// 自增 —— 四套列表的代次串里都带上它，配合清空的账本重演一次。
   int _reloadToken = 0;
 
   /// 本批次起点（翻页追加时置为「追加前的条数」）：新增项按
@@ -273,11 +326,31 @@ class _SearchPageState extends State<SearchPage>
   /// Tab 切换：切到「我的白名单」时 scroll 监听暂停（不影响功能，但能避免
   /// 视错觉）；切到 UP 主 Tab 时清空视频搜索的错误状态，避免两 Tab 错误信息
   /// 互相串味。
+  ///
+  /// 另外（v2.28.0+）：切到会发请求的 Tab（0 全部 B 站 / 2 搜索 UP 主）时，
+  /// 若输入框里已有词就直接补搜一次——此前切 Tab 只 setState，用户得再点一下
+  /// 搜索键才看到结果。
   void _onTabChanged() {
     if (!_tabCtrl.indexIsChanging && _tabCtrl.index != _lastTabIndex) {
       _lastTabIndex = _tabCtrl.index;
       if (mounted) setState(() {});
+      _autoSearchOnTabSwitch(_tabCtrl.index);
     }
+  }
+
+  /// 切 Tab 后的自动补搜：本 Tab + 本关键词没搜过才发请求。
+  ///
+  /// - Tab 1（我的白名单）是本地过滤，**永不**发请求
+  /// - 关键词为空不动（历史面板 / 空态提示才是该看到的）
+  /// - 记 `record: false`（_doSearch 默认）→ 切 Tab 不进搜索历史，沿用
+  ///   「只有明确的搜索行为才记录」的既有约定
+  void _autoSearchOnTabSwitch(int tabIndex) {
+    if (tabIndex != 0 && tabIndex != 2) return;
+    final keyword = _keywordCtrl.text.trim();
+    if (keyword.isEmpty) return;
+    if (_searchedKeyword[tabIndex] == keyword) return; // 已搜过 → 用已有结果
+    _debounce?.cancel();
+    unawaited(_doSearch());
   }
 
   @override
@@ -336,6 +409,9 @@ class _SearchPageState extends State<SearchPage>
   void _onKeywordChanged(String _) {
     _debounce?.cancel();
     if (_keywordCtrl.text.trim().isEmpty) {
+      // 关键词清空 = 之前那次搜索作废：代次 +1，晚到的在途响应一律丢弃
+      // （否则清空输入框后旧结果还会「自己」跳出来）
+      _searchGen++;
       setState(() {
         _results = null;
         _searchError = null;
@@ -349,6 +425,9 @@ class _SearchPageState extends State<SearchPage>
         _mediaPage = 1;
         _mediaHasMore = true;
         _mediaLoadingMore = false;
+        _liveResults = null;
+        _liveError = null;
+        _liveSearching = false;
         _upownerResults = null;
         _upownerError = null;
         _upownerSearching = false;
@@ -393,6 +472,8 @@ class _SearchPageState extends State<SearchPage>
     final keyword = _keywordCtrl.text.trim();
     _debounce?.cancel();
     if (keyword.isEmpty) {
+      // 清空关键词 = 已有搜索作废：代次 +1（同 _onKeywordChanged 的理由）
+      _searchGen++;
       setState(() {
         _results = null;
         _searchError = null;
@@ -406,6 +487,9 @@ class _SearchPageState extends State<SearchPage>
         _mediaPage = 1;
         _mediaHasMore = true;
         _mediaLoadingMore = false;
+        _liveResults = null;
+        _liveError = null;
+        _liveSearching = false;
         _upownerResults = null;
         _upownerError = null;
         _upownerSearching = false;
@@ -416,8 +500,14 @@ class _SearchPageState extends State<SearchPage>
       return;
     }
     if (record) await _recordHistory(keyword);
+    // 记账「本 Tab + 本关键词已搜过」：切回同一 Tab 时直接展示已有结果，
+    // 不再重复打接口（见 [_autoSearchOnTabSwitch]）。记在**发起**时而不是
+    // 成功时——失败态自带「重试」按钮，不需要靠切 Tab 来重试。
+    _searchedKeyword[_tabCtrl.index] = keyword;
     if (_tabCtrl.index == 2) {
       await _doUpownerSearch();
+    } else if (_scope.isLive) {
+      await _doLiveSearch();
     } else if (_scope.isMedia) {
       await _doMediaSearch();
     } else {
@@ -477,7 +567,11 @@ class _SearchPageState extends State<SearchPage>
       _scope = scope;
       // 清目标范围的结果与错误（切范围展示新结果更直观；若保留旧结果会
       // 让用户误以为没切成功）
-      if (scope.isMedia) {
+      if (scope.isLive) {
+        _liveResults = null;
+        _liveError = null;
+        _liveSearching = false;
+      } else if (scope.isMedia) {
         _mediaResults = null;
         _mediaError = null;
         _mediaSearching = false;
@@ -499,6 +593,7 @@ class _SearchPageState extends State<SearchPage>
   /// 视频搜索（Tab=0）。
   Future<void> _doVideoSearch() async {
     final keyword = _keywordCtrl.text.trim();
+    final gen = ++_searchGen; // 发起新搜索：旧响应从此作废
     // 新一批数据（含重搜同一关键词）→ 重演入场
     _restartEntrance(_videoLedger);
     _videoBatchStart = 0;
@@ -511,21 +606,21 @@ class _SearchPageState extends State<SearchPage>
     });
     try {
       final page = await _api.searchVideo(keyword, order: _currentOrder);
-      if (!mounted) return;
+      if (!mounted || gen != _searchGen) return; // 过期响应丢弃
       setState(() {
         _results = page.results;
         _hasMore = page.hasMore;
         _searching = false;
       });
     } on BiliApiException catch (e) {
-      if (!mounted) return;
+      if (!mounted || gen != _searchGen) return;
       setState(() {
         _results = null;
         _searching = false;
         _searchError = '搜索失败：${e.message}';
       });
     } on DioException {
-      if (!mounted) return;
+      if (!mounted || gen != _searchGen) return;
       setState(() {
         _results = null;
         _searching = false;
@@ -534,9 +629,10 @@ class _SearchPageState extends State<SearchPage>
     }
   }
 
-  /// media（番剧/电影/电视剧）搜索（Tab=0 + 范围非视频）。
+  /// media（番剧/电影/电视剧）搜索（Tab=0 + 范围非视频非直播）。
   Future<void> _doMediaSearch() async {
     final keyword = _keywordCtrl.text.trim();
+    final gen = ++_searchGen;
     _restartEntrance(_mediaLedger);
     _mediaBatchStart = 0;
     setState(() {
@@ -551,21 +647,21 @@ class _SearchPageState extends State<SearchPage>
         keyword,
         searchType: _scope.searchType,
       );
-      if (!mounted) return;
+      if (!mounted || gen != _searchGen) return; // 过期响应丢弃
       setState(() {
         _mediaResults = page.results;
         _mediaHasMore = page.hasMore;
         _mediaSearching = false;
       });
     } on BiliApiException catch (e) {
-      if (!mounted) return;
+      if (!mounted || gen != _searchGen) return;
       setState(() {
         _mediaResults = null;
         _mediaSearching = false;
         _mediaError = '搜索失败：${e.message}';
       });
     } on DioException {
-      if (!mounted) return;
+      if (!mounted || gen != _searchGen) return;
       setState(() {
         _mediaResults = null;
         _mediaSearching = false;
@@ -574,9 +670,46 @@ class _SearchPageState extends State<SearchPage>
     }
   }
 
+  /// 直播搜索（Tab=0 + 范围=直播，v2.28.0+）。
+  ///
+  /// 只请求第 1 页（产品边界，见 [_loadMore]），因此没有 page/hasMore 状态、
+  /// 也不翻页；请求期间切范围/切关键词时旧响应由 [_searchGen] 丢弃。
+  Future<void> _doLiveSearch() async {
+    final keyword = _keywordCtrl.text.trim();
+    final gen = ++_searchGen;
+    _restartEntrance(_liveLedger);
+    setState(() {
+      _liveSearching = true;
+      _liveError = null;
+    });
+    try {
+      final page = await _api.searchLive(keyword);
+      if (!mounted || gen != _searchGen) return; // 过期响应丢弃
+      setState(() {
+        _liveResults = page.results;
+        _liveSearching = false;
+      });
+    } on BiliApiException catch (e) {
+      if (!mounted || gen != _searchGen) return;
+      setState(() {
+        _liveResults = null;
+        _liveSearching = false;
+        _liveError = '搜索失败：${e.message}';
+      });
+    } on DioException {
+      if (!mounted || gen != _searchGen) return;
+      setState(() {
+        _liveResults = null;
+        _liveSearching = false;
+        _liveError = '网络请求失败，请检查网络后重试';
+      });
+    }
+  }
+
   /// UP 主搜索（Tab=2）：search_type=bili_user，不带排序 chip。
   Future<void> _doUpownerSearch() async {
     final keyword = _keywordCtrl.text.trim();
+    final gen = ++_searchGen;
     _restartEntrance(_upownerLedger);
     _upownerBatchStart = 0;
     setState(() {
@@ -588,21 +721,21 @@ class _SearchPageState extends State<SearchPage>
     });
     try {
       final result = await _api.searchUpowner(keyword);
-      if (!mounted) return;
+      if (!mounted || gen != _searchGen) return; // 过期响应丢弃
       setState(() {
         _upownerResults = result.upowners;
         _upownerHasMore = result.hasMore;
         _upownerSearching = false;
       });
     } on BiliApiException catch (e) {
-      if (!mounted) return;
+      if (!mounted || gen != _searchGen) return;
       setState(() {
         _upownerResults = null;
         _upownerSearching = false;
         _upownerError = '搜索失败：${e.message}';
       });
     } on DioException {
-      if (!mounted) return;
+      if (!mounted || gen != _searchGen) return;
       setState(() {
         _upownerResults = null;
         _upownerSearching = false;
@@ -627,9 +760,15 @@ class _SearchPageState extends State<SearchPage>
   }
 
   /// 上拉加载下一页：根据当前 Tab + 搜索范围分发。
+  ///
+  /// 直播范围**不翻页**（产品边界，v2.28.0+）：本 App 的定位是「只看事先选好
+  /// 的内容」，搜索是显式动作，不做「无限刷直播」的体验——直播结果只要第 1 页
+  /// （20 条足够挑一个房间进去看），到底就停，不请求 page=2。
   Future<void> _loadMore() async {
     if (_tabCtrl.index == 2) {
       await _loadMoreUpowner();
+    } else if (_scope.isLive) {
+      return;
     } else if (_scope.isMedia) {
       await _loadMoreMedia();
     } else {
@@ -644,6 +783,7 @@ class _SearchPageState extends State<SearchPage>
     if (base == null) return;
     final keyword = _keywordCtrl.text.trim();
     if (keyword.isEmpty) return;
+    final gen = _searchGen; // 期间若有新搜索，本次追加作废
     setState(() => _mediaLoadingMore = true);
     final nextPage = _mediaPage + 1;
     try {
@@ -652,7 +792,7 @@ class _SearchPageState extends State<SearchPage>
         searchType: _scope.searchType,
         page: nextPage,
       );
-      if (!mounted) return;
+      if (!mounted || gen != _searchGen) return;
       final existing = base.map((m) => m.seasonId).toSet();
       final appended = <MediaSearchResult>[
         ...base,
@@ -668,11 +808,11 @@ class _SearchPageState extends State<SearchPage>
         _mediaBatchStart = base.length;
       });
     } on BiliApiException catch (e) {
-      if (!mounted) return;
+      if (!mounted || gen != _searchGen) return;
       setState(() => _mediaLoadingMore = false);
       _showSnack('加载失败：${e.message}，点击重试');
     } on DioException {
-      if (!mounted) return;
+      if (!mounted || gen != _searchGen) return;
       setState(() => _mediaLoadingMore = false);
       _showSnack('网络请求失败，请检查网络后重试');
     }
@@ -686,6 +826,7 @@ class _SearchPageState extends State<SearchPage>
     if (base == null) return;
     final keyword = _keywordCtrl.text.trim();
     if (keyword.isEmpty) return;
+    final gen = _searchGen; // 期间若有新搜索，本次追加作废
     setState(() => _loadingMore = true);
     final nextPage = _page + 1;
     try {
@@ -694,7 +835,7 @@ class _SearchPageState extends State<SearchPage>
         page: nextPage,
         order: _currentOrder,
       );
-      if (!mounted) return;
+      if (!mounted || gen != _searchGen) return;
       // 按 bvid 去重追加（理论上一页 20 条、下一页 20 条不会撞，但切排序/
       // 接口偶发重排时去重更稳）
       final existing = base.map((r) => r.bvid).toSet();
@@ -712,11 +853,11 @@ class _SearchPageState extends State<SearchPage>
         _videoBatchStart = base.length;
       });
     } on BiliApiException catch (e) {
-      if (!mounted) return;
+      if (!mounted || gen != _searchGen) return;
       setState(() => _loadingMore = false);
       _showSnack('加载失败：${e.message}，点击重试');
     } on DioException {
-      if (!mounted) return;
+      if (!mounted || gen != _searchGen) return;
       setState(() => _loadingMore = false);
       _showSnack('网络请求失败，请检查网络后重试');
     }
@@ -729,11 +870,12 @@ class _SearchPageState extends State<SearchPage>
     if (base == null) return;
     final keyword = _keywordCtrl.text.trim();
     if (keyword.isEmpty) return;
+    final gen = _searchGen; // 期间若有新搜索，本次追加作废
     setState(() => _upownerLoadingMore = true);
     final nextPage = _upownerPage + 1;
     try {
       final result = await _api.searchUpowner(keyword, page: nextPage);
-      if (!mounted) return;
+      if (!mounted || gen != _searchGen) return;
       final existing = base.map((u) => u.mid).toSet();
       final appended = <Upowner>[
         ...base,
@@ -749,11 +891,11 @@ class _SearchPageState extends State<SearchPage>
         _upownerBatchStart = base.length;
       });
     } on BiliApiException catch (e) {
-      if (!mounted) return;
+      if (!mounted || gen != _searchGen) return;
       setState(() => _upownerLoadingMore = false);
       _showSnack('加载失败：${e.message}，点击重试');
     } on DioException {
-      if (!mounted) return;
+      if (!mounted || gen != _searchGen) return;
       setState(() => _upownerLoadingMore = false);
       _showSnack('网络请求失败，请检查网络后重试');
     }
@@ -892,7 +1034,9 @@ class _SearchPageState extends State<SearchPage>
                       ? '搜索 B 站 UP 主（昵称 / 认证名）'
                       : (_tabCtrl.index == 0 && _scope.isMedia
                           ? '搜索 B 站${_scope.label}（可整季导入）'
-                          : '搜索 B 站视频或白名单'),
+                          : (_tabCtrl.index == 0 && _scope.isLive
+                              ? '搜索 B 站直播间（点结果直接进直播间）'
+                              : '搜索 B 站视频或白名单')),
                   border: InputBorder.none,
                   isDense: true,
                 ),
@@ -1005,18 +1149,18 @@ class _SearchPageState extends State<SearchPage>
         if (_scope == _SearchScope.video) _buildOrderBar(),
         const Divider(height: 1),
         Expanded(
-          child: _scope.isMedia
-              ? _buildMediaResults()
-              : _buildGlobalResults(),
+          child: _scope.isLive
+              ? _buildLiveResults()
+              : (_scope.isMedia ? _buildMediaResults() : _buildGlobalResults()),
         ),
       ],
     );
   }
 
-  /// 搜索范围 chip 横行（视频/番剧/电影/电视剧，v2.16.5+）。
+  /// 搜索范围 chip 横行（视频/番剧/电影/电视剧/直播，v2.16.5+，直播 v2.28.0+）。
   ///
-  /// media 范围下不显示排序行（media 搜索接口不支持 order），排序 chip 只
-  /// 在视频范围出现。切换即清结果重搜第 1 页。
+  /// media / 直播范围下不显示排序行（这两类接口都不支持 order），排序 chip
+  /// 只在视频范围出现。切换即清结果重搜第 1 页。
   Widget _buildScopeBar() {
     return SingleChildScrollView(
       scrollDirection: Axis.horizontal,
@@ -1356,6 +1500,126 @@ class _SearchPageState extends State<SearchPage>
         idleLabel: '导入',
         addedLabel: '已导入',
         onPressed: importing ? null : () => _importMedia(m),
+      ),
+    );
+  }
+
+  // ---- 直播结果（v2.28.0+） ----
+
+  /// 直播搜索结果区：状态机与 media 结果区对齐（搜索中 / 错误重试 / 空提示 /
+  /// 列表）。
+  ///
+  /// **没有翻页 footer**：只展示第 1 页（产品边界见 [_loadMore]）——20 条
+  /// 直播间足够挑一个进去看，不做「无限刷」。
+  Widget _buildLiveResults() {
+    if (_liveSearching) {
+      return const AppLoadingHero(seed: 'search.live');
+    }
+    if (_liveError != null) {
+      return AppErrorView(
+        message: _liveError!,
+        onRetry: _doSearch,
+        illustrationSeed: 'search.live',
+      );
+    }
+    final results = _liveResults;
+    if (results == null) {
+      return const AppStateView(
+        kind: AppStateKind.empty,
+        title: '输入关键词，搜索 B 站直播间\n'
+            '点结果直接进直播间观看（不写入白名单）',
+        illustrationSeed: 'search.live',
+      );
+    }
+    if (results.isEmpty) {
+      return const AppStateView(
+        kind: AppStateKind.empty,
+        title: '没有找到相关直播间，换个关键词试试',
+        illustrationSeed: 'search.live.result',
+      );
+    }
+    final theme = Theme.of(context);
+    // 交错入场：直播结果按 roomId 记账（不翻页 → 没有 appendBatch 分支）
+    return StaggeredListScope(
+      generation: 'search.live#$_reloadToken',
+      ledger: _liveLedger,
+      child: ListView.separated(
+        controller: _scrollCtrl,
+        itemCount: results.length,
+        separatorBuilder: (_, __) => const Divider(height: 1, indent: 112),
+        itemBuilder: (context, i) => StaggeredEntrance(
+          entryKey: 'room:${results[i].roomId}',
+          index: i,
+          step: kStaggerStep,
+          duration: kDurEntrance,
+          maxIndex: kStaggerMaxIndex,
+          child: _buildLiveTile(theme, results[i]),
+        ),
+      ),
+    );
+  }
+
+  /// 直播结果卡片：封面 + 标题 + 主播名 · 在线人数，点整卡进站内直播间。
+  ///
+  /// 刻意**不放「加入白名单」按钮**：白名单里视频存 bvid、UP 主存 mid，
+  /// 直播间两个都不是，硬塞一个「加入」按钮语义就错了（想收藏主播请用
+  /// 「搜索 UP 主」Tab）。
+  Widget _buildLiveTile(ThemeData theme, LiveSearchResult r) {
+    final metaParts = <String>[
+      if (r.uname.isNotEmpty) r.uname,
+      // 在线数为 0（接口没给 / 脏值）时不显示该段，不留悬空分隔符
+      if (r.online > 0) '${_fmtPlay(r.online)} 在线',
+      // 轮播 / 未开播点进去看不到直播画面，先说清楚（正常在播的不加噪声）
+      if (!r.isLiving) (r.liveStatus == 2 ? '轮播' : '未开播'),
+    ];
+    return ListTile(
+      leading: ClipRRect(
+        borderRadius: BorderRadius.circular(4),
+        child: CoverImage(cover: r.cover, width: 96, height: 60),
+      ),
+      title: ExpandableText(
+        text: r.title,
+        // 标题 2 行截断；超行才有「展开/收起」（未超行时不增子树，点标题
+        // 照旧传给 ListTile → 不会抢走整卡点击）
+        style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+        foldLines: 2,
+        selectable: false,
+        animated: true,
+      ),
+      subtitle: Text(
+        metaParts.join(' · '),
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: theme.textTheme.bodySmall?.copyWith(
+          color: theme.colorScheme.onSurfaceVariant,
+        ),
+      ),
+      // 右侧只给一个「进直播间」的暗示：这一栏没有可提交的动作，
+      // 用 chevron 明示「点进去」而不是留一块空白
+      trailing: Icon(
+        Icons.chevron_right,
+        color: theme.colorScheme.outline,
+      ),
+      onTap: () => _openLiveRoom(r),
+    );
+  }
+
+  /// 点直播结果 → 站内直播播放页（v2.28.0+）。
+  ///
+  /// 与 UP 主页「正在直播」标记同一入口同一种转场：借用播放页的路由名
+  /// [kPlayerRouteName] 换取那套「快速淡入」（见 app_theme 按路由名分流）。
+  void _openLiveRoom(LiveSearchResult r) {
+    if (r.roomId <= 0) return; // 竞态/脏数据兜底，不该发生（API 层已过滤）
+    debugPrint('[search] 站内看直播 room=${r.roomId} mid=${r.uid}');
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        settings: const RouteSettings(name: kPlayerRouteName),
+        builder: (_) => LivePlayerPage(
+          roomId: r.roomId,
+          title: r.title,
+          upName: r.uname,
+          upMid: r.uid,
+        ),
       ),
     );
   }

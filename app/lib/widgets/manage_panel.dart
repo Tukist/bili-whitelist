@@ -363,11 +363,12 @@ class _ManagePanelState extends State<ManagePanel> {
         const SizedBox(height: 16),
         const Divider(height: 1),
         const SizedBox(height: 16),
-        // ---- 合集管理（重命名 / 删除）；新建合集在合集页（v2.19.0 移出）----
+        // ---- 合集管理（重命名 / 移动 / 删除）；新建合集在合集页（v2.19.0 移出）----
         Text('合集管理', style: theme.textTheme.titleMedium),
         const SizedBox(height: 4),
         Text(
-          '重命名会同步更新该合集下所有视频；删除会把视频移回未分类（不删视频）。',
+          '重命名会同步更新该合集下所有视频；移动到其他合集会把视频整体并入并'
+          '删除源合集；删除会把视频移回未分类（以上都不删视频）。',
           style: theme.textTheme.bodySmall?.copyWith(
             color: theme.colorScheme.onSurfaceVariant,
           ),

@@ -808,4 +808,135 @@ void main() {
       );
     });
   });
+
+  group('合集管理面板「移动到…」（并入另一个合集，v2.28.0+）', () {
+    /// 与 [_pumpHomeWithGithub] 同一套注入，但先设好 SharedPreferences mock：
+    /// 「个人」页要读本地观看历史，不设 mock 会走原生插件（测试环境没有）。
+    Future<({_FakeAdapter adapter, GithubApi github})> pumpForMove(
+      WidgetTester tester,
+      WhitelistData data,
+    ) async {
+      SharedPreferences.setMockInitialValues({});
+      return _pumpHomeWithGithub(tester, data);
+    }
+
+    /// 从主页进「个人」页 → 滚到设置区 → 点「管理合集」。
+    ///
+    /// 合集管理入口在设置面板（不是合集页），沿用既有导航路径；「合集管理」
+    /// 那行是**分区标题**，真正的按钮文案是「管理合集」。
+    Future<void> openManageSheet(WidgetTester tester) async {
+      await tester.tap(find.byTooltip('个人（观看统计 / 设置）'));
+      await tester.pumpAndSettle();
+      for (var i = 0;
+          i < 10 && find.text('管理合集').evaluate().isEmpty;
+          i++) {
+        await tester.drag(find.byType(ListView).first, const Offset(0, -400));
+        await tester.pumpAndSettle();
+      }
+      // 「管理合集」按钮在「B 站账号」下面，可能还在视口外 → 先滚到可见再点
+      // （直接 tap 会打在视口外，只得到一句 hit-test 警告）
+      await tester.ensureVisible(find.text('管理合集'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('管理合集'));
+      await tester.pumpAndSettle();
+      // 面板真的开了：认它每行 trailing 的「移动到其他合集」入口（标题「合集管理」
+      // 与设置页分区标题同名、说明文案两处逐字相同，都不能用来区分）
+      expect(
+        find.byTooltip('移动到其他合集'),
+        findsWidgets,
+        reason: '合集管理面板没打开',
+      );
+    }
+
+    /// 目标选择器是**后开**的那层 BottomSheet（tree 里排在后面）。
+    Finder pickerText(String text) => find.descendant(
+          of: find.byType(BottomSheet).last,
+          matching: find.text(text),
+        );
+
+    testWidgets('管理面板「移动到…」→ 选目标 → 确认框写清后果 → 落库并入',
+        (tester) async {
+      final ctx = await pumpForMove(
+        tester,
+        _dataWith(
+          [
+            _video('BV1', '视频A', collection: '动画'),
+            _video('BV2', '视频B', collection: '音乐'),
+          ],
+          collectionNames: ['动画', '音乐'],
+        ),
+      );
+      await openManageSheet(tester);
+
+      // 每个合集一个「移动到其他合集」入口（图标 + tooltip）
+      expect(find.byTooltip('移动到其他合集'), findsNWidgets(2));
+
+      // 把「动画」并入「音乐」：点它那一行的入口
+      await tester.tap(find.byTooltip('移动到其他合集').first);
+      await tester.pumpAndSettle();
+
+      // 目标选择器：只列除自己以外的合集，**不提供「未分类」**
+      expect(find.text('移动到合集'), findsOneWidget);
+      expect(find.text('把「动画」并入…'), findsOneWidget);
+      expect(find.text('未分类'), findsNothing,
+          reason: '「未分类」是「删除合集」的语义，不给重复入口');
+      expect(pickerText('音乐'), findsOneWidget);
+      expect(pickerText('动画'), findsNothing, reason: '自己不能作为目标');
+
+      // 选目标「音乐」→ 确认框（写清「视频去哪 + 源合集消失 + 不可撤销」）
+      await tester.tap(pickerText('音乐'));
+      await tester.pumpAndSettle();
+      expect(find.text('移动合集「动画」'), findsOneWidget);
+      expect(find.textContaining('把「动画」里的 1 个视频移到「音乐」'),
+          findsOneWidget);
+      expect(find.textContaining('并删除「动画」这个合集'), findsOneWidget);
+      expect(find.textContaining('无法在 App 内撤销'), findsOneWidget);
+
+      await tester.tap(find.text('移动'));
+      await tester.pumpAndSettle();
+
+      // 落库：源合集定义没了、视频改挂目标、目标原有在前 + 并入的接末尾
+      expect(_savedCollectionNames(ctx.adapter), ['音乐']);
+      expect(_savedOrders(ctx.adapter, '音乐'), {'BV2': 0, 'BV1': 1});
+      // 页面提示 + 管理面板列表已刷新（只剩一个合集）
+      expect(find.textContaining('已把「动画」并入「音乐」'), findsOneWidget);
+      expect(find.byTooltip('移动到其他合集'), findsOneWidget);
+    });
+
+    testWidgets('取消确认框 → 什么都不改（不发保存请求）', (tester) async {
+      final ctx = await _pumpHomeWithGithub(
+        tester,
+        _dataWith(
+          [_video('BV1', '视频A', collection: '动画')],
+          collectionNames: ['动画', '音乐'],
+        ),
+      );
+      final before = ctx.adapter.requests.length;
+      await openManageSheet(tester);
+      await tester.tap(find.byTooltip('移动到其他合集').first);
+      await tester.pumpAndSettle();
+      await tester.tap(pickerText('音乐'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('取消'));
+      await tester.pumpAndSettle();
+
+      expect(ctx.adapter.requests.length, before, reason: '取消不该产生 PATCH');
+    });
+
+    testWidgets('只有自己的合集时：给一句提示，不弹空列表', (tester) async {
+      await _pumpHomeWithGithub(
+        tester,
+        _dataWith(
+          [_video('BV1', '视频A', collection: '动画')],
+          collectionNames: ['动画'],
+        ),
+      );
+      await openManageSheet(tester);
+      await tester.tap(find.byTooltip('移动到其他合集'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('没有其它合集可以并入，请先新建一个合集'), findsOneWidget);
+      expect(find.text('移动到合集'), findsNothing, reason: '不该弹一个空的目标列表');
+    });
+  });
 }

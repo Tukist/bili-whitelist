@@ -12,6 +12,7 @@ import '../models/danmaku.dart';
 import '../models/dynamic_item.dart';
 import '../models/live_danmaku.dart';
 import '../models/live_play_info.dart';
+import '../models/live_search_result.dart';
 import '../models/live_status.dart';
 import '../models/media_search_result.dart';
 import '../models/search_result.dart';
@@ -239,6 +240,29 @@ class MediaSearchPageResult {
   final bool hasMore;
 
   const MediaSearchPageResult({
+    required this.results,
+    required this.totalCount,
+    required this.hasMore,
+  });
+}
+
+/// 直播搜索结果分页响应（`x/web-interface/wbi/search/type`，
+/// search_type=live_room，v2.28.0+）。
+///
+/// 与 [MediaSearchPageResult] 同构（单页 + 总条数 + 是否还有下一页），写法
+/// 一致便于对照。注意：UI 层**只用第 1 页**（本 App 不做「无限刷直播」，
+/// 见 search_page 的 `_loadMore` 直播分支）。
+class LiveSearchPageResult {
+  /// 当前页结果列表（已清洗；缺 roomid/title 的脏条目已过滤）。
+  final List<LiveSearchResult> results;
+
+  /// 服务端返回的总命中数（`data.numResults`）；null = 接口未返回。
+  final int? totalCount;
+
+  /// 「是否还有下一页」（按 numResults 判断，口径同视频/media 搜索）。
+  final bool hasMore;
+
+  const LiveSearchPageResult({
     required this.results,
     required this.totalCount,
     required this.hasMore,
@@ -1361,6 +1385,88 @@ class BiliApi {
         MediaSearchTypes.doc => '纪录片',
         _ => searchType,
       };
+
+  /// 搜索 B 站直播间（`x/web-interface/wbi/search/type`，
+  /// search_type=live_room，v2.28.0+）。
+  ///
+  /// 结构与 [searchVideo] 逐项对齐：WBI 签名 + buvid 指纹 Cookie + 完整浏览器
+  /// 头 + 同款错误分类；**只有 search_type 不同**。
+  ///
+  /// ⚠️ `search_type=live`（无 `_room` 后缀）实测返回 `code=0` 但
+  /// `data.result` 不是数组（等同空结果），所以固定用 [kLiveSearchType]
+  /// （2026-09-15 匿名实测 200 / code=0 / 20 条真实结果）。
+  ///
+  /// 直播搜索**不支持排序**（无 order 参数，与 media 搜索同理）。
+  ///
+  /// 返回单页结果 + 总条数 + 是否还有更多（[LiveSearchPageResult]）。
+  /// 错误处理与 [searchVideo] 一致：
+  /// - code=-412 → 抛 [BiliApiException]「搜索接口被风控拦截，请稍后再搜」
+  /// - 其他业务码 → 抛 [BiliApiException]（带接口 message）
+  /// - 网络失败（[DioException]）→ 原样上抛（UI 提示网络失败）
+  /// - code=0 但结果为空 / result 不是 List → 返回空 [LiveSearchPageResult]
+  ///
+  /// ⚠️ 与 [searchVideo] 同一风控约束：调用方必须控制频率（防抖/手动搜索）。
+  Future<LiveSearchPageResult> searchLive(
+    String keyword, {
+    int page = 1,
+  }) async {
+    await _injectAuth();
+    final (imgKey, subKey) = await _ensureWbiKeys();
+    final params = WbiSigner.encodeWbi(
+      {
+        'search_type': kLiveSearchType,
+        'keyword': keyword,
+        'page': '$page',
+        'page_size': '20',
+      },
+      imgKey: imgKey,
+      subKey: subKey,
+    );
+    debugPrint('[bili_api] searchLive keyword=$keyword page=$page');
+    final resp = await _dio.get<Map<String, dynamic>>(
+      '/x/web-interface/wbi/search/type',
+      queryParameters: params,
+    );
+    final data = resp.data;
+    final code = data?['code'] as int?;
+    if (code == -412) {
+      throw const BiliApiException(
+        code: -412,
+        message: '搜索接口被风控拦截，请稍后再搜',
+        path: '/x/web-interface/wbi/search/type',
+      );
+    }
+    if (code != 0) {
+      throw BiliApiException(
+        code: code ?? -1,
+        message: data?['message'] as String? ?? '搜索失败',
+        path: '/x/web-interface/wbi/search/type',
+      );
+    }
+    final d = data?['data'] as Map<String, dynamic>?;
+    // 与 searchVideo 一致：numResults 命中数；null 时 UI 用「装满 20」兜底
+    final totalRaw = d?['numResults'];
+    final totalCount = (totalRaw is num) ? totalRaw.toInt() : null;
+    final raw = d?['result'];
+    if (raw is! List) {
+      return LiveSearchPageResult(
+        results: const [],
+        totalCount: totalCount,
+        hasMore: false,
+      );
+    }
+    final results = raw
+        .whereType<Map<String, dynamic>>()
+        .map(LiveSearchResult.fromJson)
+        // 没有房间号（或标题为空）的条目点不进直播间，丢弃
+        .where((r) => r.roomId > 0 && r.title.isNotEmpty)
+        .toList();
+    return LiveSearchPageResult(
+      results: results,
+      totalCount: totalCount,
+      hasMore: _computeHasMore(loaded: results.length, totalCount: totalCount),
+    );
+  }
 
   /// 「是否还有下一页」判断。
   ///

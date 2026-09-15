@@ -627,7 +627,9 @@ class _UpownerPageState extends State<UpownerPage> {
   ///   （轮播没有直播流，点进去看不到直播，装作「在播」是骗人）；
   /// - 点标记进**站内**直播播放页（v2.27.0+，[LivePlayerPage]）；长按标记跳
   ///   站外（B 站 App / 系统浏览器）作为次级入口（见 [LiveNowBadge.onLongPress]）。
-  ///   搜索页仍不加直播入口——直播不可预选、无边界，不做无限内容池。
+  ///   这是全 App 唯二能进直播间的入口之一：另一处是搜索页「直播」范围的
+  ///   关键词搜索结果（v2.28.0+）——两处都是「用户先表达意图」才拿到的；
+  ///   热门直播 / 推荐直播流仍然不做（直播不可预选、无边界，不做无限内容池）。
   Future<void> _loadLive() async {
     final status = await LiveStatusHub.instance
         .statusOf(widget.mid, fetch: _api.fetchLiveStatusByMid);

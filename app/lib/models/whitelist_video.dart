@@ -278,6 +278,80 @@ WhitelistData deleteCollection(WhitelistData data, String name) {
   );
 }
 
+/// 把一个合集整体并入另一个合集（「移动到…」）：源合集的**全部视频**改挂到
+/// 目标合集，源合集定义随之删除（视频本身不删）。
+///
+/// 与 [renameCollection] 的取舍正好相反：那边「新名已存在」要**拒绝**（重命名
+/// 合并属于误操作），这边「并入已存在的合集」就是本函数的**本职**，所以目标
+/// 必须已存在——并入一个不存在的名字等于凭空造合集，语义不清。
+///
+/// **顺序必须重排**：各合集的 order 都是自己那套 `0..n-1`，跨合集可以重叠
+/// （见 [WhitelistWriter.reorderVideosInCollection] 的说明）。若只改 collection
+/// 引用，并入的视频会与目标原有视频 order 撞车，展示顺序退化成 added_at 兜底。
+/// 因此这里取「目标原有视频（保持各自相对顺序）在前 + 源合集视频按源合集内
+/// 展示顺序在后」，整段重新编号 `0..n-1`。
+///
+/// 边界：
+/// - 源/目标名去空白后相同 → 视为未改动，原样返回（不抛错；与
+///   [renameCollection] 新旧名相同的处理保持同一套约定）
+/// - 源合集不存在 / 为空 → 抛 [CollectionException]
+/// - 目标合集不存在 → 抛 [CollectionException]
+/// 返回新数据，原数据不可变不修改。
+WhitelistData moveCollectionInto(
+  WhitelistData data,
+  String source,
+  String target,
+) {
+  final src = source.trim();
+  final dst = target.trim();
+  if (src.isEmpty) throw const CollectionException('源合集名不能为空');
+  if (dst.isEmpty) throw const CollectionException('目标合集名不能为空');
+  final names = data.collections.map((c) => c.name).toList();
+  if (!names.contains(src)) {
+    throw CollectionException(
+      '合集「$src」不存在（现有合集: ${names.isEmpty ? '无' : names.join(', ')}）',
+    );
+  }
+  if (src == dst) return data; // 并入自己 = 未改动
+  if (!names.contains(dst)) {
+    throw CollectionException(
+      '目标合集「$dst」不存在（现有合集: ${names.isEmpty ? '无' : names.join(', ')}）',
+    );
+  }
+  // 重编号表：目标原有视频在前、并入视频在后（都用各自当前的展示顺序，
+  // 即 sortedVideos 的 order 升序 + added_at 倒序兜底口径）。
+  // key 用 (bvid, cid)：白名单理论上按 bvid 唯一，但合集内定位一直用
+  // bvid+cid（见 collection_page 的「同一视频」判断），这里跟同一口径。
+  final orderOf = <(String, int), int>{};
+  var seq = 0;
+  for (final v in data.sortedVideos(dst)) {
+    orderOf[(v.bvid, v.cid)] = seq++;
+  }
+  for (final v in data.sortedVideos(src)) {
+    orderOf[(v.bvid, v.cid)] = seq++;
+  }
+  return data.copyWith(
+    collections: [
+      for (final c in data.collections)
+        if (c.name != src) c,
+    ],
+    videos: [
+      for (final v in data.videos)
+        if (v.collection == src)
+          // 源合集视频：改挂目标 + 排到目标末尾
+          v.copyWith(
+            collection: dst,
+            order: orderOf[(v.bvid, v.cid)] ?? v.order,
+          )
+        else if (v.collection == dst)
+          // 目标原有视频：归属不变，只是重编号（顺序语义没变）
+          v.copyWith(order: orderOf[(v.bvid, v.cid)] ?? v.order)
+        else
+          v,
+    ],
+  );
+}
+
 /// 白名单整体（v1 结构 + videos 列表；v3 增加 collections；v4 增加 upowners）。
 class WhitelistData {
   final int version;
