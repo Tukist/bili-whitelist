@@ -29,6 +29,7 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'package:bili_whitelist_app/models/playlist_context.dart';
 import 'package:bili_whitelist_app/models/whitelist_video.dart';
 import 'package:bili_whitelist_app/pages/player_page.dart';
 import 'package:bili_whitelist_app/player/bili_dash_player.dart';
@@ -64,6 +65,9 @@ class _Rec {
 
   /// updateNowPlaying 的载荷（每次调用一条，按顺序）。
   final List<Map<Object?, Object?>> nowPlaying = [];
+
+  /// setDataSource 的标题（按顺序）：「切到哪一条」的可观测点。
+  final List<String> dataSourceTitles = [];
 
   /// getPosition 返回值（tick 轮询用；默认 0 = 不干扰位置断言）。
   int position = 0;
@@ -286,6 +290,7 @@ class _Mocks {
           case 'setDataSource':
             final map = call.arguments as Map;
             textureId = (map['textureId'] as num).toInt();
+            rec.dataSourceTitles.add(map['title'] as String? ?? '');
             sink?.success({
               'event': 'onPrepared',
               'textureId': map['textureId'],
@@ -347,14 +352,51 @@ Future<void> _pumpPlayer(
   WidgetTester tester,
   _Rec rec, {
   WhitelistVideo? video,
+  PlaylistContext? playlist,
+  int playlistIndex = 0,
 }) async {
   await tester.pumpWidget(const SizedBox());
   await tester.pump();
-  await tester.pumpWidget(
-      MaterialApp(home: PlayerPage(video: video ?? _video())));
+  await tester.pumpWidget(MaterialApp(
+      home: PlayerPage(
+    video: video ?? _video(),
+    playlist: playlist,
+    playlistIndex: playlistIndex,
+  )));
   await tester.pump();
   await tester.pump(const Duration(milliseconds: 600));
 }
+
+/// 三条视频的播放列表（上下集都可用）。
+List<WhitelistVideo> _playlistVideos() => const [
+      WhitelistVideo(
+        bvid: 'BV1NOTIFY001',
+        cid: 1001,
+        title: '媒体通知测试视频',
+        cover: '',
+        duration: 200,
+        upName: '测试UP主',
+        addedAt: '2026-01-01',
+      ),
+      WhitelistVideo(
+        bvid: 'BV1NOTIFY002',
+        cid: 1002,
+        title: '下一集视频',
+        cover: '',
+        duration: 200,
+        upName: '测试UP主',
+        addedAt: '2026-01-02',
+      ),
+      WhitelistVideo(
+        bvid: 'BV1NOTIFY003',
+        cid: 1003,
+        title: '最后一集视频',
+        cover: '',
+        duration: 200,
+        upName: '测试UP主',
+        addedAt: '2026-01-03',
+      ),
+    ];
 
 /// 推一条原生 onMediaAction 事件并泵两帧。
 ///
@@ -782,5 +824,133 @@ void main() {
     expect(rec.playerMethods.where((m) => m == 'getPosition').length,
         inInclusiveRange(inFlight, inFlight + 1),
         reason: '停止态下不应再有新的 getPosition 请求（只有那个在途的回来）');
+  });
+
+  // -------------------------------------------------------------------------
+  // v2.30.0-r2：通知收起行「上一集 / 暂停 / 下一集」的 Dart 侧契约
+  //
+  // Kotlin 那半边（自定义 action、覆写 getActions / 收起行索引）flutter test
+  // 覆盖不到，这里守住**协议**：Dart 把「真有上一集 / 真有下一集」如实推给原生，
+  // 且只在这两个都为真时原生才会换收起行（Kotlin 侧 `hasPrev && hasNext`）。
+  // 推错了就是「点了没反应的死按钮」或「明明能切却没有按钮」。
+  // -------------------------------------------------------------------------
+  testWidgets('有播放列表：updateNowPlaying 带上 hasPrev/hasNext（都可用）',
+      (tester) async {
+    final rec = _Rec();
+    _Mocks(rec).install(tester);
+    final videos = _playlistVideos();
+    // 第 2 条（中间）→ 上下集都有
+    await _pumpPlayer(
+      tester,
+      rec,
+      video: videos[1],
+      playlist: PlaylistContext(videos: videos, label: '合集'),
+      playlistIndex: 1,
+    );
+
+    expect(rec.nowPlaying, isNotEmpty);
+    expect(rec.nowPlaying.last['hasPrev'], true,
+        reason: '第 2/3 条确实有上一集 → 通知收起行才敢放「上一集」');
+    expect(rec.nowPlaying.last['hasNext'], true,
+        reason: '第 2/3 条确实有下一集');
+
+    // 换集后（界面底栏点「下一集」）载荷要跟着走到头
+    await tester.tap(find.byKey(const ValueKey('player-next-video')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 600));
+    expect(rec.dataSourceTitles.last, '最后一集视频');
+    expect(rec.nowPlaying.last['hasPrev'], true);
+    expect(rec.nowPlaying.last['hasNext'], false,
+        reason: '切到最后一集 → hasNext 必须转 false（原生据此回退成 ⏪⏸⏩）');
+  });
+
+  testWidgets('播放列表末条：hasNext=false；首条：hasPrev=false（头尾都不放死按钮）',
+      (tester) async {
+    final rec = _Rec();
+    _Mocks(rec).install(tester);
+    final videos = _playlistVideos();
+
+    await _pumpPlayer(
+      tester,
+      rec,
+      video: videos[2],
+      playlist: PlaylistContext(videos: videos),
+      playlistIndex: 2,
+    );
+    expect(rec.nowPlaying.last['hasNext'], false, reason: '末条没有下一集');
+    expect(rec.nowPlaying.last['hasPrev'], true);
+
+    // 首条：重新挂载（同名 widget 会走 update 而不是 initState，必须先卸空树）
+    final before = rec.nowPlaying.length;
+    await _pumpPlayer(
+      tester,
+      rec,
+      video: videos[0],
+      playlist: PlaylistContext(videos: videos),
+      playlistIndex: 0,
+    );
+    final first = rec.nowPlaying.sublist(before).first;
+    expect(first['hasPrev'], false, reason: '首条没有上一集');
+    expect(first['hasNext'], true);
+  });
+
+  testWidgets('单集视频（无播放列表）：hasPrev/hasNext 都是 false（通知行为与改动前一致）',
+      (tester) async {
+    final rec = _Rec();
+    _Mocks(rec).install(tester);
+    await _pumpPlayer(tester, rec); // 不传 playlist
+
+    expect(rec.nowPlaying, isNotEmpty);
+    expect(rec.nowPlaying.last['hasPrev'], false);
+    expect(rec.nowPlaying.last['hasNext'], false,
+        reason: '没有播放列表 → 原生收起行必须维持既有的 快退15s/暂停/快进15s');
+    expect(find.byKey(const ValueKey('player-playlist-row')), findsNothing);
+  });
+
+  testWidgets('通知收起行点「下一集 / 上一集」→ 真的换集（原生只回推动作）',
+      (tester) async {
+    final rec = _Rec();
+    final mocks = _Mocks(rec)..install(tester);
+    final videos = _playlistVideos();
+    await _pumpPlayer(
+      tester,
+      rec,
+      video: videos[1],
+      playlist: PlaylistContext(videos: videos),
+      playlistIndex: 1,
+    );
+    expect(rec.dataSourceTitles, ['下一集视频']);
+
+    // 收起行的「下一集」：Kotlin 侧只发 onMediaAction(action="next")，
+    // 换集全部由 Dart 完成（playVideo → 重新取流）
+    await _emitAction(tester, mocks, 'next');
+    await tester.pump(const Duration(milliseconds: 600));
+    expect(rec.dataSourceTitles, ['下一集视频', '最后一集视频'],
+        reason: '通知「下一集」必须真的切到列表下一条并重新取流');
+    expect(rec.nowPlaying.last['title'], '最后一集视频',
+        reason: '通知标题跟着换（同一 textureId 走 update 分支也要刷新）');
+    expect(rec.nowPlaying.last['hasNext'], false,
+        reason: '切到末条后通知要回退成 ⏪⏸⏩（hasNext=false）');
+
+    // 收起行的「上一集」→ 回到中间那条
+    await _emitAction(tester, mocks, 'prev');
+    await tester.pump(const Duration(milliseconds: 600));
+    expect(rec.dataSourceTitles.last, '下一集视频');
+    expect(rec.nowPlaying.last['hasPrev'], true);
+    expect(rec.nowPlaying.last['hasNext'], true);
+  });
+
+  testWidgets('单集视频收到通知的 prev/next 动作 → 无动作（没有列表可切）',
+      (tester) async {
+    final rec = _Rec();
+    final mocks = _Mocks(rec)..install(tester);
+    await _pumpPlayer(tester, rec);
+    final before = rec.dataSourceTitles.length;
+
+    await _emitAction(tester, mocks, 'next');
+    await _emitAction(tester, mocks, 'prev');
+    expect(rec.dataSourceTitles.length, before,
+        reason: '没有播放列表时通知的 prev/next 必须是空操作（原生本就不该放这两个按钮，'
+            '这里是防御）');
   });
 }

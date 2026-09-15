@@ -23,6 +23,7 @@ import 'package:flutter/foundation.dart' show listEquals;
 import 'package:flutter/material.dart';
 
 import '../cache/download_manager.dart';
+import '../models/playlist_context.dart';
 import '../models/whitelist_video.dart';
 import '../services/whitelist_writer.dart';
 import '../theme/app_palette.dart';
@@ -695,7 +696,22 @@ class _CollectionPageState extends State<CollectionPage> {
                                 MaterialPageRoute<void>(
                                   settings: const RouteSettings(
                                       name: kPlayerRouteName),
-                                  builder: (_) => PlayerPage(video: video),
+                                  // 同合集上下集（v2.30.0+）：把**整个合集**按
+                                  // 用户在本页看到的顺序交下去，「下一集」就是
+                                  // 列表里的下一条（[_videos] = sortedVideos
+                                  // 的 order 升序 + addedAt 倒序兜底，与列表
+                                  // 渲染用的是同一个 getter，不会出现两套顺序）。
+                                  // 只接这一条「点单条视频播放」的路径：多选/
+                                  // 批量/子合集下钻都不是「从某个列表开始连播」
+                                  // 的语义。
+                                  builder: (_) => PlayerPage(
+                                    video: video,
+                                    playlist: PlaylistContext(
+                                      videos: videos,
+                                      label: _label,
+                                    ),
+                                    playlistIndex: vi,
+                                  ),
                                 ),
                               );
                             },

@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  上一集（通知收起行用，v2.30.0-r2）。
+
+  为什么自己画而不是用 media3 的 setPreviousActionIconResourceId：
+  那个内建 `ACTION_PREVIOUS` 需要 `COMMAND_SEEK_TO_PREVIOUS`，单集 ExoPlayer
+  拿不到 `COMMAND_SEEK_TO_NEXT` 对应的内建 Next，成套用不了；而且它点了走
+  `seekToPrevious()` = 回到本条开头，语义也不是「上一集」。
+  形状沿用 Material 的 skip_previous（竖条 + 左三角），与用户对「上一集」的
+  预期一致；颜色写死为白，实际显示时由系统媒体模板统一着色。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M6,6h2v12H6V6zM9.5,12l8.5,6V6L9.5,12z" />
+</vector>

@@ -68,6 +68,7 @@ import '../api/github_api.dart';
 import '../models/article.dart';
 import '../models/dynamic_item.dart';
 import '../models/live_status.dart';
+import '../models/playlist_context.dart';
 import '../models/upowner.dart';
 import '../models/whitelist_video.dart';
 import '../services/followings_auto_sync.dart';
@@ -1169,8 +1170,48 @@ class _UpownerPageState extends State<UpownerPage> {
     ));
   }
 
+  /// 「全部视频」列表的播放上下文（v2.30.0+ 同 UP 主上下集）。
+  ///
+  /// 只有「全部视频」分区（`_section == 0`）**点单条视频**那条路用它；动态投稿
+  /// / 其它构造点不传 → 播放页不显示上下集入口。
+  ///
+  /// 取舍：
+  /// - 列表顺序即页面上看到的顺序（[_videos] 的 pubdate 序 / 排序 chip 选的
+  ///   序，翻页追加后的**整表**），播放页只按下标 ±1 走；
+  /// - ⚠️ 合集/列表分区共用同一个 [_buildVideoTile]，但它们的顺序来自
+  ///   `view.videos`（另一份列表）。同一个视频往往两处都在，若照旧拿 [_videos]
+  ///   当上下文，用户点某合集里的第 1 条却会拿到「按发布时间排的全部视频」当
+  ///   上下文，「下一集」跳到一条毫不相干的视频上——所以按 `_section` 关掉
+  ///   这条路的上下文（宁可不接，不接错；合集分区自己的 `view.videos` 是更
+  ///   合适的上下文，但那是另一个批次的事）；
+  /// - 该视频不在已加载列表里、或列表不足两条 → null（没有去处 = 不显示按钮，
+  ///   避免死按钮）；
+  /// - 列表是**快照**：进播放页后再翻页/换排序不会回灌已经打开的播放页会话。
+  ///   刻意如此——「下一集」在用户已经看到的那份顺序里走，中途换序会让
+  ///   「上一集」跳到一个没见过的地方。
+  ({PlaylistContext playlist, int index})? _videoListContext(WhitelistVideo v) {
+    if (_section != 0) return null; // 不是「全部视频」分区（见上）
+    if (_videos.length < 2) return null;
+    final idx = _videos.indexWhere((x) => x.bvid == v.bvid);
+    if (idx < 0) return null;
+    return (
+      playlist: PlaylistContext(
+        videos: _videos,
+        label: _info?.name ?? widget.initial?.name,
+      ),
+      index: idx,
+    );
+  }
+
   /// 点击视频：缺 cid 时 fetch view 补齐 → push PlayerPage。
-  Future<void> _openVideo(WhitelistVideo v) async {
+  /// [playlist]/[playlistIndex]（v2.30.0+ 同 UP 主上下集）：只有「全部视频」
+  /// 列表点进来的那条路传（[_videoListContext]），动态投稿等构造点不传 →
+  /// 播放页不显示上下集入口（与改动前完全一致）。
+  Future<void> _openVideo(
+    WhitelistVideo v, {
+    PlaylistContext? playlist,
+    int playlistIndex = 0,
+  }) async {
     if (_fetchingMeta) return;
     if (v.cid == 0) {
       setState(() => _fetchingMeta = true);
@@ -1182,7 +1223,11 @@ class _UpownerPageState extends State<UpownerPage> {
         Navigator.of(context).push(
           MaterialPageRoute<void>(
             settings: const RouteSettings(name: kPlayerRouteName),
-            builder: (_) => PlayerPage(video: fixed),
+            builder: (_) => PlayerPage(
+              video: fixed,
+              playlist: playlist,
+              playlistIndex: playlistIndex,
+            ),
           ),
         );
       } on BiliApiException catch (e) {
@@ -1199,7 +1244,11 @@ class _UpownerPageState extends State<UpownerPage> {
         context,
       ).push(MaterialPageRoute<void>(
         settings: const RouteSettings(name: kPlayerRouteName),
-        builder: (_) => PlayerPage(video: v),
+        builder: (_) => PlayerPage(
+          video: v,
+          playlist: playlist,
+          playlistIndex: playlistIndex,
+        ),
       ));
     }
   }
@@ -1876,7 +1925,12 @@ class _UpownerPageState extends State<UpownerPage> {
           color: Theme.of(context).colorScheme.onSurfaceVariant,
         ),
       ),
-      onTap: () => _openVideo(v),
+      // 单条视频点播：把「全部视频」列表作为播放上下文传下去（v2.30.0+ 同
+      // UP 主上下集。「上一集/下一集」用的就是用户在页面上看到的顺序）。
+      onTap: () {
+        final ctx = _videoListContext(v);
+        _openVideo(v, playlist: ctx?.playlist, playlistIndex: ctx?.index ?? 0);
+      },
       onLongPress: () => _onLongPress(v),
     );
   }

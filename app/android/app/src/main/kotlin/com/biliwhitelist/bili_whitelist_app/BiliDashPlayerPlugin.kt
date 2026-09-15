@@ -39,7 +39,9 @@ private const val kReqNotification = 9048
  *   Android Auto 读；通知文案见 `updateNowPlaying`。`isLive` 缺省 false（容错旧调用）
  * - `play` / `pause` / `seekTo` / `setVolume` / `setPlaybackSpeed` / `getPosition` / `dispose`
  * - `updateNowPlaying(textureId, title, artist, coverUrl, status, playing, positionMs,
- *   durationMs)`：同步媒体通知内容（v2.25.x，见 [DashMediaNotification]）
+ *   durationMs, hasPrev, hasNext)`：同步媒体通知内容（v2.25.x，见 [DashMediaNotification]）。
+ *   `hasPrev`/`hasNext`（v2.30.0-r2）缺省 false = 没有上下集：通知收起行维持
+ *   `快退15s / 暂停 / 快进15s`；两者都为 true 时才换成 `上一集 / 暂停 / 下一集`
  * - `requestNotificationPermission`：Android 13+ 通知权限（v2.25.0-r2 起通知**不再**
  *   绑媒体会话 token，因此不再享受「媒体会话通知」的权限豁免，这条请求是必需的）
  * - 事件通过 EventChannel `bili_dash_player/events` 回推（载荷带 textureId 区分播放器）：
@@ -201,6 +203,9 @@ class BiliDashPlayerPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
             durationMs = call.argument<Number>("durationMs")?.toLong() ?: 0L,
             // 直播：通知层据此不挂快退/快进按钮、会话命令里也摘掉 seek
             isLive = player.isLive,
+            // 上一集/下一集是否可用（缺省 false：旧 Dart 调用、单集入口都不变）
+            hasPrev = call.argument<Boolean>("hasPrev") ?: false,
+            hasNext = call.argument<Boolean>("hasNext") ?: false,
         )
     }
 

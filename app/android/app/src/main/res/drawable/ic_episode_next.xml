@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  下一集（通知收起行用，v2.30.0-r2）。
+
+  与 ic_episode_previous.xml 成对：形状沿用 Material 的 skip_next（右三角 +
+  竖条），语义是「下一集」而不是内建 `ACTION_NEXT`（单 MediaItem 的 ExoPlayer
+  永远生成不出那个 action，见 DashMediaNotification 文件头注释）。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M6,18l8.5,-6L6,6V18zM16,6h2v12h-2V6z" />
+</vector>

@@ -12,6 +12,7 @@ import '../cache/download_manager.dart';
 import '../cache/playback_progress.dart';
 import '../models/danmaku.dart';
 import '../models/danmaku_settings.dart';
+import '../models/playlist_context.dart';
 import '../models/subtitle.dart';
 import '../models/upowner.dart';
 import '../models/whitelist_video.dart';
@@ -22,6 +23,7 @@ import '../services/history_store.dart';
 import '../services/realtime_transcriber.dart';
 import '../services/video_shot_service.dart';
 import '../services/watch_stats.dart';
+import '../services/whitelist_writer.dart';
 import '../theme/app_motion.dart';
 import '../theme/app_tokens.dart';
 import '../theme/motion_control.dart';
@@ -51,6 +53,14 @@ const List<double> kPlaybackSpeeds = [
 
 /// 长按视频画面时强制使用的倍速。
 const double kLongPressSpeed = 2.0;
+
+/// 底栏「上一集 / 第 N/M 集 / 下一集」行里**中间标签**的宽度上限（dp）。
+///
+/// 参考机 411dp 宽：左右按钮各占半屏（205.5dp），按钮内容（图标 18 + 4 + 三字
+/// 标签）约 57dp 居中在各自半屏里 → 中间真正空出来的带子约 148dp。取 140 留
+/// 8dp 余量，既能完整显示「合集名 · 3/5」这种常见文案，又不会长到压住两侧按钮
+/// 的图标/文字；超长 label 一律省略号（见 `_buildPlaylistRow`）。
+const double kPlaylistLabelMaxWidth = 140.0;
 
 // -------------------------------------------------------------------------
 // 会员集播放回退决策（纯函数，便于单测）
@@ -620,12 +630,25 @@ class PlayerPage extends StatefulWidget {
   @visibleForTesting
   final VideoShotService? videoShotService;
 
+  /// 播放上下文（同合集 / 同 UP 主页的有序视频列表；v2.30.0+）。
+  ///
+  /// 传了才有「上一集 / 下一集」入口——**不传时一个像素都不多**（底栏结构与
+  /// 改动前逐像素一致），历史记录 / 搜索 / 信箱 / 评论跳转等「语义不是同合集」
+  /// 的入口一律不传（详见 [PlaylistContext] 类注释与底栏「上下集」行注释）。
+  final PlaylistContext? playlist;
+
+  /// 本视频在 [playlist] 中的下标（0 起；调用方按列表页看到的顺序给）。
+  /// 越界时按 0 处理（防御：列表在别处被改过也不至于崩）。
+  final int playlistIndex;
+
   const PlayerPage({
     super.key,
     required this.video,
     this.initialPageIndex = 0,
     this.initialPositionMs,
     this.videoShotService,
+    this.playlist,
+    this.playlistIndex = 0,
   });
 
   @override
@@ -640,6 +663,35 @@ class _PlayerPageState extends State<PlayerPage>
   /// 上。v2.17.1+ 评论链接改走「push 新播放页」（[openVideoInNewPlayer]），
   /// 不再改动本页 [_video]（本页暂停在旧视频 A 上，返回后续播 A）。
   late WhitelistVideo _video;
+
+  // -------------------------------------------------------------------------
+  // 播放上下文（同合集 / 同 UP 主页的上下集切换，v2.30.0+）
+  // ---------------------------------------------------------------------
+  // 三个字段都在 initState 里按构造参数一次性落定（见 [PlayerPage.playlist]）。
+  // [_playlistVideos] 为 null = 本次没有播放列表 → 底栏**不构建**上下集行
+  // （不是禁用、是整行不存在），行为与改动前逐像素一致。
+  //
+  // ⚠️ 这里刻意**不放进 [playVideo] 的复位清单**：换 bvid 只移动下标，
+  // 列表本身属于「这次是从哪个列表点进来的」，不随换源改变（同一合集内切
+  // 邻居时列表当然不变；这也正是「不接管评论跳转来的新页」的原因，见
+  // [_pushNewPlayer] 的注释）。
+  List<WhitelistVideo>? _playlistVideos;
+  int _playlistIndex = 0;
+  String? _playlistLabel;
+
+  /// 一次换源未走完时挡住连点（[playVideo] 内部有 await，连点两次会叠两次
+  /// 取流；通知栏/遥控器的「下一集」尤其容易连发）。
+  bool _neighborSwitching = false;
+
+  /// 是否显示「上一集 / 下一集」入口：至少两条才有去处——一条时上下集都是
+  /// 死按钮，按「无播放列表」处理（不显示）。
+  bool get _hasPlaylistNeighbors =>
+      _playlistVideos != null && _playlistVideos!.length > 1;
+
+  bool get _canPlayPrev => _hasPlaylistNeighbors && _playlistIndex > 0;
+
+  bool get _canPlayNext =>
+      _hasPlaylistNeighbors && _playlistIndex < _playlistVideos!.length - 1;
 
   final BiliApi _api = BiliApi();
 
@@ -1086,6 +1138,17 @@ class _PlayerPageState extends State<PlayerPage>
   void initState() {
     super.initState();
     _video = widget.video; // 换源前的初始视频（换源见 playVideo）
+    // 播放上下文（v2.30.0+）：只取一份**可写副本**——cid 缺失的邻居补拉完
+    // 元数据后要就地替换本列表里的那一条，下次切到它不用再拉一次（构造参数
+    // [PlaylistContext] 本身仍只读）。
+    final playlist = widget.playlist;
+    if (playlist != null && playlist.videos.isNotEmpty) {
+      _playlistVideos = List<WhitelistVideo>.of(playlist.videos);
+      _playlistLabel = playlist.label;
+      final idx = widget.playlistIndex;
+      // 下标越界（列表在别处被改过 / 调用方给错）→ 落到第 0 集，不崩
+      _playlistIndex = (idx >= 0 && idx < playlist.length) ? idx : 0;
+    }
     // 拖动预览服务：生产自建，测试可注入（见 [PlayerPage.videoShotService]）
     _videoShot = widget.videoShotService ?? VideoShotService();
     // 历史记录续播：初始定位到对应分 P（越界 / 单 P 回落第 0 集）。
@@ -1287,16 +1350,34 @@ class _PlayerPageState extends State<PlayerPage>
   /// 返回丢失进度）。须在播放器释放前调用，getPosition 才可用；看完
   /// （_completed）已清记忆，跳过进度保存（历史仍记录「看过」，位置=结尾
   /// 无妨）。
+  ///
+  /// ⚠️ 视频信息必须**同步快照**下来再进回调：`getPosition` 是异步的，而
+  /// [playVideo] 换源会在同一个事件循环里把 `_video`/`_currentPageIndex`
+  /// 换成新视频 —— 回调里再读这两个字段，就会把**旧视频的位置写进新视频的
+  /// key 与历史条目**（v2.30.0 上下集实测：切下一集后新视频被「恢复」到旧
+  /// 视频的进度、旧视频的观看记录丢失；本方法此前只有 dispose 一个调用点，
+  /// 所以这个坑一直没暴露）。
   void _saveExitProgress() {
     final store = _progressStore;
     final player = _player;
     if (player == null) return;
+    final video = _video;
+    final pageIndex = _currentPageIndex;
+    final cid = _currentCid;
+    final durationMs = _durationMs;
+    final completed = _completed;
     player.getPosition().then((pos) {
       if (pos > 0) {
-        if (store != null && !_completed) {
-          store.saveProgress(_video.bvid, _currentPageIndex, pos);
+        if (store != null && !completed) {
+          store.saveProgress(video.bvid, pageIndex, pos);
         }
-        unawaited(_writeHistory(pos));
+        unawaited(_writeHistory(
+          pos,
+          video: video,
+          pageIndex: pageIndex,
+          cid: cid,
+          durationMs: durationMs,
+        ));
       }
     }).catchError((Object _) {
       // 原生通道异常：忽略，进度最多丢一次
@@ -1761,6 +1842,9 @@ class _PlayerPageState extends State<PlayerPage>
   // -------------------------------------------------------------------------
 
   /// 通知/耳机操作回传到界面（原生播放器**已经**执行了对应动作，这里只对齐 UI）。
+  ///
+  /// 例外：`prev` / `next`（通知收起行的「上一集 / 下一集」，v2.30.0-r2）原生
+  /// **什么都没做** —— 切集要换 bvid 重新取流，只有本页做得到，见 [playNeighbor]。
   Future<void> _onMediaAction(String action, int positionMs) async {
     debugPrint('[player] onMediaAction action=$action positionMs=$positionMs');
     switch (action) {
@@ -1786,6 +1870,12 @@ class _PlayerPageState extends State<PlayerPage>
         }
       case 'stop':
         if (mounted) await _onStoppedByNotification();
+      // 通知收起行的「上一集 / 下一集」：与底栏那对按钮**走同一条路**
+      // （越界/无列表/换源中都被 playNeighbor 自己挡掉，这里不做任何判断）
+      case 'prev':
+        await playNeighbor(-1);
+      case 'next':
+        await playNeighbor(1);
       default:
         debugPrint('[player] 未知媒体动作：$action');
     }
@@ -1814,7 +1904,13 @@ class _PlayerPageState extends State<PlayerPage>
       if (store != null) {
         await store.saveProgress(_video.bvid, _currentPageIndex, pos);
       }
-      await _writeHistory(pos);
+      await _writeHistory(
+        pos,
+        video: _video,
+        pageIndex: _currentPageIndex,
+        cid: _currentCid,
+        durationMs: _durationMs,
+      );
     }
   }
 
@@ -1849,6 +1945,11 @@ class _PlayerPageState extends State<PlayerPage>
         playing: _playing,
         positionMs: _positionMs,
         durationMs: _durationMs,
+        // 上/下一集是否真有：通知收起行据此在 `上一集/暂停/下一集` 与既有的
+        // `快退15s/暂停/快进15s` 之间二选一（v2.30.0-r2）。两个都为 false
+        // （单集 / 头尾 / 没有播放列表）时原生完全不动，行为与改动前一致。
+        hasPrev: _canPlayPrev,
+        hasNext: _canPlayNext,
       );
     } catch (_) {
       // 通道异常：忽略（通知不显示，播放照常）
@@ -2275,35 +2376,56 @@ class _PlayerPageState extends State<PlayerPage>
     final store = _progressStore;
     final player = _player;
     if (store == null || player == null || _completed) return;
+    // 视频信息**同步快照**：下面 getPosition 是 await，期间可能换源/切集
+    // （[_saveExitProgress] 注释里有这条坑的完整说明）。
+    final video = _video;
+    final pageIndex = _currentPageIndex;
+    final cid = _currentCid;
+    final durationMs = _durationMs;
     final pos = await player.getPosition();
     if (pos <= 0) return;
-    await store.saveProgress(_video.bvid, _currentPageIndex, pos);
+    await store.saveProgress(video.bvid, pageIndex, pos);
     debugPrint('[player_page] 保存进度 '
-        '${_video.bvid}#$_currentPageIndex $pos ms');
+        '${video.bvid}#$pageIndex $pos ms');
     // 与进度保存同节奏写历史（_tick 每 10s / 暂停 / 快进快退 / dispose 触发）
-    await _writeHistory(pos);
+    await _writeHistory(
+      pos,
+      video: video,
+      pageIndex: pageIndex,
+      cid: cid,
+      durationMs: durationMs,
+    );
   }
 
-  /// 写入播放历史：记录当前视频信息 + 进度 + 观看时间。
-  /// 与进度保存同节奏（见 [_saveProgress]），失败静默不影响播放。
-  Future<void> _writeHistory(int positionMs) async {
+  /// 写入播放历史：记录 **调用方同步取好的那份视频快照** + 进度 + 观看时间。
+  ///
+  /// [video]/[pageIndex]/[cid]/[durationMs] 一律显式传入而不是在方法体内读
+  /// `_video` 等字段：本方法（及其调用方）都在 await 之后落笔，而播放页会在
+  /// await 间隙换源/切集 —— 那时读当前字段会把旧视频的位置写进新视频的历史
+  /// 条目（与 [_saveExitProgress] 同源的坑，见其注释）。
+  /// 失败静默不影响播放。
+  Future<void> _writeHistory(
+    int positionMs, {
+    required WhitelistVideo video,
+    required int pageIndex,
+    required int cid,
+    required int durationMs,
+  }) async {
     try {
       await HistoryStore.instance.addOrUpdate(
         HistoryEntry(
-          bvid: _video.bvid,
-          pageIndex: _currentPageIndex,
-          cid: _currentCid,
-          title: _video.title,
-          cover: _video.cover,
-          upName: _video.upName,
-          durationMs: _durationMs > 0
-              ? _durationMs
-              : _video.duration * 1000,
+          bvid: video.bvid,
+          pageIndex: pageIndex,
+          cid: cid,
+          title: video.title,
+          cover: video.cover,
+          upName: video.upName,
+          durationMs: durationMs > 0 ? durationMs : video.duration * 1000,
           positionMs: positionMs,
           watchedAt: DateTime.now(),
-          pages: _video.pages,
+          pages: video.pages,
           // 发布时间随历史一起存：历史卡副信息行显示「发布 yyyy-MM-dd」
-          pubdate: _video.pubdate,
+          pubdate: video.pubdate,
         ),
       );
     } catch (_) {
@@ -3310,6 +3432,11 @@ class _PlayerPageState extends State<PlayerPage>
   /// 方按 [openVideoInNewPlayer] 的 pageIndex/positionMs 换算传入）：>0 分 P /
   /// >0 进度 → 新页首备后直接定位（覆盖其记忆进度）；不带参时维持 v2.17.1+
   /// 从开头播/记忆进度行为。
+  ///
+  /// **不继承本页的播放列表**（v2.30.0+）：评论区的视频链接、搜索结果等来自
+  /// 另一个语境，其「上一条/下一条」与当前合集无关——把本页的 [_playlistVideos]
+  /// 漏给新页会造出「下一集」跳到合集里某条毫不相干的视频。新页只在自己
+  /// 被点进来的那条路上带 playlist（见 [PlayerPage.playlist]）。
   void _pushNewPlayer(
     WhitelistVideo video, {
     int initialPageIndex = 0,
@@ -4587,6 +4714,12 @@ class _PlayerPageState extends State<PlayerPage>
     _autoRecoverFails = 0; // 换源：自动续播预算重置（_init 内也会重置）
     _pendingRestore = true; // 新视频 onPrepared 恢复其记忆进度（同首次进入）
     _pendingSeekMs = null; // 内部换源不带 ?t 覆盖（防旧定位串到新视频）
+    // 观看时长累计基线丢弃：新视频的位置与旧视频无关。正常情况下新流 READY
+    // 时 [_onPrepared] 已重置过一次，这里补的是**取流失败/noPrepared 那条路**
+    // ——基线若还指着旧视频的位置，之后任何一次 tick 都可能把两段之间毫无关系
+    // 的差值当成「连续观看」（上限 WatchStats.maxTickDeltaMs = 5s），给新视频
+    // 白记几秒。
+    _resetWatchBaseline();
     setState(() {
       _video = video;
       _currentPageIndex = 0;
@@ -4635,6 +4768,85 @@ class _PlayerPageState extends State<PlayerPage>
       if (_danmakuEnabled && _error == null) await _loadDanmaku();
     } catch (_) {
       // 弹幕拉取异常静默（不阻塞换源播放）
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 同合集上下集（v2.30.0+）
+  // -------------------------------------------------------------------------
+
+  /// 播放列表里的邻居（「上一集」[delta] = -1 / 「下一集」= +1）。
+  ///
+  /// **公开入口**（v2.30.0-r2）：底栏那一对按钮与**通知收起行的「上一集 /
+  /// 下一集」**走的是同一条路——后者经 `_onMediaAction('prev'/'next')` 调到这里。
+  /// 之所以不再私有：通知链路与测试都要用它，而两处若各写一份「取邻居 + 换源」
+  /// 迟早会漂移（越界/防连点/缺 cid 补齐三件套都得同步）。
+  ///
+  /// 语义与取舍：
+  /// - **边界不做任何事**（越界直接 return，不弹提示、不报错、**不循环**）。
+  ///   循环播放是另一种语义（「看完了继续看」），用户没要求，且「最后一集
+  ///   的下一集」跳到第一集对合集浏览场景只会让人困惑；头尾按钮也是直接
+  ///   禁用（见 [_buildPlaylistRow]），通知层同样只在两头都可用时才放出
+  ///   上下集按钮（见 `_syncNowPlaying` 的 hasPrev/hasNext），正常操作根本
+  ///   走不到这里；
+  /// - **复用 [playVideo]**：换 bvid 要复位的状态有 17 项（播放器/定时器/
+  ///   字幕/弹幕/手势 HUD/拖动预览/UP 元数据/简介/听视频…），`playVideo`
+  ///   已经逐项做全，这里再抄一遍必然漏项、两份清单还会各自漂移。
+  ///   本方法只负责「选中列表里的下一条 + 缺 cid 时补齐元数据」；
+  /// - **不接历史 / 搜索 / 信箱 / 评论跳转**的播放列表：那些列表是「观看时间
+  ///   序 / 相关度序」，不是「同一部的第几集」，切「下一个」语义会错位——见
+  ///   [PlaylistContext] 类注释；
+  /// - 同一 bvid 在列表里重复出现（脏数据）时 `playVideo` 会短路跳过换源，
+  ///   此时下标照常移动（不影响后续导航）。
+  Future<void> playNeighbor(int delta) async {
+    final list = _playlistVideos;
+    if (list == null) return;
+    final target = _playlistIndex + delta;
+    if (target < 0 || target >= list.length) {
+      debugPrint('[player_page] 上下集越界（$target/${list.length}），无动作');
+      return;
+    }
+    if (_neighborSwitching) return; // 防连点：上一次换源还没走完
+    final picked = list[target];
+    debugPrint('[player_page] 播放列表切集 ${delta > 0 ? '下一集' : '上一集'} '
+        '${_playlistIndex + 1} -> ${target + 1}/${list.length} '
+        'bvid=${picked.bvid}');
+    setState(() => _playlistIndex = target);
+    _neighborSwitching = true;
+    try {
+      // 邻居缺 cid（合集/UP 主页一般都有；动态/脏数据可能为 0）→ 先补元数据。
+      // 取不到就只提示、**不动当前播放**：切过去只会是一个取不了流的空壳，
+      // 不如停在能看的这一集（同 upowner_page 的 _openVideo 取舍）。
+      var video = picked;
+      if (video.cid <= 0) {
+        final fixed = await _resolveNeighborMeta(video);
+        if (fixed == null) {
+          if (mounted) setState(() => _playlistIndex -= delta); // 下标退回原处
+          _showSnack('获取视频信息失败，无法切换');
+          return;
+        }
+        video = fixed;
+        // 就地替换列表里那一条：下次切回它不用再拉一次
+        final idx = _playlistVideos!.indexWhere((v) => v.bvid == picked.bvid);
+        if (idx >= 0) _playlistVideos![idx] = fixed;
+      }
+      await playVideo(video);
+    } finally {
+      _neighborSwitching = false;
+    }
+  }
+
+  /// 邻居视频缺 cid 时补拉 view 元数据（返回 null = 失败，调用方保持现状）。
+  Future<WhitelistVideo?> _resolveNeighborMeta(WhitelistVideo v) async {
+    debugPrint('[player_page] 邻居视频缺 cid，fetch view 补齐 bvid=${v.bvid}');
+    try {
+      final meta = await _api.fetchVideoMeta(v.bvid);
+      final fixed = WhitelistWriter.videoFromMeta(meta, fallbackBvid: v.bvid);
+      if (fixed.cid <= 0) return null; // 接口给了数据但没有 cid → 视为失败
+      return fixed;
+    } catch (e) {
+      debugPrint('[player_page] 邻居视频元数据拉取失败 bvid=${v.bvid} $e');
+      return null;
     }
   }
 
@@ -5182,11 +5394,30 @@ class _PlayerPageState extends State<PlayerPage>
     return Stack(
       children: [
         _buildTopBar(),
-        if (!compactEmbedded) Center(child: _buildCenterControls()),
+        if (!compactEmbedded)
+          // 有上下集行时整簇上移**一行的高度**（见 [_buildPlaylistRowHeightOffset]）：
+          // 中央簇是「在视频区里垂直居中」的，底栏长高 40 它不会自己让位，
+          // 实测竖屏 16:9（视频区仅 231dp）下中央播放键的圆环正好压在这一行的
+          // 中间标签上（白压白，标签可读性崩掉）。上移 40 后本簇相对底栏
+          // （进度条行 / 按钮行）的纵向关系与加这一行之前**逐像素一致**，
+          // 让出来的正是新那一行的带子。不改簇内部布局。
+          Transform.translate(
+            offset: Offset(0, _playlistRowHeightOffset),
+            child: Center(child: _buildCenterControls()),
+          ),
         Align(alignment: Alignment.bottomCenter, child: _buildBottomBar()),
       ],
     );
   }
+
+  /// 中央控制簇在有上下集行时的纵向偏移（0 或 `-行高`）。
+  ///
+  /// 用 [Transform.translate] 而不是给 `Center` 套 `Padding(bottom:)`：后者的
+  /// 位移量只有 padding 的一半（盒子连同 padding 一起居中），要上移 40 得写 80，
+  /// 读代码的人只会看到一对魔法数字。translate 语义就是「整簇上移 N」，且默认
+  /// `transformHitTests = true`，命中区跟着走，不需要额外补偿。
+  double get _playlistRowHeightOffset =>
+      _hasPlaylistNeighbors ? -_kPlaylistRowHeight : 0;
 
   /// 信息块的补场起点（归一化到控制器 0..1 上的 [Interval]）：前
   /// [kInfoBlockDelay] 是「等封面先落位」，与封面 Hero 的 [kHeroFlightDur]
@@ -5721,6 +5952,9 @@ class _PlayerPageState extends State<PlayerPage>
       alignment: Alignment.center,
       children: [
         Container(
+          // 测试锚点：中央播放键的圆环（与上下集行的可读性断言以它为基准 ——
+          // 压在标签上的是这个 72dp 圆，不是 IconButton 的整个盒子）。
+          key: const ValueKey('player-play-glyph'),
           width: 72,
           height: 72,
           decoration: BoxDecoration(
@@ -5999,6 +6233,13 @@ class _PlayerPageState extends State<PlayerPage>
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
+              // 有上下集行时**空出同样的高度**：这一行的位置必须与完整底栏里的
+              // 那一份逐像素一致（见本方法注释），否则「横滑 seek 浮出进度条」
+              // 与「控制层弹出」之间来回切换时进度条会上下跳 40dp。这里只留占位、
+              // 不渲染按钮：横滑 seek 手势中途冒出一对可点的「上一集/下一集」
+              // 既不是用户此刻的意图，也会把一次滑动变成误触换集。
+              if (_hasPlaylistNeighbors)
+                const SizedBox(height: _kPlaylistRowHeight),
               _buildSeekRow(),
               const SizedBox(height: _kBottomButtonRowHeight),
             ],
@@ -6021,6 +6262,137 @@ class _PlayerPageState extends State<PlayerPage>
   /// 底栏按钮行高度（选集/倍速/听视频/字幕/弹幕/评论/下载/全屏）：
   /// [_buildSeekRowOnly] 要在进度条行下方留出同样的空档（见其注释）。
   static const double _kBottomButtonRowHeight = 44;
+
+  /// 上下集行高度（仅在有播放列表时占据底栏上沿的一条）。
+  ///
+  /// 40 而不是 44：这一行只有一个 18px 图标 + 一行小字，纯粹是导航；但也不能
+  /// 更矮——「上一集」「下一集」各占左右半屏（411dp 屏上 ~205dp 宽），高度是
+  /// 唯一被压缩的维度，40dp 是可点且不误触的下限。
+  static const double _kPlaylistRowHeight = 40;
+
+  /// 底栏「上一集 / 第 N/M 集 / 下一集」行（v2.30.0+ 同合集上下集）。
+  ///
+  /// 为什么放在底栏、且**单独一行**：
+  /// - 不挤占既有按钮行：那一行在 411dp 宽屏上 8 等分后每格仅 51.4dp，为了
+  ///   不出现省略号才特意改成竖排（见 [_barIconLabel]）；再塞两个按钮必然
+  ///   压垮「选集 1/2」「听视频中」这些既有文案。所以不碰它；
+  /// - 也不用中央控制簇：视频区过矮（[compactEmbedded]）时整个中央簇会被
+  ///   收起，放那里会在横屏置顶/超宽视频下消失。底栏在竖屏 / 横屏置顶 /
+  ///   横屏全屏三种形态下都渲染；
+  /// - 位置在**进度条行上方**：底栏整体贴底（Align.bottomCenter），往上长
+  ///   不影响下方任何几何，[_buildSeekRowOnly]（手势 seek 单独浮出进度条）
+  ///   也完全不受影响；
+  /// - 播放列表**不足两条时不构建本行**（上下集都无处可去 = 两个死按钮），
+  ///   与「没有播放列表就一个像素都不多」是同一标准——这正是用户在通知栏
+  ///   那边投诉过的形态，不能在播放页重演。
+  ///
+  /// 头尾**禁用**（[InkWell.onTap] 传 null，文字转暗色）：不循环、不越界；
+  /// 禁用的按钮保持可见（位置稳定，不会因为到最后一集按钮消失而让中间
+  /// 位置文案横向跳动）。
+  ///
+  /// v2.30.0-r2 修布局缺陷（真机实测 P1）：初版写成 `Row[Expanded, Flexible,
+  /// Expanded]`，三个孩子都吃 flex，中间标签白拿 1/3 行宽却又用不满（loose fit），
+  /// 用不完的份额按 [MainAxisAlignment.start] 留在**行尾**变成死区 —— 实测竖屏
+  /// 411dp 上按钮各只有 137dp（1/3 屏），行右侧 366.8..411（44dp）纯死区；横屏
+  /// 更糟：两侧还有 cutout inset，屏宽 75% 处（视觉上就在「下一集 ▶」旁边）点下去
+  /// 落空。现在改成 **Stack：两个 [Expanded] 各拿真正的半屏 + 中间标签浮在上层**：
+  /// - 标签不参与 Row 的宽度分配（[Positioned.fill] 里的 Row 只有两个 flex 孩子
+  ///   → 各 = 行宽 × 0.5），死区从根上消失；
+  /// - 标签自己给死了最大宽度（见 [kPlaylistLabelMaxWidth]），长 label 走省略号，
+  ///   绝不会反过来挤掉按钮；
+  /// - 标签**层**用 [IgnorePointer]：文字层不得吃掉中间那一带的点击 —— 否则
+  ///   RenderParagraph 会命中自己，把「上一集 / 下一集」的分界线上的一段变成
+  ///   点击黑洞（与上面那个死区是同一个 bug 的两种表现）。
+  ///
+  /// 按钮高度撑满整行（[Positioned.fill]）：40dp 行高才是设计里的触摸目标下限，
+  /// 初版 InkWell 只包了内容（18dp 高），点偏一点就落空。
+  Widget _buildPlaylistRow() {
+    final videos = _playlistVideos!;
+    final label = _playlistLabel;
+    final posText = (label == null || label.isEmpty)
+        ? '${_playlistIndex + 1}/${videos.length}'
+        : '$label · ${_playlistIndex + 1}/${videos.length}';
+    // 深浅两色表达「可点/禁用」：可点 = kPlayerOn（纸白），禁用 = kPlayerOnDim
+    return SizedBox(
+      key: const ValueKey('player-playlist-row'),
+      height: _kPlaylistRowHeight,
+      child: LayoutBuilder(
+        builder: (context, c) {
+          // 标签宽度上限：既要装得下「合集名 · 3/5」这类文案，又不能长到压住两侧
+          // 按钮的图标/文字。`0.34 ×` 那一项是给窄屏兜底（320dp 屏左右各半屏只有
+          // 160dp，按钮内容约 57dp 宽居中，中间自由带只剩 ~103dp）。
+          final maxLabelWidth =
+              math.min(kPlaylistLabelMaxWidth, c.maxWidth * 0.34);
+          return Stack(
+            children: [
+              Positioned.fill(
+                child: Row(
+                  // 撑满整行高（40dp）—— Row 默认 center 会让 InkWell 只有内容高
+                  // （18dp），点偏一点就落空（见方法注释里的触摸目标下限）。
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    Expanded(
+                      child: InkWell(
+                        key: const ValueKey('player-prev-video'),
+                        onTap: _canPlayPrev ? () => playNeighbor(-1) : null,
+                        child: _playlistNavLabel(
+                          icon: Icons.skip_previous,
+                          label: '上一集',
+                          enabled: _canPlayPrev,
+                        ),
+                      ),
+                    ),
+                    Expanded(
+                      child: InkWell(
+                        key: const ValueKey('player-next-video'),
+                        onTap: _canPlayNext ? () => playNeighbor(1) : null,
+                        child: _playlistNavLabel(
+                          icon: Icons.skip_next,
+                          label: '下一集',
+                          enabled: _canPlayNext,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              Center(
+                child: IgnorePointer(
+                  child: ConstrainedBox(
+                    constraints: BoxConstraints(maxWidth: maxLabelWidth),
+                    child: Text(
+                      posText,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      textAlign: TextAlign.center,
+                      style: kTypeLabel.copyWith(color: kPlayerOnDim),
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+  }
+
+  /// 上下集按钮内容：图标 + 文字横排居中（图标朝外：上一集在左、下一集在右）。
+  Widget _playlistNavLabel({
+    required IconData icon,
+    required String label,
+    required bool enabled,
+  }) {
+    final color = enabled ? kPlayerOn : kPlayerOnDim;
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        Icon(icon, size: 18, color: color),
+        const SizedBox(width: 4),
+        Text(label, style: kTypeLabel.copyWith(color: color)),
+      ],
+    );
+  }
 
   Widget _buildBottomBar() {
     return Container(
@@ -6046,6 +6418,10 @@ class _PlayerPageState extends State<PlayerPage>
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
+            // 上下集行（v2.30.0+）：**仅在有播放列表时构建**——没有播放列表
+            // 的入口（历史/搜索/信箱/评论跳转/收藏夹…）这里一个像素都不多，
+            // 底栏与改动前逐像素一致。
+            if (_hasPlaylistNeighbors) _buildPlaylistRow(),
             _buildSeekRow(),
             SizedBox(
               height: _kBottomButtonRowHeight,

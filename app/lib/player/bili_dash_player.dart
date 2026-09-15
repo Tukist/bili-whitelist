@@ -137,7 +137,19 @@ class BiliDashPlayer {
   /// - [status] 是状态文案（`正在播放` / `已暂停` / `已播完` / `播放失败` /
   ///   `后台听视频省流量`），原样拼进副标题；
   /// - [playing] / [positionMs] / [durationMs] 传给原生做状态对齐记录：通知上
-  ///   的播放暂停图标与进度一律以原生播放器自身状态为准（不会与真实状态不符）。
+  ///   的播放暂停图标与进度一律以原生播放器自身状态为准（不会与真实状态不符）；
+  /// - [hasPrev] / [hasNext]（v2.30.0-r2）：当前视频在播放列表里是否**真的有**
+  ///   上一集 / 下一集。**缺省 false**，所以历史记录 / 搜索 / 信箱这些没有播放
+  ///   列表的入口（以及旧调用）行为完全不变。
+  ///   两者都为 true 时，原生把通知**收起行**换成 `上一集 / 暂停 / 下一集`
+  ///   （两个动作是 App 自己的自定义 action，点了回推 `onMediaAction` 的
+  ///   `prev` / `next`，见 [BiliDashMediaActionEvent]）；否则收起行维持既有的
+  ///   `快退15s / 暂停 / 快进15s` —— 单集视频、合集第一条/最后一条、直播都
+  ///   不会出现「点了没反应」的死按钮。
+  ///   ⚠️ 为什么不用会话的 `seekToNext()` / `seekToPrevious()`：单 MediaItem 的
+  ///   ExoPlayer 没有 NEXT 命令（内建 ⏭ 永远生成不出来），而 ⏮ 走的是
+  ///   `seekToPrevious()` = **回到本条开头**（实测位置 1396349 → 0），不是上一集。
+  ///   集号只存在于 Dart 侧（`_playlistIndex`）。
   Future<void> updateNowPlaying({
     required String title,
     required String artist,
@@ -146,6 +158,8 @@ class BiliDashPlayer {
     required bool playing,
     required int positionMs,
     required int durationMs,
+    bool hasPrev = false,
+    bool hasNext = false,
   }) =>
       _channel.invokeMethod('updateNowPlaying', {
         'textureId': textureId,
@@ -156,6 +170,8 @@ class BiliDashPlayer {
         'playing': playing,
         'positionMs': positionMs,
         'durationMs': durationMs,
+        'hasPrev': hasPrev,
+        'hasNext': hasNext,
       });
 
   /// 请求通知权限（Android 13+；<13 或已授权时原生侧空转）。
@@ -278,7 +294,14 @@ class BiliDashUrlExpiredEvent extends BiliDashEvent {
 ///   `DashMediaNotification.callback`，实现是 `seekTo(current ± 15000)`）、
 ///   进度条拖动、断点恢复；
 /// - `stop`：通知栏 / 卡片上的「关闭」（✕）——原生已停止播放并清空媒体项
-///   （再次播放需重新取流）。
+///   （再次播放需重新取流）；
+/// - `prev` / `next`（v2.30.0-r2）：通知**收起行**的「上一集 / 下一集」。
+///   这是原生侧自定义 action（`DashMediaNotification.kActionPrevEpisode` /
+///   `kActionNextEpisode`）点按后回推的，**原生没有动播放器**——切集要换 bvid
+///   重新取流，只有 Dart 播放页做得到（`_playNeighbor(±1)`）。
+///   [positionMs] 恒为 0（与切集无关）。
+///   注意**不是**媒体会话的上一曲/下一曲：单 MediaItem 下前者不存在、后者等于
+///   「回到本条开头」。
 class BiliDashMediaActionEvent extends BiliDashEvent {
   final String action;
 
