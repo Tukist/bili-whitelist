@@ -56,10 +56,14 @@
 ///    自己 → 拖动期间后层的 widget 实例**原样交回**（见 [`_layers`] 缓存），
 ///    Flutter 的 `updateChild` 见到同一个实例会直接跳过整棵子树。
 ///
-/// ## 撤销
-/// 撤销 = **反着播**同一条推进：队首插回一张（见 [didUpdateWidget] 的
-/// `_isHeadInsert` 分支）→ `u` 从 1 倒回 0，后层退回原位；那一刻被顶开的那张
-/// 恰好落回它原来的位置 → 逐层连续、无跳变。
+/// ## 撤销 / 取回（队首换成"别处来的一张"）
+/// 两件事的观感一样：**后层退回原位**（`u` 从 1 倒回 0），那一刻被顶开的那张
+/// 恰好落回它原来的位置 → 逐层连续、无跳变。触发方式不同：
+/// - **撤销**：往队首插回一张刚处理掉的（长度 +1）→ 认 id 序列就够，
+///   见 [didUpdateWidget] 的 `_isHeadInsert` 分支；
+/// - **上滑取回**（v2.32.1）：把先前推到队尾的那张挪回队首，**长度不变** ——
+///   这时两张卡的队列转一下会算出跟撤销一模一样的序列（认不出来），所以由页面
+///   显式打点：[restoreTick] 变一次就反播一次。
 ///
 /// ## 关动效（`flutter test` 默认 / 系统「减少动画」）
 /// [MotionControl.of] 为 false 时**连 AnimationController 都不建**：每层直接铺
@@ -142,6 +146,10 @@ bool _isHeadRemoval(List<String> oldIds, List<String> newIds) {
 }
 
 /// 队列前后是否只是「头部多了一张」（= 撤销放回）。
+///
+/// ⚠️ 只看 id 序列的话，「队列转了一下」（下滑稍后：队首挪到队尾）在**两张卡**
+/// 时会算出跟「撤销放回」一模一样的序列 —— 所以上滑取回**不靠这个判据**，
+/// 而是由页面显式告诉卡片栈（见 [InboxCardStack.restoreTick]）。
 bool _isHeadInsert(List<String> oldIds, List<String> newIds) {
   if (newIds.length != oldIds.length + 1) return false;
   for (var i = 0; i < oldIds.length; i++) {
@@ -172,6 +180,7 @@ class InboxCardStack extends StatefulWidget {
     required this.width,
     required this.style,
     this.advancing = false,
+    this.restoreTick = 0,
   }) : assert(items.length > 0, '空队列不该进卡片栈（页面走空态）');
 
   /// 待处理队列（index 0 = 队首 = 顶层，由 [topCard] 渲染）。
@@ -191,6 +200,13 @@ class InboxCardStack extends StatefulWidget {
   /// 由页面在「松手过了阈值、开始飞出」那一刻置起：推进与飞出并行 ——
   /// 顶层开始走，后层就开始往前顶（见文件头「与飞出并行」）。
   final bool advancing;
+
+  /// 「上滑取回」的打点：每取回一次 +1。
+  ///
+  /// 取回 = 把先前推到队尾的那张挪回队首（**长度不变**），id 序列上认不出来
+  /// （见 `_isHeadInsert` 的说明）→ 由页面显式打点，卡片栈见到它变了一次就
+  /// 反播一次推进（后层退回原位）。撤销仍走 id 序列那条路，两者互不影响。
+  final int restoreTick;
 
   @override
   State<InboxCardStack> createState() => _InboxCardStackState();
@@ -283,6 +299,13 @@ class _InboxCardStackState extends State<InboxCardStack>
     if (_isHeadInsert(oldIds, newIds)) {
       // 撤销：反向播同一条推进 —— 后层退回原位。多渲染一张才能让「被顶开的
       // 那张」留在原位（它此刻在索引 4 = 深度 3，位置没变）。
+      _extra = true;
+      c.value = 1;
+      c.reverse();
+      return;
+    }
+    if (widget.restoreTick != oldWidget.restoreTick) {
+      // 上滑取回：与撤销同一套观感（长度不变，认 id 序列认不出来，靠页面打点）
       _extra = true;
       c.value = 1;
       c.reverse();

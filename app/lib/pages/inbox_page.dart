@@ -11,20 +11,28 @@
 ///   （从更深更淡处浮现），全程无跳变；拖动跟手期间后层不动。
 ///   实现与参数表见 `widgets/inbox_card_stack.dart`（别在本文件里重写这套几何）；
 /// - 顶层卡片跟随手指**四个方向**拖动（位移按手指的真实二维位移走，旋转仍只看
-///   水平分量），松手按阈值判定：
-///   **右滑 / 上滑 = 加入白名单**（未分类）、**左滑 / 下滑 = 跳过**
-///   （只记已处理，不动白名单），没过阈值 → 弹回原位；
+///   水平分量），松手按阈值判定。四向 = **四个不同的行为**，不是两对镜像：
+///   - **右滑 = 加入白名单**（未分类）、**左滑 = 跳过**（只记已处理，不再出现）；
+///   - **下滑 = 稍后**（用户原话：「**下滑不是跳过，而是暂时不判断，先看后面的
+///     卡片，可以上滑回来**」）—— 把这张从队首**推到队尾**、不做任何判断，
+///     于是后面那张顶上来；这张之后还会再出现（它一直在队列里）；
+///   - **上滑 = 取回** —— 把最近一次被「稍后」推后的那张拿回**栈顶**
+///     （LIFO，可连续取回），同样不写任何东西；
+///   - 没过阈值 → 弹回原位；
 /// - 「快速轻扫」四个方向都算数（v2.32.0+）：位移没过距离阈值但**甩得够快**
 ///   （同一对阈值横竖共用，见 [_onDragEnd]）→ 照样判定。斜着划按**主导轴**
 ///   （位移更大的那根轴）决定这次算哪个方向 —— 不会两边都不算，也不会一次
 ///   触发两个动作；
-/// - 方向映射（哪个方向算「加入」）**只在 [_exitForEdge] 一处**：产品要上下
-///   反过来，改那里的 [kInboxSwipeUpMeansLike] 一个常量即可；
+/// - 方向 → 行为**只在 [_actionForEdge] 一处**（别在别处再写一份映射）。
+///   ⚠️ v2.32.0 在这里放过一个 `kInboxSwipeUpMeansLike` 布尔开关（"上滑 = 加入"），
+///   那是把产品意图理解错了：上下滑现在是「稍后 / 取回」两件不同的事，**不是**
+///   一对可以互换的「加入 / 跳过」，所以那个开关已经删掉，别再捡回来；
 /// - ★ 侧效应：卡片上的上下拖被判定手势吃掉（纵向拖动识别器在手势竞技场里
 ///   胜出，见 [_buildTopCard]）→ **下拉刷新要从卡片外的留白发起**；
 /// - 底部另有「跳过」/「加入」两个 ≥48dp 的按钮（不习惯滑的人 / 无障碍），
-///   与滑动等价；右下角「撤销」可把上一张放回来（飞回来 + 后层退回，
-///   见 [_undoLast] 的说明）；
+///   与滑动等价（**只等价于左右滑**：稍后 / 取回没有按钮，它们是"先放一放"
+///   的辅助手势，不是判定）；右下角「撤销」可把上一张放回来（飞回来 + 后层
+///   退回，见 [_undoLast] 的说明）；
 /// - 点按卡片仍然是老行为：打开播放页（与拖动手势由手势竞技场区分：
 ///   位移超过 touch slop 只能有一条胜出，所以「点」不会误触发拖动，
 ///   「拖」也不会误触发打开）。
@@ -125,43 +133,52 @@ const String _kConfigHint = '请先到底部导航「个人」页配置 GitHub t
 /// 卡片栈。
 const Duration _kProgressPoll = Duration(seconds: 3);
 
-/// 一次滑动/按钮操作的方向 —— 也就是**动作**。
-///
-/// 四根箭头（[_SwipeEdge]）都折到这两个动作上，折算规则只在 [_exitForEdge]
-/// 一处（别在别处再写一份 `? like : skip`）。
-enum _Exit {
-  /// 右滑 / 上滑：加入白名单
-  like,
-
-  /// 左滑 / 下滑：跳过（只记已处理）
-  skip,
-}
-
 /// 一次拖动最终落在**哪一边**（四根箭头）。
 ///
-/// 和 [_Exit] 分开：动作只有两个，而「哪一边」还要决定卡片往哪飞出、徽标怎么
-/// 摆、撤销时从哪飞回来 —— 那些都是方向信息，不能在折算成动作时就丢掉。
+/// 和 [InboxSwipeAction] 分开：行为只有四个，而「哪一边」还要决定卡片往哪飞出、
+/// 徽标怎么摆、撤销时从哪飞回来 —— 那些都是方向信息，不能在折算成行为时就丢掉
+/// （例：下滑「稍后」是往下飞出，上滑「取回」是让卡**从下方**滑回来，两者都读
+/// 方向，但行为完全不同）。
 enum _SwipeEdge { left, right, up, down }
 
-/// 竖直方向的语义开关：`true` = **上滑加入、下滑跳过**。
+/// 方向 → 行为：**全页唯一的映射点**（别在别处再写一份映射）。
 ///
-/// ★★ 产品要把上下滑反过来（上滑跳过 / 下滑加入），**只改这一行** ★★
-/// （改成 `false`）：[_exitForEdge] 的两个竖直分支都读它，判定、飞出方向、
-/// 徽标渐显、撤销 fly-back 全都是从 [_exitForEdge] 取结论的，不必改第二处。
-/// 水平方向（右 = 加入、左 = 跳过）是既有语义，固定不受影响。
+/// ★ 用户原话（v2.32.1 订正语义）★
+/// 「**下滑不是跳过，而是暂时不判断，先看后面的卡片，可以上滑回来**」
 ///
-/// 为什么默认这么定：右滑 = 「要」、左滑 = 「不要」（Tinder 的 like/nope）；
-/// 竖直沿用同一对语义 —— **往上 = 收进来（加入）**、**往下 = 丢掉（跳过）**。
-const bool kInboxSwipeUpMeansLike = true;
-
-/// 方向 → 动作：**全页唯一的映射点**（见 [kInboxSwipeUpMeansLike] 的说明）。
-_Exit _exitForEdge(_SwipeEdge edge) => switch (edge) {
+/// → 所以四向是**四件不同的事**（详见 [InboxSwipeAction]）：
+/// - 右滑 = [InboxSwipeAction.like] 加入白名单（既有语义）
+/// - 左滑 = [InboxSwipeAction.skip] 跳过：记「已处理」，不再出现（既有语义）
+/// - 下滑 = [InboxSwipeAction.defer] **稍后**：推到队尾、不做判断，之后还能看到
+/// - 上滑 = [InboxSwipeAction.restore] **取回**：把最近推后的那张拿回栈顶
+///
+/// ⚠️ 这里**不该**再有「把上下滑对调」的布尔开关（v2.32.0 的
+/// `kInboxSwipeUpMeansLike` 已删）：稍后 / 取回不是一对互逆的判定动作，
+/// 它们是两个独立的、都不写数据的手势。
+InboxSwipeAction _actionForEdge(_SwipeEdge edge) => switch (edge) {
       // 水平：右 = 加入、左 = 跳过（既有语义，别动）
-      _SwipeEdge.right => _Exit.like,
-      _SwipeEdge.left => _Exit.skip,
-      // 竖直：语义由 kInboxSwipeUpMeansLike 决定（要反过来只改那个常量）
-      _SwipeEdge.up => kInboxSwipeUpMeansLike ? _Exit.like : _Exit.skip,
-      _SwipeEdge.down => kInboxSwipeUpMeansLike ? _Exit.skip : _Exit.like,
+      _SwipeEdge.right => InboxSwipeAction.like,
+      _SwipeEdge.left => InboxSwipeAction.skip,
+      // 竖直：下滑 = 稍后（不判断）、上滑 = 取回
+      _SwipeEdge.down => InboxSwipeAction.defer,
+      _SwipeEdge.up => InboxSwipeAction.restore,
+    };
+
+/// 行为 → 中文名（只用于 debugPrint 与注释，让 logcat 里的人话和语义对得上）。
+String _actionLabel(InboxSwipeAction action) => switch (action) {
+      InboxSwipeAction.like => '加入',
+      InboxSwipeAction.skip => '跳过',
+      InboxSwipeAction.defer => '稍后',
+      InboxSwipeAction.restore => '取回',
+    };
+
+/// 方向 → 短名字（只给 debugPrint 用：`edge=down` 比 `edge=_SwipeEdge.down` 好读，
+/// `adb logcat | grep '\[inbox\] 判定'` 一眼能对上手势与行为）。
+String _edgeLabel(_SwipeEdge edge) => switch (edge) {
+      _SwipeEdge.left => 'left',
+      _SwipeEdge.right => 'right',
+      _SwipeEdge.up => 'up',
+      _SwipeEdge.down => 'down',
     };
 
 /// 当前正在跑的动画类型。
@@ -182,9 +199,11 @@ class _SwipeRecord {
   /// 它是朝**哪一边**飞出去的（撤销时从同一侧飞回来，见 [_undoLast]）。
   final _SwipeEdge edge;
 
-  /// true = 加入（右滑 / 上滑，可能已写白名单），false = 跳过（左滑 / 下滑）。
-  /// 不单独存：动作一律由方向经 [_exitForEdge] 折算，免得两处说法打架。
-  bool get liked => _exitForEdge(edge) == _Exit.like;
+  /// true = 加入（右滑，可能已写白名单），false = 跳过（左滑）。
+  /// 不单独存：行为一律由方向经 [_actionForEdge] 折算，免得两处说法打架。
+  /// 注意：只有「加入 / 跳过」会进撤销位 —— 下滑「稍后」不进（它是靠上滑
+  /// 「取回」回来的，见 [_deferred]）。
+  bool get liked => _actionForEdge(edge) == InboxSwipeAction.like;
 }
 
 class InboxPage extends StatefulWidget {
@@ -232,7 +251,22 @@ class _InboxPageState extends State<InboxPage>
   /// `checkAll` 与用户操作可以并行（一轮检查可能几分钟）：它返回的列表是
   /// 「检查过程中读到的队列」，可能包含刚被划走的条目。合并时按这份记录
   /// 过滤，已消费的条目不复活。
+  ///
+  /// ★ 只有**左滑跳过 / 右滑加入**才进这份记录 —— 下滑「稍后」**绝不**记进来
+  /// （它不是判定，那张必须还能再看到）。
   final Set<String> _consumedBvids = <String>{};
+
+  /// 「稍后」推后的卡片（**栈**，LIFO）：上滑「取回」时从栈顶拿回最近的一张。
+  ///
+  /// 关键约定（改这里之前先读这条）：
+  /// - 被推后的卡**一直留在 [_items] 里**（只是排到了队尾）→ 用户"先看后面的
+  ///   卡片"之后，它照样会随着队列转回来；这份记录只是为了记**取回的顺序**；
+  /// - 它**不进** [_consumedBvids]、不调 `markHandled`、不写 Gist、不取元数据
+  ///   （用户原话：「暂时不判断」）；
+  /// - 一张卡在这份记录里最多出现一次（再次下滑时挪到栈顶，见 [_commitDefer]）；
+  /// - 判定掉（加入 / 跳过）、撤销、全部标记已读时把它清出来（见各处调用点）——
+  ///   否则上滑会把一张已经处理掉的卡再搬回栈顶。
+  final List<InboxItem> _deferred = <InboxItem>[];
 
   /// 正在 fetch view 元数据（防连点重复 push 播放页）。
   bool _opening = false;
@@ -256,9 +290,10 @@ class _InboxPageState extends State<InboxPage>
   /// 真正的二维位移。`globalPosition` 是手指的真实位置，两次相减就是真实位移。
   Offset? _pointer;
 
-  /// 浮层标记的渐显进度（拖动时实时更新；飞出时钉在松手那一刻的值）。
-  double _likeProgress = 0;
-  double _skipProgress = 0;
+  /// 浮层标记：当前这次拖动 / 飞出落在**哪个动作**上（null = 不显示浮层）
+  /// 与它的渐显进度（拖动时实时更新；飞出时钉在松手那一刻的值）。
+  InboxSwipeAction? _reaction;
+  double _reactionProgress = 0;
 
   /// 当前这次拖动 / 飞出是不是**竖直主导**的（决定徽标摆哪、斜不斜，
   /// 见 `InboxSwipeCard.reactionVertical`）。飞出期间沿用松手那一刻的值。
@@ -282,6 +317,23 @@ class _InboxPageState extends State<InboxPage>
 
   /// 正在飞出的那张朝**哪一边**（[_commitExit] 结算用；也决定飞出方向）。
   _SwipeEdge? _exiting;
+
+  /// 正在飞出的那张对应**哪个行为**（[_commitExit] 靠它分流：稍后 vs 判定）。
+  InboxSwipeAction? _exitingAction;
+
+  /// 「取回」的两步动画走到第二步了：手上这张弹回原位结束之后，接着把推后的
+  /// 那张从下方滑回栈顶（见 [_restoreTop] / [_applyRestore]）。
+  ///
+  /// 为什么分两步：用户原话是「可以**上滑回来**」，所以要让人明确看见「有**一张
+  /// 卡回来**」，而**不能**做成"当前这张被判定/飞走"。先让手上这张稳稳弹回原位
+  /// （它没被判定），再让取回的那张滑进来盖住它。
+  bool _restorePending = false;
+
+  /// 「取回」的打点（每取回一次 +1，交给 [InboxCardStack.restoreTick]）。
+  ///
+  /// 取回是「长度不变的队首换人」，卡片栈认不出 id 序列，只能靠这个显式打点
+  /// 才知道该反播一次「后层退回原位」。
+  int _restoreTick = 0;
 
   /// 上一张（撤销用）。
   _SwipeRecord? _undo;
@@ -308,11 +360,8 @@ class _InboxPageState extends State<InboxPage>
     _fly?.dispose();
     _fly = null;
     _anim = null;
-    _drag = Offset.zero;
-    _pointer = null;
-    _vertical = false;
-    _likeProgress = 0;
-    _skipProgress = 0;
+    _restorePending = false;
+    _resetGestureState();
   }
 
   @override
@@ -502,6 +551,9 @@ class _InboxPageState extends State<InboxPage>
       setState(() {
         _items = items;
         _undo = null;
+        // 全部标记已读 = 用户明说"这些都看过了" → 「待取回」的也一并作废
+        // （否则上滑还会把一张已经标记已读的卡搬回栈顶）
+        _deferred.clear();
         _busyNote = null;
         // 用户显式清空 → 之后就是空态（不是"还没加载出来"）
         _loadedOnce = true;
@@ -631,28 +683,43 @@ class _InboxPageState extends State<InboxPage>
 
   /// 浮层渐显进度：**主导轴**的位移到阈值比例时满显。
   ///
-  /// 只按主导轴算 → 「加入」和「跳过」永远只会亮一个（斜着划不会两个徽标一起
-  /// 冒出来）；哪个方向算哪个动作，一律问 [_exitForEdge]。
+  /// 只按主导轴算 → 四个词里永远只会亮一个（斜着划不会两个徽标一起冒出来）；
+  /// 哪个方向算哪个行为，一律问 [_actionForEdge]。
   void _updateProgress() {
     final screenW = MediaQuery.sizeOf(context).width;
     final unit = screenW * kInboxSwipeThresholdRatio;
     final vertical = _drag.dy.abs() > _drag.dx.abs();
     final v = vertical ? _drag.dy : _drag.dx;
     if (v == 0) {
-      _likeProgress = 0;
-      _skipProgress = 0;
-      _vertical = false;
+      _clearReaction();
       return;
     }
     final edge = vertical
         ? (v > 0 ? _SwipeEdge.down : _SwipeEdge.up)
         : (v > 0 ? _SwipeEdge.right : _SwipeEdge.left);
-    final p = (v.abs() / unit).clamp(0.0, 1.0);
-    final like = _exitForEdge(edge) == _Exit.like;
-    _likeProgress = like ? p : 0;
-    _skipProgress = like ? 0 : p;
+    final action = _actionForEdge(edge);
+    // 没有"待取回"的卡时**不亮**「取回」：亮着却什么都回不来，会让人以为卡丢了
+    //（松手时的行为见 [_decide] 的 restore 分支：什么都不做、弹回原位）
+    _reaction = (action == InboxSwipeAction.restore && _deferred.isEmpty)
+        ? null
+        : action;
+    _reactionProgress = (v.abs() / unit).clamp(0.0, 1.0);
     // 竖直主导 → 徽标换成居中显示（原来贴左右边缘，竖滑时看不出方向）
     _vertical = vertical;
+  }
+
+  /// 收掉浮层（拖动归零 / 弹回 / 结算时用）。不动 [_drag] / [_pointer]。
+  void _clearReaction() {
+    _reaction = null;
+    _reactionProgress = 0;
+    _vertical = false;
+  }
+
+  /// 复位一次手势的**全部**瞬时状态（结算 / 撤销 / 取回 / 关动效时用）。
+  void _resetGestureState() {
+    _drag = Offset.zero;
+    _pointer = null;
+    _clearReaction();
   }
 
   /// 朝 [edge] 那一侧**飞出屏幕**的终点位移。
@@ -676,9 +743,7 @@ class _InboxPageState extends State<InboxPage>
     final c = _motion ? _fly : null;
     setState(() {
       // 没成一张 → 浮层立即收掉（徽标摆位也回到默认），卡片滑回原位
-      _likeProgress = 0;
-      _skipProgress = 0;
-      _vertical = false;
+      _clearReaction();
     });
     if (c == null || _drag == Offset.zero) {
       setState(() => _drag = Offset.zero);
@@ -693,17 +758,55 @@ class _InboxPageState extends State<InboxPage>
     c.forward(from: 0);
   }
 
-  /// 提交一张：朝 [edge] 方向飞出，加入还是跳过由 [_exitForEdge] 决定。
+  /// 提交一次滑动：四向 = 四个行为，一律经 [_actionForEdge] 折算。
+  ///
+  /// - [InboxSwipeAction.like] / [InboxSwipeAction.skip]：飞出屏幕 → [_commitExit]
+  ///   （记「已处理」，进撤销位）；
+  /// - [InboxSwipeAction.defer]（下滑 = **稍后**）：也是朝下飞出屏幕，但飞出结束
+  ///   后走 [_commitDefer] —— **不记「已处理」**，只把这张推到队尾；
+  /// - [InboxSwipeAction.restore]（上滑 = **取回**）：**当前这张不飞走**，见
+  ///   [_restoreTop]。
   Future<void> _decide(_SwipeEdge edge) async {
     if (_deciding || _items.isEmpty) return;
     // 先上锁：门禁检查也是异步的，期间不能再拖/再点（防重复提交）
     _deciding = true;
     final item = _items.first;
-    final like = _exitForEdge(edge) == _Exit.like;
+    final action = _actionForEdge(edge);
+
+    // ---- 上滑 = 取回：手上这张不判定、不飞走，把最近推后的那张拿回栈顶 ----
+    if (action == InboxSwipeAction.restore) {
+      final back = _deferred.isEmpty ? null : _deferred.last;
+      // 判定留痕：`adb logcat | grep inbox` 一眼看出"划了没反应"是为什么
+      debugPrint(back == null
+          ? '[inbox] 判定 edge=${_edgeLabel(edge)} → 取回（没有可取的卡 → 不动）'
+              ' bvid=${item.bvid} drag=$_drag'
+          : '[inbox] 判定 edge=${_edgeLabel(edge)} → 取回 bvid=${back.bvid}'
+              ' drag=$_drag');
+      if (back == null) {
+        // 从没下滑过 → 什么都不做（不判定、不提示、不当成别的动作）
+        _deciding = false;
+        _springBack();
+        return;
+      }
+      _restoreTop();
+      return;
+    }
+
+    // ---- 下滑 = 稍后：队列只有 1 张时"推到队尾"就是原地打转 → 什么都不做 ----
+    if (action == InboxSwipeAction.defer && _items.length < 2) {
+      debugPrint('[inbox] 判定 edge=${_edgeLabel(edge)} → 稍后（队列只有 1 张 → 不动）'
+          ' bvid=${item.bvid} drag=$_drag');
+      _deciding = false;
+      _springBack();
+      return;
+    }
+
     // 判定留痕：「划了没反应 / 判反了」时一眼看得出手势被认成了哪一边（tag 与
-    // inbox_service 一致，`adb logcat | grep [inbox]` 即可）
-    debugPrint('[inbox] 判定 edge=$edge → ${like ? '加入' : '跳过'} '
+    // inbox_service 一致，`adb logcat | grep '[inbox] 判定'` 即可）
+    debugPrint(
+        '[inbox] 判定 edge=${_edgeLabel(edge)} → ${_actionLabel(action)} '
         'bvid=${item.bvid} drag=$_drag');
+    final like = action == InboxSwipeAction.like;
     if (like) {
       // 配置门禁：未配置 GitHub → 提示并弹回（不改任何状态；与搜索页同文案）
       var ok = false;
@@ -728,8 +831,12 @@ class _InboxPageState extends State<InboxPage>
       return;
     }
     _exiting = edge;
-    // 记「已处理」+ 从本地未读缓存里摘掉 → 首页红点立刻下降（不触网）
-    unawaited(ServiceLocator.inboxService.markHandled(item.bvid));
+    _exitingAction = action;
+    if (action != InboxSwipeAction.defer) {
+      // 记「已处理」+ 从本地未读缓存里摘掉 → 首页红点立刻下降（不触网）。
+      // ★ 下滑「稍后」绝不走这里（它不是判定，那张必须还能再看到）
+      unawaited(ServiceLocator.inboxService.markHandled(item.bvid));
+    }
     if (like) {
       unawaited(_like(item));
     }
@@ -741,7 +848,7 @@ class _InboxPageState extends State<InboxPage>
     final vertical = edge == _SwipeEdge.up || edge == _SwipeEdge.down;
     setState(() {
       _animFrom = _drag;
-      // 朝实际判定出来的那一侧飞出去（上滑往上、下滑往下、左右同旧）
+      // 朝实际判定出来的那一侧飞出去（下滑往下、左滑往左、右滑往右）
       _animTo = _offscreen(edge, perp: vertical ? _drag.dx : _drag.dy);
       _anim = _SwipeAnim.exit;
     });
@@ -749,7 +856,7 @@ class _InboxPageState extends State<InboxPage>
     c.forward(from: 0);
   }
 
-  /// 右滑 / 上滑 = 加入白名单（未分类）：取 view 元数据 → 走共用 [WhitelistWriter]。
+  /// 右滑 = 加入白名单（未分类）：取 view 元数据 → 走共用 [WhitelistWriter]。
   Future<void> _like(InboxItem item) async {
     try {
       final meta = await _api.fetchVideoMeta(item.bvid);
@@ -780,13 +887,126 @@ class _InboxPageState extends State<InboxPage>
     }
     if (!mounted) return;
     setState(() => _drag = Offset.zero);
+    // 「取回」第一步（手上这张弹回原位）刚走完 → 接着让取回的那张滑进来
+    if (_restorePending) _applyRestore();
   }
 
-  /// 结算「这张已经处理掉了」：出栈 + 记入撤销位 + 复位手势状态。
+  /// 飞出动画结束（关动效时是松手即到）：按 [_exitingAction] 分流结算。
+  ///
+  /// - 稍后 → [_commitDefer]（**不记「已处理」**，只把这张推到队尾）；
+  /// - 加入 / 跳过 → [_commitJudged]（记「已处理」+ 进撤销位）。
   void _commitExit() {
+    if (_exitingAction == InboxSwipeAction.defer) {
+      _commitDefer();
+      return;
+    }
+    _commitJudged();
+  }
+
+  /// 结算「下滑 = 稍后」：把这一张从**队首移到队尾**，不做任何判断。
+  ///
+  /// ★ 与 [_commitJudged] 的区别（别合并）：这里**不记「已处理」**
+  /// （[_consumedBvids] 与 `markHandled` 都不动）、不写 Gist、不取元数据 ——
+  /// 用户原话「暂时不判断，先看后面的卡片」，所以这张之后还会再出现（它一直在
+  /// [_items] 里，只是排到最后）。同时把它压进 [_deferred]（LIFO）→ 上滑可逐张
+  /// 取回。
+  ///
+  /// 队列只有 1 张时在 [_decide] 就被拦下了（推到队尾 = 原地打转）。
+  void _commitDefer() {
+    final item = _items.isEmpty ? null : _items.first;
+    _exiting = null;
+    _exitingAction = null;
+    _anim = null;
+    _deciding = false;
+    if (!mounted) return;
+    setState(() {
+      if (item != null) {
+        _items = [
+          for (final it in _items)
+            if (it.bvid != item.bvid) it,
+          item, // 队首 → 队尾（其余各项相对顺序不变）
+        ];
+        // 推后记录是**栈**：绕一圈又回到队首的（先推后过、又划回来）挪到栈顶，
+        // 不留在里面两份（否则上滑会把同一张插回队列两次）
+        _deferred
+          ..removeWhere((it) => it.bvid == item.bvid)
+          ..add(item);
+        // 它已经"回到牌堆后面"了：让交错入场账本忘掉它，好让它在新的层位上
+        // 淡入一次（不退账的话，它会从"飞出屏幕"直接"啪"地出现在牌堆里）
+        _entranceLedger.clear();
+      }
+      _resetGestureState();
+    });
+    // 顶卡换人了 → 重新看一眼新顶卡作者在不在播
+    unawaited(_loadTopLive());
+    // 刻意**不提示**：用户要的是"先看后面的卡片"，弹一条 Toast 只会打断他
+  }
+
+  /// 上滑 = **取回**：把最近一次被「稍后」推后的那张拿回**栈顶**。
+  ///
+  /// 两步（见 [_restorePending]）：① 手上这张先弹回原位；② 落位后由
+  /// [_applyRestore] 把取回的那张从**下方**滑进来（它当初是往下飞出去的）。
+  /// 全程不写任何东西 —— 那张既没被判过"已处理"，也没进过白名单。
+  void _restoreTop() {
+    final c = _motion ? _fly : null;
+    if (c == null || _drag == Offset.zero) {
+      _applyRestore();
+      return;
+    }
+    setState(() {
+      _clearReaction();
+      _animFrom = _drag;
+      _animTo = Offset.zero;
+      _anim = _SwipeAnim.back;
+      _restorePending = true;
+    });
+    c.duration = kDurBase;
+    c.forward(from: 0);
+  }
+
+  /// 取回的第二步：把 [_deferred] 栈顶那张放回**队首**，并从下方滑入到栈顶。
+  ///
+  /// 它一直在 [_items] 里（只是先前被推到了队尾）→ 先摘掉旧位置再插到队首，
+  /// 免得队列里出现两张一样的。后层由卡片栈反播推进退回原位（[restoreTick]
+  /// 打点，见 `inbox_card_stack.dart`），所以是退回去、不是跳回去。
+  void _applyRestore() {
+    _restorePending = false;
+    _deciding = false;
+    _anim = null;
+    if (!mounted || _deferred.isEmpty) return;
+    final item = _deferred.removeLast();
+    final c = _motion ? _fly : null;
+    setState(() {
+      _items = [
+        item,
+        for (final it in _items)
+          if (it.bvid != item.bvid) it,
+      ];
+      _loadedOnce = true;
+      _resetGestureState();
+      _restoreTick++; // 告诉卡片栈：队首换人了，把后层退回去（见该字段的说明）
+      if (c != null) {
+        // 从**下方**屏外滑回原位（当初"稍后"就是往下飞出去的）→ 一眼看得出
+        // "有一张卡回来了"，而当前这张只是让位、没被判定
+        _animFrom = _offscreen(_SwipeEdge.down);
+        _animTo = Offset.zero;
+        _anim = _SwipeAnim.back;
+      }
+    });
+    if (c != null) {
+      c.duration = kDurBase;
+      c.forward(from: 0);
+    }
+    unawaited(_loadTopLive());
+    _showSnack('已取回「${item.title}」');
+  }
+
+  /// 结算「这一张已经处理掉了」（加入 / 跳过）：出栈 + 记入撤销位 + 复位手势状态。
+  void _commitJudged() {
     final edge = _exiting;
     final item = _items.isEmpty ? null : _items.first;
     _exiting = null;
+    _exitingAction = null;
     _anim = null;
     _deciding = false;
     if (!mounted) return;
@@ -800,18 +1020,17 @@ class _InboxPageState extends State<InboxPage>
           for (final it in _items)
             if (it.bvid != bvid) it,
         ];
-        // 撤销位记的是**飞出去的那一边**（不记动作）：动作由 [_exitForEdge]
+        // 一张卡只能"在某个地方等着"：判定掉就不再是"待取回"的了，
+        // 否则上滑会把一张已经处理掉的卡又搬回栈顶
+        _deferred.removeWhere((it) => it.bvid == bvid);
+        // 撤销位记的是**飞出去的那一边**（不记行为）：行为由 [_actionForEdge]
         // 从方向现算，撤销时还要靠它知道该从哪一侧飞回来
         if (edge != null) _undo = _SwipeRecord(item, edge: edge);
       }
       // 屏上的卡片全处理完了 → 收起「上次检查失败」的提示（错误态不该盖住
       // 「没有未读了」这个结论；要重试还可以下拉刷新）
       if (_items.isEmpty) _error = null;
-      _drag = Offset.zero;
-      _likeProgress = 0;
-      _skipProgress = 0;
-      _vertical = false;
-      _pointer = null;
+      _resetGestureState();
     });
     // 顶卡换人了（v2.25.2+）：新顶卡作者是否在播，重新看一眼（走会话缓存 +
     // 串行节流，不额外轰炸 live 接口）
@@ -826,12 +1045,13 @@ class _InboxPageState extends State<InboxPage>
       _commitExit();
       return;
     }
+    // 「取回」的两步动画走到一半：直接放弃这次取回（什么都没写，那张还在
+    // [_deferred] 里，随时能再上滑一次）。★ 必须把 [_deciding] 一起放掉——
+    // 它在这一段里是 true，留着的话刷新之后所有手势都会被 [_busy] 挡死。
+    _restorePending = false;
+    _deciding = false;
     _anim = null;
-    _drag = Offset.zero;
-    _likeProgress = 0;
-    _skipProgress = 0;
-    _vertical = false;
-    _pointer = null;
+    _resetGestureState();
   }
 
   /// 撤销上一张：放回队首 + 删掉「已处理」记录。
@@ -865,9 +1085,9 @@ class _InboxPageState extends State<InboxPage>
       _consumedBvids.remove(rec.item.bvid);
       _items = [rec.item, ..._items];
       _loadedOnce = true;
-      _likeProgress = 0;
-      _skipProgress = 0;
-      _vertical = false;
+      _clearReaction();
+      // 放回来的这张回到了队首 → 不再算「待取回」的（免得它被上滑又插一次）
+      _deferred.removeWhere((it) => it.bvid == rec.item.bvid);
       if (c == null) {
         _anim = null;
         _drag = Offset.zero;
@@ -1030,6 +1250,8 @@ class _InboxPageState extends State<InboxPage>
                             style: style,
                             // 顶层开始飞出 → 后层立刻向前推进（与飞出并行）
                             advancing: _anim == _SwipeAnim.exit,
+                            // 上滑取回一次 → 后层退回原位（见该字段的说明）
+                            restoreTick: _restoreTick,
                             topCard: _buildTopCard(_items.first, cardW, style),
                           ),
                         ),
@@ -1052,8 +1274,10 @@ class _InboxPageState extends State<InboxPage>
       item: item,
       width: cardW,
       style: style,
-      likeProgress: _likeProgress,
-      skipProgress: _skipProgress,
+      // 浮层：当前这次拖动/飞出落在哪个行为上（加入 / 跳过 / 稍后 / 取回），
+      // 由 _updateProgress 按主导轴 + _actionForEdge 算好
+      action: _reaction,
+      actionProgress: _reactionProgress,
       // 竖直主导的拖动/飞出 → 徽标居中显示（见 _vertical 的说明）
       reactionVertical: _vertical,
     );
