@@ -3,7 +3,9 @@
 /// 在上面叠两个随手势渐显的浮层标记「加入」/「跳过」。
 ///
 /// 只负责**画**，不碰手势与动画：位移、旋转、飞出/弹回都在 `inbox_page.dart`
-/// 里控制（卡片跟手是「位移 + 轻微旋转」，旋转角与水平位移成正比）。
+/// 里控制（卡片跟手是「位移 + 轻微旋转」，旋转角与水平位移成正比 ——
+/// 竖直方向也跟手，但旋转仍只看水平分量，见 [reactionVertical] 与
+/// `inbox_page.dart` 的 [_offscreen]）。
 ///
 /// ## 版式与比例（v2.21.0+）
 /// - 卡面内容（封面 / 标题 / 作者 / 时长 / 时间怎么排）全部由
@@ -65,6 +67,7 @@ class InboxSwipeCard extends StatelessWidget {
     this.style = kDefaultInboxCardStyle,
     this.likeProgress = 0,
     this.skipProgress = 0,
+    this.reactionVertical = false,
   });
 
   /// 卡片数据。
@@ -83,8 +86,20 @@ class InboxSwipeCard extends StatelessWidget {
   /// 「跳过」浮层渐显进度。
   final double skipProgress;
 
+  /// 这次拖动是不是**竖直主导**的（v2.32.0+ 的上下滑手势）。
+  ///
+  /// 为 true 时两个徽标都改为**居中**显示、不倾斜：徽标原来贴在左右边缘
+  /// （`centerLeft` / `centerRight`），那是给左右滑看的 —— 竖着划的时候
+  /// "往哪边划"的信息在竖直方向上，贴着左右边缘反而看不出反馈跟手。
+  final bool reactionVertical;
+
   @override
   Widget build(BuildContext context) {
+    // 竖直主导 → 徽标居中；水平（含静止）→ 沿用旧的贴边 + 倾斜
+    final likeAlign =
+        reactionVertical ? Alignment.center : Alignment.centerLeft;
+    final skipAlign =
+        reactionVertical ? Alignment.center : Alignment.centerRight;
     return SizedBox(
       width: width,
       height: inboxCardHeight(width),
@@ -98,8 +113,8 @@ class InboxSwipeCard extends StatelessWidget {
               progress: likeProgress,
               background: context.palette.inkFill,
               foreground: context.palette.onInk,
-              alignment: Alignment.centerLeft,
-              tilt: -kInboxSwipeMaxTilt,
+              alignment: likeAlign,
+              tilt: reactionVertical ? 0 : -kInboxSwipeMaxTilt,
             ),
           if (skipProgress > 0)
             _ReactionMark(
@@ -107,8 +122,8 @@ class InboxSwipeCard extends StatelessWidget {
               progress: skipProgress,
               background: kInkGray70,
               foreground: kPaper,
-              alignment: Alignment.centerRight,
-              tilt: kInboxSwipeMaxTilt,
+              alignment: skipAlign,
+              tilt: reactionVertical ? 0 : kInboxSwipeMaxTilt,
             ),
         ],
       ),

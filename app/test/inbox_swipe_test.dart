@@ -184,13 +184,14 @@ double _layerAlpha(WidgetTester tester, String bvid) {
 /// 起一个**开着动效**的信箱页：飞出/推进/弹回都是真在跑（用于验证动画过程）。
 Future<_Harness> _pumpInboxAnimated(
   WidgetTester tester,
-  List<InboxItem> items,
-) async {
+  List<InboxItem> items, {
+  bool githubConfigured = true,
+}) async {
   MotionControl.enabled = true;
   _usePortraitPhone(tester);
   final service = _FakeInboxService(items);
   final api = _FakeBiliApi();
-  final github = _FakeGithubApi();
+  final github = _FakeGithubApi(configured: githubConfigured);
   ServiceLocator.overrideInboxService(service);
   ServiceLocator.overrideSyncService(_FakeSyncService());
   await tester.pumpWidget(MaterialApp(
@@ -203,6 +204,20 @@ Future<_Harness> _pumpInboxAnimated(
   await tester.pump();
   await tester.pump(const Duration(milliseconds: 500));
   return _Harness(service: service, api: api, github: github);
+}
+
+/// 从卡片**外面**（卡片区上方的留白）往下甩一次 → 下拉刷新。
+///
+/// v2.32.0+ 起卡片自己吃掉了上下拖（那是判定手势），下拉刷新只能从卡片外的
+/// 留白发起。旧用例原来直接甩 `CustomScrollView` 的中心，而卡片正好是居中的
+/// → 那个起点现在落在卡片上，会被判成「下滑 = 跳过」。
+Future<void> _flingDeckForRefresh(WidgetTester tester) async {
+  final top = tester.getTopLeft(find.byType(CustomScrollView));
+  await tester.flingFrom(
+    top + const Offset(200, 20),
+    const Offset(0, 300),
+    1000,
+  );
 }
 
 /// 卡片上的浮层标记文字（**只**在卡片内找：底部按钮也有「加入」/「跳过」）。
@@ -784,6 +799,263 @@ void main() {
   });
 
   // -------------------------------------------------------------------------
+  // 上下滑（v2.32.0+）：四个方向都能判定
+  // -------------------------------------------------------------------------
+
+  group('上下滑手势（四向）', () {
+    /// 划 [offset] → 返回**飞出途中**顶层卡片（相对它静止位）的位移。
+    ///
+    /// ⚠️ 调用方要自己先把页面 pump 起来，而且**一个测试里只 pump 一次**：
+    /// `pumpWidget` 交回去的是同类型、同 key 的 `InboxPage` → Flutter 会复用
+    /// 原来的 State（队列与撤销位都不会重置），再 pump 一次得到的不是"新的一页"。
+    /// 要验多个方向就在同一页上连着划：每划一次下一张顶上来，静止位不变。
+    Future<Offset> exitShift(WidgetTester tester, Offset offset) async {
+      final rest = tester.getCenter(_topCard());
+      final count = find.byType(InboxSwipeCard).evaluate().length;
+      await tester.drag(_topCard(), offset);
+      await tester.pump(); // 门禁通过 → 启动飞出
+      await tester.pump(const Duration(milliseconds: 160)); // 飞到一半
+      expect(find.byType(InboxSwipeCard).evaluate().length, count,
+          reason: '飞出动画期间卡片还在树上（不是瞬间消失）');
+      final mid = tester.getCenter(_topCard());
+      await tester.pumpAndSettle();
+      return mid - rest;
+    }
+
+    testWidgets('上滑过阈值 → 加入白名单（取元数据 + 写 Gist + 记已处理 + 换下一张）',
+        (tester) async {
+      final h = await _pumpInbox(tester, [_item(1), _item(2)]);
+      final before = tester.getCenter(_topCard());
+
+      await tester.drag(_topCard(), const Offset(0, -300)); // 上滑
+      await _flush(tester);
+
+      expect(h.api.metaCalls, contains('BV1'), reason: '上滑 = 加入 → 要取 view 元数据');
+      expect(h.github.savedBvids, ['BV1'], reason: '上滑 = 加入白名单（未分类）');
+      expect(h.service.handled, ['BV1']);
+      expect(
+        tester.widget<InboxSwipeCard>(_topCard()).item.bvid,
+        'BV2',
+        reason: '进入下一张',
+      );
+      // 跟手位移不能残留：顶层卡片回到原位（新顶卡就是它）
+      final after = tester.getCenter(_topCard());
+      expect(after.dx, closeTo(before.dx, 0.5));
+      expect(after.dy, closeTo(before.dy, 0.5));
+    });
+
+    testWidgets('下滑过阈值 → 跳过：记已处理、不写白名单、换下一张', (tester) async {
+      final h = await _pumpInbox(tester, [_item(1), _item(2)]);
+      final before = tester.getCenter(_topCard());
+
+      await tester.drag(_topCard(), const Offset(0, 300)); // 下滑
+      await _flush(tester);
+
+      expect(h.service.handled, ['BV1']);
+      expect(h.github.savedBvids, isEmpty, reason: '跳过不写白名单');
+      expect(h.api.metaCalls, isEmpty, reason: '跳过不该去 fetch 元数据');
+      expect(tester.widget<InboxSwipeCard>(_topCard()).item.bvid, 'BV2');
+      final after = tester.getCenter(_topCard());
+      expect(after.dy, closeTo(before.dy, 0.5));
+      expect(after.dx, closeTo(before.dx, 0.5));
+    });
+
+    testWidgets('上滑 / 下滑：卡片分别从**上方** / **下方**飞出屏幕（开动效）',
+        (tester) async {
+      await _pumpInboxAnimated(tester, [for (var i = 1; i <= 3; i++) _item(i)]);
+
+      final up = await exitShift(tester, const Offset(0, -300)); // BV1 上滑
+      expect(up.dy, lessThan(-300), reason: '上滑 → 往上飞出屏');
+      expect(up.dx.abs(), lessThan(5), reason: '纯竖直滑动不该带水平分量');
+
+      final down = await exitShift(tester, const Offset(0, 300)); // BV2 下滑
+      expect(down.dy, greaterThan(300), reason: '下滑 → 往下飞出屏');
+      expect(down.dx.abs(), lessThan(5));
+    });
+
+    testWidgets('左右滑回归：左滑往左飞、右滑往右飞（开动效）', (tester) async {
+      await _pumpInboxAnimated(tester, [for (var i = 1; i <= 3; i++) _item(i)]);
+
+      final left = await exitShift(tester, const Offset(-300, 0)); // BV1 左滑
+      expect(left.dx, lessThan(-300), reason: '左滑 → 往左飞出屏');
+      expect(left.dy.abs(), lessThan(5));
+
+      final right = await exitShift(tester, const Offset(300, 0)); // BV2 右滑
+      expect(right.dx, greaterThan(300), reason: '右滑 → 往右飞出屏');
+      expect(right.dy.abs(), lessThan(5));
+    });
+
+    testWidgets('快速轻扫｜上：位移没过阈值 + 甩得够快 → 照样判成加入', (tester) async {
+      final h = await _pumpInbox(tester, [_item(1), _item(2)]);
+      // 位移 60 < 411×30% ≈ 123（没过距离阈值）；速度 2000 > kInboxSwipeVelocity
+      await tester.fling(_topCard(), const Offset(0, -60), 2000);
+      await _flush(tester);
+
+      expect(h.github.savedBvids, ['BV1'],
+          reason: '竖直方向也要能"快速轻扫"判定（复现用户要的"快速"）');
+      expect(h.service.handled, ['BV1']);
+    });
+
+    testWidgets('快速轻扫｜下：位移没过阈值 + 甩得够快 → 照样判成跳过', (tester) async {
+      final h = await _pumpInbox(tester, [_item(1), _item(2)]);
+      await tester.fling(_topCard(), const Offset(0, 60), 2000);
+      await _flush(tester);
+
+      expect(h.service.handled, ['BV1'], reason: '下滑轻扫 = 跳过');
+      expect(h.github.savedBvids, isEmpty);
+      expect(h.api.metaCalls, isEmpty);
+    });
+
+    testWidgets('快速轻扫｜左 / 右：既有方向回归（位移没过阈值也能判定）', (tester) async {
+      final h = await _pumpInbox(tester, [for (var i = 1; i <= 3; i++) _item(i)]);
+
+      await tester.fling(_topCard(), const Offset(-60, 0), 2000); // BV1 左滑轻扫
+      await _flush(tester);
+      expect(h.service.handled, ['BV1'], reason: '左滑轻扫 = 跳过');
+      expect(h.github.savedBvids, isEmpty);
+
+      await tester.fling(_topCard(), const Offset(60, 0), 2000); // BV2 右滑轻扫
+      await _flush(tester);
+      expect(h.github.savedBvids, ['BV2'], reason: '右滑轻扫 = 加入');
+      expect(h.service.handled, ['BV1', 'BV2']);
+    });
+
+    testWidgets('阈值内的小位移 + 慢速 → 弹回原位（四向都不判定、浮层清零）',
+        (tester) async {
+      final h = await _pumpInbox(tester, [_item(1), _item(2)]);
+      final before = tester.getCenter(_topCard());
+      // 80 < 411×30% ≈ 123；`tester.drag` 的移动事件时间戳全是 0 → 速度估不出来
+      //（DragGestureRecognizer 在拿不到速度估计时给的是 0）→ 只剩距离能判定
+      for (final d in const [
+        Offset(80, 0),
+        Offset(-80, 0),
+        Offset(0, 80),
+        Offset(0, -80),
+      ]) {
+        await tester.drag(_topCard(), d);
+        await _flush(tester);
+        expect(h.service.handled, isEmpty, reason: '$d 没过阈值 → 不该判定');
+        expect(h.github.savedBvids, isEmpty);
+        expect(h.api.metaCalls, isEmpty, reason: '拖动不该触发打开播放页');
+        final now = tester.getCenter(_topCard());
+        expect(now.dx, closeTo(before.dx, 0.5), reason: '$d 之后要弹回原位');
+        expect(now.dy, closeTo(before.dy, 0.5));
+      }
+      expect(_badgeText('加入'), findsNothing, reason: '没成一张 → 浮层收掉');
+      expect(_badgeText('跳过'), findsNothing);
+    });
+
+    testWidgets('斜向拖动按**主导轴**判定：dx 明显大 → 水平；dy 明显大 → 竖直',
+        (tester) async {
+      final h = await _pumpInbox(tester, [for (var i = 1; i <= 3; i++) _item(i)]);
+
+      // ① (200, 60)：dx 明显大 → 按水平轴判成「右滑加入」
+      await tester.drag(_topCard(), const Offset(200, 60));
+      await _flush(tester);
+      expect(h.github.savedBvids, ['BV1'], reason: 'dx 主导 → 走水平判定（加入）');
+      expect(h.service.handled, ['BV1']);
+
+      // ② (60, 200)：dy 明显大 → 按竖直轴判成「下滑跳过」
+      await tester.drag(_topCard(), const Offset(60, 200));
+      await _flush(tester);
+      expect(h.service.handled, ['BV1', 'BV2'], reason: 'dy 主导 → 走竖直判定（跳过）');
+      expect(h.github.savedBvids, ['BV1'], reason: '第二张是跳过，不该进白名单');
+      expect(h.api.metaCalls, ['BV1'], reason: '只有第一张去取过元数据');
+    });
+
+    testWidgets('上滑之后「撤销」：卡片从**上方**飞回来并回到栈顶（开动效）',
+        (tester) async {
+      final h = await _pumpInboxAnimated(tester, [_item(1), _item(2)]);
+      final restTop = tester.getRect(_cardByBvid('BV1')).top;
+
+      await tester.drag(_topCard(), const Offset(0, -300)); // 上滑划走（加入）
+      await tester.pump();
+      await tester.pumpAndSettle();
+      expect(_cardByBvid('BV1'), findsNothing);
+
+      await tester.tap(find.byTooltip('撤销'));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 40)); // 飞回来的途中
+      expect(
+        tester.getRect(_cardByBvid('BV1')).top,
+        lessThan(restTop - 100),
+        reason: '起点在屏外**上方** → 从上方飞回来，不是"啪"地出现在原位',
+      );
+
+      await tester.pumpAndSettle();
+      expect(tester.getRect(_cardByBvid('BV1')).top, closeTo(restTop, 0.6));
+      expect(h.service.unhandled, ['BV1'], reason: '撤销要把「已处理」记录也去掉');
+      expect(tester.widget<InboxSwipeCard>(_topCard()).item.bvid, 'BV1');
+    });
+
+    testWidgets('浮层：竖着拖中的徽标居中显示，横着拖仍贴左右边缘（回归）',
+        (tester) async {
+      await _pumpInbox(tester, [_item(1), _item(2)]);
+
+      // ① 上滑 → 出现「加入」，且**居中**（贴左边缘看不出竖滑的方向）
+      final up = await tester.startGesture(tester.getCenter(_topCard()));
+      await up.moveBy(const Offset(0, -60)); // 第一次移动被 touch slop 吃掉
+      await tester.pump();
+      await up.moveBy(const Offset(0, -60));
+      await tester.pump();
+      expect(_badgeText('加入'), findsOneWidget);
+      expect(_badgeText('跳过'), findsNothing);
+      expect(
+        tester.getRect(_badgeText('加入')).center.dx,
+        closeTo(tester.getRect(_topCard()).center.dx, 1),
+        reason: '竖直主导 → 徽标居中',
+      );
+      await up.up();
+      await _flush(tester);
+      expect(_badgeText('加入'), findsNothing);
+
+      // ② 下滑 → 出现「跳过」，也居中
+      final down = await tester.startGesture(tester.getCenter(_topCard()));
+      await down.moveBy(const Offset(0, 60));
+      await tester.pump();
+      await down.moveBy(const Offset(0, 60));
+      await tester.pump();
+      expect(_badgeText('跳过'), findsOneWidget);
+      expect(_badgeText('加入'), findsNothing);
+      expect(
+        tester.getRect(_badgeText('跳过')).center.dx,
+        closeTo(tester.getRect(_topCard()).center.dx, 1),
+      );
+      await down.up();
+      await _flush(tester);
+
+      // ③ 右滑回归 → 仍贴左边缘（既有观感不变）
+      final right = await tester.startGesture(tester.getCenter(_topCard()));
+      await right.moveBy(const Offset(60, 0));
+      await tester.pump();
+      await right.moveBy(const Offset(60, 0));
+      await tester.pump();
+      expect(_badgeText('加入'), findsOneWidget);
+      expect(
+        tester.getRect(_badgeText('加入')).center.dx,
+        lessThan(tester.getRect(_topCard()).center.dx - 60),
+        reason: '水平主导 → 徽标仍贴左边缘',
+      );
+      await right.up();
+      await _flush(tester);
+    });
+
+    testWidgets('卡片上的上下拖不再带动页面滚动 / 不触发下拉刷新', (tester) async {
+      final h = await _pumpInbox(tester, [_item(1), _item(2)]);
+      expect(h.service.checkCalls, 1);
+
+      // 从卡片中心往下甩（这正是旧用例里"下拉刷新"的起点）：现在算「下滑 = 跳过」
+      await tester.fling(_topCard(), const Offset(0, 300), 1000);
+      await _flush(tester);
+
+      expect(h.service.checkCalls, 1,
+          reason: '纵向拖动被卡片吃掉 → 不带页面滚动、不触发下拉刷新');
+      expect(h.service.handled, ['BV1'], reason: '这一下算「下滑 = 跳过」');
+      expect(h.github.savedBvids, isEmpty);
+    });
+  });
+
+  // -------------------------------------------------------------------------
   // 右滑加入（含飞出动画）
   // -------------------------------------------------------------------------
 
@@ -1014,11 +1286,7 @@ void main() {
       final h = await _pumpInbox(tester, [_item(1), _item(2)]);
       expect(h.service.checkCalls, 1);
 
-      await tester.fling(
-        find.byType(CustomScrollView),
-        const Offset(0, 300),
-        1000,
-      );
+      await _flingDeckForRefresh(tester);
       await tester.pump();
       await tester.pump(const Duration(seconds: 1));
       expect(h.service.checkCalls, 2, reason: '卡片栈不是列表，但下拉刷新必须还在');
@@ -1068,11 +1336,7 @@ void main() {
 
       // 之后的检查挂起（模拟"这一轮又要跑几分钟"）
       service.checkGate = Completer<void>();
-      await tester.fling(
-        find.byType(CustomScrollView),
-        const Offset(0, 300),
-        1000,
-      );
+      await _flingDeckForRefresh(tester);
       await tester.pump();
       await tester.pump(const Duration(seconds: 1));
       expect(service.checkCalls, 2);
@@ -1123,11 +1387,7 @@ void main() {
       final h = await _pumpInbox(tester, [_item(1), _item(2)]);
       h.service.failNext = true;
 
-      await tester.fling(
-        find.byType(CustomScrollView),
-        const Offset(0, 300),
-        1000,
-      );
+      await _flingDeckForRefresh(tester);
       await tester.pump();
       await tester.pump(const Duration(seconds: 1));
       await _flush(tester);

@@ -1,0 +1,161 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  播放通知卡片（v2.32.0）：**整张卡片由 App 自己用 RemoteViews 画**，
+  不再用 MediaStyle 模板（原因与取舍见 DashMediaNotification 文件头注释）。
+
+  为什么是这个形状（全部来自模拟器 API 35 实测，不是猜的）：
+  - 系统给「收起态自定义布局」的盒子只有 **~271dp 宽 × ~48dp 高**
+    （1080px/dpr2.625 上实测：左边 36dp 被系统的小图标徽标占了，右边 56dp
+    被展开箭头那一条占了，纵向按 8dp 网格一格格量到第 6 格就没了）；
+  - 所以「封面 + 标题 + 六个按钮」**不可能**在一行里放下（6×44dp = 264dp
+    已经把 271dp 吃光，标题一个字都放不下 —— 这正是探针 #4 实测到的：
+    标题被压成 0 宽、第 6 个按钮被展开箭头那一条盖掉）；
+  - 于是走**两行**：上行标题（16dp），下行六个按钮（32dp），共 **48dp**
+    —— 正好等于实测的盒子高度，不再有多余的 4dp 被系统裁掉
+    （52dp 版本实测被裁掉底部 3.6dp，按钮的可点高度从 36dp 掉到 32dp）。
+
+  六条按钮用 weight=1 **平分**宽度（不写死 dp）：系统给多少宽度就排多少，
+  窄屏（360dp）上也不会把最后一个按钮挤出可视区。
+
+  标题行是两个 TextView：左边标题（weight=1，超长末尾省略）、右边
+  「UP 名 · 状态」（定宽上限 88dp，没有 UP/状态时整块 GONE 把宽度还给标题）。
+  为什么不像旧通知那样上下两行文字：48dp 里放不下「标题 + 副标题 + 按钮行」
+  三行，只能把副标题挤到标题行右侧，好处是 UP 名与状态文案在长标题下
+  也不会整块消失（旧通知的收起行会把副标题截断，见 v2.30.0 截图）。
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="48dp"
+    android:gravity="center_vertical"
+    android:orientation="horizontal"
+    android:paddingStart="8dp"
+    android:paddingEnd="4dp">
+
+    <!-- 封面缩略图：34dp；没下载到之前先用启动图标占位（与旧通知一致的颜色块） -->
+    <ImageView
+        android:id="@+id/notif_cover"
+        android:layout_width="34dp"
+        android:layout_height="34dp"
+        android:contentDescription="封面"
+        android:scaleType="centerCrop"
+        android:src="@mipmap/ic_launcher" />
+
+    <LinearLayout
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_marginStart="8dp"
+        android:layout_weight="1"
+        android:orientation="vertical">
+
+        <!-- 标题行：左标题（可伸缩）+ 右 UP 名 · 状态（定宽上限） -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="16dp"
+            android:gravity="center_vertical"
+            android:orientation="horizontal">
+
+            <TextView
+                android:id="@+id/notif_title"
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_weight="1"
+                android:ellipsize="end"
+                android:gravity="center_vertical"
+                android:singleLine="true"
+                android:textColor="?android:attr/textColorPrimary"
+                android:textSize="12sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/notif_meta"
+                android:layout_width="wrap_content"
+                android:layout_height="match_parent"
+                android:layout_marginStart="4dp"
+                android:ellipsize="end"
+                android:gravity="center_vertical"
+                android:maxWidth="88dp"
+                android:singleLine="true"
+                android:textColor="?android:attr/textColorSecondary"
+                android:textSize="11sp" />
+        </LinearLayout>
+
+        <!-- 按钮行：上一集 / 快退15s / 播放暂停 / 快进15s / 下一集 / 关闭 -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="32dp"
+            android:orientation="horizontal">
+
+            <ImageButton
+                android:id="@+id/notif_btn_prev"
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_weight="1"
+                android:background="?android:attr/selectableItemBackgroundBorderless"
+                android:contentDescription="上一集"
+                android:padding="4dp"
+                android:scaleType="centerInside"
+                android:src="@drawable/ic_episode_previous"
+                android:tint="?android:attr/textColorPrimary" />
+
+            <ImageButton
+                android:id="@+id/notif_btn_rewind"
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_weight="1"
+                android:background="?android:attr/selectableItemBackgroundBorderless"
+                android:contentDescription="快退15秒"
+                android:padding="4dp"
+                android:scaleType="centerInside"
+                android:src="@drawable/ic_notif_rewind"
+                android:tint="?android:attr/textColorPrimary" />
+
+            <ImageButton
+                android:id="@+id/notif_btn_play"
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_weight="1"
+                android:background="?android:attr/selectableItemBackgroundBorderless"
+                android:contentDescription="播放"
+                android:padding="4dp"
+                android:scaleType="centerInside"
+                android:src="@drawable/ic_notif_play"
+                android:tint="?android:attr/textColorPrimary" />
+
+            <ImageButton
+                android:id="@+id/notif_btn_forward"
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_weight="1"
+                android:background="?android:attr/selectableItemBackgroundBorderless"
+                android:contentDescription="快进15秒"
+                android:padding="4dp"
+                android:scaleType="centerInside"
+                android:src="@drawable/ic_notif_fastforward"
+                android:tint="?android:attr/textColorPrimary" />
+
+            <ImageButton
+                android:id="@+id/notif_btn_next"
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_weight="1"
+                android:background="?android:attr/selectableItemBackgroundBorderless"
+                android:contentDescription="下一集"
+                android:padding="4dp"
+                android:scaleType="centerInside"
+                android:src="@drawable/ic_episode_next"
+                android:tint="?android:attr/textColorPrimary" />
+
+            <ImageButton
+                android:id="@+id/notif_btn_close"
+                android:layout_width="0dp"
+                android:layout_height="match_parent"
+                android:layout_weight="1"
+                android:background="?android:attr/selectableItemBackgroundBorderless"
+                android:contentDescription="关闭"
+                android:padding="4dp"
+                android:scaleType="centerInside"
+                android:src="@drawable/ic_notif_close"
+                android:tint="?android:attr/textColorPrimary" />
+        </LinearLayout>
+    </LinearLayout>
+</LinearLayout>

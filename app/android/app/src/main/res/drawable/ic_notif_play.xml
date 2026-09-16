@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  通知卡片按钮：播放（v2.32.0）。
+
+  为什么自建而不是用 media3-ui 的 exo_notification_play：
+  应用模块的 R 类**不含**库资源名（AGP 默认 nonTransitiveRClass），
+  Kotlin 里写不出 R.drawable.exo_notification_play（实测编译报
+  Unresolved reference）；而播放/暂停图标必须在运行时按播放器状态互换
+  （RemoteViews.setImageViewResource 需要 app 自己的资源 id），
+  所以这组按钮图标一律自建，形状沿用 Material 的 play_arrow。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M8,5v14l11,-7z" />
+</vector>
