@@ -78,6 +78,33 @@ void main() {
       expect(parseScheduleMonthDay('13月1日', year: 2026), isNull);
     });
 
+    test('「星期X」写法也认得（导入 Excel 后列头就是这种，v2.34.0）', () {
+      // 用户原型文件（超级代办 大三上.xlsx）的表头是「星期一9.14」这种写法：
+      // 「星期」而不是「周」。日期解析本来就只看「数字.数字」那一段，
+      // 所以这里靠用例把这条口径钉住——导入后「加日期列」能接着往后排。
+      expect(parseScheduleMonthDay('星期一9.14', year: 2026),
+          DateTime(2026, 9, 14));
+      expect(parseScheduleMonthDay('星期一 9.14', year: 2026),
+          DateTime(2026, 9, 14));
+      expect(parseScheduleMonthDay('星期日9.20', year: 2026),
+          DateTime(2026, 9, 20));
+      // 只有星期、没有日期 → 认不出来（导入进来的「星期二」这种列头）
+      expect(parseScheduleMonthDay('星期二', year: 2026), isNull);
+      // 空表头导入后的兜底文案也不该被误认成日期
+      expect(parseScheduleMonthDay('第23列', year: 2026), isNull);
+    });
+
+    test('导入后的列头里往回扫：星期一9.14 → 9.15', () {
+      const cols = [
+        ScheduleColumn(id: 'c1', label: '星期日'),
+        ScheduleColumn(id: 'c2', label: '星期一9.14'),
+        // 空列头导入后的兜底 label，认不出来 → 继续往回扫
+        ScheduleColumn(id: 'c3', label: '第3列'),
+      ];
+      expect(nextScheduleColumnDate(cols, today: DateTime(2026, 9, 17)),
+          DateTime(2026, 9, 15));
+    });
+
     test('nextScheduleColumnDate = 最后一个**能认出来**的列头 + 1 天', () {
       const cols = [
         ScheduleColumn(id: 'c1', label: '周一 9.14'),

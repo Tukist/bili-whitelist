@@ -5,7 +5,9 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../models/schedule.dart';
+import '../services/schedule_import.dart';
 import '../services/schedule_store.dart';
+import '../services/xlsx_reader.dart';
 import '../theme/app_palette.dart';
 import '../theme/app_tokens.dart';
 
@@ -27,7 +29,7 @@ const double kScheduleRowHeadW = 44;
 /// 作为主页 PageView 的一页（与主页共享 AppBar，**不带自己的 Scaffold**，
 /// 同 [HistoryPage] / [WatchStatsPage]）；底部导航第 3 项进入。
 ///
-/// 交互四件套（对应需求原话）：
+/// 交互五件套（对应需求原话）：
 /// 1. **点格子 → 编辑面板**（底部弹层）：改文字 / 选颜色 / 清除此格
 ///    （用户说的「点击日程可以标色」）；
 /// 2. **长按格子 → 拖动 → 松手自动填充**：拖动时经过的格子**实时预览**
@@ -36,7 +38,9 @@ const double kScheduleRowHeadW = 44;
 ///    删列有二次确认——它会带走一整列数据）；
 /// 4. **表头行与行头列冻结**：横向滚看更多日期时日期表头跟着走，纵向滚看
 ///    更多行时行号跟着走，左上角小方块固定（见 [_buildGrid] 的两条
-///    单向跟随滚动，注释里解释了为什么不是独立滚动）。
+///    单向跟随滚动，注释里解释了为什么不是独立滚动）；
+/// 5. **导入 Excel**（v2.34.0）：系统文件选择器挑一个 .xlsx → 解析 →
+///    （多表时选一张）→ 预览确认 → **整表替换**（见 [_importExcel]）。
 ///
 /// 数据只存本地（[ScheduleStore] → SharedPreferences），**不进 Gist**，
 /// 理由写在 [ScheduleStore] 的类注释里。
@@ -44,7 +48,11 @@ class SchedulePage extends StatefulWidget {
   /// 测试注入：日程存储（默认用全局单例 [ScheduleStore.instance]）。
   final ScheduleStore? store;
 
-  const SchedulePage({super.key, this.store});
+  /// 测试注入：选文件服务（默认走真实的 MethodChannel）。
+  /// 解析/UI 流程的测试注入一个假实现，通道协议的测试单独 mock channel。
+  final ScheduleImportService? importer;
+
+  const SchedulePage({super.key, this.store, this.importer});
 
   @override
   SchedulePageState createState() => SchedulePageState();
@@ -111,8 +119,14 @@ class _FillDrag {
 class SchedulePageState extends State<SchedulePage> {
   ScheduleStore get _store => widget.store ?? ScheduleStore.instance;
 
+  ScheduleImportService get _importer =>
+      widget.importer ?? const ScheduleImportService();
+
   ScheduleData _data = ScheduleData.empty();
   bool _loading = true;
+
+  /// 「导入 Excel」进行中（选文件 + 解析）：按钮位置换成转圈，防重复点击。
+  bool _importing = false;
 
   /// 网格主体（右下方那块）的纵向滚动控制器 —— **用户唯一能直接拖的纵向滚动**。
   final ScrollController _vBody = ScrollController();
@@ -259,6 +273,168 @@ class SchedulePageState extends State<SchedulePage> {
     );
     if (name == null || !mounted) return;
     await _mutate(_data.renameColumn(col.id, name));
+  }
+
+  // ==================== 导入 Excel（v2.34.0） ====================
+
+  /// 「导入 Excel」全流程：选文件 → 解析 → （多表时）选表 → 预览确认 → 整表替换。
+  ///
+  /// 几条刻意的取舍：
+  /// - **解析是同步的**（不引 isolate）：手写读取器处理用户这种 500KB 的表是
+  ///   几十毫秒的量级，而 isolate 会让 widget 测试没法可靠地等它（`pumpAndSettle`
+  ///   不驱动真实 isolate），为几十毫秒把测试搞脆不值得。代价是这一帧要等，
+  ///   所以先 `setState` 把 loading 亮出来、再 `await Future.delayed(zero)`
+  ///   让那一帧真的画出去，用户至少看到"在转圈"而不是"点了没反应"。
+  /// - **用户取消不提示**：点开选择器又退出来是正常操作。
+  /// - **整表替换而不是合并**：导入的是用户手上那张表的全貌，合并没有可
+  ///   对齐的主键（格子没有 id），只会拼出一张谁也说不清的表 → 换成
+  ///   "覆盖 + 确认弹层"（弹层里写明当前表会被清空）。
+  /// - **不留撤销快照**：确认弹层已经明确写了"此操作不可恢复"，
+  ///   这里就不给一个藏着的一级撤销（文案与行为要一致）。
+  /// - **转圈只转"重活"那一段**（选文件 + 解析）：弹层一打开就收掉。
+  ///   弹层本身就是"进行中"的指示，再挂个转圈在后面既没意义，
+  ///   又会让 widget 测试的 `pumpAndSettle` 永不收敛（转圈是无限动画）。
+  Future<void> _importExcel() async {
+    if (_importing) return;
+    setState(() => _importing = true);
+
+    final pick = await _importer.pickXlsx();
+    XlsxWorkbook? workbook;
+    if (pick.isOk) {
+      // 让 loading 那一帧先画出来（同步解析会占住接下来这一段）
+      await Future<void>.delayed(Duration.zero);
+      workbook = readXlsx(pick.bytes!);
+    }
+    if (!mounted) return;
+    setState(() => _importing = false);
+
+    if (pick.isCancelled) return; // 用户取消：不提示、不改表
+    if (!pick.isOk) {
+      _toast(pick.error!);
+      return;
+    }
+    if (workbook == null) {
+      _toast('这个 .xlsx 打不开：文件可能已损坏或被截断');
+      return;
+    }
+    final sheets = workbook.importableSheets;
+    if (sheets.isEmpty) {
+      _toast('这个文件里没有可导入的工作表');
+      return;
+    }
+    var ref = sheets.first;
+    if (sheets.length > 1) {
+      final chosen = await _chooseSheet(sheets);
+      if (chosen == null || !mounted) return; // 取消选表 = 什么都不做
+      ref = chosen;
+    }
+    final sheet = workbook.readSheet(ref);
+    final preview = sheet == null ? null : buildScheduleFromSheet(sheet);
+    if (preview == null) {
+      _toast('「${ref.name}」里没有可导入的内容');
+      return;
+    }
+    final ok = await _confirmImport(preview);
+    if (ok != true || !mounted) return;
+
+    setState(() {
+      _data = preview.data;
+      _undoSnapshot = null; // 与"不可恢复"的文案保持一致
+    });
+    await _store.save(preview.data);
+    _toast(
+      '已导入 ${preview.columnCount} 列 × ${preview.rowCount} 行，'
+      '${preview.coloredCells} 格带底色',
+    );
+  }
+
+  /// 多工作表时让用户选一张（WPS 的保留表已在 [XlsxWorkbook.importableSheets]
+  /// 里过滤掉了，这里只列真正能导的表）。返回 null = 用户取消。
+  Future<XlsxSheetRef?> _chooseSheet(List<XlsxSheetRef> sheets) {
+    return showModalBottomSheet<XlsxSheetRef>(
+      context: context,
+      useSafeArea: true,
+      showDragHandle: true,
+      builder: (sheetCtx) => SafeArea(
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(
+                  kSectionPadH,
+                  0,
+                  kSectionPadH,
+                  kSpace8,
+                ),
+                child: Text(
+                  '选择要导入的工作表',
+                  style: kTypeTitleM.copyWith(color: kInkBlack),
+                ),
+              ),
+              for (var i = 0; i < sheets.length; i++)
+                ListTile(
+                  key: ValueKey('schedule-import-sheet-$i'),
+                  leading: const Icon(Icons.table_chart_outlined, size: 20),
+                  title: Text(sheets[i].name),
+                  subtitle: sheets[i].hidden ? const Text('隐藏工作表') : null,
+                  onTap: () => Navigator.pop(sheetCtx, sheets[i]),
+                ),
+              const SizedBox(height: kSpace8),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 导入前的预览 + 覆盖确认。返回 false / null = 取消。
+  Future<bool?> _confirmImport(XlsxImportPreview preview) {
+    final current = _data.rows.fold<int>(0, (sum, r) => sum + r.cells.length);
+    return showDialog<bool>(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        title: const Text('导入 Excel'),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              '将导入 ${preview.columnCount} 列 × ${preview.rowCount} 行，'
+              '其中 ${preview.coloredCells} 格有底色。',
+              style: kTypeBody.copyWith(color: kInkBlack),
+            ),
+            const SizedBox(height: kSpace12),
+            Text(
+              '会替换当前日程（当前表里的 $current 个非空格子会被清空），'
+              '此操作不可恢复。',
+              style: kTypeBodyS.copyWith(color: kError),
+            ),
+            if (preview.truncated) ...[
+              const SizedBox(height: kSpace8),
+              Text(
+                '文件超出网格上限，超出部分已截断'
+                '（最多 $kXlsxMaxColumns 列 × $kXlsxMaxRows 行）。',
+                style: kTypeBodyS.copyWith(color: kInkGray70),
+              ),
+            ],
+          ],
+        ),
+        actions: [
+          TextButton(
+            key: const ValueKey('schedule-import-cancel'),
+            onPressed: () => Navigator.pop(dialogCtx, false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            key: const ValueKey('schedule-import-confirm'),
+            onPressed: () => Navigator.pop(dialogCtx, true),
+            child: const Text('覆盖导入', style: TextStyle(color: kError)),
+          ),
+        ],
+      ),
+    );
   }
 
   // ==================== 点格子 → 编辑面板 ====================
@@ -760,6 +936,21 @@ class SchedulePageState extends State<SchedulePage> {
                 ),
               ),
               TextButton.icon(
+                key: const ValueKey('schedule-import'),
+                // 选文件 / 解析期间按钮变转圈并失效：一次只允许一个导入流程
+                onPressed: _importing ? null : () => unawaited(_importExcel()),
+                icon: _importing
+                    ? const SizedBox(
+                        key: ValueKey('schedule-import-progress'),
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.file_upload_outlined, size: 18),
+                label: const Text('导入 Excel'),
+                style: TextButton.styleFrom(visualDensity: VisualDensity.compact),
+              ),
+              TextButton.icon(
                 key: const ValueKey('schedule-add-row'),
                 onPressed: () => unawaited(_addRow()),
                 icon: const Icon(Icons.add, size: 18),
@@ -821,6 +1012,10 @@ class SchedulePageState extends State<SchedulePage> {
   /// 是否还在读盘（首帧）。
   @visibleForTesting
   bool get debugLoading => _loading;
+
+  /// 是否正在导入 Excel（选文件 / 解析）。
+  @visibleForTesting
+  bool get debugImporting => _importing;
 }
 
 /// 单元格编辑面板（底部弹层内容）。

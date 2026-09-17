@@ -69,7 +69,11 @@ String scheduleColumnLabel(DateTime date) =>
 
 /// 从列头文案里反解出「月.日」（用于「新列 = 最后一列 +1 天」）。
 ///
-/// 认不出来（用户手改成了「国庆周」「考试周」之类）→ null，
+/// 写法很宽松：**只看文本里"数字 + 分隔符 + 数字"那一段**，所以
+/// `周一 9.15` / `周一9.15` / `9月15日` / `9-15` 都认；
+/// **`星期一9.14`（导入 Excel 后常见的「星期X」写法）同样认**——
+/// 前缀是「周」还是「星期」都不影响（v2.34.0 起有专门的用例把这条钉住）。
+/// 认不出来（用户手改成了「国庆周」「考试周」，或导入时兜底的「第3列」）→ null，
 /// 由 [nextScheduleColumnDate] 决定退路。
 DateTime? parseScheduleMonthDay(String label, {int? year}) {
   final m = RegExp(r'(\d{1,2})\s*[.\-/月]\s*(\d{1,2})').firstMatch(label);
