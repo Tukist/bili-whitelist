@@ -695,25 +695,28 @@ void main() {
     });
   });
 
-  group('「个人」入口（v2.19.0：原「统计」+「设置」合并为底部导航第 4 项）', () {
-    testWidgets('底部导航 4 项；点「个人」→ 统计在上、设置在下（同一页滚动流）',
+  group('「个人」入口（v2.19.0：原「统计」+「设置」合并为底部导航第 4 项；'
+      'v2.33.0 起因中间插入「日程」挪到第 5 项）', () {
+    testWidgets('底部导航 5 项（日程在第 3 位）；点「个人」→ 统计在上、设置在下（同一页滚动流）',
         (tester) async {
       SharedPreferences.setMockInitialValues({});
       await _pumpHomeWithGithub(tester, WhitelistData.empty());
 
-      // 目的地 = 合集 / UP 主 / 历史 / 个人（原「统计」「设置」两项已合并）
+      // 目的地 = 合集 / UP 主 / **日程**（v2.33.0 新增）/ 历史 / 个人
+      // （原「统计」「设置」两项在 v2.19.0 已合并）
       final nav = tester.widget<NavigationBar>(find.byType(NavigationBar));
       final labels = [
         for (final d in nav.destinations) (d as NavigationDestination).label,
       ];
-      expect(labels, ['合集', 'UP 主', '历史', '个人']);
-      // 4 个标签都实际渲染（单行不截断；M3 NavigationBar + 11sp label +
-      // 4 等分宽度下最长的「UP 主」也只有 ~30dp，不会挤爆）
+      expect(labels, ['合集', 'UP 主', '日程', '历史', '个人']);
+      // 5 个标签都实际渲染（单行不截断；M3 NavigationBar + 11sp label +
+      // 5 等分宽度下最长的「UP 主」也只有 ~30dp，不会挤爆）
       for (final label in labels) {
         expect(find.text(label), findsOneWidget, reason: '标签 $label 未渲染');
       }
       expect(find.byTooltip('个人（观看统计 / 设置）'), findsOneWidget);
       expect(find.byTooltip('历史记录'), findsOneWidget); // 历史 tooltip 逐字保留
+      expect(find.byTooltip('日程（可编辑表格）'), findsOneWidget);
       // 旧的两个目的地不再存在
       expect(find.byTooltip('观看统计'), findsNothing);
       expect(find.byTooltip('管理（GitHub 配置 / 合集 / B 站账号）'), findsNothing);

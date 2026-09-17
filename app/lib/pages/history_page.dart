@@ -11,7 +11,8 @@ import 'player_page.dart';
 /// 历史记录页（播放历史：记录看过的视频，点击续播）。
 ///
 /// 作为主页 PageView 的一页（与主页共享 AppBar，**不带自己的 Scaffold**）：
-/// 底部导航「历史」进入（index 2）；数据按 watchedAt 倒序；
+/// 底部导航「历史」进入（index 3，v2.33.0 起——原先 2，因为中间插入了
+/// 「日程」）；数据按 watchedAt 倒序；
 /// 点击条目 → 构造 WhitelistVideo →
 /// push [PlayerPage]（现有进度恢复逻辑自动续播到上次位置/分 P）；
 /// 长按或条目右侧删除按钮 → 删除单条；顶部「清空」→ 确认后清空全部；

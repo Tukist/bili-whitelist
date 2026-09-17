@@ -37,10 +37,35 @@ import 'followings_import_page.dart';
 import 'history_page.dart';
 import 'inbox_page.dart';
 import 'login_page.dart';
+import 'schedule_page.dart';
 import 'search_page.dart';
 import 'update_dialog.dart';
 import 'upowner_page.dart';
 import 'watch_stats_page.dart';
+
+// ==================== 底部导航目的地下标（唯一真相） ====================
+//
+// v2.33.0 在「UP 主」与「历史」之间插入了「日程」，历史与个人各 +1。
+// 之所以把这些下标提升成具名常量：本页里有 [PlaylistPage] 的 PageView 顺序、
+// [_PlaylistPageState._tab] 初值、[_PlaylistPageState._reloadTab] 的分支、
+// NavigationBar 的 destinations 顺序**四处**必须完全对齐，任何一处漏改都是
+// "点了历史进了日程"这类静默错位。以前这里散着 `2` / `3` 两个字面量，
+// 插一页就要满页找；提成常量后，"再插一页"只需改这一处 + 两个列表。
+
+/// 合集（白名单视频）：PageView 第 1 页。
+const int kTabCollections = 0;
+
+/// UP 主管理：PageView 第 2 页。
+const int kTabUpowners = 1;
+
+/// 日程（v2.33.0 新增）：PageView 第 3 页，夹在 UP 主与历史之间。
+const int kTabSchedule = 2;
+
+/// 历史记录：PageView 第 4 页（v2.33.0 起由 2 → 3）。
+const int kTabHistory = 3;
+
+/// 个人（观看统计 + 设置）：PageView 第 5 页（v2.33.0 起由 3 → 4）。
+const int kTabPersonal = 4;
 
 /// 唯一首页：合集卡片视图（两级导航第一级）。
 ///
@@ -76,14 +101,17 @@ import 'watch_stats_page.dart';
 ///   登录成功自动保存，之后每次进入静默恢复（登录一次长期保持）。
 ///   登录页可关闭：关闭 = 匿名，首页/播放页给明确「未登录仅 720P，
 ///   去登录解锁 1080P」提示入口（v2.16.21，不默认静默降级）
-/// - **底部导航 4 个目的地**（v2.19.0 起把原「统计」+「设置」合并为
-///   **「个人」**；取代更早的 AppBar 历史/统计/管理三个图标；同时保留
+/// - **底部导航 5 个目的地**（v2.19.0 起把原「统计」+「设置」合并为
+///   **「个人」**；v2.33.0 在「UP 主」与「历史」之间插入 **「日程」**；
+///   取代更早的 AppBar 历史/统计/管理三个图标；同时保留
 ///   PageView 左右滑动）：
-///   合集(0) → UP 主管理(1) → **历史记录**(2，播放历史，点击续播) →
-///   **个人**(3)：**观看统计在上**（v2.17.9+ 每日真实观看时长；v2.17.10+
+///   合集(0) → UP 主管理(1) → **日程**(2，v2.33.0 新增，本地可编辑网格) →
+///   **历史记录**(3，播放历史，点击续播) →
+///   **个人**(4)：**观看统计在上**（v2.17.9+ 每日真实观看时长；v2.17.10+
 ///   克莱因蓝 GitHub 式热力单张大图 + 总览在热力下方 + 点日期格看当天历史）、
 ///   **设置在下**（与旧齿轮弹层共用 [ManagePanel]，内联嵌入不 pop 路由，
 ///   见 watch_stats_page.dart / widgets/manage_panel.dart）。
+///   下标唯一真相 = 本文件顶部的 [kTabCollections] 一组常量。
 ///   切换目的地 = animateToPage(kDurBase) + 显式幂等刷新目标页数据
 ///   （见 [_goToPage]/[_reloadTab]）；图标 + 文字标签常显（Material 3
 ///   [NavigationBar]，触摸目标 ≥ 48dp）
@@ -143,13 +171,13 @@ class _PlaylistPageState extends State<PlaylistPage> {
 
   bool get _hasData => _data.videos.isNotEmpty;
 
-  /// 主页 PageView（4 页：合集主页 / UP 主管理 / 历史记录 / 个人，
-  /// 见 [_buildPersonalPage]），初始停在合集主页（index 0，与底部导航首项一致）。
+  /// 主页 PageView（v2.33.0 起 5 页：合集主页 / UP 主管理 / **日程** /
+  /// 历史记录 / 个人），初始停在合集主页（index 0，与底部导航首项一致）。
   final PageController _pageController = PageController(initialPage: 0);
 
   /// 当前选中的底部导航目的地（= PageView 当前页；点导航与滑动都会同步它，
   /// 供 [NavigationBar.selectedIndex] 高亮）。
-  int _tab = 0;
+  int _tab = kTabCollections;
 
   /// 历史页 State 的全局 key：切到历史页时刷新数据（PageView 相邻页存活，
   /// 用户可能刚从别处播放回来，需要重新读表）。
@@ -172,12 +200,16 @@ class _PlaylistPageState extends State<PlaylistPage> {
     _reloadTab(i);
   }
 
-  /// 目标页数据刷新（幂等）：历史(2) / 个人(3，观看统计) 页重读本地表；
-  /// 首页(0) 重算合集统计（切回来时把「已看 X/Y」对齐刚看完的那几集）。
+  /// 目标页数据刷新（幂等）：[kTabHistory] / [kTabPersonal]（观看统计）页重读
+  /// 本地表；[kTabCollections] 重算合集统计（切回来时把「已看 X/Y」对齐刚看完
+  /// 的那几集）。
+  ///
+  /// [kTabSchedule]（日程）**故意不在这里刷新**：日程表全在内存里、每次改动
+  /// 即刻落库，切回来不需要重读；反而重读会把用户正在编辑的态打断。
   void _reloadTab(int i) {
-    if (i == 0) unawaited(_refreshCollectionStats());
-    if (i == 2) _historyKey.currentState?.reload();
-    if (i == 3) _statsKey.currentState?.reload();
+    if (i == kTabCollections) unawaited(_refreshCollectionStats());
+    if (i == kTabHistory) _historyKey.currentState?.reload();
+    if (i == kTabPersonal) _statsKey.currentState?.reload();
   }
 
   /// 首页是否需要「未登录仅 720P」提示条（去登录入口，v2.16.21）：
@@ -1126,6 +1158,10 @@ class _PlaylistPageState extends State<PlaylistPage> {
           // 每页给稳定 key：启动 4s 后的静默同步 setState 会重建 PageView，
           // 无 key 时只能按 index 匹配 Element，State 可能错配/被重置
           // （「个人」页的 ManagePanel 持有输入框与账号状态）。
+          //
+          // ★ 顺序必须与 [kTabCollections] / [kTabUpowners] / [kTabSchedule] /
+          //   [kTabHistory] / [kTabPersonal] 及下面 NavigationBar 的
+          //   destinations **逐项对齐**（v2.33.0 在中间插了「日程」）。
           _buildCollectionHome(theme, cards),
           _UpownerManagePage(
             key: const ValueKey('upowner'),
@@ -1137,8 +1173,13 @@ class _PlaylistPageState extends State<PlaylistPage> {
             onRemove: _removeUpowner,
             onImportFollowings: _importFollowings,
           ),
+          // 「日程」（kTabSchedule，v2.33.0 新增）：本地可编辑网格，数据只在
+          // 本机（ScheduleStore → SharedPreferences，不进 Gist，理由见该类注释）。
+          // 页面**不是**路由、是本 PageView 的一页（同历史/个人），因此没有
+          // 自己的 Scaffold/AppBar，顶部标题由页面内部自绘。
+          const SchedulePage(key: ValueKey('schedule')),
           HistoryPage(key: _historyKey),
-          // 「个人」（index 3，v2.19.0 把原「统计」+「设置」合并）：观看统计
+          // 「个人」（kTabPersonal，v2.19.0 把原「统计」+「设置」合并）：观看统计
           // 在上、设置在下的同一滚动流——设置区以 [WatchStatsPage.settingsSection]
           // 交给统计页内联渲染在统计内容之后（[ManagePanel] 无滚动/无内边距，
           // 由统计页的 ListView 提供滚动与留白）。统计页 State 的全局 key
@@ -1154,13 +1195,17 @@ class _PlaylistPageState extends State<PlaylistPage> {
           ),
         ],
       ),
-      // 底部导航（v2.18.0+，v2.19.0 起 4 个目的地，Material 3）：
+      // 底部导航（v2.18.0+，v2.19.0 起 4 个目的地；**v2.33.0 起 5 个**——
+      // 在「UP 主」与「历史」之间插入「日程」，Material 3）：
       // 图标 + 文字标签常显（触摸目标 ≥ 48dp 由 NavigationBar +
       // materialTapTargetSize 保证）。
       // 选中态墨色与指示器底由 app_theme 的 navigationBarTheme 统一配置，
       // 页面不写死颜色；顶部 1px 描边代替阴影（层级靠细线，不靠投影）。
       // tooltip：历史记录逐字沿用旧 AppBar 图标文案（测试锚点）；
       // 「个人」= 观看统计 + 设置（v2.19.0 合并后的新语义）。
+      //
+      // ★ destinations 的顺序必须与上面 PageView 的 children 顺序一致
+      //   （见 [kTabCollections] 一组常量的注释）。
       //
       // 描边必须用**独立**的 Divider 占位绘制：`NavigationBar` 自带不透明的
       // `backgroundColor: kPaper`（见 app_theme），若像旧实现那样把描边画在
@@ -1183,6 +1228,14 @@ class _PlaylistPageState extends State<PlaylistPage> {
                 icon: Icon(Icons.person_outline),
                 label: 'UP 主',
                 tooltip: '白名单 UP 主',
+              ),
+              // 「日程」（v2.33.0 新增）：图标用 calendar_month_outlined 而不是
+              // event_note——日历格形状与页面里那张网格表最贴，且与
+              // video_library / person / history / account_circle 互不撞脸。
+              NavigationDestination(
+                icon: Icon(Icons.calendar_month_outlined),
+                label: '日程',
+                tooltip: '日程（可编辑表格）',
               ),
               NavigationDestination(
                 icon: Icon(Icons.history),
@@ -1313,7 +1366,9 @@ class _PlaylistPageState extends State<PlaylistPage> {
         Padding(
           padding: const EdgeInsets.symmetric(vertical: 4),
           child: Text(
-            'v$_version · 底部导航切换：合集 / UP 主 / 历史 / 个人',
+            // 底部导航项列表写在这里也是"硬编码的 tab 清单"之一（虽然只是文案，
+            // 但页脚列错项同样是 bug）——v2.33.0 插入「日程」后同步补上。
+            'v$_version · 底部导航切换：合集 / UP 主 / 日程 / 历史 / 个人',
             style: theme.textTheme.labelSmall?.copyWith(
               color: theme.colorScheme.outline,
             ),

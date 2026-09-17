@@ -12,8 +12,9 @@ import 'daily_history_page.dart';
 /// P1.5 起热力墨色跟随当前配色配方，见 `theme/ink_recipes.dart`）。
 ///
 /// 作为主页 PageView 的一页（与主页共享 AppBar，**不带自己的 Scaffold**）：
-/// 底部导航**「个人」**进入（index 3，v2.19.0 起「统计」+「设置」合并为
-/// 「个人」＝本页统计在上 + 设置在下）。数据源 [WatchStats]
+/// 底部导航**「个人」**进入（index 4，v2.19.0 起「统计」+「设置」合并为
+/// 「个人」＝本页统计在上 + 设置在下；v2.33.0 起由 3 → 4，因为中间插入了
+/// 「日程」）。数据源 [WatchStats]
 /// （shared_preferences，播放页 playing 时按位置增量累计，见 player_page）。
 ///
 /// 页内纵向滚动，布局（v2.17.10）：
