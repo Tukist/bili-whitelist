@@ -51,6 +51,8 @@ class CommentPicture {
 ///   [parent] 直接父级 rpid（根评论自己为 0）
 /// - [count] 根评论的回复总数（楼中楼条数；子回复恒为 0）
 /// - [like] 点赞数；[ctime] 发布时间（Unix 秒）
+/// - [action] → [liked]：**本账号**是否已赞（位掩码 bit0，见
+///   [CommentReply.likedFromAction]）；旧数据没有这个字段 → 按未赞处理
 /// - [member] → [uname]/[avatar]/[level]（member.level_info.current_level）/
 ///   [mid]（作者 uid，**接口返回字符串**，见字段说明）
 /// - [content.message] 纯文本（含 `<br />` 需转行）→ [message] 已清洗；
@@ -64,6 +66,17 @@ class CommentReply {
   final int count;
   final int like;
   final int ctime;
+
+  /// 「我」是否已给这条评论点过赞（v2.43.0+）。
+  ///
+  /// 来源是接口返回的 `action` 字段（**位掩码**：bit0 = 已点赞、bit1 = 已点踩，
+  /// 见 [CommentReply.likedFromAction]）。它表达的是**本账号的操作态**，不是点赞数
+  /// ——界面据此渲染已赞（实心图标）并决定点下去是赞还是取消。
+  ///
+  /// 默认 false：旧数据 / 接口没给这个字段时按"没赞过"显示。用户点一下会走
+  /// 「点赞」分支，即使服务端认为已经赞过，也只是白点一次（服务端回明确业务
+  /// 码，UI 会提示），不会把状态改坏。
+  final bool liked;
 
   /// 作者 uid（`member.mid`）。**接口返回的是字符串**（如 `"12345678"`），
   /// 此处统一转成 int；缺失 / 非数字 / `"0"` 一律落到 0。
@@ -94,6 +107,7 @@ class CommentReply {
     required this.message,
     required this.pictures,
     required this.previews,
+    this.liked = false,
   });
 
   /// 是否根评论（root=0 && parent=0）。
@@ -118,6 +132,16 @@ class CommentReply {
         ? raw.toInt()
         : (raw is String ? int.tryParse(raw.trim()) : null);
     return (n != null && n > 0) ? n : 0;
+  }
+
+  /// `action` 位掩码 → 「我是否已赞」（v2.43.0+）。
+  ///
+  /// B 站 `x/v2/reply` 系列的 `action` 是**位掩码**：bit0 = 已点赞、
+  /// bit1 = 已点踩（`action=3` = 既赞又踩，虽然实际不会这样）。所以不能写
+  /// `action == 1`——那会把 `action=3` 判成未赞。缺失 / 非法一律 false。
+  static bool likedFromAction(dynamic raw) {
+    final n = raw is num ? raw.toInt() : int.tryParse('$raw');
+    return n != null && (n & 1) == 1;
   }
 
   factory CommentReply._fromJson(
@@ -157,6 +181,7 @@ class CommentReply {
       parent: (json['parent'] as num?)?.toInt() ?? 0,
       count: (json['count'] as num?)?.toInt() ?? 0,
       like: (json['like'] as num?)?.toInt() ?? 0,
+      liked: CommentReply.likedFromAction(json['action']),
       ctime: (json['ctime'] as num?)?.toInt() ?? 0,
       mid: parseMemberMid(member['mid']),
       uname: member['uname'] as String? ?? '',

@@ -33,7 +33,9 @@ import '../models/playlist_context.dart';
 import '../models/whitelist_video.dart';
 import '../services/collection_stats.dart';
 import '../services/history_store.dart';
+import '../services/service_locator.dart';
 import '../services/whitelist_writer.dart';
+import '../sync/whitelist_freshness.dart';
 import '../theme/app_palette.dart';
 import '../theme/app_tokens.dart';
 import '../widgets/app_block.dart';
@@ -639,6 +641,12 @@ class _CollectionPageState extends State<CollectionPage> {
   /// 返回值仍是上层回调的 Future（调用方 `await` 它只是为了知道"写已经交给
   /// 上层了"，而不是"远端写完了"）。
   Future<void> _saveAndRefresh(WhitelistData next) {
+    // 陈旧快照门禁（v2.43.0）：本页有自己的内存副本，**必须在 setState 之前**
+    // 拦——否则用户在本页看到"改好了"（乐观更新已生效），实际一条都没落库，
+    // 而他会据此继续做后面的操作。父页（首页）另有一道同样的检查（本页的写
+    // 最终回传到那里），两道缺一不可：父页那道挡的是"远端被写旧"，本页这道
+    // 挡的是"本页界面先出现假成功"。
+    if (_blockWriteOnStaleSnapshot()) return Future.value();
     if (mounted) {
       setState(() {
         _data = next;
@@ -649,6 +657,51 @@ class _CollectionPageState extends State<CollectionPage> {
       });
     }
     return widget.saveAndRefresh(next);
+  }
+
+  /// 陈旧快照门禁（v2.43.0）：返回 true = 写被拦下（调用方必须直接 return）。
+  ///
+  /// 文案与首页共用 [kStaleSnapshotWriteBlockedMessage]（唯一一份），动作是
+  /// 「立即同步」——用户此刻唯一的出路就是先同步。
+  bool _blockWriteOnStaleSnapshot() {
+    final reason = WhitelistFreshness.instance.writeBlockReason;
+    if (reason == null) return false;
+    debugPrint('[collection] 陈旧快照：拒绝写入（0 PATCH）');
+    if (mounted) {
+      AppSnack.show(
+        context,
+        reason,
+        kind: SnackKind.error,
+        duration: const Duration(seconds: 8),
+        action: SnackBarAction(
+          label: '立即同步',
+          onPressed: () => unawaited(_resyncAfterStaleBlock()),
+        ),
+      );
+    }
+    return true;
+  }
+
+  /// 「立即同步」：本页没有写队列（落库要回传到首页），但同步是**只读**操作，
+  /// 直接调 [ServiceLocator] 即可。成功后本页数据一起换成最新（否则用户看到
+  /// 的还是那份让他卡住的旧数据），门禁随之解除。
+  ///
+  /// 不自动重放刚才那次修改：理由与首页一致（见 `PlaylistPage._resyncAfterStaleBlock`）。
+  Future<void> _resyncAfterStaleBlock() async {
+    try {
+      final result = await ServiceLocator.syncService.sync();
+      WhitelistFreshness.instance
+          .markSync(sourceName: result.sourceName, stale: result.stale);
+      if (!mounted) return;
+      setState(() => _data = result.data);
+      final stale = WhitelistFreshness.instance.isStale;
+      _showSnack(
+        stale ? '仍然同步失败：请确认网络后重试' : '已同步到最新，请重新操作一次',
+        kind: stale ? SnackKind.error : SnackKind.info,
+      );
+    } catch (e) {
+      if (mounted) _showSnack('同步失败：$e', kind: SnackKind.error);
+    }
   }
 
   /// 视频拖动排序：该合集视频按新顺序赋 order = 0..n-1（其他合集 order

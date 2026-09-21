@@ -21,6 +21,7 @@ import '../services/update_storage.dart';
 import '../services/upowner_writer.dart';
 import '../services/whitelist_write_queue.dart';
 import '../services/whitelist_writer.dart';
+import '../sync/whitelist_freshness.dart';
 import '../theme/app_palette.dart';
 import '../theme/app_tokens.dart';
 import '../utils/import_parser.dart';
@@ -724,6 +725,12 @@ class _PlaylistPageState extends State<PlaylistPage> {
     setState(() => _syncing = true);
     try {
       final result = await ServiceLocator.syncService.sync();
+      // 门禁打标（v2.43.0）：判据在服务里（[SyncResult.stale]），这里只把
+      // "页面此刻展示的是哪一份数据"同步给门禁。服务内部已标过一次，这里再标
+      // 一次是为了覆盖**测试替身直接改写 sync()** 的路径（页面是数据落地的
+      // 唯一位置，标记跟着数据走才不会出现"数据换了、门禁还记着旧的"）。
+      WhitelistFreshness.instance
+          .markSync(sourceName: result.sourceName, stale: result.stale);
       if (mounted) {
         setState(() {
           _data = result.data;
@@ -836,7 +843,16 @@ class _PlaylistPageState extends State<PlaylistPage> {
   /// 实现一致（旧代码也只在 setState 前判 mounted），用户已经做出的操作不该
   /// 因为"页面刚好被关掉"而静默丢掉——乐观更新最容易踩的坑就是"本地没落、
   /// 远端也没写"，那才是真的丢数据。
+  ///
+  /// **陈旧快照门禁（v2.43.0，本版新增，优先级最高）**：若当前展示的数据是
+  /// 离线本地快照且已落后于"已知最新"，这里**直接拦下**——不 setState、不写
+  /// 本地缓存、不发 PATCH，只给错误提示 +「立即同步」入口。
+  /// 为什么必须在 setState **之前**拦：乐观更新会先改内存与界面，若写成
+  /// "先让用户看到成功、再告诉他没同步"，用户对"哪份数据是真的"的判断就彻底
+  /// 乱了；更糟的是队列还会把这份陈旧快照写进本地缓存，下次启动它会变成新的
+  /// 基准。所以门禁的位置只能在这里（最早的写入口）。
   Future<void> _saveAndRefresh(WhitelistData next) async {
+    if (_blockWriteOnStaleSnapshot()) return;
     debugPrint('[wq] 收到落库请求（用户操作已在内存里）'
         ' t=${DateTime.now().millisecondsSinceEpoch}');
     if (mounted) {
@@ -852,6 +868,52 @@ class _PlaylistPageState extends State<PlaylistPage> {
         ' t=${DateTime.now().millisecondsSinceEpoch}');
     // 不 await：远端写是后台的事（失败经 onError 提示），界面已经更新完了。
     unawaited(_writeQueue.submit(next));
+  }
+
+  /// 陈旧快照门禁（v2.43.0）：返回 true = 这次写被拦下（调用方必须直接 return）。
+  ///
+  /// 拦的是**所有**管理写操作（本页新建/移动/重命名/删除/排序/导入，以及
+  /// 合集页逐层回传到本页的那条链——[CollectionPage] 自己也有一道同样的检查），
+  /// 因为它们是同一个风险：把**内存里的整份陈旧快照**覆盖到远端。
+  ///
+  /// 提示用 [SnackKind.error]（关掉"界面提示"也不静默）+「立即同步」动作：
+  /// 用户这时唯一的正确出路就是先同步，把入口直接放在提示上比让他自己去找
+  /// 下拉刷新更接近他此刻的意图。
+  bool _blockWriteOnStaleSnapshot() {
+    final reason = WhitelistFreshness.instance.writeBlockReason;
+    if (reason == null) return false;
+    debugPrint('[wq] 陈旧快照：拒绝写入（0 PATCH / 0 本地缓存写）');
+    if (mounted) {
+      AppSnack.show(
+        context,
+        reason,
+        kind: SnackKind.error,
+        // 比普通提示多留一会儿：这句话信息量大（要读明白"为什么没保存"）
+        duration: const Duration(seconds: 8),
+        action: SnackBarAction(
+          label: '立即同步',
+          onPressed: () => unawaited(_resyncAfterStaleBlock()),
+        ),
+      );
+    }
+    return true;
+  }
+
+  /// 「立即同步」：重新走一次同步，成功即解除门禁（用户再操作一次即可）。
+  ///
+  /// 为什么**不自动重放**刚才那次修改：从点同步到回来可能几秒，这期间列表
+  /// 可能已经变成了另一份数据（别人改的、或他自己又动了别的），把"刚才那一下"
+  /// 重放到新数据上，恰恰又是"基于旧意图改新数据"。这里只负责把数据变成最新，
+  /// 让用户按当下看到的内容重新决定——这与本页"乐观更新但不猜用户意图"的
+  /// 一贯取舍一致。
+  Future<void> _resyncAfterStaleBlock() async {
+    await _load();
+    if (!mounted) return;
+    if (WhitelistFreshness.instance.isStale) {
+      _showSnack('仍然同步失败：请确认网络后重试', kind: SnackKind.error);
+    } else {
+      _showSnack('已同步到最新，请重新操作一次');
+    }
   }
 
   /// 新建合集：校验后写入 collections → 持久化。

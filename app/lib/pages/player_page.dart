@@ -1172,11 +1172,17 @@ class _PlayerPageState extends State<PlayerPage>
   // 全屏画面变换（缩放 / 旋转 / 平移，v2.39.0+）
   // ---------------------------------------------------------------------
   // 需求（用户原话）：「全屏模式下可以手势放大，旋转视频窗口。注意不要和之前
-  // 的手势冲突」。四个字段全部**只在全屏下**被写（[kMinViewScale]..4.0 的
-  // 缩放、90° 步进的旋转、缩放态下的单指平移）：
+  // 的手势冲突」。三个字段在**非全屏永远保持默认值**（[kMinViewScale]..4.0 的
+  // 缩放、90° 步进的旋转、缩放态下的单指平移都只在全屏生效）：
   // - 非全屏视频区只有 ~231dp 高，放大/旋转后能看到的有效内容反而更少；
-  // - 且非全屏的横滑是 seek（用户验收过的三向语义），双指手势会把单指拖动的
-  //   判断搅乱（[kPanModeThreshold] 那套豁免/锁定逻辑只认单指）。
+  // - 且非全屏的横滑是 seek（用户验收过的三向语义），让画面变换插进来会把
+  //   单指拖动的判断搅乱（[kPanModeThreshold] 那套豁免/锁定逻辑只认单指）。
+  //
+  // v2.43.0 起**双指「让位」不再只在全屏**（[kPanModeThreshold] 那条注释里
+  // "非全屏双指可能被当单指拖动去 seek" 的已知限制已修）：非全屏的双指同样会
+  // 让单指三向语义整体让位（不 seek / 不调亮度音量），但不做任何变换——
+  // 见 [_viewTransformEnabled] 与 [_applyViewGesture] 的取舍说明。
+  //
   // 复位时机：退出全屏（[_toggleFullscreen]）、换 bvid（[playVideo]）、切分 P
   // （[_switchToPage]）——三者都会让「画面窗口」换一个坐标系。另有可见的复位
   // 按钮（底栏，仅缩放态出现，见 [_buildBottomBar]）。
@@ -1210,9 +1216,11 @@ class _PlayerPageState extends State<PlayerPage>
 
   /// 复位画面变换（退出全屏 / 换 bvid / 切集 / 点复位按钮）。
   ///
-  /// 同时**清掉双指手势状态**：退出全屏时 Listener 的四个回调会被摘掉
-  /// （`_viewGesturesEnabled` 变 false），若不在这里清，[_viewGestureActive]
-  /// 会永远停在 true → 之后所有单指拖动都被让路掉（seek / 亮度 / 音量全哑）。
+  /// 同时**清掉双指手势状态**。v2.39.0 时这么做是因为"退出全屏 → Listener 回调
+  /// 被摘掉 → [_viewGestureActive] 会永远停在 true → 单指拖动全哑"；v2.43.0 起
+  /// 回调不再随全屏开关摘换（非全屏也跟踪双指以保证让位），但这里照旧清一次：
+  /// 换 bvid / 切集时用户手上那次双指已经失去意义（画面窗口换了坐标系），
+  /// 留着 active 只会让接下来第一下拖动被白白让位掉。
   void _resetViewTransform() {
     _viewPointers.clear();
     _viewPanRaw = Offset.zero;
@@ -1256,10 +1264,21 @@ class _PlayerPageState extends State<PlayerPage>
   // 但那部分本来就抽成了顶层纯函数（[viewScaleFromGesture] /
   // [snapViewRotation] / [clampViewOffset]），可单测。
 
-  /// 双指手势是否启用：**只在全屏**（见 [_viewScale] 字段注释）。
-  bool get _viewGesturesEnabled => _fullscreen;
+  /// 双指**变换**（缩放/旋转/平移）是否启用：**只在全屏**（见 [_viewScale]
+  /// 字段注释：非全屏视频区太矮，放大反而看不到东西）。
+  ///
+  /// ⚠️ 注意它**不**控制"是否跟踪双指 / 是否让位"——那个始终开着
+  /// （v2.43.0 起，见 [_onViewPointerDown] 与 [_applyViewGesture]）：
+  /// 非全屏双指虽然不变换画面，但必须让单指三向语义整体让位，否则一次捏合
+  /// 会被 Pan 识别器当成长横滑 → **莫名 seek**（用户在这一版之前遇到的就是
+  /// 这个：他只想捏合看细节，进度却跳了）。
+  bool get _viewTransformEnabled => _fullscreen;
 
   /// 当前按下的指针（pointerId → 手势层局部坐标）。只用于双指换算。
+  ///
+  /// v2.43.0 起**非全屏也记录**（旧实现在非全屏直接 return）：记录 + 配对是
+  /// 「双指让位」的判据来源，而让位是全屏/非全屏都要的。代价只是两个 int/double
+  /// 的字典操作，且非全屏不变换画面（[_applyViewGesture] 早退）。
   final Map<int, Offset> _viewPointers = <int, Offset>{};
 
   /// 本轮双指手势的起始双指间距 / 起始连线角度 / 起始焦点。
@@ -1274,13 +1293,12 @@ class _PlayerPageState extends State<PlayerPage>
   bool _longPressSpeedActive = false;
 
   void _onViewPointerDown(PointerDownEvent e) {
-    if (!_viewGesturesEnabled) return;
     _viewPointers[e.pointer] = e.localPosition;
     if (_viewPointers.length >= 2) _beginViewGesture();
   }
 
   void _onViewPointerMove(PointerMoveEvent e) {
-    if (!_viewGesturesEnabled || !_viewGestureActive) return;
+    if (!_viewGestureActive) return;
     if (!_viewPointers.containsKey(e.pointer)) return;
     _viewPointers[e.pointer] = e.localPosition;
     if (_viewPointers.length < 2) return;
@@ -1331,7 +1349,13 @@ class _PlayerPageState extends State<PlayerPage>
   }
 
   /// 双指移动 → 换算缩放 / 旋转（90° 吸附）/ 平移，并同步渲染。
+  ///
+  /// **非全屏在这里早退**（v2.43.0）：非全屏的双指只做「让位」（见
+  /// [_onViewPointerDown]），不改画面 —— 画面变换仍按 v2.39.0 的设计只在全屏
+  /// 生效（原因见 [_viewScale] 字段注释）。早退放在**换算之前**是为了不改动
+  /// [_viewScaleStart] 等基准（非全屏来回捏几次不会给全屏攒下状态）。
   void _applyViewGesture() {
+    if (!_viewTransformEnabled) return;
     final ids = _viewPointers.keys.toList();
     final p1 = _viewPointers[ids[0]]!;
     final p2 = _viewPointers[ids[1]]!;
@@ -3412,8 +3436,9 @@ class _PlayerPageState extends State<PlayerPage>
   /// （tap 无位移不触发 Pan），按下点豁免不影响单击显隐等。
   void _onPanDown(DragDownDetails d) {
     if (_player == null) return;
-    // 双指手势进行中（v2.39.0）：单指那一套整体让位——Pan 识别器此时可能已
-    // 赢下竞技场（两指同向拖动就是一次合法的 pan），但语义上属于画面手势。
+    // 双指手势进行中（v2.39.0；v2.43.0 起非全屏同样生效）：单指那一套整体
+    // 让位——Pan 识别器此时可能已赢下竞技场（两指同向拖动就是一次合法的
+    // pan），但语义上属于画面手势（非全屏时是"用户在捏合"，不是"他在横滑"）。
     if (_viewGestureActive) return;
     final size = _gestureAreaSize();
     final w = size.width;
@@ -6134,17 +6159,17 @@ class _PlayerPageState extends State<PlayerPage>
           //    等方法与那里的「为什么不用 ScaleGestureRecognizer」实测理由）。
           //    Listener **不参与手势竞技场**——这是本方案的核心：单指拖动仍然
           //    完全落在下面这个 GestureDetector 的 Pan 识别器手里，用户验收过的
-          //    三条 seek 用例零回归。回调只在全屏挂载（非全屏双指不生效）。
+          //    三条 seek 用例零回归。
+          //    v2.43.0：回调**不再只在全屏挂**（旧实现非全屏时传 null）——非全屏
+          //    也要让双指期间的让位生效，否则一次捏合会被当成单指长横滑 →
+          //    无故 seek。变换本身仍只在全屏生效（[_viewTransformEnabled]）。
           if (!_listenMode)
             Positioned.fill(
               child: Listener(
-                onPointerDown:
-                    _viewGesturesEnabled ? _onViewPointerDown : null,
-                onPointerMove:
-                    _viewGesturesEnabled ? _onViewPointerMove : null,
-                onPointerUp: _viewGesturesEnabled ? _onViewPointerUp : null,
-                onPointerCancel:
-                    _viewGesturesEnabled ? _onViewPointerUp : null,
+                onPointerDown: _onViewPointerDown,
+                onPointerMove: _onViewPointerMove,
+                onPointerUp: _onViewPointerUp,
+                onPointerCancel: _onViewPointerUp,
                 child: GestureDetector(
                   behavior: HitTestBehavior.opaque,
                   onTap: _toggleControls,

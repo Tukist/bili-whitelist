@@ -606,6 +606,9 @@ class _CommentListViewState extends State<CommentListView> {
             ..addAll(page.topReplies);
           _roots.clear();
           _total = page.totalCount;
+          // 重载 = 以服务端为准：清掉本地乐观覆盖（否则旧覆盖会盖住刚拉回的
+          // 真实点赞态）。翻页追加不清（那批评论的覆盖还有意义）。
+          _likeOverrides.clear();
         } else if (page.totalCount > 0) {
           _total = page.totalCount;
         }
@@ -768,6 +771,81 @@ class _CommentListViewState extends State<CommentListView> {
     });
     if (_scrollCtrl.hasClients) _scrollCtrl.jumpTo(0);
     _loadMain(reset: true);
+  }
+
+  // -------------------------------------------------------------------------
+  // 评论点赞（v2.43.0+，仅 enableCompose 时可见/可点）
+  // -------------------------------------------------------------------------
+
+  /// 本地**乐观覆盖**：rpid → (已赞?, 点赞数)。没覆盖项 = 用服务端给的值。
+  ///
+  /// 为什么评论点赞可以乐观：它是**目标态**语义（赞 / 取消赞），点两次正好
+  /// 回到原状，不存在投币那种"不可逆副作用"；而网络往返在国内常要几百毫秒，
+  /// 等它回来再动界面 = "点了没反应"成为常态。失败则整条丢弃覆盖（回滚），
+  /// 界面回到服务端给的状态 —— 与服务端重新对齐，而不是留下一个假状态。
+  final Map<int, ({bool liked, int like})> _likeOverrides = {};
+
+  /// 正在发点赞请求的评论（防连点：同一时间对同一条评论只放行一个写请求）。
+  final Set<int> _likeBusy = {};
+
+  /// 这条评论现在是否显示为"已赞"（本地覆盖优先于服务端返回值）。
+  bool _isLiked(CommentReply reply) =>
+      _likeOverrides[reply.rpid]?.liked ?? reply.liked;
+
+  /// 这条评论现在显示的点赞数（本地覆盖优先）。
+  int _likeCountOf(CommentReply reply) =>
+      _likeOverrides[reply.rpid]?.like ?? reply.like;
+
+  /// 点一下点赞数：赞 ↔ 取消（**目标态取反**，因此天然幂等：连点两次就是
+  /// 一次"赞了再取消"）。
+  ///
+  /// 门禁与发表一致（[_canCompose] 那三条）：开了总开关、归属 id 到手、
+  /// 评论区没关——点赞同样是写操作，评论区关了就不该装作能用。
+  Future<void> _toggleCommentLike(CommentReply reply) async {
+    final aid = _aid;
+    if (!widget.enableCompose) return;
+    if (aid == null || _commentClosed) return;
+    if (_likeBusy.contains(reply.rpid)) return; // 正忙：忽略这次点击
+    final target = !_isLiked(reply);
+    final base = _likeCountOf(reply);
+    setState(() {
+      final next = base + (target ? 1 : -1);
+      // 计数先跟着动（赞 +1 / 取消 -1）；下限 0：服务端给 0 时再减会显示
+      // "-1"，那比"没变"更像坏了。
+      _likeOverrides[reply.rpid] = (
+        liked: target,
+        like: next < 0 ? 0 : next,
+      );
+      _likeBusy.add(reply.rpid);
+    });
+    try {
+      await _api.likeComment(
+        oid: aid,
+        // 归属口径**原样透传**（与 _sendComment 同一条纪律：本组件不猜类型，
+        // 猜错不会报错、只会把赞点到别的内容名下）
+        type: widget.commentType,
+        rpid: reply.rpid,
+        like: target,
+      );
+    } on BiliApiException catch (e) {
+      _rollbackLike(reply.rpid, e.message);
+    } on DioException {
+      _rollbackLike(reply.rpid, '网络请求失败，请检查网络后重试');
+    } catch (e) {
+      _rollbackLike(reply.rpid, '$e');
+    } finally {
+      if (mounted) setState(() => _likeBusy.remove(reply.rpid));
+    }
+  }
+
+  /// 失败回滚：丢掉这条评论的乐观覆盖 → 显示回到服务端给的状态 + 错误类提示。
+  ///
+  /// 提示用 [SnackKind.error]（关掉"界面提示"也不静默）：点赞失败而界面停在
+  /// 已赞态是最坏的结果——用户以为点上了，对方永远收不到。
+  void _rollbackLike(int rpid, String message) {
+    if (!mounted) return;
+    setState(() => _likeOverrides.remove(rpid));
+    AppSnack.show(context, '点赞失败：$message', kind: SnackKind.error);
   }
 
   // -------------------------------------------------------------------------
@@ -1424,6 +1502,14 @@ class _CommentListViewState extends State<CommentListView> {
                 replyEnabled: composeEnabled,
                 onReply: (target, rootRpid) =>
                     _openCompose(target: target, rootRpid: rootRpid),
+                // 点赞（v2.43.0）：与发表走**同一道总开关**（enableCompose）
+                // ——都是"写操作"，一起开一起关；默认关时渲染树逐节点不变。
+                canLike: widget.enableCompose,
+                likeEnabled: composeEnabled,
+                liked: _isLiked(reply),
+                likeCount: _likeCountOf(reply),
+                likeBusy: _likeBusy.contains(reply.rpid),
+                onToggleLike: _toggleCommentLike,
               ),
             );
           },
@@ -1688,6 +1774,26 @@ class _CommentRootTile extends StatelessWidget {
   /// 点「回复」→ 交给列表层弹发表弹层（带着它自己维护的楼层归属）。
   final CommentReplyIntent onReply;
 
+  /// 是否**渲染**可点的点赞数（v2.43.0+，[CommentListView.enableCompose] 原样
+  /// 透传）。false 时点赞仍是"图标 + 数字"的静态展示，渲染树与 v2.42.0 逐节点
+  /// 一致（其余 3 个使用点不受影响）。
+  final bool canLike;
+
+  /// 点赞是否**可点**（归属 id 到手 + 评论区没关；与 [replyEnabled] 同源）。
+  final bool likeEnabled;
+
+  /// 这条评论当前是否显示为「已赞」（列表层的乐观覆盖值已算好）。
+  final bool liked;
+
+  /// 当前显示的点赞数（同上，覆盖值优先）。
+  final int likeCount;
+
+  /// 点赞请求在飞（轻量反馈 + 防连点）。
+  final bool likeBusy;
+
+  /// 点点赞数 → 交给列表层做乐观切换 + 请求 + 失败回滚。
+  final ValueChanged<CommentReply> onToggleLike;
+
   const _CommentRootTile({
     required this.reply,
     required this.pinned,
@@ -1703,6 +1809,12 @@ class _CommentRootTile extends StatelessWidget {
     this.canReply = false,
     this.replyEnabled = false,
     required this.onReply,
+    this.canLike = false,
+    this.likeEnabled = false,
+    this.liked = false,
+    this.likeCount = 0,
+    this.likeBusy = false,
+    required this.onToggleLike,
   });
 
   @override
@@ -1804,12 +1916,25 @@ class _CommentRootTile extends StatelessWidget {
       padding: const EdgeInsets.only(top: 8),
       child: Row(
         children: [
-          Icon(Icons.thumb_up_alt_outlined, size: 14, color: kInkGray50),
-          const SizedBox(width: 4),
-          Text(
-            _fmtLike(reply.like),
-            style: TextStyle(fontSize: 12, color: kInkGray70),
-          ),
+          // 点赞数：默认（未开启写能力）是静态展示；开启后可点（v2.43.0）。
+          if (canLike)
+            _LikeAffordance(
+              // 稳定 key（按 rpid）：测试用它精确点到"某一条评论"的点赞入口
+              key: ValueKey('comment-like-${reply.rpid}'),
+              liked: liked,
+              count: likeCount,
+              enabled: likeEnabled,
+              busy: likeBusy,
+              onTap: () => onToggleLike(reply),
+            )
+          else ...[
+            Icon(Icons.thumb_up_alt_outlined, size: 14, color: kInkGray50),
+            const SizedBox(width: 4),
+            Text(
+              _fmtLike(reply.like),
+              style: TextStyle(fontSize: 12, color: kInkGray70),
+            ),
+          ],
           const SizedBox(width: 14),
           Text(
             _fmtCtime(reply.ctime),
@@ -1940,6 +2065,77 @@ class _CommentRootTile extends StatelessWidget {
                     ),
             ),
         ],
+      ),
+    );
+  }
+}
+
+/// 评论行左端的「点赞数」入口（v2.43.0+）。
+///
+/// 与 [_ReplyAffordance] 同款取舍：小号文字 + 图标 + 小热区内边距，**不用**
+/// Material 按钮的默认最小尺寸（那会把只有 ~30dp 高的元信息行撑高、连带改动
+/// 既有排版）。已赞 = 实心图标 + 主题色，未赞 = 线框图标 + 灰。
+///
+/// [busy]（请求在飞）时点击被忽略（防连点）并换成 12px 进度圈——这就是任务里
+/// 说的"轻量反馈"：比整行置灰轻（列表还在滚动、别的评论照常可点），又比什么
+/// 都不说诚实（用户知道这一下已经发出去了）。失败时列表层会回滚 + 弹错误提示。
+class _LikeAffordance extends StatelessWidget {
+  final bool liked;
+  final int count;
+  final bool enabled;
+  final bool busy;
+  final VoidCallback onTap;
+
+  const _LikeAffordance({
+    super.key,
+    required this.liked,
+    required this.count,
+    required this.enabled,
+    required this.busy,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final primary = Theme.of(context).colorScheme.primary;
+    final color = !enabled ? kInkGray30 : (liked ? primary : kInkGray70);
+    final canTap = enabled && !busy;
+    return Semantics(
+      button: true,
+      enabled: canTap,
+      // 读屏语义带上"现在点下去会发生什么"：已赞时是"取消赞"
+      label: '${liked ? '取消赞' : '点赞'} ${_fmtLike(count)}',
+      child: InkWell(
+        onTap: canTap ? onTap : null,
+        borderRadius: BorderRadius.circular(4),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              if (busy)
+                SizedBox(
+                  width: 12,
+                  height: 12,
+                  child: CircularProgressIndicator(
+                    strokeWidth: 1.6,
+                    color: color,
+                  ),
+                )
+              else
+                Icon(
+                  liked ? Icons.thumb_up_alt : Icons.thumb_up_alt_outlined,
+                  size: 14,
+                  color: color,
+                ),
+              const SizedBox(width: 4),
+              Text(
+                _fmtLike(count),
+                style: TextStyle(fontSize: 12, color: color),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }

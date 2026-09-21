@@ -37,6 +37,7 @@ import 'package:flutter/foundation.dart';
 import '../api/github_api.dart';
 import '../models/whitelist_video.dart';
 import '../services/service_locator.dart';
+import '../sync/whitelist_freshness.dart';
 import '../sync/whitelist_source.dart';
 
 class WhitelistWriteQueue {
@@ -71,7 +72,19 @@ class WhitelistWriteQueue {
   /// 返回的 Future 在**队列排空后**完成，值 = 最后一次远端写是否成功。
   /// 页面**不要 await** 它（await 就是把延迟又搬回来了），测试可以 await
   /// 来断言顺序与失败处理；连续提交共享同一次排空的 Future。
+  ///
+  /// **陈旧快照门禁（v2.43.0）**：当前展示的数据被判定为陈旧离线快照时，
+  /// 这里**直接拒掉**——不写本地缓存、不发 PATCH。页面已经先拦一道（在
+  /// setState 之前，见 `_saveAndRefresh`），这里再拦一道是因为本队列才是
+  /// 「用整份快照覆盖远端」的真正出口：任何绕过页面的调用方都会在这里被挡，
+  /// 本地缓存文件也不会被陈旧数据污染（否则下次启动会把污染当成"已知最新"）。
   Future<bool> submit(WhitelistData data) {
+    final blocked = WhitelistFreshness.instance.writeBlockReason;
+    if (blocked != null) {
+      debugPrint('[wq] 陈旧快照：拒绝排队（0 PATCH / 0 本地缓存写）');
+      onError?.call(blocked);
+      return Future.value(false);
+    }
     _pending = data;
     return _running ??= _drain();
   }

@@ -8,6 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../api/github_api.dart';
 import '../config.dart';
 import '../models/whitelist_video.dart';
+import 'whitelist_freshness.dart';
 
 /// 白名单数据源抽象。
 ///
@@ -200,11 +201,20 @@ class SyncResult {
   /// 是否发生了网络同步（gist/lan 成功）。
   final bool fromNetwork;
 
+  /// 这份数据是否**确证**落后于已知最新（v2.43.0）。
+  ///
+  /// 只有离线快照（local / cache）才可能为 true：判据见
+  /// [WhitelistFreshness.isBehind] —— 快照的 `updated_at` 不等于最近一次
+  /// 成功同步到的 `updated_at` 时为真（**落后**）。默认 false（= 不拦），
+  /// 这样测试替身与未打标的路径都不会被门禁误伤。
+  final bool stale;
+
   const SyncResult({
     required this.data,
     required this.sourceName,
     required this.fetchedAt,
     required this.fromNetwork,
+    this.stale = false,
   });
 }
 
@@ -213,14 +223,27 @@ class SyncResult {
 /// - 网络源（Gist/Lan）成功后把结果写入本地缓存文件（记录 fetched_at），
 ///   下次启动即使没网也能展示最近一次数据。
 /// - 任何单个源失败都不会崩溃，自动尝试下一个源。
+/// - **离线子集（local / cache）按新鲜度选**（v2.43.0）：两个都不是"当前"的
+///   权威副本，所以谁的数据 `updated_at` 更新就用谁，而不是"local 文件存在
+///   就用 local"——后者实测会把几周前的导入快照盖在昨晚刚同步的缓存上，
+///   界面显示的是陈旧数据（详见 [WhitelistFreshness] 的说明）。
 class WhitelistSyncService {
   final GistSource _gistSource;
   final LanSource _lanSource;
   final LocalFileSource _localSource;
   final CacheSource _cacheSource;
 
-  WhitelistSyncService({Dio? dio, GithubApi? githubApi})
-      : _gistSource =
+  /// 应用文档目录覆盖（**测试用**）：正常运行时为 null → 走
+  /// `path_provider` 的 [getApplicationSupportDirectory]；测试里给它一个临时
+  /// 目录就能真跑整个 [sync] 回退链（否则原生插件缺失，只能注入假服务，
+  /// 那样恰好把本轮要改的"选源"逻辑测掉了）。
+  final Directory? supportDirOverride;
+
+  WhitelistSyncService({
+    Dio? dio,
+    GithubApi? githubApi,
+    this.supportDirOverride,
+  })  : _gistSource =
             GistSource(url: AppConfig.gistUrl, dio: dio, githubApi: githubApi),
         _lanSource = LanSource(url: AppConfig.lanUrl, dio: dio),
         _localSource = LocalFileSource(file: File('')),
@@ -255,32 +278,81 @@ class WhitelistSyncService {
         _log('lan 源失败: $e');
       }
     }
-    // 3) 本地导入文件
-    try {
-      final data = await _localSource.fetch();
-      return SyncResult(
-        data: data,
-        sourceName: 'local',
-        fetchedAt: now,
+    // 3) 离线快照：local（手动导入文件）与 cache（上次同步副本）**按新鲜度选**
+    //    （v2.43.0）。旧实现是"local 文件存在就用 local、否则 cache"——但 local
+    //    是用户**某次手动导入**的静态快照，可能比 cache 老得多，于是离线冷启动
+    //    会展示陈旧数据（实测：`flcl` 显示 8 个视频，实际 3 个 + 1 个子合集）。
+    //    两者都不可比较（都没有 updated_at）时才按原顺序（local 优先）兜底。
+    final snapshot = await _pickOfflineSnapshot(dir);
+    if (snapshot != null) {
+      final knownLatest = await _readKnownLatestUpdatedAt();
+      final stale =
+          WhitelistFreshness.isBehind(snapshot.data.updatedAt, knownLatest);
+      _log('离线快照源=${snapshot.name}'
+          ' updated_at=${snapshot.data.updatedAt.isEmpty ? '-' : snapshot.data.updatedAt}'
+          ' 已知最新=${knownLatest ?? '-'}'
+          '${stale ? '（陈旧：写操作将被拦，见 WhitelistFreshness）' : '（与已知最新一致）'}');
+      final result = SyncResult(
+        data: snapshot.data,
+        sourceName: snapshot.name,
+        fetchedAt: snapshot.fetchedAt ?? now,
         fromNetwork: false,
+        stale: stale,
       );
+      // 打标**只在这里**做（判据只有一份）：页面/写入口只读状态，不重复判断。
+      WhitelistFreshness.instance
+          .markSync(sourceName: result.sourceName, stale: result.stale);
+      return result;
+    }
+    throw StateError('所有白名单源都不可用（gist/lan/local/cache 全失败）');
+  }
+
+  /// 离线快照源：读 local 与 cache，按数据自带的 `updated_at` 选更新的那一份。
+  ///
+  /// 为什么两个都读（旧实现读到 local 就返回）：不读另一份就无从比较，
+  /// "选源"就退化成"猜"。两份文件都在应用文档目录下、几百 KB，读开销可忽略
+  /// （只在网络源都失败时才走这里）。
+  ///
+  /// 平局/无从比较 → [preferLatest] 保持旧顺序（local 优先），不引入新行为。
+  Future<_OfflineSnapshot?> _pickOfflineSnapshot(
+    ({File cacheFile, File localFile}) dir,
+  ) async {
+    _OfflineSnapshot? local;
+    try {
+      local = _OfflineSnapshot('local', await _localSource.fetch(), null);
     } catch (e) {
       _log('local 源失败: $e');
     }
-    // 4) 本地缓存（含 fetched_at）
+    _OfflineSnapshot? cache;
     try {
       final meta = await _readCacheMeta(dir.cacheFile);
-      final data = await _cacheSource.fetch();
-      return SyncResult(
-        data: data,
-        sourceName: 'cache',
-        fetchedAt: meta.fetchedAt ?? now,
-        fromNetwork: false,
-      );
+      cache = _OfflineSnapshot('cache', await _cacheSource.fetch(), meta.fetchedAt);
     } catch (e) {
       _log('cache 源失败: $e');
     }
-    throw StateError('所有白名单源都不可用（gist/lan/local/cache 全失败）');
+    if (local == null) return cache;
+    if (cache == null) return local;
+    // >0 = local 更新；<0 = cache 更新；0 = 无从比较 → 保持旧顺序（local 优先）
+    final cmp = WhitelistFreshness.compareUpdatedAt(
+      local.data.updatedAt,
+      cache.data.updatedAt,
+    );
+    return cmp > 0 ? local : (cmp < 0 ? cache : local);
+  }
+
+  /// 「已知最新」= 最近一次**成功同步/写入远端**时那份数据的 `updated_at`。
+  ///
+  /// 记录点有两个：[_cacheNetworkResult]（网络同步成功）与 [saveToCache]
+  /// （管理写操作成功落盘）。没有它就无法判断"离线这份是不是落后"——读取
+  /// 失败（测试环境无原生插件）返回 null，此时判据按"无法证明是最新"处理
+  /// （见 [WhitelistFreshness.isBehind]）。
+  Future<String?> _readKnownLatestUpdatedAt() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      return prefs.getString(_kRemoteUpdatedAtKey);
+    } catch (_) {
+      return null;
+    }
   }
 
   /// 读取缓存文件并附带 fetched_at 元信息。
@@ -309,6 +381,10 @@ class WhitelistSyncService {
     );
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('whitelist_fetched_at', now.toIso8601String());
+    await prefs.setString(_kRemoteUpdatedAtKey, data.updatedAt);
+    // 网络源 = 权威副本 → 顺手解除可能还挂着的陈旧标记（否则用户明明联网
+    // 同步成功了，却因为上次离线留下的标记继续被门禁挡着）。
+    WhitelistFreshness.instance.markSync(sourceName: sourceName, stale: false);
     return SyncResult(
       data: data,
       sourceName: sourceName,
@@ -333,11 +409,15 @@ class WhitelistSyncService {
     );
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('whitelist_fetched_at', now.toIso8601String());
+    // 刚刚成功写上去的那份就是远端现状 → 它成为「已知最新」。
+    // （不这么做的话，下次离线启动会把"自己刚写成功的副本"判成陈旧，
+    //   用户每离线一次就要多同步一次。）
+    await prefs.setString(_kRemoteUpdatedAtKey, data.updatedAt);
   }
 
   /// 惰性绑定应用文档目录下的缓存文件与导入文件路径。
   Future<({File cacheFile, File localFile})> _bindFiles() async {
-    final dir = await getApplicationSupportDirectory();
+    final dir = supportDirOverride ?? await getApplicationSupportDirectory();
     final cacheFile = File('${dir.path}/${AppConfig.cacheFileName}');
     final localFile = File('${dir.path}/${AppConfig.localImportFileName}');
     _localSource.file = localFile;
@@ -350,4 +430,24 @@ class WhitelistSyncService {
     // ignore: avoid_print
     print('[sync] $message');
   }
+}
+
+/// shared_preferences 键：最近一次**成功同步/写入远端**那份数据的 `updated_at`。
+///
+/// 它是「已知最新」的唯一凭据（离线判断"这份快照落不落后"全靠它），
+/// 所以只由 [WhitelistSyncService] 的两个成功落盘点写入。
+const String _kRemoteUpdatedAtKey = 'whitelist_remote_updated_at';
+
+/// 一份**离线快照**候选（local 或 cache），[WhitelistSyncService] 按
+/// `updated_at` 在两者之间选新的那一份。
+class _OfflineSnapshot {
+  /// 源名（`local` / `cache`），直接进 [SyncResult.sourceName]。
+  final String name;
+  final WhitelistData data;
+
+  /// 本机取得这份数据的时间（cache 源 = 缓存文件里的 fetched_at；local 源没有，
+  /// 因为"导入那一刻"不是数据新鲜度，由调用方回退到当前时间）。
+  final DateTime? fetchedAt;
+
+  const _OfflineSnapshot(this.name, this.data, this.fetchedAt);
 }

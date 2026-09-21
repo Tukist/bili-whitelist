@@ -3703,6 +3703,67 @@ class BiliApi {
     });
   }
 
+  /// 评论点赞接口的操作码（`action`）：**1 = 点赞**。
+  ///
+  /// 注意与视频点赞（[kLikeOn] / [kLikeOff] 用的是 `like=1/2`）**不同**：评论
+  /// 这套接口的 `action` 是 **1 赞 / 0 取消**（0 也是默认值）。照搬视频那套
+  /// 取值会把"取消赞"发成"点赞"，所以两套各自定义常量、不共用。
+  static const int kCommentLikeOn = 1;
+
+  /// 评论点赞接口的操作码：**0 = 取消赞**（见 [kCommentLikeOn]）。
+  static const int kCommentLikeOff = 0;
+
+  /// 给评论点赞 / 取消点赞（`POST x/v2/reply/action`）。
+  ///
+  /// **[like] 是目标状态**（true = 赞，false = 取消）——语义幂等：传同一个目标
+  /// 态就是"要它变成这样"。所以 UI 可以放心做「乐观切换 + 失败回滚」（与
+  /// [likeVideo] 同一取舍）。
+  ///
+  /// ⚠️ 与 [likeVideo] 一样是**公开写操作**（赞会进对方的消息通知），因此本
+  /// 方法绝不自动重试（[BiliApi._postAuth] 那条纪律），失败由调用方给可读提示。
+  ///
+  /// 接口口径（**按社区文档实现**）：
+  /// - 路径 `x/v2/reply/action`；表单 `oid` / `type` / `rpid` / `action` / `csrf`；
+  /// - `type` 与 [addComment] 同一套口径（**原样透传宿主的 commentType**：本层
+  ///   不猜类型，猜错不报错、只会把赞点到别的内容名下）；
+  /// - ⚠️ **本条未经真机验证**：本轮模拟器上的 B 站登录态已丢失（见交付说明），
+  ///   路径与参数取自 bilibili-API-collect `docs/comment/action.md` 的"点赞
+  ///   评论"一节（action 默认为 0 = 取消赞 / 1 = 点赞）。将来第一次真机点时
+  ///   应重点复核"赞完计数 +1、再点回 -1"。
+  ///
+  /// 错误码由 [_throwWriteError] 统一分类（-101 未登录 / -111 csrf 失效 /
+  /// -412 风控 / -509 频繁 / 12002 评论区已关闭…）；没实测过的码一律回落到
+  /// 接口自己的中文 message，不猜。
+  Future<void> likeComment({
+    required int oid,
+    required int type,
+    required int rpid,
+    required bool like,
+  }) async {
+    if (oid <= 0 || rpid <= 0) {
+      throw const BiliApiException(
+        code: -400,
+        message: '评论 id 无效，无法点赞',
+        path: '/x/v2/reply/action',
+      );
+    }
+    if (type <= 0) {
+      throw const BiliApiException(
+        code: -400,
+        message: '评论归属类型无效，无法点赞',
+        path: '/x/v2/reply/action',
+      );
+    }
+    debugPrint('[bili_api] likeComment oid=$oid type=$type rpid=$rpid '
+        'like=$like（action=${like ? kCommentLikeOn : kCommentLikeOff}）');
+    await _postAuth('/x/v2/reply/action', {
+      'oid': '$oid',
+      'type': '$type',
+      'rpid': '$rpid',
+      'action': like ? '$kCommentLikeOn' : '$kCommentLikeOff',
+    });
+  }
+
   // -------------------------------------------------------------------------
   // 直播开播状态（v2.25.2+）：白名单 UP 主「正在直播」标记（最小形态）
   // -------------------------------------------------------------------------

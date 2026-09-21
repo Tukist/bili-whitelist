@@ -10,6 +10,7 @@ import '../api/bilibili_api.dart';
 import '../api/github_api.dart';
 import '../models/upowner.dart';
 import '../models/whitelist_video.dart';
+import '../sync/whitelist_freshness.dart';
 import 'service_locator.dart';
 
 /// 「UP 主加入/更新」一次操作的结果。
@@ -69,6 +70,18 @@ class UpownerWriter {
   /// token + gist_id 是否都已配置（写操作前调用）。
   Future<bool> hasConfig() => github.hasConfig();
 
+  /// 写入前的「拉远端整份」：本服务的每个写入口都是 read-modify-write
+  /// （GET 远端 → 改 → PATCH 整份），所以**只要这里成功**，写出去的 baseline
+  /// 就是远端最新，不存在"拿本地陈旧快照覆盖远端"的风险（v2.43.0 的陈旧门禁
+  /// 因此必须在这里解除：否则用户明明在线、GET 都成功了，却因为离线那次留下的
+  /// 陈旧标记被挡住）。GET 失败会抛异常/返回 null，调用方各自处理——**任何
+  /// 一条路径都不会拿本地旧数据去 PATCH**。
+  Future<WhitelistData?> _fetchRemoteForWrite() async {
+    final data = await github.fetchFromGist();
+    WhitelistFreshness.instance.confirmRemote();
+    return data;
+  }
+
   /// 把 UP 主加入白名单：mid 查重 → 合并 → saveToGist → 写本地缓存。
   /// 重复/未配置/保存失败返回 [UpownerWriteResult] 说明原因，不抛异常。
   Future<UpownerWriteResult> add(Upowner up) async {
@@ -78,7 +91,7 @@ class UpownerWriter {
         message: '请先到底部导航「个人」页配置 GitHub token 与 Gist ID',
       );
     }
-    final current = await github.fetchFromGist();
+    final current = await _fetchRemoteForWrite();
     final data = current ?? WhitelistData.empty();
     // 查重（mid）
     if (data.upowners.any((u) => u.mid == up.mid)) {
@@ -136,7 +149,7 @@ class UpownerWriter {
         message: '请先到底部导航「个人」页配置 GitHub token 与 Gist ID',
       );
     }
-    final current = await github.fetchFromGist();
+    final current = await _fetchRemoteForWrite();
     final data = current ?? WhitelistData.empty();
     final existingMids = data.upowners.map((u) => u.mid).toSet();
     final toAdd = <Upowner>[];
@@ -183,7 +196,7 @@ class UpownerWriter {
         message: '请先到底部导航「个人」页配置 GitHub token 与 Gist ID',
       );
     }
-    final current = await github.fetchFromGist();
+    final current = await _fetchRemoteForWrite();
     if (current == null) {
       return const UpownerWriteResult(ok: false, message: '白名单为空');
     }
@@ -227,7 +240,7 @@ class UpownerWriter {
         message: '请先到底部导航「个人」页配置 GitHub token 与 Gist ID',
       );
     }
-    final current = await github.fetchFromGist();
+    final current = await _fetchRemoteForWrite();
     if (current == null) {
       return const UpownerWriteResult(ok: false, message: '白名单为空');
     }

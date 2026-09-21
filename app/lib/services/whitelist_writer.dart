@@ -17,6 +17,7 @@ import '../api/bilibili_api.dart';
 import '../api/github_api.dart';
 import '../models/whitelist_video.dart';
 import '../services/service_locator.dart';
+import '../sync/whitelist_freshness.dart';
 
 /// 「加入白名单」一次操作的结果。
 ///
@@ -303,6 +304,12 @@ class WhitelistWriter {
   /// [addVideo] 的实际工作（已经在串行闸门里面）。
   Future<AddResult> _addVideoNow(WhitelistVideo video) async {
     final current = await github.fetchFromGist();
+    // 门禁记账（v2.43.0）：本入口是 read-modify-write —— 上面那次 GET 成功就
+    // 证明"远端权威数据已经拿到手"，下面写出去的 baseline 是**远端最新**而不是
+    // 本地旧快照，所以不存在"整份陈旧覆盖"的问题，必须把可能还挂着的陈旧标记
+    // 解掉（否则用户明明在线、GET 都成功了，却因为离线时留下的标记被门禁挡）。
+    // GET 失败会直接抛异常、根本走不到写（离线时更不该拿本地快照去覆盖）。
+    WhitelistFreshness.instance.confirmRemote();
     final existing = current?.videos ?? const <WhitelistVideo>[];
     final displayTitle = video.title.isEmpty ? video.bvid : video.title;
     if (existing.any((v) => v.bvid == video.bvid)) {
