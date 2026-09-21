@@ -170,12 +170,17 @@ class SearchPage extends StatefulWidget {
   /// B 站接口（测试注入假实现，避免 widget 测试发起真实搜索请求）。
   final BiliApi? api;
 
+  /// 白名单写入服务（测试注入假实现）：搜索页「加入 / 整季导入」走它写 Gist，
+  /// 而「点卡片直接看」**不该**碰它——注入点就是为了让测试能断言这一点。
+  final WhitelistWriter? writer;
+
   const SearchPage({
     super.key,
     this.initialTab = 0,
     this.historyStore,
     this.syncService,
     this.api,
+    this.writer,
   });
 
   @override
@@ -186,7 +191,7 @@ class _SearchPageState extends State<SearchPage>
     with SingleTickerProviderStateMixin {
   final TextEditingController _keywordCtrl = TextEditingController();
   late final BiliApi _api = widget.api ?? BiliApi();
-  final WhitelistWriter _writer = WhitelistWriter();
+  late final WhitelistWriter _writer = widget.writer ?? WhitelistWriter();
   final UpownerWriter _upwriter = UpownerWriter();
 
   late final SearchHistoryStore _historyStore =
@@ -277,6 +282,10 @@ class _SearchPageState extends State<SearchPage>
   /// 正在「加入」的 bvid / mid 集合（防止连点重复提交）。
   final Set<String> _joining = {};
   final Set<int> _joiningUpowners = {};
+
+  /// 「点卡片直接看」补元数据期间置位（视频卡与番剧卡共用一个闸门）：
+  /// 补 cid 是异步的（一次 view / pgc 请求），期间再点会重复推播放页。
+  bool _openingResult = false;
 
   // ---- 交错入场（批次 4）---------------------------------------------------
 
@@ -968,6 +977,88 @@ class _SearchPageState extends State<SearchPage>
     return _whitelist?.videos.any((v) => v.epId == firstEp) ?? false;
   }
 
+  // ---------------------------------------------------------------------------
+  // 点结果卡直接看（v2.38.0+）：只播、不写白名单
+  // ---------------------------------------------------------------------------
+
+  /// 点视频结果卡 → 直接进播放页（**只播，不写白名单**）。
+  ///
+  /// 为什么点整卡不顺手写白名单：卡片尾部已经有一个语义明确的「加入」按钮，
+  /// 点整卡的意图是「看这个视频」；把它变成写操作等于用户在看片前就被动改了
+  /// 白名单（而且每次写都是几秒的 Gist PATCH，还可能失败）。白名单是「订阅」
+  /// 语义，该由那个按钮单独承担。UP 主页 / 收藏夹 / 评论跳转 / 信箱早就是
+  /// 这个规矩，本页只是补齐。
+  ///
+  /// 与收藏夹浏览页的同名流程一套做法：搜索结果只有 bvid，没有 cid/pages/
+  /// desc/owner → 先用 view 接口补全元数据，再构造完整 [WhitelistVideo] →
+  /// push 播放页。失败按既有分类提示（失效条目 62002 / 其它业务码 / 网络），
+  /// **不跳空白页**。
+  Future<void> _openSearchResultVideo(SearchResult r) async {
+    if (_openingResult) return; // 补元数据期间防连点
+    _openingResult = true;
+    try {
+      final meta = await _api.fetchVideoMeta(r.bvid);
+      if (!mounted) return;
+      final full = WhitelistWriter.videoFromMeta(meta, fallbackBvid: r.bvid);
+      await Navigator.of(context).push(
+        MaterialPageRoute<void>(
+          // 借用播放页路由名换取那套「快速淡入」转场（与直播卡同一入口约定）
+          settings: const RouteSettings(name: kPlayerRouteName),
+          builder: (_) => PlayerPage(video: full),
+        ),
+      );
+    } on BiliApiException catch (e) {
+      if (!mounted) return;
+      _showSnack(e.code == 62002
+          ? '该视频已失效或不可播放（62002）'
+          : '获取视频信息失败：${e.message}');
+    } on DioException {
+      if (!mounted) return;
+      _showSnack('网络请求失败，请检查网络后重试');
+    } finally {
+      _openingResult = false;
+    }
+  }
+
+  /// 点番剧/影视结果卡 → 取该季**首集** → 直接进播放页（**只播，不写白名单**）。
+  ///
+  /// 为什么取首集就播而不是弹选集：搜索看到的是「一季」，用户点进去最自然的
+  /// 期望是从第 1 集开始看；播放页本身有分 P/选集 UI（整季导入后）与上下集
+  /// 导航，进入后再切比在搜索页先弹一层选集更顺。
+  ///
+  /// **首集可能是会员/付费集**（[PgcEpisode.isVipOrPay]）：本函数**不**替用户
+  /// 挑「免费集」——挑集会让「第一集」这个直觉失效，而播放页已经对受限流做了
+  /// 试看/会员提示（`player_page.dart` 的受限分支）；点进去看到提示是预期行为。
+  /// 真正取不到可播集（整季没有一条带 bvid 的有效集，`fetchPgcSeason` 会过滤
+  /// 掉这种脏条目）时给一句明确提示，**不跳空白页**。
+  Future<void> _openMediaFirstEpisode(MediaSearchResult m) async {
+    if (_openingResult) return; // 取季信息期间防连点
+    _openingResult = true;
+    try {
+      final season = await _api.fetchPgcSeason(seasonId: m.seasonId);
+      if (!mounted) return;
+      if (season.episodes.isEmpty) {
+        _showSnack('「${m.title}」暂时取不到可播放的剧集');
+        return;
+      }
+      final full = WhitelistWriter.videoFromPgcEpisode(season, season.episodes.first);
+      await Navigator.of(context).push(
+        MaterialPageRoute<void>(
+          settings: const RouteSettings(name: kPlayerRouteName),
+          builder: (_) => PlayerPage(video: full),
+        ),
+      );
+    } on BiliApiException catch (e) {
+      if (!mounted) return;
+      _showSnack('获取剧集信息失败：${e.message}');
+    } on DioException {
+      if (!mounted) return;
+      _showSnack('网络请求失败，请检查网络后重试');
+    } finally {
+      _openingResult = false;
+    }
+  }
+
   /// UP 主加入白名单（搜索页 UP 主 Tab 用；文案统一为「关注」）。
   Future<void> _joinUpowner(Upowner up) async {
     if (_joiningUpowners.contains(up.mid)) return;
@@ -1356,14 +1447,43 @@ class _SearchPageState extends State<SearchPage>
           ),
         ],
       ),
-      // 三态 + 加入成功的确认动效（波纹 + 打勾，v2.18.x P7）；
-      // 「加入」/「已加入」文案不变（既有测试锚点），提交逻辑仍在 _join。
-      trailing: AddSuccessButton(
-        state: added
-            ? AddState.added
-            : (joining ? AddState.loading : AddState.idle),
-        onPressed: () => _join(r),
+      // 尾部 = 「直接看 ›」（点进去的暗示 + 一句最短的可见提示）+ 原样的「加入」按钮。
+      //
+      // **为什么这句提示不另起一行**（想改的话先看这里）：搜索结果是长列表，
+      // 卡片高一点，一屏能看到的条数就少一条 —— `search_inbox_entrance_flow_test`
+      // 的「交错入场」用例正卡着这条线（默认测试画布下至少要有 6 条被建出来）。
+      // 挂在尾部只吃**宽度**、不吃高度：标题区靠 [Expanded] 自然让位，卡高不变。
+      // 文案压到 3 个字（「点卡片直接看」太长，会把尾部撑到 130dp+）。
+      // 「直接看」放在 chevron **左边**，读起来是「直接看 ›」这一个整体，
+      // 而不是给右边那个「加入」按钮加了个前缀。
+      // **权限与白名单划分**：点整卡 = 只播（不写白名单，见 [_openSearchResultVideo]）；
+      // 写白名单永远只由右边的「加入」按钮负责。
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            '直接看',
+            style: theme.textTheme.labelSmall?.copyWith(
+              color: theme.colorScheme.outline,
+            ),
+          ),
+          Icon(
+            Icons.chevron_right,
+            size: 18,
+            color: theme.colorScheme.outline,
+          ),
+          // 三态 + 加入成功的确认动效（波纹 + 打勾，v2.18.x P7）；
+          // 「加入」/「已加入」文案不变（既有测试锚点），提交逻辑仍在 _join。
+          AddSuccessButton(
+            state: added
+                ? AddState.added
+                : (joining ? AddState.loading : AddState.idle),
+            onPressed: () => _join(r),
+          ),
+        ],
       ),
+      // 点整卡 = 直接看（**不写白名单**，理由见 [_openSearchResultVideo]）
+      onTap: () => _openSearchResultVideo(r),
     );
   }
 
@@ -1484,23 +1604,48 @@ class _SearchPageState extends State<SearchPage>
           ),
         ],
       ),
-      subtitle: Text(
-        metaParts.join(' · '),
-        maxLines: 1,
-        overflow: TextOverflow.ellipsis,
-        style: theme.textTheme.bodySmall?.copyWith(
-          color: theme.colorScheme.outline,
-        ),
+      subtitle: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            metaParts.join(' · '),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: theme.colorScheme.outline,
+            ),
+          ),
+        ],
       ),
+      // 尾部 = 「直接看 ›」+ 原样的「导入」按钮（与视频结果卡同一套交互，
+      // 理由与「为什么不另起一行」见 [_buildResultTile]）。
       // 整季导入按钮：同样换 [AddSuccessButton]（P7）。这里**不用 loading 态**——
       // 现存观感就是「禁用但文案不变」（进度由 runPgcSeasonImport 的进度对话框
       // 负责），多一个内联转圈会和对话框打架，故 importing 映射成 idle + 禁用。
-      trailing: AddSuccessButton(
-        state: imported ? AddState.added : AddState.idle,
-        idleLabel: '导入',
-        addedLabel: '已导入',
-        onPressed: importing ? null : () => _importMedia(m),
+      trailing: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            '直接看',
+            style: theme.textTheme.labelSmall?.copyWith(
+              color: theme.colorScheme.outline,
+            ),
+          ),
+          Icon(
+            Icons.chevron_right,
+            size: 18,
+            color: theme.colorScheme.outline,
+          ),
+          AddSuccessButton(
+            state: imported ? AddState.added : AddState.idle,
+            idleLabel: '导入',
+            addedLabel: '已导入',
+            onPressed: importing ? null : () => _importMedia(m),
+          ),
+        ],
       ),
+      // 点整卡 = 直接看**首集**（不写白名单，理由见 [_openMediaFirstEpisode]）
+      onTap: () => _openMediaFirstEpisode(m),
     );
   }
 

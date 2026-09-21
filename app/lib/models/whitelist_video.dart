@@ -323,11 +323,36 @@ List<WhitelistVideo> sortedSeasonEpisodes(
 ///
 /// v2.30.0 起 [name] 是**路径**（如 `动画/2024冬`）而不是单段名字，
 /// 详见 [kCollectionSep]。
+///
+/// v2.38.0 起新增可选的 [cover]（封面图 URL）与 [desc]（简介）。两者都是
+/// **可选字段**：`fromJson` 容错（缺失/脏类型 → 空串）、`toJson` **仅非空才
+/// 输出** —— 老数据（没有这两个字段）读进来再写回去，JSON 里一个字节都不会多，
+/// 也不会出现 `"cover":""` 这种噪声；PC 端 `whitelist.py` 对未知字段原样保留，
+/// 所以加字段对 PC 零影响。
 class CollectionInfo {
   final String name;
   final String createdAt; // ISO 8601
 
-  const CollectionInfo({required this.name, required this.createdAt});
+  /// 封面图 **URL**（空串 = 没设，UI 回落到「合集内第一个视频的封面」）。
+  ///
+  /// **为什么 v1 只支持 URL、不做「从相册选图」**（别改成 base64）：白名单整份
+  /// 存在一个 GitHub Gist 的文本 JSON 里，而**每一次写操作都要 PATCH 整份**
+  /// （改个合集名、加一个视频都会重传全部内容）。把图片塞成 base64 会让每次
+  /// 写入膨胀到十几 MB，既过不了 Gist 单文件体积上限，也会让「改个名字」这种
+  /// 小操作变成几十秒的网络请求。存本地路径同样不行：换设备 / 重装后路径失效，
+  /// 而白名单是跟着 Gist 走的跨设备数据。URL 是这里唯一「零成本、可跨设备」的
+  /// 方案。
+  final String cover;
+
+  /// 简介（纯文本，可含换行；空串 = 没设，UI 不占位）。
+  final String desc;
+
+  const CollectionInfo({
+    required this.name,
+    required this.createdAt,
+    this.cover = '',
+    this.desc = '',
+  });
 
   /// 父路径（顶层 → 空串）。层级由 [name] 自身表达，不另存 parent 字段。
   String get parentPath => collectionParentOf(name);
@@ -338,16 +363,37 @@ class CollectionInfo {
   /// 层级：顶层 = 0，每深一层 +1。
   int get depth => collectionDepth(name);
 
+  /// 只改指定字段的副本。
+  ///
+  /// **重命名 / 删除 / 移动合集时必须走它（或原样透传 cover/desc）**：
+  /// 那三处都要重写 [name]（路径前缀变了），早先的代码是 `CollectionInfo(
+  /// name: …, createdAt: …)` 重新构造 —— 那样每加一个字段就会「一改合集名，
+  /// 新字段全被清空」，而且是**静默**的（没有报错，只是数据没了）。加
+  /// [copyWith] 就是为了让这种「重建」有个不会漏字段的写法。
+  CollectionInfo copyWith({String? name, String? createdAt, String? cover, String? desc}) =>
+      CollectionInfo(
+        name: name ?? this.name,
+        createdAt: createdAt ?? this.createdAt,
+        cover: cover ?? this.cover,
+        desc: desc ?? this.desc,
+      );
+
   factory CollectionInfo.fromJson(Map<String, dynamic> json) {
     return CollectionInfo(
       name: json['name'] as String? ?? '',
       createdAt: json['created_at'] as String? ?? '',
+      // 脏类型（数字 / null / 嵌套对象）一律按「没设」处理，不让解析炸掉
+      cover: json['cover'] is String ? json['cover'] as String : '',
+      desc: json['desc'] is String ? json['desc'] as String : '',
     );
   }
 
   Map<String, dynamic> toJson() => {
         'name': name,
         'created_at': createdAt,
+        // 仅非空才输出：老数据读进来写回去逐字节不变，也不产生空字段噪声
+        if (cover.isNotEmpty) 'cover': cover,
+        if (desc.isNotEmpty) 'desc': desc,
       };
 }
 
@@ -582,10 +628,9 @@ WhitelistData renameCollection(
     collections: [
       for (final c in data.collections)
         if (c.name == old || isCollectionUnder(c.name, old))
-          CollectionInfo(
-            name: _rebasePath(c.name, old, newPath),
-            createdAt: c.createdAt,
-          )
+          // 走 copyWith 而不是重新构造：封面/简介（以及以后再加的字段）自动透传，
+          // 改名不该顺手把封面简介清空
+          c.copyWith(name: _rebasePath(c.name, old, newPath))
         else
           c,
     ],
@@ -649,12 +694,10 @@ WhitelistData deleteCollection(WhitelistData data, String name) {
     collections: [
       for (final c in data.collections)
         if (c.name != n)
-          // 子孙合集上提一级（_rebasePath 把前缀 n 换成父路径）
+          // 子孙合集上提一级（_rebasePath 把前缀 n 换成父路径）；
+          // 走 copyWith → 它们的封面/简介原样保留（删父不该清子的封面）
           isCollectionUnder(c.name, n)
-              ? CollectionInfo(
-                  name: _rebasePath(c.name, n, parent),
-                  createdAt: c.createdAt,
-                )
+              ? c.copyWith(name: _rebasePath(c.name, n, parent))
               : c,
     ],
     videos: [
@@ -733,10 +776,8 @@ WhitelistData moveCollectionUnder(
     collections: [
       for (final c in data.collections)
         if (c.name == src || isCollectionUnder(c.name, src))
-          CollectionInfo(
-            name: _rebasePath(c.name, src, newPath),
-            createdAt: c.createdAt,
-          )
+          // 走 copyWith：移动只换路径前缀，封面/简介（自己与子孙的）全保留
+          c.copyWith(name: _rebasePath(c.name, src, newPath))
         else
           c,
     ],
@@ -747,6 +788,48 @@ WhitelistData moveCollectionUnder(
           v.copyWith(collection: _rebasePath(v.collection, src, newPath))
         else
           v,
+    ],
+  );
+}
+
+/// 设置合集的封面与简介（v2.38.0+）：只改 [path] 这一个合集的 [cover]/[desc]，
+/// 名字、层级、子孙、视频归属一律不动，也不做级联（封面是每个合集自己的事，
+/// 父合集换封面不该动子合集）。
+///
+/// 传 `null` = 该项**不改**（想清空就传空串）——这样「只改简介」的调用不会
+/// 顺手把封面抹掉。
+///
+/// 校验：合集不存在 / [path] 为空 → 抛 [CollectionException]（与 rename /
+/// delete / move 同一套错误约定，页面层直接展示 message）。
+/// 封面 URL 只做**去空白**，不做格式校验：B 站图床之外的用户自备图（图床、
+/// 对象存储）形态各异，判错不如让 `Image.network` 的 errorBuilder 如实回落。
+///
+/// 返回新数据，原数据不可变不修改。
+WhitelistData setCollectionMeta(
+  WhitelistData data,
+  String path, {
+  String? cover,
+  String? desc,
+}) {
+  final p = normalizeCollectionPath(path);
+  if (p.isEmpty) throw const CollectionException('合集名不能为空');
+  final names = data.collections.map((c) => c.name).toList();
+  if (!names.contains(p)) {
+    throw CollectionException(
+      '合集「$p」不存在（现有合集: ${_existingHint(names)}）',
+    );
+  }
+  final newCover = cover?.trim();
+  final newDesc = desc?.trim();
+  return data.copyWith(
+    collections: [
+      for (final c in data.collections)
+        c.name == p
+            ? c.copyWith(
+                cover: newCover ?? c.cover,
+                desc: newDesc ?? c.desc,
+              )
+            : c,
     ],
   );
 }

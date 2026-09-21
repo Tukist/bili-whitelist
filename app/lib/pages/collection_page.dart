@@ -23,6 +23,7 @@ import 'package:flutter/foundation.dart' show listEquals;
 import 'package:flutter/material.dart';
 
 import '../cache/download_manager.dart';
+import '../config.dart';
 import '../models/playlist_context.dart';
 import '../models/whitelist_video.dart';
 import '../services/whitelist_writer.dart';
@@ -247,6 +248,39 @@ class _CollectionPageState extends State<CollectionPage> {
           ? '已把「${collectionDisplay(path)}」移到顶层'
           : '已把「${collectionDisplay(path)}」移动到'
               '「${collectionDisplay(target)}」下面');
+    } on CollectionException catch (e) {
+      _showSnack(e.message, kind: SnackKind.error);
+    }
+  }
+
+  /// 编辑子合集的封面与简介（v2.38.0）：与首页管理面板同一个对话框，
+  /// 落库走本页的 [_saveAndRefresh]（会往上一层逐级同步，返回父页面看到新值）。
+  ///
+  /// 封面只收 **URL**（不做「从相册选图」的理由见 [CollectionInfo.cover]）；
+  /// 两个输入框留空 = 不设置（清空即恢复默认）。
+  Future<void> _editSubCollectionMeta(String path) async {
+    final matches = _data.collections.where((c) => c.name == path);
+    if (matches.isEmpty) return; // 竞态：卡片还在但合集已被删
+    final current = matches.first;
+    final input = await showEditCollectionMetaDialog(
+      context,
+      path,
+      cover: current.cover,
+      desc: current.desc,
+    );
+    if (input == null || !mounted) return;
+    if (input.cover.trim() == current.cover &&
+        input.desc.trim() == current.desc) {
+      return; // 没改任何东西 → 不产生一次无意义的 Gist 写入
+    }
+    try {
+      final next = setCollectionMeta(
+        _data,
+        path,
+        cover: input.cover,
+        desc: input.desc,
+      );
+      await _saveAndRefresh(next);
     } on CollectionException catch (e) {
       _showSnack(e.message, kind: SnackKind.error);
     }
@@ -613,18 +647,27 @@ class _CollectionPageState extends State<CollectionPage> {
     );
   }
 
-  /// 子合集卡片：点进下一层；左滑「移动 / 重命名 / 删除」（多选模式下全部禁用）。
+  /// 子合集卡片：点进下一层；左滑「封面 / 移动 / 重命名 / 删除」
+  /// （多选模式下全部禁用）。
+  ///
+  /// 封面 / 简介（v2.38.0）：封面**只认用户自己设的 URL**，没设就保持原来的
+  /// 文件夹图标（与首页合集卡不同——那边没设封面时回落「合集内第一个视频的
+  /// 封面」，这里回落到图标，因为子合集卡只有 40×40 的一小块，塞视频截图
+  /// 反而认不出层级）。
   Widget _subCard(CollectionInfo c) {
     final path = c.name;
     return _SubCollectionCard(
       key: ValueKey('sub-$path'),
       name: c.localName,
+      cover: c.cover,
+      desc: c.desc,
       videoCount: _data.videos.where((v) => v.collection == path).length,
       childCount: collectionChildrenOf(_data, path).length,
       onTap: _selectMode ? null : () => _openSubCollection(path),
       onMove: _selectMode ? null : () => _moveSubCollection(path),
       onRename: _selectMode ? null : () => _renameSubCollection(path),
       onDelete: _selectMode ? null : () => _deleteSubCollection(path),
+      onEditMeta: _selectMode ? null : () => _editSubCollectionMeta(path),
     );
   }
 
@@ -819,30 +862,47 @@ class _CollectionPageState extends State<CollectionPage> {
   }
 }
 
-/// 子合集卡片：文件夹图标 + 局部名 + 「N 个视频 / 含 M 个子合集」，
-/// 尾部 chevron 表示「点进去还有一层」。
+/// 子合集卡片：文件夹图标（或用户自设封面）+ 局部名 +
+/// 「N 个视频 / 含 M 个子合集」（+ 自设简介），尾部 chevron 表示
+/// 「点进去还有一层」。
 ///
 /// 视觉沿用首页合集卡那套块化规格（[AppBlockVariant.collectionCard]），
-/// 左滑同样是 [SwipeActionBox]（首页合集卡是「重命名 / 删除」，这里是
-/// 「移动 / 重命名 / 删除」——合集页没有管理面板，移动只能做在卡片上）。
+/// 左滑同样是 [SwipeActionBox]（首页合集卡是「移动 / 重命名 / 删除」，这里是
+/// 「封面 / 移动 / 重命名 / 删除」——合集页没有管理面板，移动与封面只能做在
+/// 卡片上）。
+///
+/// v2.38.0：加 [cover] / [desc] / [onEditMeta]。**没设封面时保持原来的文件夹
+/// 图标**（不退化成首页那种「首个视频封面」——40×40 那么小一块，塞视频截图
+/// 反而认不出层级）；[desc] 为空时**整段不建节点**（旧数据逐像素不变）。
 class _SubCollectionCard extends StatelessWidget {
   final String name;
   final int videoCount;
   final int childCount;
+
+  /// 用户自设封面 URL；空串 → 文件夹图标。
+  final String cover;
+
+  /// 用户自设简介；空串 → 不渲染不占位。
+  final String desc;
+
   final VoidCallback? onTap;
   final VoidCallback? onMove;
   final VoidCallback? onRename;
   final VoidCallback? onDelete;
+  final VoidCallback? onEditMeta;
 
   const _SubCollectionCard({
     super.key,
     required this.name,
     required this.videoCount,
     required this.childCount,
+    this.cover = '',
+    this.desc = '',
     this.onTap,
     this.onMove,
     this.onRename,
     this.onDelete,
+    this.onEditMeta,
   });
 
   @override
@@ -857,17 +917,30 @@ class _SubCollectionCard extends StatelessWidget {
           onTap: onTap,
           child: Row(
             children: [
-              Container(
-                width: 40,
-                height: 40,
-                decoration: BoxDecoration(
-                  color: theme.colorScheme.secondaryContainer,
-                  borderRadius: BorderRadius.circular(kRadiusSm),
-                ),
-                child: Icon(
-                  Icons.folder_outlined,
-                  size: 22,
-                  color: theme.colorScheme.onSecondaryContainer,
+              // 代表视觉：有自设封面就显图，没有就是原来的文件夹图标
+              ClipRRect(
+                borderRadius: BorderRadius.circular(kRadiusSm),
+                child: SizedBox(
+                  width: 40,
+                  height: 40,
+                  child: cover.isNotEmpty
+                      ? Image.network(
+                          cover,
+                          fit: BoxFit.cover,
+                          // 与首页合集卡 / CoverImage 一致：B 站图床必须带
+                          // 防盗链头，否则 403；加载失败回落文件夹图标
+                          headers: {
+                            'User-Agent': kBrowserUA,
+                            'Referer': kBiliReferer,
+                          },
+                          errorBuilder: (_, __, ___) =>
+                              _folderIcon(theme),
+                          loadingBuilder: (context, child, progress) {
+                            if (progress == null) return child;
+                            return _folderIcon(theme);
+                          },
+                        )
+                      : _folderIcon(theme),
                 ),
               ),
               const SizedBox(width: kSpace12),
@@ -891,6 +964,18 @@ class _SubCollectionCard extends StatelessWidget {
                         color: theme.colorScheme.onSurfaceVariant,
                       ),
                     ),
+                    // 简介（v2.38.0）：空串时整段不建节点，旧数据逐像素不变
+                    if (desc.isNotEmpty) ...[
+                      const SizedBox(height: 2),
+                      Text(
+                        desc,
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.colorScheme.outline,
+                        ),
+                      ),
+                    ],
                   ],
                 ),
               ),
@@ -904,9 +989,28 @@ class _SubCollectionCard extends StatelessWidget {
         ),
       ),
     );
+    // 左滑（v2.38.0 起 4 块：封面 / 移动 / 重命名 / 删除）：
+    // - 既有三块的**顺序与含义一个像素没变**（移动 → 重命名 → 删除，删除在最右），
+    //   新增的「封面」加在**最左**（最低频的设置在离拇指最远、误触最少的一端）；
+    // - 4 × 60 = 240dp ≤ 卡片可用宽 312dp（360 - 左右各 12 内边距，再减页面
+    //   给子合集行的 12×2 内边距）→ 全露出后卡片仍留 72dp（40dp 封面 + 一截
+    //   名字），**不撑破盒子**（[SwipeActionBox] 的 `_travel` 本来就是
+    //   `min(操作块总宽, 宿主宽)`）；
+    // - [actionWidth] 从默认 76 收到 60：4 块按默认宽度是 304dp，卡片会几乎
+    //   全被推出去，那就真挤坏了；60 仍 ≥ 48dp 最小触摸目标，11px 的块标签
+    //   （最长「重命名」≈ 35dp）也装得下。
     return SwipeActionBox(
       enabled: canSwipe,
+      actionWidth: 60,
       actions: [
+        if (onEditMeta != null)
+          SwipeAction(
+            label: '封面',
+            icon: Icons.image_outlined,
+            color: context.palette.inkFill,
+            textColor: context.palette.onInk,
+            onTap: onEditMeta!,
+          ),
         if (onMove != null)
           SwipeAction(
             label: '移动',
@@ -935,4 +1039,20 @@ class _SubCollectionCard extends StatelessWidget {
       child: card,
     );
   }
+
+  /// 没有自设封面时的代表视觉：与改动前逐像素一致的文件夹图标
+  /// （40×40 secondaryContainer 圆角块 + folder_outlined 22px）。
+  Widget _folderIcon(ThemeData theme) => Container(
+        width: 40,
+        height: 40,
+        decoration: BoxDecoration(
+          color: theme.colorScheme.secondaryContainer,
+          borderRadius: BorderRadius.circular(kRadiusSm),
+        ),
+        child: Icon(
+          Icons.folder_outlined,
+          size: 22,
+          color: theme.colorScheme.onSecondaryContainer,
+        ),
+      );
 }

@@ -53,6 +53,12 @@ docs/screenshots/**/_backup/
 # ---------- 调试期截图（Gist ID 未打码，不入库；README 用的是 v2.18.0/） ----------
 docs/screenshots/v2.18.0-r2/
 
+# ---------- v2.38.0 起：按版本分隔的功能取证图默认不入库（本地留档） ----------
+# 每个版本二十多张、十几 MB，仓库不再随之膨胀。已跟踪的历史图不受影响
+# （ignore 只对未跟踪文件生效）；确实要入库时 `git add -f <文件>`，
+# 或在 app/tools/release_all.sh 上加 --with-screenshots。
+docs/screenshots/v*/*.png
+
 # ---------- Python ----------
 __pycache__/
 *.pyc

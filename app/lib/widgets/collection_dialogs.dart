@@ -4,6 +4,8 @@
 /// 移动到…」弹层，而这些弹层的**文案就是语义本身**（「移动到下面、不删源合集」
 /// 与旧的「并入并删除源合集」是完全相反的两件事）。只留一处真相，才不会出现
 /// 首页已经改对、合集页还写着旧文案的情况。
+/// v2.38.0 加的「编辑封面与简介」同理：首页管理面板与子合集卡左滑用的是同一个
+/// 对话框。
 ///
 /// 合集名的展示统一走 [collectionDisplay]（`甲/乙` → `甲 / 乙`）：顶层合集没有
 /// `/`，展示出来与原样完全一致（既有测试锚点不受影响）；子合集带全路径，
@@ -188,6 +190,120 @@ class CollectionPathTile extends StatelessWidget {
       ),
       trailing: trailing,
       onTap: onTap,
+    );
+  }
+}
+
+/// 编辑合集封面与简介：返回用户填的两个值（null = 取消）。
+///
+/// 只负责**收集输入**，落库交给调用方（模型层的 [setCollectionMeta]）。
+/// - 封面只收 **URL**（为什么不做「从相册选图」见 [CollectionInfo.cover] 的
+///   注释：白名单整份存在 Gist，每次写操作都要 PATCH 整份，图片 base64 进去
+///   会让每次写入膨胀到十几 MB；本地路径换设备就丢）；
+/// - **留空 = 不设置**：封面留空 → 卡片回落到「合集内第一个视频的封面」
+///   （与改动前完全一致）；简介留空 → 卡片不占位。所以对话框不提供「恢复
+///   默认」按钮，清空输入框本身就是要表达的意思；
+/// - 简介 `maxLines: 4`：卡片上只展示 1–2 行，「够写一句话」比「能写一篇」
+///   更贴合这个字段的用途。
+///
+/// 对话框本体的输入框状态放在一个**私有 StatefulWidget** 里（[_CollectionMetaDialog]），
+/// 而不是在这个函数里 `TextEditingController()` + 用完 `dispose()`：
+/// `showDialog` 的 future 在路由**开始退场**时就完成，此时对话框里的 TextField
+/// 还没被卸载 —— 那时候 dispose 控制器会踩到 Flutter 框架的
+/// `_dependents.isEmpty` 断言（重建树时直接抛异常）。让 State 自己管自己，
+/// 生命周期就天然对齐了。
+Future<({String cover, String desc})?> showEditCollectionMetaDialog(
+  BuildContext context,
+  String path, {
+  String cover = '',
+  String desc = '',
+}) =>
+    showDialog<({String cover, String desc})>(
+      context: context,
+      builder: (_) => _CollectionMetaDialog(
+        path: path,
+        initialCover: cover,
+        initialDesc: desc,
+      ),
+    );
+
+/// 「封面与简介」对话框本体：自己持有两个输入控制器，随 State 一起释放。
+class _CollectionMetaDialog extends StatefulWidget {
+  final String path;
+  final String initialCover;
+  final String initialDesc;
+
+  const _CollectionMetaDialog({
+    required this.path,
+    required this.initialCover,
+    required this.initialDesc,
+  });
+
+  @override
+  State<_CollectionMetaDialog> createState() => _CollectionMetaDialogState();
+}
+
+class _CollectionMetaDialogState extends State<_CollectionMetaDialog> {
+  late final TextEditingController _coverCtrl =
+      TextEditingController(text: widget.initialCover);
+  late final TextEditingController _descCtrl =
+      TextEditingController(text: widget.initialDesc);
+
+  @override
+  void dispose() {
+    _coverCtrl.dispose();
+    _descCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: Text('封面与简介「${collectionDisplay(widget.path)}」'),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextField(
+              controller: _coverCtrl,
+              autofocus: true,
+              keyboardType: TextInputType.url,
+              decoration: const InputDecoration(
+                labelText: '封面图片 URL',
+                helperText: '留空 = 自动用合集内第一个视频的封面',
+                helperMaxLines: 2,
+                border: OutlineInputBorder(),
+                isDense: true,
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _descCtrl,
+              maxLines: 4,
+              minLines: 3,
+              decoration: const InputDecoration(
+                labelText: '简介',
+                hintText: '这个合集是干什么的（留空则不显示）',
+                border: OutlineInputBorder(),
+                isDense: true,
+              ),
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('取消'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.pop(
+            context,
+            (cover: _coverCtrl.text, desc: _descCtrl.text),
+          ),
+          child: const Text('保存'),
+        ),
+      ],
     );
   }
 }

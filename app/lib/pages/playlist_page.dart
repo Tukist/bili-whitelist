@@ -1115,6 +1115,8 @@ class _PlaylistPageState extends State<PlaylistPage> {
         onRename: _renameCollection,
         onDelete: _deleteCollection,
         onMove: _moveCollectionUnder,
+        // 封面 / 简介编辑（v2.38.0）：面板里改的是**顶层**合集
+        onEditMeta: _editCollectionMeta,
       ),
     );
   }
@@ -1188,6 +1190,83 @@ class _PlaylistPageState extends State<PlaylistPage> {
     await _deleteCollection(path);
   }
 
+  /// 合集卡左滑「移动」：选目标 → 确认 → [_moveCollectionUnder]。
+  ///
+  /// **为什么不是「把卡片直接拖到另一张卡上」**（说明白，免得以后有人想改）：
+  /// 首页的同级重排用的是 [ReorderableListView]，它内部走
+  /// `MultiDragGestureRecognizer` + 自己的 `_DragInfo extends Drag`，**不是**
+  /// `Draggable` —— 所以 `DragTarget` 收不到它的事件，拿不到「手指现在悬在
+  /// 哪张卡上」这个信息，也就做不出「拖到卡上落点」。要做真拖拽只能把首页整个
+  /// 拖拽机制换掉（换成 Draggable + DragTarget 手写），代价是丢掉
+  /// ReorderableListView 现成的自动滚动、松手弹回、拖拽代理样式与
+  /// `ReorderableDelayedDragStartListener` 的长按语义，还要自己处理索引映射
+  /// 与「拖到卡片上 = 嵌套 / 拖到卡片间 = 同级重排」两套落点判定——风险与
+  /// 回归面都远大于收益，所以 v2.38.0 走「两步选择」（选目标 → 确认），
+  /// 与管理面板那条入口完全同一个动作、同一套防环校验。
+  ///
+  /// 目标列表由 [collectionMoveTargetsFor] 给：已排除自己 / 自己的子孙 /
+  /// 当前父级（防环 + 不列无效项），非顶层时首项是「移到顶层」。
+  /// 目标为空（只有自己一个合集）→ 给一句提示，不弹空列表。
+  Future<void> _moveCollectionFromCard(String path) async {
+    final targets = collectionMoveTargetsFor(
+      path,
+      [for (final c in _data.collections) c.name],
+    );
+    if (targets.isEmpty) {
+      _showSnack('没有其它合集可以作为目标，请先新建一个合集');
+      return;
+    }
+    final target = await showCollectionMoveTargetSheet(
+      context,
+      source: path,
+      targets: targets,
+    );
+    if (target == null || !mounted) return;
+    final confirmed = await showMoveCollectionConfirmDialog(
+      context,
+      source: path,
+      target: target,
+      videoCount: _data.videos.where((v) => v.collection == path).length,
+      childCount: collectionChildrenOf(_data, path).length,
+    );
+    if (confirmed != true || !mounted) return;
+    await _moveCollectionUnder(path, target);
+  }
+
+  /// 编辑合集的封面与简介（v2.38.0）：弹对话框收 URL + 简介 →
+  /// [setCollectionMeta] → 落库刷新。
+  ///
+  /// 封面只收 **URL**（不做「从相册选图」的理由见 [CollectionInfo.cover]）；
+  /// 两个输入框都支持留空 = 不设置（清空即恢复默认），所以对话框没有额外的
+  /// 「恢复默认」按钮。
+  Future<void> _editCollectionMeta(String path) async {
+    final matches = _data.collections.where((c) => c.name == path);
+    if (matches.isEmpty) return; // 竞态：面板开着时合集被删了
+    final current = matches.first;
+    final input = await showEditCollectionMetaDialog(
+      context,
+      path,
+      cover: current.cover,
+      desc: current.desc,
+    );
+    if (input == null || !mounted) return;
+    if (input.cover.trim() == current.cover &&
+        input.desc.trim() == current.desc) {
+      return; // 没改任何东西 → 不产生一次无意义的 Gist 写入
+    }
+    try {
+      final next = setCollectionMeta(
+        _data,
+        path,
+        cover: input.cover,
+        desc: input.desc,
+      );
+      await _saveAndRefresh(next);
+    } on CollectionException catch (e) {
+      _showSnack(e.message, kind: SnackKind.error);
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // 合集卡片数据：collections 数组顺序即展示顺序；「未分类」固定最后一张。
   // ---------------------------------------------------------------------------
@@ -1205,11 +1284,22 @@ class _PlaylistPageState extends State<PlaylistPage> {
   /// 的精确匹配一致），子合集数另算一行提示。
   List<_CollectionCardData> _cards() {
     final cards = <_CollectionCardData>[];
-    void addCard(String name, List<WhitelistVideo> vids, {int childCount = 0}) {
+    void addCard(
+      String name,
+      List<WhitelistVideo> vids, {
+      int childCount = 0,
+      String cover = '',
+      String desc = '',
+    }) {
       cards.add((
         name: name,
         count: vids.length,
-        cover: vids.isNotEmpty ? vids.first.cover : '',
+        // 封面优先级：合集自己设的 cover（v2.38.0）> 合集内第一个视频的封面
+        // （改动前的行为，零成本，老数据完全不变）> 空串走占位图标
+        cover: cover.isNotEmpty
+            ? cover
+            : (vids.isNotEmpty ? vids.first.cover : ''),
+        desc: desc,
         stat: _stats[name == kUncategorizedLabel ? '' : name],
         childCount: childCount,
       ));
@@ -1222,10 +1312,13 @@ class _PlaylistPageState extends State<PlaylistPage> {
         c.name,
         _data.sortedVideos(c.name),
         childCount: collectionChildrenOf(_data, c.name).length,
+        cover: c.cover,
+        desc: c.desc,
       );
     }
     // 「未分类」固定卡片：始终显示（含 0 个），让用户知道新导入视频的默认归处
-    // （未分类不是路径，不能有子合集 → childCount 恒 0）
+    // （未分类不是路径，不能有子合集 → childCount 恒 0；它也不是合集，
+    // 没有 CollectionInfo → 没有可设的封面简介，行为与改动前一致）
     addCard(kUncategorizedLabel, _data.sortedVideos(''));
     return cards;
   }
@@ -1579,17 +1672,24 @@ class _PlaylistPageState extends State<PlaylistPage> {
                           name: card.name,
                           count: card.count,
                           cover: card.cover,
+                          desc: card.desc,
                           stat: card.stat,
                           childCount: card.childCount,
                           draggable: !isUncategorized,
                           onTap: () => _openCollection(card.name),
-                          // 「未分类」不可重命名/删除 → 不传回调 → 不启用左滑
+                          // 「未分类」不是合集：不能重命名 / 删除 / 移动 / 设封面
+                          // → 两个回调都不传 → 左滑整块关掉（与改动前一致）
                           onRename: isUncategorized
                               ? null
                               : () => _renameCollectionFromCard(card.name),
                           onDelete: isUncategorized
                               ? null
                               : () => _deleteCollectionFromCard(card.name),
+                          // 左滑「移动」= 把这张顶层卡嵌套到别的合集下面
+                          // （与管理面板里那条「移动到其他合集」同一个动作）
+                          onMove: isUncategorized
+                              ? null
+                              : () => _moveCollectionFromCard(card.name),
                         ),
                       );
                     },
@@ -1892,10 +1992,13 @@ String _trimNumber(double v) =>
 /// 更新时间角标和一条观看进度条，其余照常渲染。
 /// [childCount] 是 v2.30.0 加的**直属子合集数**（嵌套后卡片要能看出「里面
 /// 还有子合集」）；0 → 不显示那句提示（顶层平面结构的老数据看起来不变）。
+/// [desc] 是 v2.38.0 加的用户自设简介；空串 → 卡片上不渲染任何节点（与改动前
+/// 逐像素一致）。
 typedef _CollectionCardData = ({
   String name,
   int count,
   String cover,
+  String desc,
   CollectionStat? stat,
   int childCount,
 });
@@ -1907,6 +2010,11 @@ const double _kCollectionProgressH = 3;
 ///
 /// 多张卡片共用同一个 key 值不会冲突（它们各自是不同 [Stack] 的孩子）。
 const Key kCollectionProgressBarKey = ValueKey('collection-progress-bar');
+
+/// 合集卡「简介」那一行的 key（测试锚点：没设简介时这一行**根本不存在**，
+/// 而不是「渲染成一个空串」——用 key 断言比数 [Text] 个数稳，卡片上还有
+/// 异步加载的角标 / 进度条会改变 Text 的数量）。
+Key collectionDescKey(String name) => ValueKey('collection-desc:$name');
 
 /// 合集卡右上角「更新时间角标」的文案；取不到时间 → null（不显示角标，
 /// 绝不出现「null 更新」这种）。
@@ -1927,8 +2035,9 @@ String? collectionBadgeText(CollectionStat? stat, {DateTime? now}) {
 /// 合集卡片（行式）：左侧代表视觉（封面 / 渐变底 + 图标），右侧合集名 +
 /// 更新时间角标 + 视频数 / 观看进度，尾部拖动手柄提示（未分类不可拖不显示）。
 ///
-/// - **左滑操作块**（v2.19.x）：整卡由 [SwipeActionBox] 包住，左滑露出
-///   「重命名」「删除」；[onRename] / [onDelete] 都不传（「未分类」固定卡）
+/// - **左滑操作块**（v2.19.x；v2.38.0 加「移动」）：整卡由 [SwipeActionBox]
+///   包住，左滑露出「移动」「重命名」「删除」；[onRename] / [onDelete] 都不传
+///   （「未分类」固定卡）
 ///   时左滑整块关掉（`enabled: false`，树里连手势层都没有）。「收藏夹」
 ///   入口卡是 [_FavoritesCard]，不经过这里。
 ///
@@ -1948,18 +2057,26 @@ String? collectionBadgeText(CollectionStat? stat, {DateTime? now}) {
 class _CollectionCard extends StatelessWidget {
   final String name;
   final int count;
-  final String cover; // 该合集首个视频封面（无视频/未分类 → 空串走图标）
+  final String cover; // 合集自设封面（v2.38.0）> 首个视频封面；都没有 → 空串走图标
   final bool draggable; // 是否可拖动（未分类固定最后，不可拖）
   final VoidCallback onTap;
 
   /// 直属子合集数（v2.30.0 嵌套）：> 0 时副信息行加一句「含 N 个子合集」。
   final int childCount;
 
+  /// 用户自设简介（v2.38.0）；空串 → **不渲染任何节点**（不占位、不加间距），
+  /// 老数据（没有这个字段）的卡片与改动前逐像素一致。
+  final String desc;
+
   /// 左滑「重命名」回调；null → 不启用左滑操作块（「未分类」固定卡）。
   final VoidCallback? onRename;
 
   /// 左滑「删除」回调；null → 不启用左滑操作块。
   final VoidCallback? onDelete;
+
+  /// 左滑「移动」回调（v2.38.0）：把本合集嵌套到别的合集下面；null → 不显示
+  /// 这一块（「未分类」不是合集，不能移动）。
+  final VoidCallback? onMove;
 
   /// 该合集的观看统计；null = 统计未加载完（或加载失败）→ 素态显示。
   final CollectionStat? stat;
@@ -1971,9 +2088,11 @@ class _CollectionCard extends StatelessWidget {
     required this.draggable,
     required this.onTap,
     this.childCount = 0,
+    this.desc = '',
     this.stat,
     this.onRename,
     this.onDelete,
+    this.onMove,
   });
 
   @override
@@ -2097,6 +2216,23 @@ class _CollectionCard extends StatelessWidget {
                               ],
                             ],
                           ),
+                          // 用户自设简介（v2.38.0）：**空串时整段不建节点**
+                          // ——不加 Text、不加间距，老数据卡片与改动前逐像素一致。
+                          // 2 行截断：合集卡是列表项，简介只是「一句话说明」，
+                          // 撑高卡片会把合集列表的可视条数压下去；全文可在
+                          // 「编辑封面与简介」里看。
+                          if (desc.isNotEmpty) ...[
+                            const SizedBox(height: 4),
+                            Text(
+                              desc,
+                              key: collectionDescKey(name),
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: theme.textTheme.bodySmall?.copyWith(
+                                color: theme.colorScheme.outline,
+                              ),
+                            ),
+                          ],
                         ],
                       ),
                     ),
@@ -2144,12 +2280,28 @@ class _CollectionCard extends StatelessWidget {
     );
 
     // 左滑操作块（v2.19.x）：只对**真实合集**启用 —— 「未分类」是不可
-    // 重命名/删除的固定卡（页面不传回调 → enabled=false → 直接就是这张卡，
-    // 零手势层）。「收藏夹」卡是另一个 widget，压根不经过这里。
+    // 重命名 / 删除 / 移动的固定卡（页面不传回调 → enabled=false → 直接就是
+    // 这张卡，零手势层）。「收藏夹」卡是另一个 widget，压根不经过这里。
+    //
+    // v2.38.0 起是**三块**（移动 / 重命名 / 删除），顺序与合集页子合集卡完全
+    // 一致：删除固定在**最右**（贴屏边，误触概率最低），新增的「移动」加在
+    // **最左**——既有两块的位置一个像素都没变，老用户的手感不变。
+    // 宽度实测：3 × 76 = 228dp，卡片可用宽 336dp（360 - 左右各 12 内边距）→
+    // 全露出后卡片仍留 108dp（封面 64 + 一截名字可见），且 [SwipeActionBox]
+    // 内部 `_travel` 是按 `min(操作块总宽, 宿主宽)` 取的，任何宽度都不会撑破
+    // 卡片盒子（`swipe_action_box_test` 已覆盖窄宿主裁剪）。
     final canSwipe = onRename != null && onDelete != null;
     return SwipeActionBox(
       enabled: canSwipe,
       actions: [
+        if (onMove != null)
+          SwipeAction(
+            label: '移动',
+            icon: Icons.drive_file_move_outlined,
+            color: context.palette.inkFill,
+            textColor: context.palette.onInk,
+            onTap: onMove!,
+          ),
         if (onRename != null)
           SwipeAction(
             label: '重命名',
@@ -2520,7 +2672,7 @@ class _EmptyView extends StatelessWidget {
 }
 
 /// 合集管理面板（BottomSheet）：列出**本层**合集（路径名 + 视频数 / 子合集数），
-/// 每个合集可 移动到其他合集 / 重命名 / 删除。
+/// 每个合集可 编辑封面与简介 / 移动到其他合集 / 重命名 / 删除。
 ///
 /// - 首页传的 [pathsOf] 只有顶层（子合集在自己的父合集页里管理）；合集页若复用
 ///   也传自己那一层的路径 —— 面板只负责展示给它的那一层
@@ -2528,7 +2680,8 @@ class _EmptyView extends StatelessWidget {
 ///   层级的合集，但要排除自己与自己的子孙，见 [_move]）
 /// - 数据不持有快照：通过 [pathsOf] / [countOf] / [childCountOf] 每次从页面拉取
 ///   最新值，操作成功后内部 setState 重拉，列表即时反映页面 `_data`
-/// - [onRename] / [onDelete] / [onMove] 交回页面统一走「写 Gist → 缓存 → 刷新」
+/// - [onRename] / [onDelete] / [onMove] / [onEditMeta] 交回页面统一走
+///   「写 Gist → 缓存 → 刷新」
 class _CollectionManageSheet extends StatefulWidget {
   final List<String> Function() pathsOf;
   final List<String> Function() allPathsOf;
@@ -2541,6 +2694,9 @@ class _CollectionManageSheet extends StatefulWidget {
   /// 源合集不被删除，视频与子孙跟着走（见模型层 `moveCollectionUnder`）。
   final Future<void> Function(String source, String target) onMove;
 
+  /// 编辑封面与简介（v2.38.0）：页面层弹对话框 + 落库。
+  final Future<void> Function(String path) onEditMeta;
+
   const _CollectionManageSheet({
     required this.pathsOf,
     required this.allPathsOf,
@@ -2549,6 +2705,7 @@ class _CollectionManageSheet extends StatefulWidget {
     required this.onRename,
     required this.onDelete,
     required this.onMove,
+    required this.onEditMeta,
   });
 
   @override
@@ -2596,6 +2753,12 @@ class _CollectionManageSheetState extends State<_CollectionManageSheet> {
     if (confirmed != true || !mounted) return;
     await widget.onMove(path, target);
     if (mounted) setState(() {}); // 重拉合集列表
+  }
+
+  /// 编辑封面与简介：弹对话框收输入 → 回调页面落库。
+  Future<void> _editMeta(String path) async {
+    await widget.onEditMeta(path);
+    if (mounted) setState(() {}); // 重拉合集列表（页面 _data 已更新）
   }
 
   /// 删除确认对话框：提示该合集下 N 个视频将移回未分类、M 个子合集上提一级。
@@ -2663,6 +2826,16 @@ class _CollectionManageSheetState extends State<_CollectionManageSheet> {
                     trailing: Row(
                       mainAxisSize: MainAxisSize.min,
                       children: [
+                        // 封面与简介（v2.38.0）：加在最前，既有三块的位置一动
+                        // 不动（既有测试锚着它们的 tooltip 与顺序）。宽度用
+                        // compact 收一档：360dp 屏上四块默认 48dp 会把标题挤到
+                        // 只剩 5 个字，这一块属于「设置类低频动作」，让位给名字。
+                        IconButton(
+                          tooltip: '编辑封面与简介',
+                          visualDensity: VisualDensity.compact,
+                          icon: const Icon(Icons.image_outlined, size: 20),
+                          onPressed: () => _editMeta(path),
+                        ),
                         IconButton(
                           tooltip: '移动到其他合集',
                           icon: const Icon(Icons.drive_file_move_outlined,
