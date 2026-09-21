@@ -587,6 +587,171 @@ final Map<String, String> _viewDescCache = {};
 const double kPortraitVideoHeightRatio = 0.6;
 const double kLandscapeVideoHeightRatio = 0.55;
 
+/// 底栏按钮行高度（选集/倍速/听视频/字幕/弹幕/评论/下载/全屏）。
+///
+/// [_PlayerPageState._buildSeekRowOnly] 要在进度条行下方留出同样的空档（见其
+/// 注释），两条路径共用本常量。
+///
+/// 44 → **40**（v2.39.0，用户原话「视频播放窗口下方的功能栏太高。ui美术，
+/// 比例需要改进」）：底栏是**叠在视频区里**的（见 `_buildVideoLayers`），收矮
+/// 只会露出更多画面，不影响视频区 / 评论区高度。竖向内容的实测高度是 36.2dp
+/// （算式见 `_barIconLabel`），44 里有 7.8dp 是纯空白——两行各收 4dp（本行 +
+/// 进度条行 `_PlayerSeekBar.height`）一共让出 **8dp** 画面。**不往 36 收**：
+/// 那会顶到内容且没有余量，中文字体在不同机型上的行高微差就会裁切。
+///
+/// 触摸目标：本行 40dp 高，但每格宽 51.4dp（411dp 屏 8 等分），实际可点区
+/// 51.4×40dp 与改动前同量级；真正被 Android ≥44 规范约束的是进度条行
+/// （细轨 + 拖动柄），它的下限单列在 `_PlayerSeekBar.height`。
+const double _kBottomButtonRowHeight = 40;
+
+/// 底栏控制行总高 = 进度条行（[_PlayerSeekBar.height]）+ 按钮行
+/// （[_kBottomButtonRowHeight]）——v2.39.0 起 40 + 40 = **80**（改动前
+/// 44 + 44 = 88）。
+///
+/// 从两个行高**推导**而不是写死 80：字幕层的悬浮基准
+/// （[subtitleBottomOffset]）必须与控制行顶部保持定值间隙（全屏 30 / 非全屏
+/// 12），写死数字的话下次再调行高就会静默错位——历史上 P5 把控制行 80 → 88
+/// 时就得手工把两个基准各 +8，v2.39.0 再 -8，正是同一个隐患。
+/// 上下集行 `_PlaylistRowHeight`（40）**不计入**：它只出现在有播放列表时，
+/// 字幕让开的永远是下面两行。
+const double kPlayerBottomBarHeight =
+    _PlayerSeekBar.height + _kBottomButtonRowHeight;
+
+/// 字幕悬浮基准（相对**视频区矩形底边**的 bottom 偏移，dp）——纯函数，为了
+/// 把「字幕让开控制行」这条几何关系钉进单测（widget 层的字幕文本要在测试里
+/// 真拉到字幕才出现，成本和脆弱度都高于直接测这条关系）。
+///
+/// 语义（v2.17.0+，v2.39.0 改控制行高度后仍成立）：
+/// - 控制层**可见**：抬到控制行顶部之上，全屏 30 / 非全屏 12——这两个间隙是
+///   历史观感值（全屏画面大、留白可以更松），与 [kPlayerBottomBarHeight] 相加
+///   得到实际 bottom（全屏 110 / 非全屏 92，改动前是 118 / 100）。
+/// - 控制层**隐藏**（沉浸观影）：贴画面底部，全屏 24 / 非全屏 16——与控制行
+///   无关的历史取值，故不随控制行高度变化（防字幕跑偏）。
+double subtitleBottomOffset({
+  required bool fullscreen,
+  required bool controlsVisible,
+}) {
+  if (!controlsVisible) return fullscreen ? 24 : 16;
+  return fullscreen ? kPlayerBottomBarHeight + 30 : kPlayerBottomBarHeight + 12;
+}
+
+// ---------------------------------------------------------------------------
+// 全屏画面变换（缩放 / 旋转 / 平移）的换算纯函数（v2.39.0+）
+// ---------------------------------------------------------------------------
+// 放在顶层（而不是 _PlayerPageState 的 static）的唯一理由是**可单测**：本仓库
+// 的既有约定就是「几何/判定逻辑抽成顶层纯函数，widget 测试直接断言」（见
+// decideMode / nextPanMode / seekTargetMs / subtitleBottomOffset）。
+// 手势实现（Listener + 手算）见 [_PlayerPageState] 里的 _onViewPointer* 一节。
+
+/// 平移偏移夹取：把 [offset] 夹在当前缩放/旋转下画面**允许外移的最大范围**内。
+///
+/// 语义：缩放后画面比可视区大，最多能拖到「画面边缘贴住可视区边缘」；缩放为 1
+/// （画面本来就装得下）时只能为 0。旋转 90°/270° 时画面长短边互换，所以先按
+/// 「旋转后的贴合尺寸」再算余量。余量 = (缩放后画面尺寸 - 可视区尺寸) / 2，
+/// 负数取 0（画面比可视区小 → 不许拖）。
+Offset clampViewOffset({
+  required Offset offset,
+  required double scale,
+  required Size viewSize,
+  required double aspectRatio,
+  required double rotation,
+}) {
+  final maxX = viewPanLimit(
+    scale: scale,
+    viewWidth: viewSize.width,
+    viewHeight: viewSize.height,
+    aspectRatio: aspectRatio,
+    rotation: rotation,
+    horizontal: true,
+  );
+  final maxY = viewPanLimit(
+    scale: scale,
+    viewWidth: viewSize.width,
+    viewHeight: viewSize.height,
+    aspectRatio: aspectRatio,
+    rotation: rotation,
+    horizontal: false,
+  );
+  return Offset(
+    offset.dx.clamp(-maxX, maxX),
+    offset.dy.clamp(-maxY, maxY),
+  );
+}
+
+/// 单轴可平移上限（px，≥0）：见 [clampViewOffset] 的语义。
+double viewPanLimit({
+  required double scale,
+  required double viewWidth,
+  required double viewHeight,
+  required double aspectRatio,
+  required double rotation,
+  required bool horizontal,
+}) {
+  if (viewWidth <= 0 || viewHeight <= 0) return 0;
+  final rotated = rotation % math.pi != 0; // 90° / 270°：长短边互换
+  final aspect = aspectRatio > 0 ? aspectRatio : 16 / 9;
+  // 画面在可视区内按 AspectRatio 居中后的「贴合尺寸」
+  double w = viewWidth;
+  double h = viewWidth / aspect;
+  if (h > viewHeight) {
+    h = viewHeight;
+    w = viewHeight * aspect;
+  }
+  final boxW = rotated ? h : w; // 旋转 90° 后画面占的横向尺寸
+  final boxH = rotated ? w : h;
+  final scaledW = boxW * scale;
+  final scaledH = boxH * scale;
+  final limit = horizontal
+      ? (scaledW - viewWidth) / 2
+      : (scaledH - viewHeight) / 2;
+  return limit > 0 ? limit : 0;
+}
+
+/// 双指捏合 → 缩放倍数：以**手势起始倍数**为基准乘「间距比」，钳制在
+/// [kMinViewScale]..[kMaxViewScale]。
+///
+/// 用起始倍数 × 比值而不是逐帧累乘：逐帧累乘会把夹取损失与浮点误差滚进基准，
+/// 捏到上限再松开时画面不会跟着回缩（手感「粘住」）。
+/// [startSpan] ≤ 0（两指重合，极端）→ 保持起始倍数（不做除零）。
+double viewScaleFromGesture({
+  required double startScale,
+  required double startSpan,
+  required double span,
+}) {
+  if (startSpan <= 0 || span <= 0 || !span.isFinite) {
+    return startScale.clamp(kMinViewScale, kMaxViewScale);
+  }
+  final next = startScale * (span / startSpan);
+  return next.isFinite
+      ? next.clamp(kMinViewScale, kMaxViewScale)
+      : startScale.clamp(kMinViewScale, kMaxViewScale);
+}
+
+/// 旋转角**吸附到 90° 步进**并归一化到 [0, 2π)。
+///
+/// 为什么吸附：自由旋转必然出现 37° 这种歪画面——四角露黑边、字幕/弹幕又不
+/// 跟着转，读起来像渲染坏了；B 站/iOS 播放器也都是 90° 档。
+double snapViewRotation(double radians) {
+  if (!radians.isFinite) return 0;
+  final steps = (radians / kViewRotationStep).round();
+  final snapped = steps * kViewRotationStep;
+  final twoPi = 2 * math.pi;
+  final normalized = snapped % twoPi;
+  return normalized < 0 ? normalized + twoPi : normalized;
+}
+
+/// 把角度差归一化到 (-π, π]：两指连线方向 `Offset.direction` 的值域是
+/// [-π, π]，跨界时会从 π 跳到 -π，直接相减会得到 ±2π 的假旋转。
+/// 代价：单次手势最多转 ±180°（要 180° 就转两次），对 90° 档位足够。
+double normalizeAngleDelta(double delta) {
+  if (!delta.isFinite) return 0;
+  final twoPi = 2 * math.pi;
+  var d = delta % twoPi;
+  if (d > math.pi) d -= twoPi;
+  if (d <= -math.pi) d += twoPi;
+  return d;
+}
+
 /// 「评论区滚动收起视频信息块」（竖屏非全屏）的方向判定阈值（px）。
 ///
 /// 评论列表滚动时按**累积位移**判方向：连续向下翻（内容上移，scrollDelta > 0）
@@ -605,6 +770,85 @@ const List<DeviceOrientation> kPlayerPageFreeOrientations = [
   DeviceOrientation.landscapeLeft,
   DeviceOrientation.landscapeRight,
 ];
+
+/// 播放源（v2.39.0+「本地缓存 / 网络流」二态切换）。
+///
+/// 背景（用户原话）：「当我缓存了一个视频的音频的时候，我就没法观看视频
+/// 画面了。也就是说我需要一个切换本地播放和流媒体播放的东西」——**仅音频
+/// 缓存**时不带视频轨，缓存命中就无条件走本地 → 永远看不到画面。用户没有
+/// 别的出口（删缓存重看要重下整段），所以给播放页一个显式的源切换。
+///
+/// 语义边界：这不是清晰度档位，只回答「这一次取源走哪条路」。
+/// - [local]：命中本地缓存就用本地文件（省流量、离线可看）——**默认值**，
+///   与 v2.38.0 及以前的行为逐字节一致（含离线缓存页的「仅音频离线播放」
+///   契约：那条路径进来也是 local）。
+/// - [network]：强制走 [BiliApi] 取流那条既有路径（可看画面 / 更高清晰度），
+///   代价是流量与 URL 过期后的重取（active 预取照常工作，见 [_netStreamDeadlineMs]）。
+///
+/// 与 [_audioOnlyPlayback]/[_listenMode] 正交：「源本身没有视频轨」（前者）
+/// 和「用户主动隐藏画面」（后者）都不决定取源走哪条路——切到 [network]
+/// 正是为了绕开「源没有视频轨」这件事。
+enum PlaySource {
+  /// 本地缓存优先（默认；缓存缺失时自然回落网络）。
+  local,
+
+  /// 强制网络取流（忽略本地缓存）。
+  network,
+}
+
+/// 「接近正方形」的宽高比容差（|aspect - 1| ≤ 本值 → 视为正方形/近方形，
+/// 进全屏**不锁方向**，避免在两向之间抖）。0.1 = 0.9 ~ 1.1，覆盖 1:1 与
+/// 常见的近方形测试卡/录屏。
+const double kFullscreenSquareAspectTolerance = 0.1;
+
+/// 进全屏时应锁的方向（纯函数，v2.39.0+，可单测）。
+///
+/// 背景（用户原话）：「竖屏视频全屏之后还是竖屏，而不是现在的旋转九十度」——
+/// 旧实现进全屏**无条件**锁 landscape 两向（[kPlayerPageFreeOrientations] 的
+/// 横屏部分），竖屏视频（如 9:16）在横屏整屏里只占约 1/3 宽、左右大黑边。
+///
+/// 返回语义（**空列表 = 不下发方向命令**，保持设备当前方向）：
+/// - [known] 为 false（宽高比还没拿到：`_onPrepared` 尚未上报）→ 返回
+///   [kPlayerPageFreeOrientations]（"不锁"：竖屏 + 双向横屏都允许，用户可以
+///   自由转，等画面就绪后由 `_onPrepared` 补一次锁）。这条兜底很要紧：全屏
+///   按钮在 `!_loaded` 时也可点，而 [_aspectRatio] 初值是 16:9——不兜底就会
+///   出现「竖屏视频被错锁横屏」的窗口；
+/// - 接近 1:1（|aspect - 1| ≤ [kFullscreenSquareAspectTolerance]）→ 空列表，
+///   两个方向都说得通，锁谁都会让另一半用户觉得错，保持现状最稳；
+/// - 竖向（aspect < 1）→ 只锁 [DeviceOrientation.portraitUp]（**不含
+///   portraitDown**：倒持全屏没有任何理由）；
+/// - 横向（aspect > 1）→ 锁 landscape 两向（**与旧行为完全一致**，横屏视频
+///   的既有体验零改动）。
+///
+/// 比例异常（NaN/∞/≤0，防御）→ 空列表（不下命令，不等于锁横屏）。
+List<DeviceOrientation> fullscreenOrientationsFor(
+  double aspectRatio, {
+  bool known = true,
+}) {
+  if (!known) return kPlayerPageFreeOrientations;
+  if (!aspectRatio.isFinite || aspectRatio <= 0) return const [];
+  if ((aspectRatio - 1).abs() <= kFullscreenSquareAspectTolerance) {
+    return const [];
+  }
+  return aspectRatio < 1
+      ? const [DeviceOrientation.portraitUp]
+      : const [
+          DeviceOrientation.landscapeLeft,
+          DeviceOrientation.landscapeRight,
+        ];
+}
+
+/// 全屏画面缩放的上下限（v2.39.0+，见 [_PlayerPageState._viewScale]）。
+///
+/// 下限 1.0：不支持缩小到比「贴合尺寸」更小——那只会露出更多黑边，没有任何
+/// 信息量（视频播放器不需要「缩小看整幅」）。
+/// 上限 4.0：1080P 画面在 411dp 宽的竖屏上放大 4 倍已经接近「逐字看字幕」的
+/// 极限，再大就纯粹是马赛克；4 倍也刚好让单指平移有足够的可移动余量。
+const double kMinViewScale = 1.0;
+const double kMaxViewScale = 4.0;
+
+/// 旋转档位步进（弧度）：π/2 = 90°。手势里的连续旋转角只用于判定换档。
+const double kViewRotationStep = math.pi / 2;
 
 class PlayerPage extends StatefulWidget {
   final WhitelistVideo video;
@@ -715,6 +959,17 @@ class _PlayerPageState extends State<PlayerPage>
   int _positionMs = 0;
   int _durationMs = 0;
   double _aspectRatio = 16 / 9;
+
+  /// 宽高比是否**真的**来自播放器（[_onPrepared] 的 width/height）。
+  ///
+  /// 为什么不能只看 `_aspectRatio != 16/9`：16:9 是初值也是真实值（绝大多数
+  /// 视频就是 16:9），两者无法区分；而进全屏的方向策略（v2.39.0，
+  /// [fullscreenOrientationsFor]）必须知道「这个比例是真的还是占位初值」——
+  /// 占位值下把竖屏视频锁成横屏正是要修的那个 bug。
+  /// 置 false 的时机：换源换 bvid（[playVideo]）、切分 P（[_switchToPage]）——
+  /// 新源的宽高比未知，等它的 [onPrepared] 再判定；若此刻正好在全屏，
+  /// [onPrepared] 会补一次锁。
+  bool _aspectKnown = false;
 
   // 信息块「补场」动画（块化与动效系统 · 批次 C）
   // ---------------------------------------------------------------------
@@ -847,6 +1102,219 @@ class _PlayerPageState extends State<PlayerPage>
   // 用 videoFromMeta 现构的无 desc 视频）。换源复位。
   String _runtimeDesc = '';
 
+  // 全屏画面变换（缩放 / 旋转 / 平移，v2.39.0+）
+  // ---------------------------------------------------------------------
+  // 需求（用户原话）：「全屏模式下可以手势放大，旋转视频窗口。注意不要和之前
+  // 的手势冲突」。四个字段全部**只在全屏下**被写（[kMinViewScale]..4.0 的
+  // 缩放、90° 步进的旋转、缩放态下的单指平移）：
+  // - 非全屏视频区只有 ~231dp 高，放大/旋转后能看到的有效内容反而更少；
+  // - 且非全屏的横滑是 seek（用户验收过的三向语义），双指手势会把单指拖动的
+  //   判断搅乱（[kPanModeThreshold] 那套豁免/锁定逻辑只认单指）。
+  // 复位时机：退出全屏（[_toggleFullscreen]）、换 bvid（[playVideo]）、切分 P
+  // （[_switchToPage]）——三者都会让「画面窗口」换一个坐标系。另有可见的复位
+  // 按钮（底栏，仅缩放态出现，见 [_buildBottomBar]）。
+  // 渲染（[Transform]）只包**画面本身**，手势层仍在 Transform 之外：否则缩放后
+  // 「点画面显隐控制层」的命中区会跟着变形（点空白处不再显隐）。字幕/弹幕层
+  // 同样不参与变换——B 站也是这个层级（字幕/弹幕跟着屏幕走，不跟着画面平移）。
+  /// 画面缩放倍数（1.0 = 原始大小；范围 [kMinViewScale]..[kMaxViewScale]）。
+  double _viewScale = 1;
+
+  /// 画面平移偏移（**视频区坐标系内的逻辑像素**；缩放态下单指拖动累加）。
+  /// 偏移量按当前缩放与区域尺寸夹取（见 [clampViewOffset]），保证画面不会
+  /// 被拖出可视区之外。
+  Offset _viewOffset = Offset.zero;
+
+  /// 旋转（弧度，恒为 90° 的整数倍：0 / π/2 / π / 3π/2）。
+  ///
+  /// **吸附到 90° 步进**而不是自由角度：自由旋转必然出现 37° 这种歪画面，四角
+  /// 露黑边、字幕/弹幕又不会跟着转，读起来像渲染坏了；B 站/iOS 播放器的旋转
+  /// 也是 90° 档。吸附换算在顶层纯函数 [snapViewRotation] 里（可单测）。
+  double _viewRotation = 0;
+
+  /// 本轮双指手势的起始状态（手势期间在起点值上叠加增量，不逐帧累加）：
+  /// 逐帧累加会把浮点误差和夹取损失滚进基准，松手再捏合时手感会漂。
+  double _viewScaleStart = 1;
+  double _viewRotationStart = 0;
+  Offset _viewPanStart = Offset.zero;
+
+  /// 多指手势是否正在进行（供 [_onPanDown] 等单指回调让路：双指期间单指拖动
+  /// 不能去 seek/调亮度）。
+  bool _viewGestureActive = false;
+
+  /// 复位画面变换（退出全屏 / 换 bvid / 切集 / 点复位按钮）。
+  ///
+  /// 同时**清掉双指手势状态**：退出全屏时 Listener 的四个回调会被摘掉
+  /// （`_viewGesturesEnabled` 变 false），若不在这里清，[_viewGestureActive]
+  /// 会永远停在 true → 之后所有单指拖动都被让路掉（seek / 亮度 / 音量全哑）。
+  void _resetViewTransform() {
+    _viewPointers.clear();
+    _viewPanRaw = Offset.zero;
+    final changed = _viewScale != 1 ||
+        _viewOffset != Offset.zero ||
+        _viewRotation != 0 ||
+        _viewGestureActive;
+    if (!changed) return;
+    debugPrint('[player_page] 画面变换复位（scale=$_viewScale rot=$_viewRotation）');
+    if (!mounted) {
+      _viewScale = 1;
+      _viewOffset = Offset.zero;
+      _viewRotation = 0;
+      _viewGestureActive = false;
+      return;
+    }
+    setState(() {
+      _viewScale = 1;
+      _viewOffset = Offset.zero;
+      _viewRotation = 0;
+      _viewGestureActive = false;
+    });
+  }
+
+  // -------- 双指缩放 / 旋转 / 平移的手势实现（v2.39.0+） --------
+  // 实现方式：**原始指针事件（Listener）+ 自己算变换**，不用 ScaleGestureRecognizer。
+  //
+  // 为什么不用 ScaleGestureRecognizer（实测依据，不是猜的）：
+  // Flutter 3.32 的 `ScaleGestureRecognizer._advanceStateMachine`（
+  // packages/flutter/lib/src/gestures/scale.dart:731-741）在 **单指** 时也判定
+  // `focalPointDelta > computePanSlop(...)` → `resolve(accepted)`——即单指拖动
+  // 一旦超过 slop，scale 识别器就**赢下竞技场**、把同场竞争的 Pan 挤掉。而
+  // onScaleStart 是「已经赢下竞技场之后」才回调的，那时候按 pointerCount 让位
+  // 已经晚了（Pan 那一轮已被判负、onPanStart 不会再来了）→ 用户验收过的三条
+  // 单指 seek 用例会直接挂掉。所以「在 onScaleStart 里按 pointerCount 让位」
+  // 这条方案在本项目**不可行**（本机 Flutter 源码逐行核对 + widget 测试验证）。
+  //
+  // 换成 Listener 的好处：Listener 不参与手势竞技场，只在命中路径上旁观原始
+  // 事件 → 单指拖动仍然完全落在原来的 Pan 识别器手里（三向语义逐字不变、
+  // 零回归），双指则由我们自己按 pointerId 配对计算。代价是要自己写几何换算，
+  // 但那部分本来就抽成了顶层纯函数（[viewScaleFromGesture] /
+  // [snapViewRotation] / [clampViewOffset]），可单测。
+
+  /// 双指手势是否启用：**只在全屏**（见 [_viewScale] 字段注释）。
+  bool get _viewGesturesEnabled => _fullscreen;
+
+  /// 当前按下的指针（pointerId → 手势层局部坐标）。只用于双指换算。
+  final Map<int, Offset> _viewPointers = <int, Offset>{};
+
+  /// 本轮双指手势的起始双指间距 / 起始连线角度 / 起始焦点。
+  double _viewStartSpan = 0;
+  double _viewStartAngle = 0;
+  Offset _viewStartFocal = Offset.zero;
+
+  /// 单指平移的**未夹取**累计偏移（夹取只在取值时做，避免「贴边后回不来」）。
+  Offset _viewPanRaw = Offset.zero;
+
+  /// 长按 2x 是否生效中（双指接管时要把它放掉，见 [_onLongPressStart]）。
+  bool _longPressSpeedActive = false;
+
+  void _onViewPointerDown(PointerDownEvent e) {
+    if (!_viewGesturesEnabled) return;
+    _viewPointers[e.pointer] = e.localPosition;
+    if (_viewPointers.length >= 2) _beginViewGesture();
+  }
+
+  void _onViewPointerMove(PointerMoveEvent e) {
+    if (!_viewGesturesEnabled || !_viewGestureActive) return;
+    if (!_viewPointers.containsKey(e.pointer)) return;
+    _viewPointers[e.pointer] = e.localPosition;
+    if (_viewPointers.length < 2) return;
+    _applyViewGesture();
+  }
+
+  void _onViewPointerUp(PointerEvent e) {
+    if (_viewPointers.remove(e.pointer) == null) return;
+    if (_viewPointers.length < 2 && _viewGestureActive) {
+      // 少于两指：双指手势结束（剩下那一指若继续拖 → 走「缩放态单指平移」，
+      // 与松手后再按一指的语义一致）
+      if (mounted) {
+        setState(() => _viewGestureActive = false);
+      } else {
+        _viewGestureActive = false;
+      }
+      _viewPanRaw = _viewOffset;
+    }
+  }
+
+  /// 双指就位（第二指按下 / 第三指加入）：接管手势 + 取本轮基准。
+  ///
+  /// 取「当前值」作基准而不是上次的起点：第三指加入或双指抬手再按都能从画面
+  /// 当前状态接着走，不会跳变。
+  void _beginViewGesture() {
+    // 单指那一轮可能在做的 seek / 亮度音量 / hud 一并作废（双指接管）
+    _onPanCancel();
+    // 长按 2x 若正生效：双指手势要看清画面，先放回原速（否则捏合一直在 2x）
+    if (_longPressSpeedActive) {
+      _longPressSpeedActive = false;
+      _applySpeed(_speedBeforeLongPress);
+    }
+    final ids = _viewPointers.keys.toList();
+    final p1 = _viewPointers[ids[0]]!;
+    final p2 = _viewPointers[ids[1]]!;
+    _viewScaleStart = _viewScale;
+    _viewRotationStart = _viewRotation;
+    _viewPanStart = _viewOffset;
+    _viewPanRaw = _viewOffset;
+    _viewStartSpan = (p2 - p1).distance;
+    _viewStartAngle = (p2 - p1).direction;
+    _viewStartFocal = (p1 + p2) / 2;
+    debugPrint('[player_page] 双指手势开始 span=${_viewStartSpan.toStringAsFixed(1)} '
+        'scale=$_viewScale rot=${_viewRotation.toStringAsFixed(2)}');
+    if (!_viewGestureActive) {
+      setState(() => _viewGestureActive = true);
+    }
+  }
+
+  /// 双指移动 → 换算缩放 / 旋转（90° 吸附）/ 平移，并同步渲染。
+  void _applyViewGesture() {
+    final ids = _viewPointers.keys.toList();
+    final p1 = _viewPointers[ids[0]]!;
+    final p2 = _viewPointers[ids[1]]!;
+    final span = (p2 - p1).distance;
+    final angle = (p2 - p1).direction;
+    final focal = (p1 + p2) / 2;
+    final scale = viewScaleFromGesture(
+      startScale: _viewScaleStart,
+      startSpan: _viewStartSpan,
+      span: span,
+    );
+    final rotation = snapViewRotation(
+      _viewRotationStart + normalizeAngleDelta(angle - _viewStartAngle),
+    );
+    final rawOffset = _viewPanStart + (focal - _viewStartFocal);
+    _viewPanRaw = rawOffset;
+    setState(() {
+      _viewScale = scale;
+      _viewRotation = rotation;
+      _viewOffset = clampViewOffset(
+        offset: rawOffset,
+        scale: scale,
+        viewSize: _gestureAreaSize(),
+        aspectRatio: _aspectRatio,
+        rotation: rotation,
+      );
+    });
+  }
+
+  /// 缩放态下的单指平移（v2.39.0+，iOS / YouTube / B 站 的通行做法）。
+  ///
+  /// 只在 [_viewTransformed] 时启用：[_viewScale] == 1 且无旋转时**完全走原来的
+  /// 三向判定**（用户验收过的 seek / 亮度 / 音量语义零改动）。
+  void _onViewPanUpdate(DragUpdateDetails d) {
+    final raw = _viewPanRaw + d.delta;
+    _viewPanRaw = raw;
+    final offset = clampViewOffset(
+      offset: raw,
+      scale: _viewScale,
+      viewSize: _gestureAreaSize(),
+      aspectRatio: _aspectRatio,
+      rotation: _viewRotation,
+    );
+    if (offset == _viewOffset) return;
+    setState(() => _viewOffset = offset);
+  }
+
+  /// 画面是否处于「变换态」（缩放 / 旋转生效）——决定单指拖动是平移还是 seek，
+  /// 也决定底栏「复位」入口是否出现。
+  bool get _viewTransformed => _viewScale != 1 || _viewRotation != 0;
 
   // B 站式快捷手势（v2.16.7+）
   // -------------------------------------------------------------------
@@ -901,6 +1369,20 @@ class _PlayerPageState extends State<PlayerPage>
   /// 这个是**源本身没有视频轨**——不提示的话用户会以为播放器坏了（黑屏有声）。
   /// 网络取流 / 整段缓存的路径一律复位 false（见 [_setAudioOnlyPlayback]）。
   bool _audioOnlyPlayback = false;
+
+  // 播放源（v2.39.0+「本地缓存 / 网络流」切换，见 [PlaySource]）
+  // ---------------------------------------------------------------------
+  // 只决定「这一次取源走哪条路」，与 [_audioOnlyPlayback]（源本身有没有视频轨）
+  // 和 [_listenMode]（用户是否主动隐藏画面）正交。
+  //
+  // 复位时机：换 bvid（[playVideo]）→ 回 [PlaySource.local]（新视频重新按「有
+  // 缓存就用缓存」判定，不让上一个视频的选择串台）；**切分 P 不复位**——同一条
+  // 视频里用户的意愿是一样的（在选集与「看网络画面」之间来回切很烦），且新分 P
+  // 无缓存时 [PlaySource.local] 本来就会自然回落网络，不会有死路。
+  PlaySource _playSource = PlaySource.local;
+
+  /// 正在切换播放源（防连点：本方法内部有 await 取流，连点会叠两次 setDataSource）。
+  bool _sourceSwitching = false;
 
   /// 置位/复位「仅音频缓存播放」标记（值不变则不动，避免多余重建）。
   void _setAudioOnlyPlayback(bool value) {
@@ -1520,15 +2002,21 @@ class _PlayerPageState extends State<PlayerPage>
     }
   }
 
-  /// 取流并开始播放：**已缓存 → 直接播本地文件**（无网络、无 URL 过期问题）；
-  /// 否则优先 DASH 双流（video+audio），无 dash 则 fnval=0 降级 mp4 单流。
+  /// 取流并开始播放：**已缓存且源为本地 → 直接播本地文件**（无网络、无 URL
+  /// 过期问题）；否则优先 DASH 双流（video+audio），无 dash 则 fnval=0 降级
+  /// mp4 单流。
   /// cid 取当前集 `_currentCid`（多 P 切换选集后为 pages[index].cid）。
+  ///
+  /// v2.39.0+ 缓存命中多了一个前提 [PlaySource.local]：源为 [PlaySource.network]
+  /// 时**跳过缓存、强制走取流**（这是「缓存了音频之后还能切回网络看画面」的
+  /// 实现点——仅音频缓存本地源没有视频轨，只有网络流能出画面）。
   Future<void> _loadStreamAndPlay({required int positionMs}) async {
     final player = _player;
     if (player == null) return;
-    // 本地缓存优先：命中则不请求网络流
-    final cached =
-        _downloads.getCached(_video.bvid, _currentPageIndex);
+    // 本地缓存优先：命中则不请求网络流（源为网络流时不查缓存，见上方注释）
+    final cached = _playSource == PlaySource.local
+        ? _downloads.getCached(_video.bvid, _currentPageIndex)
+        : null;
     if (cached != null) {
       // 仅音频缓存（videoPath 为空）：**把音频文件当 videoUrl 传**。
       //
@@ -1980,11 +2468,20 @@ class _PlayerPageState extends State<PlayerPage>
       // 误触发过停止事件，这里自愈；原生真被关闭时不会再有 onPrepared）
       _stoppedByNotification = false;
       _durationMs = durationMs;
-      if (width > 0 && height > 0) _aspectRatio = width / height;
+      if (width > 0 && height > 0) {
+        _aspectRatio = width / height;
+        _aspectKnown = true; // 比例是真的了 → 进全屏的方向策略可据此判定
+      }
       // 新流成功 READY → 自动续播预算清零：每段播放独立预算，
       // 播放中多次零星网络抖动各自都能拿到完整重试次数
       _autoRecoverFails = 0;
     });
+    // 宽高比此刻才拿到（或换集后变了）→ 若正在全屏，按新比例**补一次方向锁**
+    // （v2.39.0）：覆盖两个窗口——① 用户在全屏按钮可点时（!_loaded）先点了
+    // 全屏，那时 [_aspectKnown] 还是 false、只放过自由方向；② 全屏中切集到
+    // 另一个方向的视频（如横屏集 → 竖屏集）。已锁对时重复下发同一组方向是
+    // 幂等的，不会转屏。
+    if (_fullscreen) unawaited(_applyFullscreenOrientation());
     // 首次进入 / 切集后恢复该集记忆进度（不打断自动播放）
     _maybeRestoreProgress(durationMs);
     // 画面就绪 → 封面占位层淡出（换源时这一层早已卸载，调用是空操作）
@@ -2848,6 +3345,9 @@ class _PlayerPageState extends State<PlayerPage>
   /// （tap 无位移不触发 Pan），按下点豁免不影响单击显隐等。
   void _onPanDown(DragDownDetails d) {
     if (_player == null) return;
+    // 双指手势进行中（v2.39.0）：单指那一套整体让位——Pan 识别器此时可能已
+    // 赢下竞技场（两指同向拖动就是一次合法的 pan），但语义上属于画面手势。
+    if (_viewGestureActive) return;
     final size = _gestureAreaSize();
     final w = size.width;
     final h = size.height;
@@ -2892,6 +3392,20 @@ class _PlayerPageState extends State<PlayerPage>
       debugPrint('[player_page] 按下点已豁免 → panStart 早退（本次 Pan 忽略）');
       return;
     }
+    if (_viewGestureActive) {
+      debugPrint('[player_page] 双指手势中 → panStart 早退（单指语义让位）');
+      return;
+    }
+    // 缩放 / 旋转生效后（v2.39.0）：单指拖动 = **平移画面**（iOS / YouTube /
+    // B 站的通行做法），不再走三向判定——此时用户想看的正是「被放大后的
+    // 局部」，横滑 seek 会把画面动机变成碰运气。scale==1 且无旋转时完全走
+    // 下面的原逻辑（零回归）。
+    if (_viewTransformed) {
+      _viewPanRaw = _viewOffset;
+      debugPrint('[player_page] 缩放态单指拖动 → 平移画面 '
+          'scale=$_viewScale rot=${_viewRotation.toStringAsFixed(2)}');
+      return;
+    }
     _panMode = null;
     _panStartX = d.localPosition.dx;
     _panDx = 0;
@@ -2908,6 +3422,11 @@ class _PlayerPageState extends State<PlayerPage>
   /// 再按锁定模式分发到 seek / 亮度·音量逻辑。
   void _onPanUpdate(DragUpdateDetails d) {
     if (_panExcluded) return; // 豁免带起点：本次 Pan 已整体忽略
+    if (_viewGestureActive) return; // 双指手势中：单指语义不参与
+    if (_viewTransformed) {
+      _onViewPanUpdate(d); // 缩放态：拖动 = 平移画面（不发 seek）
+      return;
+    }
     if (_panMode == null) {
       _panDx += d.delta.dx;
       _panDy += d.delta.dy;
@@ -2953,6 +3472,12 @@ class _PlayerPageState extends State<PlayerPage>
     if (_panExcluded) {
       _panExcluded = false;
       return; // 豁免带起点：本次 Pan 已整体忽略（不 seek / 不调节 / 不出 hud）
+    }
+    if (_viewGestureActive || _viewTransformed) {
+      // 双指手势中 / 缩放态平移：偏移已实时生效，松手无需收尾（不 seek）
+      _viewPanRaw = _viewOffset;
+      _panMode = null;
+      return;
     }
     final m = _panMode;
     _panMode = null;
@@ -3219,14 +3744,21 @@ class _PlayerPageState extends State<PlayerPage>
   }
 
   /// 长按开始：记下进入长按时倍速，立即切 2x（松手恢复的是这个值）。
+  ///
+  /// 双指手势进行中直接忽略（v2.39.0）：捏合/旋转时若第一指已按下 500ms，
+  /// LongPress 会赢下竞技场把播放打到 2x——那时用户是在调整画面，不是要快进。
   void _onLongPressStart(LongPressStartDetails _) {
+    if (_viewGestureActive) return;
     debugPrint('[player_page] longPress start, speedBefore=$_speed');
     _speedBeforeLongPress = _speed;
+    _longPressSpeedActive = true;
     _applySpeed(kLongPressSpeed);
   }
 
   /// 长按结束：恢复进入长按前的倍速（而非 1x）。
   void _onLongPressEnd(LongPressEndDetails _) {
+    if (!_longPressSpeedActive) return; // 双指接管时已放掉，不重复恢复
+    _longPressSpeedActive = false;
     debugPrint('[player_page] longPress end, restore=$_speedBeforeLongPress');
     _applySpeed(_speedBeforeLongPress);
   }
@@ -4288,11 +4820,79 @@ class _PlayerPageState extends State<PlayerPage>
   DownloadTask? get _currentTask => _downloads.tasks.value[
       CachedVideo.keyOf(_video.bvid, _currentPageIndex)];
 
+  /// 切换播放源（本地缓存 ⇄ 网络流，v2.39.0+，入口在缓存操作菜单里）。
+  ///
+  /// 为什么要「取当前进度 → 重新设源 → 带 positionMs 定位」而不是别的路：
+  /// - 不走 [playVideo]：它对同 bvid 直接短路返回（换源语义是换视频，不是换源）；
+  /// - 不走 [_switchToPage]：那是切分 P，会清字幕/弹幕/拖动预览（同集换源不该
+  ///   把这些擦掉）；
+  /// - 走 [_loadStreamAndPlay]：它就是「按当前 [_playSource] 决定本地还是网络」
+  ///   的唯一入口（同集重取流换源的既有写法，见 [_maybePrefetchSource]），
+  ///   且 positionMs 是原生 `setDataSource` 的既有参数 → 进度无缝接上。
+  ///
+  /// 进度取 [BiliDashPlayer.getPosition] 的真值而**不是** [_positionMs]：后者靠
+  /// 500ms 一次的 [_tick] 刷新，切源时刻最多落后半秒，用它会每次都往回退一点。
+  ///
+  /// 失败回退（风控 -412 / 断网）：**源字段与实际播放的源一起退回**。只回退
+  /// 字段是不够的——字段是「下一次取源走哪条路」和菜单勾选态的唯一依据，若
+  /// 字段已指向网络而实际播着本地（或反过来），下次取源就会按错的假设走，且
+  /// 菜单会骗人。所以回退时重新 [_loadStreamAndPlay] 一次把上一源真正装回去，
+  /// 再用 [SnackBar] 说明；连回退都失败才交给 [_handleLoadFailure] 走统一错误页。
+  Future<void> _switchPlaySource(PlaySource target) async {
+    final player = _player;
+    if (player == null) return;
+    if (target == _playSource) return; // 已是该源：无事发生
+    if (_sourceSwitching) return; // 连点保护（内部有 await 取流）
+    _sourceSwitching = true;
+    final prev = _playSource;
+    try {
+      final pos = await player.getPosition();
+      if (!mounted) return;
+      debugPrint('[player_page] 切换播放源 ${prev.name} → ${target.name} '
+          '（带进度 ${pos}ms）');
+      setState(() {
+        _playSource = target;
+        _buffering = true;
+        _error = null; // 上一次的错误态不该压在换源结果上（新源可能没问题）
+        _canRetry = true;
+      });
+      try {
+        await _loadStreamAndPlay(positionMs: pos);
+        await _player?.setPlaybackSpeed(_speed); // 换源后原生倍速被重置为 1x
+        if (mounted) setState(() => _buffering = false);
+      } catch (e) {
+        debugPrint('[player_page] 切换播放源失败（$e）→ 回退 ${prev.name}');
+        if (!mounted) return;
+        setState(() {
+          _playSource = prev; // 字段与实际播放的源必须一致（见方法注释）
+          _buffering = true;
+        });
+        try {
+          await _loadStreamAndPlay(positionMs: pos);
+          await _player?.setPlaybackSpeed(_speed);
+          if (mounted) setState(() => _buffering = false);
+          if (mounted) {
+            _showSnack(prev == PlaySource.local
+                ? '网络取流失败，已回到本地缓存播放'
+                : '本地缓存不可用，已回到网络流播放');
+          }
+        } catch (retryE) {
+          // 两个源都装不回来：没有可播的源了，交给统一失败处理（错误页 + 重试）
+          if (!mounted) return;
+          await _handleLoadFailure(retryE);
+        }
+      }
+    } finally {
+      _sourceSwitching = false;
+    }
+  }
+
   /// 点击下载按钮：未缓存 → 下载菜单；已缓存 → 缓存操作菜单；下载中不响应。
   ///
   /// v2.29.0 起菜单里多了「仅缓存音频」（省空间：30 分钟视频 15~36MB vs
   /// 整段 200~500MB）；已缓存时也给这一项——已整段缓存过的视频可以重下成
   /// 仅音频把空间收回来（覆盖式重下，旧的视频文件会被清掉）。
+  /// v2.39.0 起已缓存菜单里还有「本地缓存 ⇄ 网络流」切换（[PlaySource]）。
   void _onDownloadTap() {
     final task = _currentTask;
     if (task != null &&
@@ -4372,6 +4972,41 @@ class _PlayerPageState extends State<PlayerPage>
                   },
                 ),
             ] else ...[
+              // 本地缓存 ⇄ 网络流（v2.39.0+）：**放在菜单第一项**——这是
+              // 「缓存了音频之后看不了画面」的唯一出口，压在「重新下载」下面
+              // 用户找不到（重下要重新花流量/时间，而切源立刻就能看）。
+              ListTile(
+                leading: Icon(
+                  _playSource == PlaySource.local
+                      ? Icons.cloud_outlined
+                      : Icons.sd_storage_outlined,
+                  color: kPlayerOn,
+                ),
+                title: Text(
+                  _playSource == PlaySource.local
+                      ? '切到网络流播放（看画面/更高清晰度）'
+                      : '切回本地缓存播放（省流量/离线可用）',
+                  style: const TextStyle(color: kPlayerOn, fontSize: 15),
+                ),
+                subtitle: Text(
+                  // 仅音频缓存时把话说透：本地源**物理上没有视频轨**，切回本地
+                  // 就是黑屏有声，别让用户来回切两次才发现（文案即原因）
+                  _playSource == PlaySource.local
+                      ? (cached.audioOnly
+                          ? '本地只缓存了音频，要看画面得用网络流'
+                          : '当前用本地缓存文件播放；网络流可按账号清晰度重取')
+                      : '当前用网络流播放；切回本地不消耗流量',
+                  style: const TextStyle(color: kPlayerOnDim, fontSize: 12),
+                ),
+                onTap: () {
+                  Navigator.pop(sheetCtx);
+                  unawaited(_switchPlaySource(
+                    _playSource == PlaySource.local
+                        ? PlaySource.network
+                        : PlaySource.local,
+                  ));
+                },
+              ),
               ListTile(
                 leading: const Icon(Icons.refresh, color: kPlayerOn),
                 title: const Text('重新下载（视频+音频）',
@@ -4544,7 +5179,8 @@ class _PlayerPageState extends State<PlayerPage>
       ..hideCurrentSnackBar()
       ..showSnackBar(SnackBar(
         content: Text(message),
-        // 悬浮在底部控制行（进度条行 36 + 按钮行 44 = 80px）之上，
+        // 悬浮在底部控制行（进度条行 40 + 按钮行 40 = 80px，v2.39.0 起，
+        // 与 [kPlayerBottomBarHeight] 同一口径）之上，
         // 避免「从头播放」action 与全屏按钮区域重叠误触
         behavior: SnackBarBehavior.floating,
         margin: const EdgeInsets.only(left: 16, right: 16, bottom: 80),
@@ -4572,8 +5208,8 @@ class _PlayerPageState extends State<PlayerPage>
     if (downloading) {
       // 下载中：进度环本身就是非颜色的状态载体（环 + 百分比文字），不再加短线
       icon = SizedBox(
-        width: 20,
-        height: 20,
+        width: 18,
+        height: 18,
         child: CircularProgressIndicator(
           value: task.progress,
           strokeWidth: 2,
@@ -4630,6 +5266,13 @@ class _PlayerPageState extends State<PlayerPage>
       _error = null;
       _positionMs = 0;
       _durationMs = 0;
+      // 宽高比未知 + 画面变换复位（v2.39.0）：新分 P 的宽高比要等它的
+      // onPrepared；缩放/旋转是「上一个画面窗口」的坐标系，带过去会裁错。
+      // 若此刻正在全屏，onPrepared 会按新比例补一次方向锁。
+      _aspectKnown = false;
+      _viewScale = 1;
+      _viewOffset = Offset.zero;
+      _viewRotation = 0;
       // 字幕：切集清空轨道/文本（新集字幕等下次打开面板重新拉取）
       _subtitleTracks = const [];
       _subtitleLoading = false;
@@ -4732,6 +5375,18 @@ class _PlayerPageState extends State<PlayerPage>
       _positionMs = 0;
       _durationMs = 0;
       _aspectRatio = 16 / 9;
+      // 宽高比回到未知（v2.39.0）：新视频的比例要等它的 onPrepared，期间
+      // 进全屏只放开自由方向（见 [fullscreenOrientationsFor]）。
+      _aspectKnown = false;
+      // 画面缩放/旋转复位（v2.39.0）：换 bvid 后「画面窗口」是新的坐标系，
+      // 上一个视频的放大/旋转带过去会裁错。切分 P 同样复位（见 [_switchToPage]）。
+      _viewScale = 1;
+      _viewOffset = Offset.zero;
+      _viewRotation = 0;
+      // 播放源随换 bvid 复位为「本地优先」（v2.39.0+）：新视频按自己的缓存
+      // 情况重新判定，不让上一个视频的「强制网络流」串台。切分 P 不复位
+      // （见 [_playSource] 字段注释）。
+      _playSource = PlaySource.local;
       _error = null;
       _loginPrompt = false;
       _canRetry = true;
@@ -4939,6 +5594,26 @@ class _PlayerPageState extends State<PlayerPage>
     return '${t.endsWith('0') ? t.substring(0, t.length - 1) : t}x';
   }
 
+  /// 按当前视频的宽高比下发全屏方向锁（v2.39.0+）。
+  ///
+  /// 决策在纯函数 [fullscreenOrientationsFor] 里（可单测）；这里只负责「拿到
+  /// 决策 → 下发」，并且**空列表不下发**（= 保持设备当前方向：近方形视频 /
+  /// 比例异常时锁谁都会让一半用户觉得错，保持现状最稳）。
+  ///
+  /// 调用点两处：进全屏（[_toggleFullscreen]）与 [onPrepared] 后补锁。两处都
+  /// 是幂等的——已锁对时重复下发同一组方向不会真的转屏。
+  Future<void> _applyFullscreenOrientation() async {
+    final orientations = fullscreenOrientationsFor(
+      _aspectRatio,
+      known: _aspectKnown,
+    );
+    debugPrint('[player_page] 全屏方向锁 aspect=$_aspectRatio '
+        'known=$_aspectKnown → ${orientations.map((o) => o.name).join('/')}'
+        '${orientations.isEmpty ? '（保持当前方向）' : ''}');
+    if (orientations.isEmpty) return;
+    await SystemChrome.setPreferredOrientations(orientations);
+  }
+
   Future<void> _toggleFullscreen() async {
     debugPrint('[player_page] _toggleFullscreen called, full=$_fullscreen');
     final full = !_fullscreen;
@@ -4952,11 +5627,13 @@ class _PlayerPageState extends State<PlayerPage>
       _commentScrollByUser = false;
     });
     if (full) {
-      // 进全屏：锁横屏（原行为）——整屏沉浸横屏播放（无下方内容区）。
-      await SystemChrome.setPreferredOrientations([
-        DeviceOrientation.landscapeLeft,
-        DeviceOrientation.landscapeRight,
-      ]);
+      // 进全屏：**按视频宽高比**锁方向（v2.39.0，用户原话「竖屏视频全屏之后
+      // 还是竖屏，而不是现在的旋转九十度」）——旧实现无条件锁 landscape 两向，
+      // 竖屏视频在横屏整屏里只占约 1/3 宽、左右大黑边。
+      // 横屏视频仍锁 landscape 两向（行为与旧版逐字一致）；竖屏视频锁
+      // portraitUp；近 1:1 不下发命令；比例未就绪时下发放开的三向（见
+      // [fullscreenOrientationsFor]）。
+      await _applyFullscreenOrientation();
       await SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
     } else {
       // v2.17.17 退出全屏：**不再强制转竖屏**——放开「竖屏 + 双向横屏」
@@ -4967,6 +5644,9 @@ class _PlayerPageState extends State<PlayerPage>
       await SystemChrome.setPreferredOrientations(kPlayerPageFreeOrientations);
       await SystemChrome.setEnabledSystemUIMode(SystemUiMode.edgeToEdge);
     }
+    // 退出全屏 → 画面缩放/旋转复位（v2.39.0，见 [_resetViewTransform]）：
+    // 那些变换只在全屏下有意义，带回竖屏视频区会变成「画面被裁掉一块」。
+    if (!full) _resetViewTransform();
   }
 
   void _restoreSystemUi() {
@@ -5156,20 +5836,53 @@ class _PlayerPageState extends State<PlayerPage>
   /// Positioned.fill 的层（弹幕/手势/缓冲/听视频占位等）填满矩形；
   /// 字幕与控制层按矩形底部定位（字幕悬浮在控制行上方）——所有播放相关
   /// UI 与手势都只在视频区内，不覆盖下方评论区。
+  /// 播放画面本体（保持宽高比居中 + 全屏下的缩放/旋转/平移）。
+  ///
+  /// 结构：`ClipRect → Transform(scale/rotateZ/translate) → Center(AspectRatio
+  /// → Texture)`（v2.39.0+）。
+  /// - [ClipRect] 是必须的：放大或旋转 90° 后画面会越出视频区，不裁就会画到
+  ///   顶栏、字幕、评论区上去；
+  /// - [Transform] 的 matrix 顺序是 `T · R · S`（translate 写最前 = 应用在
+  ///   最外层）：这样 [_viewOffset] 恒为**可视区坐标系**里的像素，与
+  ///   [clampViewOffset] 的夹取口径一致，旋转/缩放都不会让平移量改变含义；
+  /// - 非全屏且未变换时**不构建** ClipRect/Transform（返回裸 Center），非全屏
+  ///   的渲染树与改动前逐节点一致、零额外开销。
+  ///
+  /// 注意字幕/弹幕层在画面**之上**且**不参与**这套变换（B 站也是这个层级）：
+  /// 弹幕/字幕是「贴屏幕」的信息层，跟着画面缩放平移会让它们跑出可视区、
+  /// 也会与字号体系打架。这是有意为之，不是漏做。
+  Widget _buildVideoPicture() {
+    final picture = Center(
+      child: AspectRatio(
+        aspectRatio: _aspectRatio,
+        child: BiliDashTexture(textureId: _textureId!),
+      ),
+    );
+    if (!_fullscreen && !_viewTransformed) return picture;
+    return ClipRect(
+      child: Transform(
+        // 测试锚点：断言缩放倍数 / 旋转档位 / 平移量都读这个 Transform 的矩阵
+        key: const ValueKey('player-view-transform'),
+        alignment: Alignment.center,
+        transform: Matrix4.identity()
+          ..translate(_viewOffset.dx, _viewOffset.dy)
+          ..rotateZ(_viewRotation)
+          ..scale(_viewScale),
+        child: picture,
+      ),
+    );
+  }
+
   Widget _buildVideoLayers() {
     return Stack(
       fit: StackFit.expand,
       children: [
-          // 1. 播放画面（保持宽高比居中，黑色铺底；听视频模式下隐藏但播放不中断）
+          // 1. 播放画面（保持宽高比居中，黑色铺底；听视频模式下隐藏但播放不中断；
+          //    全屏下支持双指缩放/旋转与缩放态单指平移，见 [_buildVideoPicture]）
           if (_textureId != null)
             Offstage(
               offstage: _listenMode,
-              child: Center(
-                child: AspectRatio(
-                  aspectRatio: _aspectRatio,
-                  child: BiliDashTexture(textureId: _textureId!),
-                ),
-              ),
+              child: _buildVideoPicture(),
             ),
           // 2. 听视频占位界面（封面 + 标题 + 提示，点按恢复画面）
           if (_listenMode) _buildListenPlaceholder(),
@@ -5272,15 +5985,14 @@ class _PlayerPageState extends State<PlayerPage>
               ),
             ),
           // 2.5 字幕层：Texture 之上、控制层之下（听视频模式隐藏）。
-          // 底部控制行 88px（进度条行 44 + 按钮行 44，见 _buildBottomBar），
-          // 字幕悬浮在其上方。主字幕大号在上，副字幕小号在其下（见
-          // _SubtitleOverlay）。
-          // v2.17.0+：字幕相对**视频区矩形**底部定位（不再相对整屏）——
-          // 全屏横屏按控制层显隐取值（显示 → 抬升到控制行上方 118；
-          // 隐藏沉浸观影 → 贴画面底部 24，历史取值防跑偏）；非全屏视频区
-          // 较短，控制层显示时贴其上方（100），隐藏时贴视频区底（16）。
-          // （P5：控制行 80 → 88，可见态两个基准同步 +8，保持与控制行顶部
-          // 原有的 22 / 12 px 间隙不变。）
+          // 底部控制行 [kPlayerBottomBarHeight] = 80px（进度条行 40 + 按钮行 40，
+          // 见 _buildBottomBar），字幕悬浮在其上方。主字幕大号在上，副字幕
+          // 小号在其下（见 _SubtitleOverlay）。
+          // v2.17.0+：字幕相对**视频区矩形**底部定位（不再相对整屏）；基准值
+          // 全交给纯函数 [subtitleBottomOffset]（控制行可见时 = 控制行高度 +
+          // 定值间隙，全屏 30 / 非全屏 12；控制行隐藏时贴画面底部 24 / 16）。
+          // 这样控制行高度再变也只需改一处，字幕不会静默错位——P5（80 → 88）
+          // 与 v2.39.0（88 → 80）两次都踩过「数字散落两处」。纯函数同时可单测。
           if (!_listenMode &&
               _subtitleEnabled &&
               (_mainSubtitleText.isNotEmpty ||
@@ -5288,9 +6000,10 @@ class _PlayerPageState extends State<PlayerPage>
             Positioned(
               left: 24,
               right: 24,
-              bottom: _fullscreen
-                  ? (_controlsVisible ? 118.0 : 24.0)
-                  : (_controlsVisible ? 100.0 : 16.0),
+              bottom: subtitleBottomOffset(
+                fullscreen: _fullscreen,
+                controlsVisible: _controlsVisible,
+              ),
               child: _SubtitleOverlay(
                 mainText: _mainSubtitleText,
                 secondaryText: _secondarySubtitleText,
@@ -5345,21 +6058,38 @@ class _PlayerPageState extends State<PlayerPage>
           //      点击与拖动天然拦截（按钮优先）；弹幕层 IgnorePointer 不参与命中
           //    听视频模式下让位给占位层（其自己处理点按恢复画面 + 长按 2x），
           //    否则本 opaque 层会拦截占位层的点击。
+          //
+          //    v2.39.0 全屏双指缩放/旋转：外层套一个 **Listener** 旁观原始指针
+          //    事件（按 pointerId 配对算缩放/旋转/平移，见 [_onViewPointerDown]
+          //    等方法与那里的「为什么不用 ScaleGestureRecognizer」实测理由）。
+          //    Listener **不参与手势竞技场**——这是本方案的核心：单指拖动仍然
+          //    完全落在下面这个 GestureDetector 的 Pan 识别器手里，用户验收过的
+          //    三条 seek 用例零回归。回调只在全屏挂载（非全屏双指不生效）。
           if (!_listenMode)
             Positioned.fill(
-              child: GestureDetector(
-                behavior: HitTestBehavior.opaque,
-                onTap: _toggleControls,
-                onDoubleTap: _player == null ? null : _onDoubleTap,
-                onLongPressStart: _player == null ? null : _onLongPressStart,
-                onLongPressEnd: _player == null ? null : _onLongPressEnd,
-                // 滑动统一 Pan（v2.16.9+）：方向判定在手势内完成——水平主导
-                // seek（竖屏 / 横屏统一）、垂直主导亮度/音量共存
-                onPanDown: _player == null ? null : _onPanDown,
-                onPanStart: _player == null ? null : _onPanStart,
-                onPanUpdate: _player == null ? null : _onPanUpdate,
-                onPanEnd: _player == null ? null : _onPanEnd,
-                onPanCancel: _player == null ? null : _onPanCancel,
+              child: Listener(
+                onPointerDown:
+                    _viewGesturesEnabled ? _onViewPointerDown : null,
+                onPointerMove:
+                    _viewGesturesEnabled ? _onViewPointerMove : null,
+                onPointerUp: _viewGesturesEnabled ? _onViewPointerUp : null,
+                onPointerCancel:
+                    _viewGesturesEnabled ? _onViewPointerUp : null,
+                child: GestureDetector(
+                  behavior: HitTestBehavior.opaque,
+                  onTap: _toggleControls,
+                  onDoubleTap: _player == null ? null : _onDoubleTap,
+                  onLongPressStart:
+                      _player == null ? null : _onLongPressStart,
+                  onLongPressEnd: _player == null ? null : _onLongPressEnd,
+                  // 滑动统一 Pan（v2.16.9+）：方向判定在手势内完成——水平主导
+                  // seek（竖屏 / 横屏统一）、垂直主导亮度/音量共存
+                  onPanDown: _player == null ? null : _onPanDown,
+                  onPanStart: _player == null ? null : _onPanStart,
+                  onPanUpdate: _player == null ? null : _onPanUpdate,
+                  onPanEnd: _player == null ? null : _onPanEnd,
+                  onPanCancel: _player == null ? null : _onPanCancel,
+                ),
               ),
             ),
           // 5. 控制层（置于点击层之上）
@@ -5370,6 +6100,12 @@ class _PlayerPageState extends State<PlayerPage>
           //     手感），但不把整套控制层弹出来、也不改用户的显隐偏好。
           else if (_gestureSeeking)
             _buildSeekRowOnly(),
+          // 5.2 画面变换的复位入口（v2.39.0）：只在全屏且真的缩放/旋转过时出现。
+          //     悬浮在底栏之上（**不进底栏那一行**——8 等分已经每格 51.4dp，
+          //     再挤第 9 个按钮会把「选集 1/2」「听视频中」压到省略号），
+          //     且不受控制层显隐影响：画面被放大后若找不到复位入口，用户只能
+          //     退出全屏再来（那个动作会复位，但不该是唯一出路）。
+          if (_fullscreen && _viewTransformed) _buildViewResetButton(),
           // 5.5 手势提示浮层（B 站式快捷手势）：seek 时间 / 亮度 / 音量，
           //     中心偏上、不拦截任何点击（IgnorePointer）。
           if (_hudKind != null)
@@ -5833,6 +6569,39 @@ class _PlayerPageState extends State<PlayerPage>
     );
   }
 
+  /// 画面变换的复位入口（v2.39.0+，仅全屏且 [_viewTransformed] 时出现）。
+  ///
+  /// 位置：右下方、底栏之上（`bottom: kPlayerBottomBarHeight + 12`）——**不进
+  /// 底栏那一行**（8 等分每格 51.4dp，第 9 个按钮会压垮「选集 1/2」这类文案，
+  /// 见 ② 的约束）；也不放中央（会与播放簇抢点击）。
+  ///
+  /// 是**开关式**的可见性而不是常驻：只有画面真的被放大/旋转过才出现，
+  /// 没变换时一个像素都不多（与「没有播放列表就不构建上下集行」同一标准）。
+  /// 顺带显示当前倍数，用户一眼知道自己在哪一档（4.0x 会显示 4.0x）。
+  Widget _buildViewResetButton() {
+    return Positioned(
+      right: 12,
+      bottom: kPlayerBottomBarHeight + 12,
+      child: TextButton.icon(
+        key: const ValueKey('player-view-reset'),
+        onPressed: _resetViewTransform,
+        icon: const Icon(Icons.restart_alt, size: 16, color: kPlayerOn),
+        label: Text(
+          '复位 ${_viewScale.toStringAsFixed(1)}x',
+          style: kTypeLabel.copyWith(color: kPlayerOn),
+        ),
+        style: TextButton.styleFrom(
+          // 压在任意画面上都要读得清：墨黑 62% 圆角底 + 纸白字（与手势 hud
+          // 同一套语汇，不引入新配色）
+          backgroundColor: kInkBlack.withValues(alpha: .62),
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+          minimumSize: const Size(0, 32),
+          tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        ),
+      ),
+    );
+  }
+
   /// 手势提示浮层（seek 时间 / 亮度 / 音量）：半透明黑底圆角小条，居中偏上。
   /// 整体包 IgnorePointer——纯展示，不拦截下方任何点击/拖动。
   Widget _buildGestureHud() {
@@ -6069,11 +6838,15 @@ class _PlayerPageState extends State<PlayerPage>
   /// 短线是**颜色之外的第二状态载体**（Android 无障碍规范：状态不得只用颜色
   /// 表达）；关闭态同样占 2px 槽位（无子节点 = 不绘制），保证两态图标垂直
   /// 位置不跳动。
+  ///
+  /// v2.39.0 起图标 20 → 18：按钮行 44 → 40 后竖向余量从 4.8dp 收到 3.8dp，
+  /// 18 的图标把「图标 + 短线槽 + 间距 + 单行文字」压到 36.2dp，余量回到 3.8dp
+  /// 之上（详见 [_barIconLabel] 的算式）。
   Widget _barToggleIcon(IconData icon, {required bool on}) {
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
-        Icon(icon, color: on ? kPlayerOn : kPlayerOff, size: 20),
+        Icon(icon, color: on ? kPlayerOn : kPlayerOff, size: 18),
         const SizedBox(height: 2),
         SizedBox(
           width: 10,
@@ -6097,8 +6870,12 @@ class _PlayerPageState extends State<PlayerPage>
   /// [FittedBox]（`scaleDown`，Flutter 内置组件，不引入新依赖）是最后一道
   /// 保险：极端长度（如「选集 1/100」≈ 56dp 超出整格）整体等比缩到格宽以内
   /// 而**不省略**；正常长度缩放比 = 1，字号仍是 [kTypeLabel]，字阶不乱。
-  /// 竖排单元高约 39.2（图标 20 + 短线槽 4 + 间距 2 + 单行文字 13.2）＜ 按钮行
-  /// 44，行高与整条控制行高度（88）不变；点击回调、按钮顺序全部照旧。
+  /// 竖排单元高 = 图标（开关类 18 + 短线槽 2 + 短线 2 = 22，非开关类 18）
+  /// + 间距 + 单行文字 13.2：最坏情况（开关类按钮，如「听视频中」「字幕中」）
+  /// 22 + 1 + 13.2 = **36.2** ＜ 按钮行 [_kBottomButtonRowHeight] 40，仍留
+  /// 3.8dp 余量（v2.39.0 起把图标 20 → 18、间距 2 → 1，就是为了在行高收 4dp
+  /// 之后保住这段余量——图标或文字一旦顶到行高它俩就会被竖向挤压裁切）。
+  /// 点击回调、按钮顺序全部照旧。
   Widget _barIconLabel({
     required Widget icon,
     required String label,
@@ -6108,7 +6885,7 @@ class _PlayerPageState extends State<PlayerPage>
       mainAxisSize: MainAxisSize.min,
       children: [
         icon,
-        const SizedBox(height: 2),
+        const SizedBox(height: 1),
         SizedBox(
           // 撑满整格宽（Column 交叉轴对子级是松约束，infinity 会夹到格宽），
           // 让 FittedBox 拿到确定的可用宽度
@@ -6259,11 +7036,7 @@ class _PlayerPageState extends State<PlayerPage>
     ),
   );
 
-  /// 底栏按钮行高度（选集/倍速/听视频/字幕/弹幕/评论/下载/全屏）：
-  /// [_buildSeekRowOnly] 要在进度条行下方留出同样的空档（见其注释）。
-  static const double _kBottomButtonRowHeight = 44;
-
-  /// 上下集行高度（仅在有播放列表时占据底栏上沿的一条）。
+  /// 底栏「上下集行」高度（仅在有播放列表时占据底栏上沿的一条）。
   ///
   /// 40 而不是 44：这一行只有一个 18px 图标 + 一行小字，纯粹是导航；但也不能
   /// 更矮——「上一集」「下一集」各占左右半屏（411dp 屏上 ~205dp 宽），高度是
@@ -6396,18 +7169,24 @@ class _PlayerPageState extends State<PlayerPage>
 
   Widget _buildBottomBar() {
     return Container(
+      // 测试锚点：底栏整体（几何断言量它的高度 = 上下集行 40 + 进度条行 40 +
+      // 按钮行 40；无播放列表时不含第一项）。手势 seek 单独浮出的那一份
+      // （[_buildSeekRowOnly]）**不挂 key**——它是另一条渲染路径，锚点会撞车。
+      key: const ValueKey('player-bottom-bar'),
       decoration: _kBottomBarScrim,
-      // 两行结构：进度条行（[_buildSeekRow]，固定 44 高）+
-      // 按钮行（[_kBottomButtonRowHeight]，44 高：选集/倍速/听视频/字幕/
-      // 弹幕/评论/下载/全屏）。
+      // 两行结构：进度条行（[_buildSeekRow]，[_PlayerSeekBar.height] = 40）+
+      // 按钮行（[_kBottomButtonRowHeight] = 40：选集/倍速/听视频/字幕/弹幕/
+      // 评论/下载/全屏）；合计 [kPlayerBottomBarHeight] = 80。
       //
       // P5：进度条行不用原生 Slider——Slider 在「有界高度」约束下会撑满整个
       // 高度（_RenderSlider 布局取 constraints.maxHeight）并吞掉中心播放/暂停
       // 与返回按钮的点击，且两端内建 24px 边距让细轨几何不可控。改为自绘后
       // 轨道位置 / 命中区 / 柄形状全部自定（见 [_PlayerSeekBar] 类注释）。
-      // 本行高度 36 → 44：满足拖动触摸目标 ≥44（Android 触摸规范），整条
-      // 控制行由 80 抬到 88（+8，未显著变高），字幕悬浮基准同步 +8（见
-      // [_buildVideoLayers] 字幕层的 bottom 取值）。
+      // 行高沿革：P5 曾把进度条行 36 → 44 以满足 ≥44 触摸目标（控制行 80 → 88）；
+      // v2.39.0 用户要求「功能栏太高、比例要改进」→ 两行各回 40（控制行 **80**），
+      // 字幕悬浮基准改用 [kPlayerBottomBarHeight] 推导自动跟随（见 [_buildVideoLayers]
+      // 字幕层的 bottom 取值与 [kPlayerBottomBarHeight] 注释）。底栏叠在视频区里，
+      // 收矮只多露画面，不动视频区/评论区几何。
       // v2.17.0+：底部 SafeArea 只在全屏吃系统底 inset——非全屏（竖屏 /
       // 横屏置顶）时本行位于视频区黑盒底部（屏幕中部，不在屏底），系统
       // 导航条在屏幕最下方（横屏在侧边），不需也**不能**再垫底（否则按钮
@@ -6435,7 +7214,7 @@ class _PlayerPageState extends State<PlayerPage>
                         onTap: _player == null ? null : _showEpisodeSheet,
                         child: _barIconLabel(
                           icon: const Icon(Icons.queue_music,
-                              color: kPlayerOn, size: 20),
+                              color: kPlayerOn, size: 18),
                           label:
                               '选集 ${_currentPageIndex + 1}/${_video.pageCount}',
                           color: kPlayerOn,
@@ -6449,7 +7228,7 @@ class _PlayerPageState extends State<PlayerPage>
                       onTap: _player == null ? null : _showSpeedSheet,
                       child: _barIconLabel(
                         icon: const Icon(Icons.speed,
-                            color: kPlayerOn, size: 20),
+                            color: kPlayerOn, size: 18),
                         label: _fmtSpeed(_speed),
                         color: kPlayerOn,
                       ),
@@ -6515,7 +7294,7 @@ class _PlayerPageState extends State<PlayerPage>
                       onTap: _player == null ? null : _onCommentsButtonTap,
                       child: _barIconLabel(
                         icon: const Icon(Icons.comment_outlined,
-                            color: kPlayerOn, size: 20),
+                            color: kPlayerOn, size: 18),
                         label: '评论',
                         color: kPlayerOn,
                       ),
@@ -6527,7 +7306,7 @@ class _PlayerPageState extends State<PlayerPage>
                   Expanded(
                     child: IconButton(
                       color: kPlayerOn,
-                      iconSize: 20,
+                      iconSize: 18,
                       icon: Icon(
                           _fullscreen ? Icons.fullscreen_exit : Icons.fullscreen),
                       onPressed: _toggleFullscreen,
@@ -6764,10 +7543,12 @@ class _SeekPreviewPainter extends CustomPainter {
 /// 上对比度 ≈3:1 可见，深色画面上暗垫融入背景、白 24% 照旧发亮；已播段与柄
 /// 是**不透明纸白**，压在暗垫上完全不受影响，层级仍是「已播 + 柄 ＞ 未播」。
 ///
-/// 触摸目标：整条 [height]=44 高、整宽都是命中区（`HitTestBehavior.opaque`），
-/// 比原生 Slider 的 2px 细轨好按得多——Android 规范的目标是 ≥48，这里取
-/// 44（本行原为 36）：再抬高会让整条控制行显著变高，牵动视频区几何与
-/// 字幕悬浮基准，收益不抵代价（见 [_PlayerPageState._buildBottomBar]）。
+/// 触摸目标：整条 [height]=40 高、整宽都是命中区（`HitTestBehavior.opaque`），
+/// 比原生 Slider 的 2px 细轨好按得多。**取 40 而不是 44（Android 规范的 ≥48
+/// 更达不到）**：v2.39.0 用户要求「功能栏太高、比例要改进」，底栏两行各收 4dp
+/// 一共让出 8dp 画面（底栏叠在视频区里，收矮 = 多露画面）；这一行的命中判断
+/// 只用到 dx（dy 不参与取值），竖向容差损失在实际操作里不可感，而水平方向上
+/// 仍有 300+dp 的通宽 —— 收益（8dp 画面）大于代价（4dp 竖向命中带）。
 ///
 /// 回调语义与 Slider 一一对应：[onDrag] = `onChanged`（拖动/点按过程持续
 /// 回调，播放页只更新 UI 位置）、[onDragEnd] = `onChangeEnd`（松手/抬手
@@ -6821,7 +7602,15 @@ class _PlayerSeekBar extends StatelessWidget {
   });
 
   /// 触摸目标高度（与 [_PlayerPageState._buildBottomBar] 的进度条行一致）。
-  static const double height = 44;
+  ///
+  /// 44 → **40**（v2.39.0，见 [_PlayerPageState._kBottomButtonRowHeight] 的
+  /// 取值理由）：这一行是**整条轨道通宽**的可点/可拖面（`HitTestBehavior.opaque`
+  /// 铺满 40 高），水平方向 300+dp，垂直方向收 4dp 后横向拖动的跟手区域不变
+  /// ——真正要求 ≥44 的场景是「点一下定位」的竖向容差，而这里点按与拖动都
+  /// 落在同一条 2px 细轨的**放大命中带**上（本组件自己按 dx 取值，dy 不参与），
+  /// 收矮不改变命中语义。旧注解里「44 是为满足 Android ≥44 触摸目标」的说法
+  /// 在 v2.39.0 按「改矮 8dp 让出画面」的用户诉求重新权衡后不再成立，如实更新。
+  static const double height = 40;
 
   /// 轨道粗细（px）。
   static const double trackThickness = 2;

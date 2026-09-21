@@ -733,7 +733,9 @@ void main() {
 
     rec.seeks.clear();
     final bar = tester.getRect(find.byKey(_kSeekBar));
-    expect(bar.height, 44, reason: '进度条触摸目标高 44');
+    expect(bar.height, 40,
+        reason: '进度条触摸目标高 40（v2.39.0：用户要求底栏收矮 8dp，'
+            '两行各 44 → 40；命中判断只用 dx，竖向容差损失不可感）');
     expect(find.byKey(_kOverlay), findsNothing, reason: '未拖动时没有浮层');
 
     final drag = await _startSeekDrag(tester, bar.width * 0.5);
@@ -1229,9 +1231,9 @@ void main() {
     expect(find.byIcon(Icons.fullscreen), findsNothing,
         reason: '不把整套控制层弹出来（显隐是用户点画面定下的偏好）');
     final bar = tester.getRect(find.byKey(_kSeekBar));
-    expect(bar.height, 44);
-    expect(bar.bottom, closeTo(videoRect.bottom - 44, 0.5),
-        reason: '行位置与底栏里那一行一致（下方留出按钮行的高度）');
+    expect(bar.height, 40, reason: '进度条行 40（v2.39.0 底栏收矮 8dp，见 ② 用例）');
+    expect(bar.bottom, closeTo(videoRect.bottom - 40, 0.5),
+        reason: '行位置与底栏里那一行一致（下方留出按钮行的高度 40）');
     expect(_barShowHandle(tester), isTrue, reason: '手势 seek 中手柄可见');
     expect(_barPositionMs(tester), greaterThan(0),
         reason: '位置跟着目标走 → 手柄与已播段跟手');

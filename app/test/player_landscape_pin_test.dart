@@ -352,6 +352,12 @@ void main() {
       home: PlayerPage(video: _video()),
     ));
     await tester.pump();
+    // v2.39.0：进全屏的方向策略改按**视频宽高比**判定（竖屏视频不再被锁横屏），
+    // 而宽高比要等 onPrepared 上报——所以这里必须先把播放器泵到就绪（`_init`
+    // 里两个 500ms 超时兜底要走完），否则下面那次全屏点击落在「比例未就绪」
+    // 的窗口里（那时按设计只放开三向、不锁横屏）。这也正是真机上的顺序：
+    // 用户总是先看到画面再点全屏。
+    await tester.pump(const Duration(milliseconds: 600));
     await tester.pump(const Duration(milliseconds: 300));
 
     Rect videoRect = tester.getRect(find.byKey(_kVideoArea));
