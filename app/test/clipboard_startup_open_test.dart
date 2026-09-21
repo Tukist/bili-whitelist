@@ -467,7 +467,16 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(ClipboardLinkStore.instance.enabled, isFalse);
-    expect(find.textContaining('已关闭'), findsOneWidget);
+    // 断言收窄到**该开关自己的子树**（v2.40.0）：原来是
+    // `find.textContaining('已关闭')`，匹配范围是整个设置面板；v2.40.0 新增的
+    // 「允许点赞/投币/收藏」开关关闭时的副标题同样以「已关闭：」开头（面板里
+    // SwitchListTile 副标题的既有写法），于是这条 finder 变成 2 个命中。
+    // 收窄后断言的**主张不变**（剪贴板开关关掉后，它自己的副标题说「已关闭」），
+    // 只是不再受"面板里别的开关也这么写"影响。
+    expect(
+      find.descendant(of: switchFinder, matching: find.textContaining('已关闭')),
+      findsOneWidget,
+    );
 
     // 落盘：重启后仍然是关的
     ClipboardLinkStore.instance.resetForTest();

@@ -663,6 +663,19 @@ class BiliApi {
   /// 从 secure storage 读取 SESSDATA（未登录返回 null）。
   Future<String?> readSessdata() => _storage.read(key: _sessdataKey);
 
+  /// 读取 `bili_jct`（B 站的 CSRF 令牌，v2.40.0+）。
+  ///
+  /// 所有写操作（点赞 / 投币 / 收藏）都要在表单里带 `csrf=<bili_jct>`，服务端
+  /// 据此确认"这个写请求确实来自持有该会话的客户端"。在 v2.40.0 之前它只被
+  /// [refreshSession] 内部读过一次、**没有对外入口**，这里照 [readSessdata]
+  /// 同款开一个（不缓存、不打印值——它是能改账号状态的凭据，日志里连前缀
+  /// 都不该出现）。
+  ///
+  /// 未登录（或登录态被 [_injectAuth] 判为过期而清除）返回 null：调用方据此
+  /// 给「请先登录 B 站账号」的可读异常，而不是把空 csrf 发出去换一个语焉不详
+  /// 的 -111。
+  Future<String?> readBiliJct() => _storage.read(key: _biliJctKey);
+
   /// secure storage 里是否存了 refresh_token（续期阈值档位判断，见
   /// [planSessionStart]——有刷新口令才能走"提前续期"档）。
   Future<bool> hasRefreshToken() async {
@@ -3240,6 +3253,278 @@ class BiliApi {
   }
 
   // -------------------------------------------------------------------------
+  // 写操作第一阶段（v2.40.0+）：点赞 / 投币 / 收藏
+  //
+  // 这几个是**本 App 第一批"反向操作"接口**（在那之前全是只读）——所以三条
+  // 纪律写在这里，后面每个方法都按它执行：
+  //   ① **必须带 csrf**：见 [readBiliJct] / [_postAuth]；
+  //   ② **不做自动重试**：读接口（reply/main）用退避重试是对的（重试没有副
+  //      作用），但写接口重试可能就是第二次点赞/第二次投币。投币尤其致命：
+  //      它扣的是真硬币，B 站也没有"取消投币"接口；
+  //   ③ **错误分类必须可读**：写失败比读失败更需要说清发生了什么（[-101]
+  //      没登录 / [-111] csrf 失效 / [-412] 风控 / [34005] 超过投币上限…），
+  //      见 [_throwWriteError]。
+  //
+  // 未做（有意）：**评论**（要输入框 UI，且与"评论区横滑"抢同一片区域，
+  // 下一轮）、**投稿/发视频**（需 up 权限校验 + 分片上传 + 封面 + 分区 +
+  // 审核轮询 + 后台传输，量级是独立大版本，也与本 App"看白名单视频"的定位
+  // 无关）。
+  // -------------------------------------------------------------------------
+
+  /// 写操作的统一出口：注入登录态 → 取 csrf → POST 表单 → 分类业务码。
+  ///
+  /// 为什么统一：B 站的写接口"形状"完全一样（POST +
+  /// `application/x-www-form-urlencoded` + 表单里带 `csrf=<bili_jct>`），
+  /// 错误码也共享一大半；散在各处写会把「csrf 从哪来」「-101 怎么提示」重复
+  /// 三遍。样板与 [refreshSession]（既有唯一写请求先例）保持同一套：
+  /// `contentType` 用 `formUrlEncoded`（dio 才会把 map 编码成表单体而不是
+  /// JSON），csrf 放 **body 而不是 header**。
+  ///
+  /// 失败分类见 [_throwWriteError]；**网络失败（[DioException]）原样上抛**，
+  /// 由 UI 层转成「网络请求失败」——写接口的"没收到响应"绝不能被当成"成功"。
+  Future<Map<String, dynamic>?> _postAuth(
+    String path,
+    Map<String, String> form, {
+    Set<int> okCodes = const {},
+    String? referer,
+  }) async {
+    await _injectAuth();
+    final jct = await readBiliJct();
+    if (jct == null || jct.isEmpty) {
+      // 提前拦下：发出去只会得到一个语焉不详的 -111，不如直接说清是没登录
+      throw BiliApiException(
+        code: -101,
+        message: '请先登录 B 站账号',
+        path: path,
+      );
+    }
+    // 与浏览器一致：把 bili_jct **也作为 Cookie** 发出去
+    // （[_injectAuth] 拼的 Cookie 只有 buvid3/buvid4/SESSDATA，因为读接口
+    // 不用 csrf；而 B 站网页端每个请求都带着 bili_jct cookie）。
+    _appendJctCookie(jct);
+    final resp = await _dio.post<Map<String, dynamic>>(
+      path,
+      data: {...form, 'csrf': jct},
+      options: Options(
+        contentType: Headers.formUrlEncodedContentType,
+        // `Referer` 换成**当前视频页**：全局头里是站点首页（`biliHeaders()`），
+        // 而浏览器发这个请求时的 Referer 是视频页。B 站写接口的风控会看它，
+        // 真机上「取消点赞」曾被拒成 -400 请求错误（点赞能过、取消被拒）。
+        // `Origin` 不用在这里补：`biliHeaders()` 已经带了
+        // `Origin: https://www.bilibili.com`。
+        headers: {if (referer != null) 'Referer': referer},
+      ),
+    );
+    final data = resp.data;
+    // ⚠️ 日志只打业务码与响应体，**不打表单**（表单里就是 csrf）。
+    // 响应体整条打出来：写接口的失败原因（尤其 -400 这类笼统码）常常只在
+    // body 里说清，光留个码事后无法归因。
+    debugPrint('[bili_api] POST $path → code=${data?['code']} '
+        'msg=${data?['message']} body=$data');
+    // 有些"业务码"其实表达的是"你要的状态已经在了"（典型：点赞的 65006
+    // 重复点赞）——对调用方来说这就是成功，由调用方通过 [okCodes] 声明。
+    final code = _looseInt(data?['code']);
+    if (code != null && okCodes.contains(code)) {
+      debugPrint('[bili_api] POST $path code=$code 是"已经是该状态"，按成功处理');
+      final d0 = data?['data'];
+      return d0 is Map<String, dynamic> ? d0 : null;
+    }
+    _throwWriteError(data, path);
+    final d = data?['data'];
+    return d is Map<String, dynamic> ? d : null;
+  }
+
+  /// 把 `bili_jct` 追加进请求的 Cookie 头（幂等：已有就不重复加）。
+  ///
+  /// 只给写请求用（[_postAuth] 调），不动 [_injectAuth] 的通用 Cookie——
+  /// 读接口加不加它都一样，改了就要重新验证全部读链路，收益为零。
+  void _appendJctCookie(String jct) {
+    final cur = _dio.options.headers['Cookie'] as String? ?? '';
+    final parts =
+        cur.isEmpty ? <String>[] : cur.split('; ').where((p) => p.isNotEmpty).toList();
+    if (!parts.any((p) => p.startsWith('bili_jct='))) {
+      parts.add('bili_jct=$jct');
+    }
+    _dio.options.headers['Cookie'] = parts.join('; ');
+  }
+
+  /// 写接口的业务错误 → 抛 [BiliApiException]（带**可读**的中文提示）。
+  ///
+  /// 只映射"有把握"的几个码；其余一律回落到接口自己的 `message`（B 站的中文
+  /// 原文比我们编的更准），message 也空才给「操作失败」。故意不猜没实测过的
+  /// 码——猜错会把"硬币不足"说成"网络错误"，比原样透出更糟。
+  void _throwWriteError(Map<String, dynamic>? data, String path) {
+    final code = _looseInt(data?['code']);
+    if (code == null || code == 0) return;
+    final raw = data?['message'] as String?;
+    // switch 表达式（不是 switch 语句）：每个分支都直接给值，不涉及
+    // case 穿透/break 的写法分歧，读起来也短一截
+    final message = switch (code) {
+      -101 => '登录已失效，请重新登录 B 站账号',
+      -111 => '操作校验失败（csrf 无效），请重新登录 B 站账号',
+      -400 => '操作参数被拒绝，请稍后再试',
+      -403 => (raw == null || raw.isEmpty) ? '没有权限执行该操作' : raw,
+      -404 => (raw == null || raw.isEmpty) ? '内容不存在或已失效' : raw,
+      -412 => '操作被风控拦截，请稍后再试',
+      -509 => '操作过于频繁，请稍后再试',
+      -352 => '操作被限流，请稍后再试',
+      _ => (raw == null || raw.isEmpty) ? '操作失败' : raw,
+    };
+    throw BiliApiException(code: code, message: message, path: path);
+  }
+
+  /// 点赞接口的 `like` 取值（**2026-09 真机实测，与社区文档不一致**）：
+  /// **1 = 点赞、2 = 取消点赞**。
+  ///
+  /// 文档与旧客户端写的是 `like=0` 取消，但真机实测 `like=0` 一律被服务端拒成
+  /// `-400 请求错误`——换了 5 种请求形状都一样（`aid+bvid` 且 csrf 放 body /
+  /// 只给 bvid / csrf 放 query / 旧接口 `x/v2/view/like`（404 不存在）/
+  /// **`like=2`**），只有 `like=2` 返回 `code=0`，且 `stat.like` 由 1522 回到
+  /// 1521（这才是"取消成功"的硬证据）。**按实测实现，不按文档实现**。
+  static const int kLikeOn = 1;
+
+  /// 取消点赞（见 [kLikeOn] 的实测说明：**是 2 不是 0**）。
+  static const int kLikeOff = 2;
+
+  /// 点赞接口的"已经是这个状态"码：重复点赞。
+  ///
+  /// 2026-09 真机实测拿到：`like=1` 作用在已点赞的视频上 → `65006 重复点赞`。
+  /// 对调用方来说这就是**成功**（要的状态已经在了），所以 [likeVideo] 把它
+  /// 声明成 [okCodes] 放行——不然"界面不认识点赞态 → 再点一次点赞"
+  /// 会被当成失败并回滚，界面反而显示成"没赞"。
+  static const int kLikeAlreadyCode = 65006;
+
+  /// 点赞 / 取消点赞（`POST x/web-interface/archive/like`）。
+  ///
+  /// **[like] 是目标状态**（true = 点赞，false = 取消）——语义上幂等：传同一个
+  /// 目标态就是"要它变成这样"。但接口本身**不是静默幂等**：重复点赞会回
+  /// `65006 重复点赞`（见 [kLikeAlreadyCode]，已按成功处理），所以调用方可以
+  /// 放心做"乐观切换 + 失败回滚"。
+  ///
+  /// ⚠️ 发出去的值是 [kLikeOn]/[kLikeOff]（**1/2**，不是 1/0）——原因见
+  /// [kLikeOff] 的真机实测说明。
+  ///
+  /// [aid] 从 view 接口的 `data.aid` 来（[resolveAidForVideo] / [fetchVideoAid]）；
+  /// [bvid] 可选，调用方握着就一起给（B 站这个接口 aid/bvid 二者任选，多带一个
+  /// 是兼容性更稳，不是必需）。
+  ///
+  /// **番剧集不走这里**：pgc 内容的点赞是另一套（ep_id）接口，本版不接。
+  ///
+  /// 错误码见 [_throwWriteError]：-101 未登录/登录失效、-111 csrf 失效、
+  /// -403 无权限（稿件被锁/私密）、-412 风控、-509 频繁。
+  Future<void> likeVideo({
+    required int aid,
+    required bool like,
+    String? bvid,
+  }) async {
+    if (aid <= 0) {
+      throw const BiliApiException(
+        code: -400,
+        message: '视频 id 无效，无法点赞',
+        path: '/x/web-interface/archive/like',
+      );
+    }
+    debugPrint('[bili_api] likeVideo aid=$aid bvid=${bvid ?? '-'} like=$like');
+    await _postAuth(
+      '/x/web-interface/archive/like',
+      {
+        'aid': '$aid',
+        if (bvid != null && bvid.isNotEmpty) 'bvid': bvid,
+        'like': like ? '$kLikeOn' : '$kLikeOff',
+      },
+      okCodes: const {kLikeAlreadyCode},
+      // 与浏览器一致：写这个接口时的 Referer 是当前视频页
+      referer: (bvid != null && bvid.isNotEmpty)
+          ? 'https://www.bilibili.com/video/$bvid'
+          : null,
+    );
+  }
+
+  /// 投币（`POST x/web-interface/coin/add`）。
+  ///
+  /// ⚠️ **不幂等、且不可撤回**：[multiply] 是**本次投出的枚数**（1 或 2），
+  /// 不是目标状态——重复调用会重复扣币；B 站**没有"取消投币"接口**，硬币投
+  /// 出去就回不来。所以本方法**绝不自动重试**（[_postAuth] 那条纪律在这里最
+  /// 要紧），UI 层也必须二次确认（见 player_page 的投币确认框）。
+  ///
+  /// [alsoLike]（`select_like`）= 投币时顺带点赞，就是 B 站网页端的"投币并
+  /// 点赞"。它会让**一个动作产生两个后果**，确认框里必须说清（用户没点过赞
+  /// 就凭空多了一个赞）。
+  ///
+  /// 错误码：-101/-111/-400/-412/-509 之外，常见 **34005 = 超过投币上限**
+  /// （单个稿件最多 2 枚），这些码的原文由接口给（见 [_throwWriteError] 的
+  /// default 分支）。
+  Future<void> addCoin({
+    required int aid,
+    int multiply = 1,
+    bool alsoLike = false,
+  }) async {
+    if (aid <= 0) {
+      throw const BiliApiException(
+        code: -400,
+        message: '视频 id 无效，无法投币',
+        path: '/x/web-interface/coin/add',
+      );
+    }
+    if (multiply < 1 || multiply > 2) {
+      // B 站单稿件上限 2 枚；越界先在本机拦下（少一次会扣币的往返）
+      throw const BiliApiException(
+        code: -400,
+        message: '投币数只能是 1 或 2 枚',
+        path: '/x/web-interface/coin/add',
+      );
+    }
+    debugPrint('[bili_api] addCoin aid=$aid multiply=$multiply '
+        'alsoLike=$alsoLike');
+    await _postAuth('/x/web-interface/coin/add', {
+      'aid': '$aid',
+      'multiply': '$multiply',
+      'select_like': alsoLike ? '1' : '0',
+    });
+  }
+
+  /// 收藏 / 取消收藏（`POST x/v3/fav/resource/deal`）。
+  ///
+  /// [addFid] / [delFid] **只能给一个**（都非空直接 -400 拦下：服务端同时收到
+  /// 两个的行为没实测过，不拿用户的收藏夹去试）：
+  /// - 收藏：`add_media_ids=<fid>`；
+  /// - 取消：`del_media_ids=<fid>`——必须是**它当前所在**的夹 id，B 站是按
+  ///   "从哪个夹里删"来删的（一条视频可以在多个夹里，取消只针对指定的那个）。
+  ///
+  /// `rid = aid` + `type = 2`（2 = 稿件；音频 12 / 专栏 4 等本 App 不涉及）。
+  /// **夹 id 从 [fetchMyFavorites] 拿**（`x/v3/fav/folder/created/list-all`，
+  /// 只读接口 v2.17.5+ 就有了）——不另开一个 `listMyFavFolders()` 重复方法：
+  /// 同一个接口、同一个模型 [FavoriteFolder]，多一层壳只会多一处要维护。
+  Future<void> favVideo({required int aid, int? addFid, int? delFid}) async {
+    if (aid <= 0) {
+      throw const BiliApiException(
+        code: -400,
+        message: '视频 id 无效，无法收藏',
+        path: '/x/v3/fav/resource/deal',
+      );
+    }
+    final bool adding = addFid != null && addFid > 0;
+    final bool removing = delFid != null && delFid > 0;
+    if (adding == removing) {
+      throw const BiliApiException(
+        code: -400,
+        message: '收藏与取消收藏必须二选一',
+        path: '/x/v3/fav/resource/deal',
+      );
+    }
+    debugPrint('[bili_api] favVideo aid=$aid '
+        '${adding ? 'add=$addFid' : 'del=$delFid'}');
+    await _postAuth('/x/v3/fav/resource/deal', {
+      'rid': '$aid',
+      'type': '2',
+      // 两个字段**都要带**（不用的那个为空串）：B 站网页端就是一直带两个，
+      // 只带一个时服务端行为未实测，按已知可用的形状发。
+      'add_media_ids': adding ? '$addFid' : '',
+      'del_media_ids': removing ? '$delFid' : '',
+    });
+  }
+
+  // -------------------------------------------------------------------------
   // 直播开播状态（v2.25.2+）：白名单 UP 主「正在直播」标记（最小形态）
   // -------------------------------------------------------------------------
 
@@ -3492,4 +3777,78 @@ int? resolveAidForVideo(WhitelistVideo v, {Map<String, dynamic>? meta}) {
   final raw = meta?['aid'];
   if (raw is num && raw.toInt() > 0) return raw.toInt();
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// 写操作（v2.40.0+）：view 接口里的「我的互动态」与展示计数
+// ---------------------------------------------------------------------------
+
+/// 当前登录用户对某个视频的互动态（`view` 接口的 `data.req_user`）。
+///
+/// 用途：点赞 / 投币 / 收藏三个按钮的**真实初始态**——不然按钮只能显示
+/// "未点赞"，用户看到自己明明点过赞的视频会是"App 显示错了"。
+///
+/// ⚠️ 2026-09 实测（1 次匿名只读探针）：**匿名请求的响应里根本没有
+/// `data.req_user` 这个键**（`'req_user' in data == False`），也就是说这个
+/// 字段只在带 SESSDATA 时下发。未登录 / 接口没给 → [parseVideoReqUser] 返回
+/// null，调用方**必须降级**（只做"本次会话内乐观切换"），并在 UI 上如实
+/// 标注"重启后显示可能不准"——这是本版已知的行为边界，不是 bug。
+class VideoReqUser {
+  /// 我是否已点赞。
+  final bool like;
+
+  /// 我是否已投过币（投过就是 true，具体几枚接口不给）。
+  final bool coin;
+
+  /// 我是否已收藏（只要在任意一个夹里就是 true）。
+  final bool favorite;
+
+  const VideoReqUser({
+    required this.like,
+    required this.coin,
+    required this.favorite,
+  });
+
+  @override
+  String toString() =>
+      'VideoReqUser(like=$like, coin=$coin, favorite=$favorite)';
+}
+
+/// 从 view 接口的 `data` 解析 [VideoReqUser]；`req_user` 缺失/类型不对 → null。
+///
+/// 字段容错：B 站这几个值在不同接口里给过 `0/1`（数字）与 `true/false`
+/// （布尔）两种形态，这里都当"有没有"读；单字段缺失 → 该字段 false（不因为
+/// 一个字段脏就把整块丢掉，其余两态仍然是有效信息）。
+VideoReqUser? parseVideoReqUser(Map<String, dynamic>? meta) {
+  final raw = meta?['req_user'];
+  if (raw is! Map) return null;
+  bool flag(String key) {
+    final v = raw[key];
+    if (v is bool) return v;
+    if (v is num) return v != 0;
+    return false;
+  }
+
+  return VideoReqUser(
+    like: flag('like'),
+    coin: flag('coin'),
+    favorite: flag('favorite'),
+  );
+}
+
+/// 从 view 接口的 `data.stat` 读展示用计数（点赞 / 投币 / 收藏）。
+///
+/// 只用于按钮上的数字；缺失/脏/负数 → 0（0 就显示纯文案，不显示"0"）。
+/// 独立函数而不是塞进 [VideoReqUser]：`stat` 是**全站公开数据**（匿名就有），
+/// `req_user` 是**我的私有状态**（要登录），两者的可用性与失败模式都不同。
+({int like, int coin, int favorite}) viewStatCounts(
+  Map<String, dynamic>? meta,
+) {
+  int pick(String key) {
+    final v = (meta?['stat'] as Map?)?[key];
+    if (v is num && v > 0) return v.toInt();
+    return 0;
+  }
+
+  return (like: pick('like'), coin: pick('coin'), favorite: pick('favorite'));
 }

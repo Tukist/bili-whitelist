@@ -32,7 +32,8 @@ import 'inbox_card_styles.dart';
 /// 信箱卡片样式（v2.21.0+ 多版式切换）→
 /// GitHub 配置（token/gist）→ 合集管理（重命名/删除）→ 离线缓存管理 →
 /// 翻译服务 → 界面文案（空态/加载/错误/页脚，可改可恢复，v2.19.0 补）→
-/// 版本更新（检查更新）。面板只含内容本身（无自己的滚动/
+/// 启动行为 → 界面提示 → **写操作（v2.40.0+，点赞/投币/收藏总开关，
+/// 默认关）** → 版本更新（检查更新）。面板只含内容本身（无自己的滚动/
 /// 内边距），外层（弹层 or 页面滚动流）负责滚动与留白。
 /// **新建合集已移到合集页**（v2.19.0），面板不再提供该分区。
 ///
@@ -88,6 +89,9 @@ const Key kClipboardOpenSwitchKey = Key('clipboard-open-switch');
 
 /// 「显示底部提示条」开关的 key（测试锚点；v2.36.0）。
 const Key kTipsSwitchKey = Key('ui-tips-switch');
+
+/// 「允许点赞 / 投币 / 收藏」总开关的 key（测试锚点；v2.40.0）。
+const Key kWriteActionsSwitchKey = Key('ui-write-actions-switch');
 
 class _ManagePanelState extends State<ManagePanel> {
   final _tokenCtrl = TextEditingController();
@@ -543,6 +547,43 @@ class _ManagePanelState extends State<ManagePanel> {
               subtitle: Text(on
                   ? '已开启：操作结果都会用底部提示条告知'
                   : '已关闭：只剩错误提示与带「撤销」的提示'),
+            );
+          },
+        ),
+        const SizedBox(height: 16),
+        const Divider(height: 1),
+        const SizedBox(height: 16),
+        // ---- 写操作（v2.40.0+：点赞 / 投币 / 收藏，总开关默认关）----
+        Text('写操作', style: theme.textTheme.titleMedium),
+        const SizedBox(height: 4),
+        Text(
+          '打开后，播放页的视频信息块里会出现「点赞 / 投币 / 收藏」三个按钮，'
+          '直接作用在你真实的 B 站账号上。\n'
+          '默认关闭：这个 App 至今为止都是只读的（不碰你的账号），'
+          '而这三件事会改账号状态——点赞会进你的动态、收藏会进收藏夹、'
+          '投币会扣真实硬币且 B 站不支持撤回。想用再自己开。\n'
+          '投币会再问一次才发出去；评论与投稿不在这里（评论要输入框，'
+          '投稿是另一件事，本版都不做）。',
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+        const SizedBox(height: 8),
+        // 开关态要跟着 store 走 → 单独监听 UiPrefsStore
+        ListenableBuilder(
+          listenable: UiPrefsStore.instance,
+          builder: (context, _) {
+            final on = UiPrefsStore.instance.writeActionsEnabled;
+            return SwitchListTile(
+              key: kWriteActionsSwitchKey,
+              value: on,
+              onChanged: (v) =>
+                  UiPrefsStore.instance.setWriteActionsEnabled(v),
+              contentPadding: EdgeInsets.zero,
+              title: const Text('允许点赞 / 投币 / 收藏'),
+              subtitle: Text(on
+                  ? '已开启：播放页信息块显示三个写操作按钮（投币会二次确认）'
+                  : '已关闭：播放页一个写操作按钮都不显示'),
             );
           },
         ),

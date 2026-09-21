@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:math' as math;
 
+import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -21,6 +22,7 @@ import '../services/danmaku_settings_store.dart';
 import '../services/device_media.dart';
 import '../services/history_store.dart';
 import '../services/realtime_transcriber.dart';
+import '../services/ui_prefs_store.dart';
 import '../services/video_shot_service.dart';
 import '../services/watch_stats.dart';
 import '../services/whitelist_writer.dart';
@@ -29,6 +31,7 @@ import '../theme/app_tokens.dart';
 import '../theme/motion_control.dart';
 import '../theme/route_names.dart';
 import '../widgets/app_block.dart';
+import '../widgets/app_snack.dart';
 import '../widgets/comment_list.dart';
 import '../widgets/cover_hero.dart';
 import '../widgets/cover_image.dart';
@@ -519,6 +522,27 @@ String viewDescOf(Map<String, dynamic> data) =>
 /// 会话内简介缓存（bvid → desc）：与 [_upMetaCache] 同一次 view 响应写入，
 /// 让同一 bvid 的后续播放页（缓存命中跳过请求）也能拿到 desc。
 final Map<String, String> _viewDescCache = {};
+
+// -------------------------------------------------------------------------
+// 写操作（点赞 / 投币 / 收藏，v2.40.0+）：初始态的会话内缓存
+//
+// 三个缓存都与 [_upMetaCache] 写在**同一次 view 响应**里（零额外请求），
+// 按 bvid 记账的理由也一样：同一条视频可能被反复进播放页（历史/评论链接
+// 叠页/上下集来回切），不该每次都等一次网络往返才敢把按钮画成正确状态。
+//
+// ⚠️ [_reqUserCache] 用 `containsKey` 区分「探过了但接口没给 req_user」
+// （匿名/未登录，值就是 null）与「还没探」——两者都让按钮显示"未点赞"，
+// 但只有后者值得再等等（前者等到下次启动也一样）。
+// -------------------------------------------------------------------------
+
+/// 会话内「我的互动态」缓存（bvid → req_user；值可为 null = 接口没下发）。
+final Map<String, VideoReqUser?> _reqUserCache = {};
+
+/// 会话内公开计数缓存（bvid → stat{like,coin,favorite}）。
+final Map<String, ({int like, int coin, int favorite})> _viewStatCache = {};
+
+/// 会话内 aid 缓存（bvid → aid）：写接口只认 aid，拿到就记着。
+final Map<String, int> _viewAidCache = {};
 
 /// 播放页：进入即取流（DASH 双流 fnval=16，老视频降级 mp4 单流），
 /// 原生 ExoPlayer MergingMediaSource 合并播放。
@@ -1101,6 +1125,37 @@ class _PlayerPageState extends State<PlayerPage>
   // WhitelistVideo.desc 非空用它；为空才用 _runtimeDesc（旧数据/评论链路上
   // 用 videoFromMeta 现构的无 desc 视频）。换源复位。
   String _runtimeDesc = '';
+
+  // 写操作（点赞 / 投币 / 收藏，v2.40.0+）
+  // ---------------------------------------------------------------------
+  // 全部状态都搭 [_refreshUpownerMeta] 那次 view 请求的顺风车（零额外请求）：
+  // - _reqUser：view 的 `data.req_user`（我点过赞没/投过币没/收藏过没），
+  //   **未登录时接口根本不下发这个键** → 为 null，此时只做"本次会话内乐观
+  //   切换"，UI 会如实标注"重启后显示可能不准"（见 api 里 parseVideoReqUser）；
+  // - _viewStat：view 的 `data.stat`（公开展示计数），按钮上的数字用它；
+  // - _writeAid：view 的 `data.aid`——写接口只认 aid。它同时也被下面三个
+  //   按钮的可用性依赖（拿不到 aid 的番剧集/接口失败时不显示按钮）。
+  // 换源（playVideo 换 _video）后必须复位，防止把上一个视频的点赞态带过来。
+  VideoReqUser? _reqUser;
+  int? _writeAid;
+
+  /// 点赞数的**可显示值**：初始 = view 的 `stat.like`，本页点赞/取消时 ±1。
+  ///
+  /// 单独一个字段而不是从 `stat` 现算：现算要反推"初始时我赞没赞过"，
+  /// 而那个信息在降级路径（[_reqUser] 为 null）里根本没有——用可变的显示值
+  /// 最不容易算错，回滚时也只是把 ±1 还回去。
+  ///
+  /// （投币数/收藏数不展示：接口的 `stat.coin`/`stat.favorite` 是**全站**计数，
+  /// 与"我投没投/收没收藏"不是一回事，摆出来反而容易被读成"我投了 1.2 万枚"。）
+  int _likeCount = 0;
+
+  /// 三个按钮的**会话内**真实态（初始值取 [_reqUser]，之后由本页乐观维护）。
+  bool _liked = false;
+  bool _coined = false;
+  bool _faved = false;
+
+  /// 写请求在飞（防连点：一次只放行一个写动作，三个按钮一起置灰）。
+  bool _writeBusy = false;
 
   // 全屏画面变换（缩放 / 旋转 / 平移，v2.39.0+）
   // ---------------------------------------------------------------------
@@ -5370,6 +5425,9 @@ class _PlayerPageState extends State<PlayerPage>
       _ownerMeta = null;
       // 运行时简介随换源复位（desc 优先 _video.desc，旧数据等重拉补齐）
       _runtimeDesc = '';
+      // 写操作态随换源复位（v2.40.0+）：不把上一个视频的点赞/收藏态带过来，
+      // 否则用户切到新视频会看到"已点赞"（其实是上一条的）
+      _resetWriteActions();
       _playing = false;
       _completed = false;
       _positionMs = 0;
@@ -6437,6 +6495,24 @@ class _PlayerPageState extends State<PlayerPage>
             ),
           ],
         ),
+        // 写操作行（v2.40.0+，默认关闭）：点赞 / 投币 / 收藏。
+        //
+        // 落点为什么在这里（信息块里独立一行，**不是底栏**）：底栏刚在
+        // v2.39.0 收窄到 8 个 40dp 的按钮，第 9 个必然压垮「选集 1/2」这类
+        // 文案（见 _buildBottomBar 的注释）；而信息块这一行本来就贴着
+        // 标题/UP 主，是"关于这个视频"的信息集中地，写操作放在这里语义最近。
+        //
+        // 为什么套 ListenableBuilder：设置页那个总开关可能在播放页还活着
+        // 的时候被改（播放页在路由栈下层），监听 store 才能一回来就对上。
+        // **关闭时返回 SizedBox.shrink()**：零高度，Column 里不产生任何
+        // 视觉变化（信息块几何与改动前逐像素一致），
+        // 也就是"总开关关着 = 一个像素都不多"。
+        ListenableBuilder(
+          listenable: UiPrefsStore.instance,
+          builder: (context, _) => _writeActionsAvailable
+              ? _buildWriteActionsRow(context)
+              : const SizedBox.shrink(),
+        ),
         // 简介区：desc 空（无简介/番剧/拉取失败）不占位，避免空行喧宾夺主
         if (desc.isNotEmpty)
           Padding(
@@ -6475,44 +6551,402 @@ class _PlayerPageState extends State<PlayerPage>
     return (belowVideo - reservedForInfoBar).clamp(80.0, 220.0);
   }
 
-  /// 信息行 UP 主入口的元数据拉取（阶段 C）+ 简介运行时补拉（v2.17.3+）：
+  /// 信息行 UP 主入口的元数据拉取（阶段 C）+ 简介运行时补拉（v2.17.3+）
+  /// + 写操作初始态（v2.40.0+）：
   /// fetchVideoMeta 拿 view 接口 data.owner{mid,name,face} 补齐头像与 UP 主页
-  /// 入口，同时拿 data.desc 补旧数据缺的简介（结果按 bvid 分别缓存在
-  /// [_upMetaCache]/[_viewDescCache]，多播放页/切集不重复请求）。
+  /// 入口，同时拿 data.desc 补旧数据缺的简介、拿 data.req_user / data.stat /
+  /// data.aid 给点赞·投币·收藏三个按钮（**同一次响应，零额外请求**；结果按
+  /// bvid 分别缓存在 [_upMetaCache]/[_viewDescCache]/[_reqUserCache]/
+  /// [_viewStatCache]/[_viewAidCache]，多播放页/切集不重复请求）。
   ///
   /// 番剧（epId != null）**不拉取**——阶段 C 取舍为弱化展示（见
   /// [_buildVideoInfoBar] 注释），避免为官方号做无意义请求；简介同理
   /// （番剧简介是季级、逐集导入留空，运行时也不补——见 whitelist_writer
-  /// videoFromPgcEpisode 取舍）。
+  /// videoFromPgcEpisode 取舍）。**写操作按钮在番剧上也不出现**：pgc 内容的
+  /// 点赞/投币是另一套 ep_id 接口，本版不接（见 [_writeActionsAvailable]）。
   Future<void> _refreshUpownerMeta() async {
-    if (_video.epId != null) return; // 番剧：无 UP 入口/无简介，不请求
+    if (_video.epId != null) return; // 番剧：无 UP 入口/无简介/无写操作，不请求
     final bvid = _video.bvid;
     final cached = _upMetaCache[bvid];
     if (cached != null) {
       _ownerMeta = cached;
-      // 缓存命中（同会话再次进入同一视频）：顺带恢复 desc（同一响应写入）
+      // 缓存命中（同会话再次进入同一视频）：顺带恢复 desc 与写操作态
+      // （都与 owner 写在同一次响应里）
       _runtimeDesc = _viewDescCache[bvid] ?? _runtimeDesc;
+      _restoreWriteCache(bvid);
       return; // 会话内缓存命中（无需 setState：build 前同步赋值即可）
     }
     try {
       final data = await _api.fetchVideoMeta(bvid);
       final parsed = parseViewOwner(data);
       final desc = viewDescOf(data);
+      final reqUser = parseVideoReqUser(data);
+      final stat = viewStatCounts(data);
+      final aid = resolveAidForVideo(_video, meta: data);
       if (parsed != null) _upMetaCache[bvid] = parsed;
       if (desc.isNotEmpty) _viewDescCache[bvid] = desc;
+      // 写操作相关一律**按 bvid 记账**（含"probed 但接口没给 req_user"这种
+      // 情况：也要记下来，否则每次进同一视频都要等一次 view 请求才敢渲染）
+      _reqUserCache[bvid] = reqUser;
+      _viewStatCache[bvid] = stat;
+      if (aid != null) _viewAidCache[bvid] = aid;
       // 拉取期间可能换源/退出：按 bvid 对账，防把旧视频的 UP 信息串到新视频
       if (!mounted || _video.bvid != bvid) return;
       setState(() {
         _ownerMeta = parsed;
         _runtimeDesc = desc;
+        _reqUser = reqUser;
+        _likeCount = stat.like;
+        if (aid != null) _writeAid = aid;
+        // 初始态：拿到 req_user 就用真的，没拿到就维持"未点赞/未投币/未收藏"
+        // （即本次会话内的乐观态起点，见 [_writeStateKnown] 的降级标注）
+        if (reqUser != null) {
+          _liked = reqUser.like;
+          _coined = reqUser.coin;
+          _faved = reqUser.favorite;
+        }
       });
       debugPrint('[player_page] UP 主信息 bvid=$bvid '
           'mid=${parsed?.mid} name=${parsed?.name}');
+      debugPrint('[player_page] 写操作初始态 bvid=$bvid aid=$aid '
+          'reqUser=$reqUser stat=$stat');
     } catch (e) {
       // 失败静默：信息行保持 up_name 文本展示；点击时提示无法获取；
-      // 简介区保持隐藏（desc 空时不占位）
+      // 简介区保持隐藏（desc 空时不占位）；写操作三个按钮此时 tap 会各自
+      // 再兜底解析一次 aid（见 [_ensureWriteAid]），不必在这里拦
       debugPrint('[player_page] 拉取 UP 主信息失败 bvid=$bvid error=$e');
     }
+  }
+
+  /// 从会话内缓存恢复当前 bvid 的写操作态（[bvid] 命中 [_upMetaCache] 时走）。
+  void _restoreWriteCache(String bvid) {
+    if (_reqUserCache.containsKey(bvid)) _reqUser = _reqUserCache[bvid];
+    final stat = _viewStatCache[bvid];
+    if (stat != null) _likeCount = stat.like;
+    final aid = _viewAidCache[bvid];
+    if (aid != null) _writeAid = aid;
+    final ru = _reqUserCache[bvid];
+    if (ru != null) {
+      _liked = ru.like;
+      _coined = ru.coin;
+      _faved = ru.favorite;
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 写操作 UI（点赞 / 投币 / 收藏，v2.40.0+）
+  // -------------------------------------------------------------------------
+
+  /// 三个写操作按钮是否出现：**总开关打开 + 当前不是番剧集**。
+  ///
+  /// 为什么番剧集排除：pgc 内容的点赞/投币走的是另一套按 `ep_id` 的接口，
+  /// 本版只接了普通视频的 `archive/like` / `coin/add`（都只认 aid）；
+  /// 番剧集上摆三个点了会失败的按钮比不摆更糟。
+  bool get _writeActionsAvailable =>
+      UiPrefsStore.instance.writeActionsEnabled && _video.epId == null;
+
+  /// 是否拿到了**真实的**初始态（view 的 `data.req_user`）。
+  ///
+  /// false = 未登录 / 接口没下发 → 页面上的点赞态是"本次会话内的乐观切换"，
+  /// 重启后可能与真实状态不一致。这种情况**必须在界面上说出来**，不能让
+  /// 用户以为看到的就是账号里的真实状态（见 [_buildWriteActionsRow] 尾部标注）。
+  bool get _writeStateKnown => _reqUser != null;
+
+  /// 写操作行：`点赞 N · 投币 · 收藏` 三个轻量按钮 + （降级时）一句如实标注。
+  ///
+  /// 三个按钮行高只有一行（约 30dp），并且只在总开关打开时才构建——关着时
+  /// 信息块高度与改动前逐像素一致。
+  Widget _buildWriteActionsRow(BuildContext context) {
+    final primary = Theme.of(context).colorScheme.primary;
+    return Padding(
+      key: const ValueKey('player-write-actions'),
+      padding: const EdgeInsets.only(top: 6),
+      child: Row(
+        children: [
+          _WriteActionChip(
+            key: const ValueKey('write-like'),
+            icon: _liked ? Icons.thumb_up_alt : Icons.thumb_up_alt_outlined,
+            label: _liked ? '已赞' : '点赞',
+            count: _likeCount,
+            active: _liked,
+            accent: primary,
+            onTap: _writeBusy ? null : _onLikeTap,
+          ),
+          const SizedBox(width: 4),
+          _WriteActionChip(
+            key: const ValueKey('write-coin'),
+            icon: Icons.monetization_on_outlined,
+            label: _coined ? '已投币' : '投币',
+            count: 0,
+            active: _coined,
+            accent: primary,
+            onTap: _writeBusy ? null : _onCoinTap,
+          ),
+          const SizedBox(width: 4),
+          _WriteActionChip(
+            key: const ValueKey('write-fav'),
+            icon: _faved ? Icons.star : Icons.star_border,
+            label: _faved ? '已收藏' : '收藏',
+            count: 0,
+            active: _faved,
+            accent: primary,
+            onTap: _writeBusy ? null : _onFavTap,
+          ),
+          if (!_writeStateKnown) ...[
+            const SizedBox(width: 8),
+            // 降级如实标注（不是装饰）：没有 req_user 时上面的"已赞/未赞"只是
+            // 本次会话的猜测，重启后可能显示错——与其让用户以为 App 显示错了，
+            // 不如直接说明白。
+            Flexible(
+              child: Text(
+                '状态未取到，重启后可能显示不准',
+                key: const ValueKey('write-state-unknown'),
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(fontSize: 11, color: kInkGray50),
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  /// 拿写操作用的 aid：缓存命中直接用；否则现拉一次 view（[fetchVideoAid]
+  /// 内部自己解析并兜异常，失败返回 null）。
+  Future<int?> _ensureWriteAid() async {
+    final cached = _writeAid;
+    if (cached != null && cached > 0) return cached;
+    final aid = await _api.fetchVideoAid(_video);
+    if (aid != null && aid > 0) {
+      _writeAid = aid;
+      _viewAidCache[_video.bvid] = aid;
+    }
+    return aid;
+  }
+
+  /// 写操作失败的统一提示（**错误类** SnackBar）。
+  ///
+  /// 用 `SnackKind.error` 而不是页内 [_showSnack]：写操作失败绝不能被设置里
+  /// 的「显示底部提示条」开关静默——用户以为点赞成功了、其实没有（或反过来
+  /// 以为投币没出去、其实扣了硬币），这个误解比多看一条提示糟糕得多。
+  void _writeSnack(String message) {
+    if (!mounted) return;
+    AppSnack.show(context, message, kind: SnackKind.error);
+  }
+
+  /// 点赞 / 取消点赞（**幂等**：传的是目标态，所以可以放心先改界面）。
+  ///
+  /// 乐观切换 + 失败回滚：点赞是唯一幂等的写操作，失败时把界面改回去不会
+  /// 让服务端状态和界面脱节（重新点一次仍是同一个目标态）。
+  Future<void> _onLikeTap() async {
+    final aid = await _ensureWriteAid();
+    if (!mounted) return;
+    if (aid == null) {
+      _writeSnack('拿不到视频信息（aid），无法点赞');
+      return;
+    }
+    final target = !_liked;
+    setState(() {
+      _liked = target;
+      _likeCount += target ? 1 : -1;
+      _writeBusy = true;
+    });
+    try {
+      await _api.likeVideo(aid: aid, like: target, bvid: _video.bvid);
+      if (!mounted) return;
+      setState(() => _writeBusy = false);
+      _rememberWriteState();
+      debugPrint('[player_page] 点赞 aid=$aid like=$target ok');
+    } on BiliApiException catch (e) {
+      if (!mounted) return;
+      // 回滚：接口没生效，界面也不能留着"已赞"
+      setState(() {
+        _liked = !target;
+        _likeCount -= target ? 1 : -1;
+        _writeBusy = false;
+      });
+      _writeSnack(target ? '点赞失败：${e.message}' : '取消点赞失败：${e.message}');
+    } on DioException {
+      if (!mounted) return;
+      setState(() {
+        _liked = !target;
+        _likeCount -= target ? 1 : -1;
+        _writeBusy = false;
+      });
+      _writeSnack('网络请求失败，点赞未生效');
+    }
+  }
+
+  /// 投币：**先二次确认，再发请求**。
+  ///
+  /// 为什么必须要这一步（三道风险，确认框里逐条说清）：
+  /// ① **不可撤回**——B 站没有"取消投币"接口，投出去就回不来；
+  /// ② **扣的是真硬币**——不是"记录一个状态"，是消耗账号里的资产；
+  /// ③ **会连带点赞**（`select_like`）——一次点击产生两个后果，用户没点过赞
+  ///    就凭空多一个赞（会进对方的消息/动态）。
+  ///
+  /// 所以：**取消 → 一个请求都不发**（`confirmed != true` 直接 return）。
+  /// 投币同时也**不做乐观更新**（[multiply] 不是目标态、不幂等）——只有服务端
+  /// 确认成功才把按钮改成"已投币"。
+  Future<void> _onCoinTap() async {
+    final aid = await _ensureWriteAid();
+    if (!mounted) return;
+    if (aid == null) {
+      _writeSnack('拿不到视频信息（aid），无法投币');
+      return;
+    }
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('投 1 枚硬币？'),
+        content: const Text(
+          '硬币会从你的 B 站账号里真实扣除，投出后 B 站不支持撤回，也不退还。'
+          '（同一个稿件最多 2 枚。）\n\n'
+          '投币会同时给这个视频点赞（B 站「投币并点赞」）——'
+          '不想点赞的话，这里点「取消」。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            key: const ValueKey('write-coin-confirm'),
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('投 1 枚并点赞'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+    setState(() => _writeBusy = true);
+    try {
+      await _api.addCoin(aid: aid, multiply: 1, alsoLike: true);
+      if (!mounted) return;
+      setState(() {
+        _writeBusy = false;
+        _coined = true;
+        // 连带点赞：select_like=1 时服务端也会把点赞置上，界面跟着走
+        _liked = true;
+      });
+      _rememberWriteState();
+      AppSnack.show(context, '已投 1 枚硬币并点赞');
+    } on BiliApiException catch (e) {
+      if (!mounted) return;
+      setState(() => _writeBusy = false);
+      _writeSnack('投币失败：${e.message}');
+    } on DioException {
+      if (!mounted) return;
+      setState(() => _writeBusy = false);
+      _writeSnack('网络请求失败：投币可能没成功，请到 B 站确认后再决定要不要重投');
+    }
+  }
+
+  /// 收藏 / 取消收藏：弹收藏夹列表让用户选（**收藏与取消用同一个弹层**）。
+  ///
+  /// 为什么取消也要选夹：B 站按"从哪个夹里删"来取消，同一条视频可以在多个夹
+  /// 里——不选夹就无从取消。选中的夹会被记到本地 prefs（
+  /// [UiPrefsStore.setFavFolderId]，**不写 Gist**：那是本机操作习惯，跨设备
+  /// 同步可能指到别的账号的夹 id 上），下次进来它排第一个。
+  Future<void> _onFavTap() async {
+    final aid = await _ensureWriteAid();
+    if (!mounted) return;
+    if (aid == null) {
+      _writeSnack('拿不到视频信息（aid），无法收藏');
+      return;
+    }
+    setState(() => _writeBusy = true);
+    List<FavoriteFolder> folders;
+    try {
+      // 只读接口（v2.17.5+ 就有）：拿夹列表，不新增重复方法
+      folders = await _api.fetchMyFavorites();
+    } on BiliApiException catch (e) {
+      if (!mounted) return;
+      setState(() => _writeBusy = false);
+      _writeSnack('收藏夹列表获取失败：${e.message}');
+      return;
+    } on DioException {
+      if (!mounted) return;
+      setState(() => _writeBusy = false);
+      _writeSnack('网络请求失败，收藏夹列表没拿到');
+      return;
+    }
+    if (!mounted) return;
+    setState(() => _writeBusy = false);
+    if (folders.isEmpty) {
+      _writeSnack('没有可用的收藏夹，请先到 B 站建一个');
+      return;
+    }
+    final removing = _faved;
+    final picked = await showModalBottomSheet<FavoriteFolder>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      builder: (_) => _FavFolderSheet(
+        folders: folders,
+        removing: removing,
+        lastFid: UiPrefsStore.instance.favFolderId,
+      ),
+    );
+    if (picked == null || !mounted) return;
+    unawaited(UiPrefsStore.instance.setFavFolderId(picked.mediaId));
+    setState(() => _writeBusy = true);
+    try {
+      await _api.favVideo(
+        aid: aid,
+        addFid: removing ? null : picked.mediaId,
+        delFid: removing ? picked.mediaId : null,
+      );
+      if (!mounted) return;
+      setState(() {
+        _writeBusy = false;
+        _faved = !removing;
+      });
+      _rememberWriteState();
+      debugPrint('[player_page] ${removing ? '取消收藏' : '收藏'} aid=$aid '
+          'fid=${picked.mediaId} ok');
+      AppSnack.show(
+          context, removing ? '已从「${picked.title}」移除' : '已收藏到「${picked.title}」');
+    } on BiliApiException catch (e) {
+      if (!mounted) return;
+      setState(() => _writeBusy = false);
+      _writeSnack('${removing ? '取消收藏' : '收藏'}失败：${e.message}');
+    } on DioException {
+      if (!mounted) return;
+      setState(() => _writeBusy = false);
+      _writeSnack('网络请求失败，请稍后重试');
+    }
+  }
+
+  /// 换源时复位写操作态（被 [playVideo] 调用）。
+  void _resetWriteActions() {
+    _reqUser = null;
+    _writeAid = null;
+    _likeCount = 0;
+    _liked = false;
+    _coined = false;
+    _faved = false;
+    _writeBusy = false;
+  }
+
+  /// 把本页刚做成功的写操作写回会话内缓存（v2.40.0+）。
+  ///
+  /// 为什么需要：[_reqUserCache] 缓存的是"服务端某次 view 报给我的互动态"，
+  /// 而这里的点赞/投币/收藏是**我们刚刚真实改掉的状态**。不写回去的话，
+  /// 「点赞 → 返回 → 再进同一条视频」（同会话命中缓存、不再打 view）会显示
+  /// 旧的"未点赞"，用户会以为没生效。
+  ///
+  /// 只在**原本就拿到过真实态**（[_reqUser] != null）时写回：未知时强行造一个
+  /// `req_user` 会把"猜的"伪装成"服务端说的"，比显示旧值更糟——那条"状态未取到"
+  /// 的降级标注必须继续说真话。
+  void _rememberWriteState() {
+    if (_reqUser == null) return;
+    _reqUserCache[_video.bvid] = VideoReqUser(
+      like: _liked,
+      coin: _coined,
+      favorite: _faved,
+    );
   }
 
   /// 点击信息行 UP 主区（仿 B 站 → 进 UP 主主页 [UpownerPage]）。
@@ -6566,6 +7000,12 @@ class _PlayerPageState extends State<PlayerPage>
       countHeaderKey: _commentCountHeaderKey,
       showCountHeader: true,
       onOpenVideo: openVideoInNewPlayer,
+      // v2.40.0+：本处（且只有本处）开启「评论区左右滑切换热门/最新排序」。
+      // 为什么只在这里开：用户是在**看视频时**抱怨"评论区不能左右划"，
+      // 而播放页内嵌评论区是唯一有"继续看下去"语境的位置；专栏 / 动态 /
+      // 独立评论页的横向手势位将来另有用途（单条左滑等），现在不占。
+      // 两者不能同时上：同一片区域只能有一套横滑手势（见参数注释）。
+      enableSortSwipe: true,
     );
   }
 
@@ -7874,4 +8314,166 @@ String _fmtMs(int ms) {
   final mm = m.toString().padLeft(2, '0');
   final ss = sec.toString().padLeft(2, '0');
   return h > 0 ? '$h:$mm:$ss' : '$m:$ss';
+}
+
+/// 一个写操作按钮（点赞 / 投币 / 收藏）：小图标 + 词 + 可选计数。
+///
+/// 为什么做成"图标 + 词"而不是纯图标：这三个动作都**不可逆或代价高**，
+/// 认错图标（尤其 `monetization_on` 与 `star`）的代价比多占一点宽度大得多。
+/// 高度压到一行（最小点击高度 32dp）：信息块每多一行都从评论区抢地方。
+/// [onTap] 为 null = 正在发写请求（三个按钮一起置灰，见 `_writeBusy`）。
+class _WriteActionChip extends StatelessWidget {
+  final IconData icon;
+  final String label;
+
+  /// 计数（0 = 不显示数字，只显示词——避免"点赞 0"这种噪音）。
+  final int count;
+
+  /// 是否处于"已做"态（主色 + 实心图标）。
+  final bool active;
+
+  /// 主色（从宿主 theme 传进来，避免每个 chip 各自查一次 Theme）。
+  final Color accent;
+
+  final VoidCallback? onTap;
+
+  const _WriteActionChip({
+    super.key,
+    required this.icon,
+    required this.label,
+    required this.count,
+    required this.active,
+    required this.accent,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final disabled = onTap == null;
+    final color = disabled
+        ? kInkGray30
+        : (active ? accent : kInkGray70);
+    return Semantics(
+      button: true,
+      enabled: !disabled,
+      selected: active,
+      label: count > 0 ? '$label $count' : label,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(6),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, size: 16, color: color),
+              const SizedBox(width: 4),
+              Text(
+                count > 0 ? '$label ${_fmtWriteCount(count)}' : label,
+                style: TextStyle(
+                  fontSize: 12.5,
+                  fontWeight: active ? FontWeight.w600 : FontWeight.w400,
+                  color: color,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// 收藏夹选择弹层（收藏 / 取消收藏共用）。
+///
+/// - [removing] = true：标题写成「取消收藏」，选中某个夹 = **从该夹移除**
+///   （B 站按夹删，同一条视频在多个夹里时只影响选中的那个）；
+/// - [lastFid]：上次选过的夹（[UiPrefsStore.favFolderId]）——**排到第一个并
+///   标「上次」**，让"再收一遍到老地方"是一下点击；
+/// - 取消返回 null（调用方据此不发任何请求）。
+class _FavFolderSheet extends StatelessWidget {
+  final List<FavoriteFolder> folders;
+  final bool removing;
+  final int? lastFid;
+
+  const _FavFolderSheet({
+    required this.folders,
+    required this.removing,
+    required this.lastFid,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    // 上次选过的夹提到最前（其余保持接口顺序，便于用户按熟悉的位置找）
+    final ordered = [
+      for (final f in folders)
+        if (lastFid != null && f.mediaId == lastFid) f,
+      for (final f in folders)
+        if (lastFid == null || f.mediaId != lastFid) f,
+    ];
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Padding(
+          padding: const EdgeInsets.only(top: 14, bottom: 6),
+          child: Text(
+            removing ? '从哪个收藏夹移除' : '收藏到',
+            textAlign: TextAlign.center,
+            style: const TextStyle(fontSize: 13, color: kInkGray70),
+          ),
+        ),
+        Flexible(
+          child: ListView.builder(
+            shrinkWrap: true,
+            itemCount: ordered.length,
+            itemBuilder: (context, i) {
+              final f = ordered[i];
+              final isLast = lastFid != null && f.mediaId == lastFid;
+              return ListTile(
+                key: ValueKey('fav-folder-${f.mediaId}'),
+                dense: true,
+                title: Row(
+                  children: [
+                    Flexible(
+                      child: Text(
+                        f.title,
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ),
+                    if (isLast) ...[
+                      const SizedBox(width: 6),
+                      Text('上次',
+                          style: TextStyle(fontSize: 11, color: kInkGray50)),
+                    ],
+                  ],
+                ),
+                subtitle: Text('${f.mediaCount} 个内容',
+                    style: const TextStyle(fontSize: 11.5)),
+                onTap: () => Navigator.of(context).pop(f),
+              );
+            },
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// 计数格式化（点赞数）：<1 万原样；≥1 万 → `1.2万`；≥1 亿 → `1.2亿`。
+///
+/// 与列表卡/专栏页的 `fmtArticleCount` 同一套口径，但**不复用它**：
+/// 那是 `article_page.dart` 的顶层函数，播放页 import 页面文件只为一个小函数
+/// 会让依赖方向变怪（页面之间互相 import 也是这个项目一直在避免的）。
+String _fmtWriteCount(int n) {
+  if (n < 10000) return '$n';
+  if (n < 100000000) {
+    final v = n / 10000;
+    final s = v >= 100 ? v.toStringAsFixed(0) : v.toStringAsFixed(1);
+    return '${s.replaceAll(RegExp(r'\.0$'), '')}万';
+  }
+  final v = n / 100000000;
+  final s = v >= 100 ? v.toStringAsFixed(0) : v.toStringAsFixed(1);
+  return '${s.replaceAll(RegExp(r'\.0$'), '')}亿';
 }

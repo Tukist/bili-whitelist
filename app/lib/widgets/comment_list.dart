@@ -26,6 +26,9 @@
 /// - 楼中楼：根评论内嵌至多 3 条预览（缩进小字）；「N 条回复」展开 →
 ///   拉完整楼中楼（`x/v2/reply/reply`，pn 递增分页，hasMore 继续加载）
 /// - 空态/错误态：暂无评论 / 评论区已关闭（12002）/ 网络与风控（可重试）
+/// - **排序切换**（v2.40.0+，可选、默认关闭）：整片左右滑或点区头
+///   `热门 | 最新` 词条 → 重载第一页。语义与开关见
+///   [CommentListView.enableSortSwipe] / [CommentListView.sortMode]。
 ///
 /// 块化与动效（P0 批次 B）：
 /// - 每条根评论 = [AppBlock]（`comment` 规格：纸底 + hairline 描边），
@@ -41,6 +44,8 @@
 /// 看全文、「收起」复原（纯文本/链接混排都支持；无链接短评保持可直接
 /// 选择复制，见 _LinkifiedBody 说明）。
 library;
+
+import 'dart:async';
 
 import 'package:dio/dio.dart';
 import 'package:flutter/gestures.dart';
@@ -79,6 +84,47 @@ const Map<String, String> _imgHeaders = {
 /// 可点头像的热区最小边长（Android 触摸目标 ≥48dp）：头像本体只有
 /// 34/20/18px，撑出这个方形热区才够手指点。
 const double _kAvatarTapMin = 48.0;
+
+// ---------------------------------------------------------------------------
+// 评论排序（v2.40.0+）：整片左右滑切换「热门 / 最新」
+// ---------------------------------------------------------------------------
+
+/// `x/v2/reply/main` 的 `mode` 取值：**3 = 按热度**（B 站网页端「最热」，
+/// 也是本组件改动前的写死值）。
+const int kCommentSortHot = 3;
+
+/// `x/v2/reply/main` 的 `mode` 取值：**2 = 按最新**（2026-09 只读探针确认，
+/// 见 [CommentListView.sortMode] 注释）。
+const int kCommentSortNewest = 2;
+
+/// 排序切换的触发门槛：**横向位移**达标 + 横向为主 + 够快，三者同时满足。
+///
+/// - **位移门槛 56px**：用户想切排序时会"拖一下"，量太小会与纵向滚动的轻微
+///   横向抖动混淆。误切的代价虽然只是再滑回来，但不该白白发生。
+/// - **横向为主**（|dx| ≥ |dy|）：斜着滚列表时不能顺手把排序切了。
+/// - **时长上限 500ms**：**与长按手势（文本选择）抢同一个起手式**——手指按住
+///   不动 500ms 就会触发长按选字，之后再横拖是"扩大选区"，不是"切排序"。
+///   所以超过这个时长的拖动一律不当横滑（详见 [_wrapSortSwipe] 为什么用
+///   [Listener] 而不是 [GestureDetector]）。
+const double _kSortSwipeMinDistance = 56.0;
+const Duration _kSortSwipeMaxDuration = Duration(milliseconds: 500);
+
+/// 排序切换浮层提示的停留时长（"已切到「最新」"，自动消失，无需点击）。
+const Duration _kSortHintDuration = Duration(milliseconds: 1400);
+
+/// 「热门」排序词条（区头切换控件 + 浮层提示共用，测试按文字找）。
+const String kCommentSortHotLabel = '热门';
+
+/// 「最新」排序词条。
+const String kCommentSortNewestLabel = '最新';
+
+/// 区头排序切换控件的锚点（测试用；仅 [CommentListView.enableSortSwipe] 为
+/// true 时构建）。
+const Key kCommentSortHotKey = Key('comment-sort-hot');
+const Key kCommentSortNewestKey = Key('comment-sort-newest');
+
+/// 切换后浮层提示的锚点（测试用；仅短暂存在）。
+const Key kCommentSortHintKey = Key('comment-sort-hint');
 
 /// 评论内视频链接点击回调：把目标视频交给宿主打开，可携带链接 ?p/?t 定位
 /// 参数（v2.17.6+；来源见 utils/comment_links.dart 的 CommentLink.pageIndex /
@@ -201,6 +247,30 @@ class CommentListView extends StatefulWidget {
   /// 复用 buvid 指纹、Cookie 与 WBI key，少一次 spi 请求。
   final BiliApi? api;
 
+  /// 是否允许在**评论列表这块区域上左右滑动切换排序**（v2.40.0+，可选，
+  /// **默认 false**）。
+  ///
+  /// 为 false 时组件**完全不包任何横向手势**（不加 GestureDetector / Stack），
+  /// 渲染树与改动前逐节点一致 —— 专栏阅读页 / 动态详情页 / 独立评论页三个
+  /// 使用点因此行为零变化，只有播放页内嵌评论区显式打开。
+  ///
+  /// ⚠️ **同一片区域只能有一套横向手势**：本能力与「单条评论左滑露出操作」
+  /// （[SwipeActionBox] 那一类）**不能同时上**——内层逐条横滑与外层整片横滑
+  /// 会在手势竞技场里互相抢，表现为"有时切排序、有时露出按钮"。两者是同一个
+  /// 交互位上的竞品，本版选了"整片横滑切排序"（改动最小、误触代价最低：
+  /// 切错了再滑回来即可，不会误发写请求）。
+  final bool enableSortSwipe;
+
+  /// 初始排序，仅当 [enableSortSwipe] 为 true 时有意义：
+  /// **3 = 按热度（默认，B 站网页端「最热」）/ 2 = 按最新**。
+  ///
+  /// 语义来自 1 次只读探针（`curl x/v2/reply/main` 同 aid 对比 mode=2/3）：
+  /// mode=2 响应 `cursor.name == "最新评论"` 且 replies 按 ctime 严格递减
+  /// （like 多为 0/1/2）、mode=3 响应 `cursor.name == "热门评论"` 且按 like
+  /// 递减，两者 `cursor.support_mode` 都是 `[2, 3]` —— 即这两个值是接口
+  /// 明确支持的两档，不是猜的。
+  final int sortMode;
+
   const CommentListView({
     super.key,
     this.video,
@@ -218,6 +288,8 @@ class CommentListView extends StatefulWidget {
     this.controller,
     this.countHeaderKey,
     this.api,
+    this.enableSortSwipe = false,
+    this.sortMode = kCommentSortHot,
   });
 
   @override
@@ -235,6 +307,28 @@ class _CommentListViewState extends State<CommentListView> {
 
   /// 已解析的视频 aid（null = 尚未解析成功）。
   int? _aid;
+
+  // --- 排序（v2.40.0+，仅 enableSortSwipe 时可见/可变）---------------------
+
+  /// 当前排序（`x/v2/reply/main` 的 `mode`）：初始值由
+  /// [CommentListView.sortMode] 给（默认 3 = 热门，与改动前写死的值一致）。
+  late int _mode = widget.sortMode;
+
+  /// 本轮横滑的指针跟踪状态（见 [_wrapSortSwipe]）。
+  ///
+  /// 用裸指针事件而不是手势识别器，所以这里自己维护"手指从哪下、走到哪、
+  /// 花了多久"三件事；多指时只认最先按下的那一根（[Listener] 拿不到"谁是
+  /// 主手指"，但双指缩放/双指滚动在评论列表里没有语义，忽略第二根是安全的）。
+  int? _sortPointer;
+  Offset _sortDownPos = Offset.zero;
+  Offset _sortLastPos = Offset.zero;
+  DateTime? _sortDownAt;
+
+  /// 切换排序后的浮层提示文案（null = 不显示）。
+  String? _sortHint;
+
+  /// 浮层提示的自动消失计时器（切换时重置）。
+  Timer? _sortHintTimer;
 
   /// 是否带登录态（SESSDATA）：B 站对未登录访客的 reply/main 只折叠返回
   /// 前几条热门评论（is_end=true），登录后才会给全量分页——据此决定
@@ -301,6 +395,7 @@ class _CommentListViewState extends State<CommentListView> {
 
   @override
   void dispose() {
+    _sortHintTimer?.cancel();
     if (_scrollListening) {
       _scrollCtrl.removeListener(_onScroll);
       _scrollListening = false;
@@ -412,7 +507,7 @@ class _CommentListViewState extends State<CommentListView> {
     try {
       final page = await _api.fetchVideoComments(
         aid: aid,
-        mode: 3,
+        mode: _mode,
         next: reset ? 0 : _cursorNext,
         type: widget.commentType,
       );
@@ -508,6 +603,85 @@ class _CommentListViewState extends State<CommentListView> {
     if (pos.pixels >= pos.maxScrollExtent - 300) {
       _loadMain(reset: false);
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // 排序切换（v2.40.0+）：整片左右滑 / 点区头词条
+  // -------------------------------------------------------------------------
+
+  /// 手指按下：开始跟踪（多指只认第一根）。
+  void _onSortPointerDown(PointerDownEvent e) {
+    if (_sortPointer != null) return;
+    _sortPointer = e.pointer;
+    _sortDownPos = e.position;
+    _sortLastPos = e.position;
+    _sortDownAt = DateTime.now();
+  }
+
+  /// 手指移动：只更新"最后位置"（判定统一在抬手时做）。
+  void _onSortPointerMove(PointerMoveEvent e) {
+    if (_sortPointer != e.pointer) return;
+    _sortLastPos = e.position;
+  }
+
+  /// 手指抬起：三个条件同时满足才算一次横滑 → 切排序（否则什么都不做，
+  /// 事件本来也没被消费，纵向滚动/文本选择完全不受影响）。
+  void _onSortPointerUp(PointerEvent e) {
+    if (_sortPointer != e.pointer) return;
+    final downAt = _sortDownAt;
+    final dx = _sortLastPos.dx - _sortDownPos.dx;
+    final dy = _sortLastPos.dy - _sortDownPos.dy;
+    _stopSortTracking();
+    // ① 够快（长按选字之后的拖动不算）
+    if (downAt == null ||
+        DateTime.now().difference(downAt) > _kSortSwipeMaxDuration) {
+      return;
+    }
+    // ② 位移够远
+    if (dx.abs() < _kSortSwipeMinDistance) return;
+    // ③ 横向为主（斜着滚列表不能顺手切排序）
+    if (dx.abs() < dy.abs()) return;
+    // 方向语义与区头那条 `热门 | 最新` 一致（最新在右）：**左滑 → 下一档
+    // （最新）**、**右滑 → 回上一档（热门）**。不是"左/右各一个动作"，而是
+    // "往哪边拨就往那边靠"——两个状态来回拨都符合直觉，也不会因为方向记错
+    // 而永远只切到同一档。
+    _switchSort(dx > 0 ? kCommentSortHot : kCommentSortNewest);
+  }
+
+  /// 手势被系统取消（来电、被上层抢走等）：停止跟踪，不切排序。
+  void _onSortPointerCancel(PointerCancelEvent e) {
+    if (_sortPointer != e.pointer) return;
+    _stopSortTracking();
+  }
+
+  void _stopSortTracking() {
+    _sortPointer = null;
+    _sortDownAt = null;
+  }
+
+  /// 切到指定排序：换档 → 给浮层提示 → 回到列表顶部 → 重新拉第一页。
+  ///
+  /// 为什么必须 `reset: true` 重载而不是本地排序：`mode` 是**服务端排序**
+  /// （分页游标也是按该排序生成的），本地重排只能排当前已加载的那几页，
+  /// 翻页会立刻错乱。
+  ///
+  /// 为什么先 `jumpTo(0)`：重载期间列表会被整块状态视图替下（detach），
+  /// 不先归零的话重新挂载时 `keepScrollOffset` 会把旧偏移量恢复回来——
+  /// 用户看到的是"滑了没反应"。归零要在把 `_loading` 置位之前做，这样
+  /// detach 时记下的偏移量就是 0。
+  void _switchSort(int next) {
+    if (!widget.enableSortSwipe || next == _mode) return;
+    debugPrint('[comment_list] 切换排序 mode=$_mode → $next');
+    setState(() {
+      _mode = next;
+      _sortHint = next == kCommentSortNewest ? '已切到「最新」' : '已切到「热门」';
+    });
+    _sortHintTimer?.cancel();
+    _sortHintTimer = Timer(_kSortHintDuration, () {
+      if (mounted) setState(() => _sortHint = null);
+    });
+    if (_scrollCtrl.hasClients) _scrollCtrl.jumpTo(0);
+    _loadMain(reset: true);
   }
 
   // -------------------------------------------------------------------------
@@ -887,13 +1061,80 @@ class _CommentListViewState extends State<CommentListView> {
         child: Center(child: state),
       );
 
+  /// 给评论区套「左右滑切换排序」（v2.40.0+，**仅**
+  /// [CommentListView.enableSortSwipe] 为 true 时）。
+  ///
+  /// 关闭时**原样返回 child**（不加 Listener、不加 Stack）—— 专栏 / 动态 /
+  /// 独立评论页三个使用点的渲染树因此逐节点不变。
+  ///
+  /// 打开时：用 **[Listener]（裸指针事件）而不是 [GestureDetector]/
+  /// 手势识别器**，这是本方法唯一的"技术判断"，理由有实测支撑：
+  /// - 识别器要进**手势竞技场**，而竞技场的成员数会改变小位移纵向拖动的行为
+  ///   ——只有一个成员时它在下指那一刻就赢了，第一段位移按原样派发；多一个
+  ///   成员后要走 slop 判定（触摸 18px），同样的一次 20px 拖动**实际滚到的
+  ///   距离会变小**。播放页的「滚评论收起信息块」是**按累积位移过阈值**判定
+  ///   的，这个差值直接把既有用例打红了（20px 拖动不再触发收起）——
+  ///   也就是说加识别器 = 悄悄改了纵向滚动手感，与"纵向滚动不受影响"直接冲突。
+  /// - [Listener] 只是**旁听**指针事件（不消费、不进竞技场），纵向滚动、
+  ///   长按选文本、点击手势全部照旧，一个像素的手感变化都没有。
+  /// - 代价：`Listener` 拿不到"手势被上层抢走"的信号，所以要自己判"够快 +
+  ///   够远 + 横向为主"（见 [_onSortPointerUp]），并且忽略多指（只跟第一根）。
+  ///
+  /// 提示浮层恒占一个 Stack 槽位：`hint == null` 时只是不构建那一个
+  /// `Positioned`，**Stack 本身一直在**。否则提示出现/消失会让 ListView 的
+  /// 父级在两种 widget 类型之间切换 → 元素被卸载重建 → 滚动位置与列表状态
+  /// （已展开的楼中楼等）全丢。
+  Widget _wrapSortSwipe(Widget child) {
+    if (!widget.enableSortSwipe) return child;
+    final hint = _sortHint;
+    return Listener(
+      onPointerDown: _onSortPointerDown,
+      onPointerMove: _onSortPointerMove,
+      onPointerUp: _onSortPointerUp,
+      onPointerCancel: _onSortPointerCancel,
+      child: Stack(
+        children: [
+          child,
+          if (hint != null)
+            Positioned(
+              top: 8,
+              left: 0,
+              right: 0,
+              // 纯展示：IgnorePointer 保证它既不拦点击也不拦滑动
+              child: IgnorePointer(
+                child: Center(
+                  child: Container(
+                    key: kCommentSortHintKey,
+                    padding: const EdgeInsets.symmetric(
+                        horizontal: 12, vertical: 5),
+                    decoration: BoxDecoration(
+                      // 与「置顶」角标同一套墨填充底/字色（不引入新配色）
+                      color: context.palette.inkFill,
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                    child: Text(
+                      hint,
+                      style: TextStyle(
+                        color: context.palette.onInk,
+                        fontSize: 12.5,
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final pageHeader = widget.header;
     final state = _bodyState();
     // 无自定义头 → 老行为：状态视图直接占满整块（_fitState 兼容矮容器）
     if (pageHeader == null) {
-      if (state != null) return _fitState(state);
+      if (state != null) return _wrapSortSwipe(_fitState(state));
     }
     final hasHeader = pageHeader != null;
     // 有自定义头但评论还没内容/出错 → 列表只有「头 + 一块状态」
@@ -904,7 +1145,7 @@ class _CommentListViewState extends State<CommentListView> {
     final headerSlot = hasHeader ? 1 : 0;
     // 翻页追加批次：本批条目用更短更密的入场节奏（见 app_motion.dart）
     final appendBatch = _batchStart > 0;
-    return NotificationListener<ScrollNotification>(
+    final list = NotificationListener<ScrollNotification>(
       onNotification: (notification) {
         // 上拉到底触发下一页（ScrollController 监听 + 此兜底双保险）
         if (notification.metrics.pixels >=
@@ -974,12 +1215,18 @@ class _CommentListViewState extends State<CommentListView> {
         ),
       ),
     );
+    return _wrapSortSwipe(list);
   }
 
   /// 列表顶部「评论 N」区头（内嵌场景的评论区锚点 + 计数展示）。
   ///
   /// 横向内边距交给列表的 [kPagePadH]（本区头在列表内），文字与下方评论块
   /// 左边线对齐；底色与页面底色相同（[ColorScheme.surface] = [kPaper]）。
+  ///
+  /// [CommentListView.enableSortSwipe] 为 true 时，行尾额外挂一个
+  /// `热门 | 最新` 词条切换器（当前档高亮）：横滑是"隐蔽手势"，光有浮层提示
+  /// 用户第一次进来根本不知道能滑——一个看得见的词条同时解决**可发现性**、
+  /// **当前档位**和**读屏可用性**（横滑对读屏/TalkBack 是不可用的交互）。
   Widget _buildCountHeader() {
     return Container(
       key: widget.countHeaderKey,
@@ -997,7 +1244,57 @@ class _CommentListViewState extends State<CommentListView> {
               fontWeight: FontWeight.w600,
             ),
           ),
+          if (widget.enableSortSwipe) ...[
+            const Spacer(),
+            _buildSortToggle(),
+          ],
         ],
+      ),
+    );
+  }
+
+  /// 区头行尾的 `热门 | 最新` 排序切换器（点按等价于横滑，见 [_switchSort]）。
+  ///
+  /// 外包一层透明 [Material] 承载水波纹：区头自己的 `Container(color:)` 会
+  /// 盖掉更外层 Material 上的涟漪（与 [_Avatar] 同一个坑）。
+  Widget _buildSortToggle() {
+    return Material(
+      type: MaterialType.transparency,
+      child: Row(
+        children: [
+          _sortWord(kCommentSortHot, kCommentSortHotLabel, kCommentSortHotKey),
+          Text('|', style: TextStyle(fontSize: 12, color: kInkGray30)),
+          _sortWord(
+              kCommentSortNewest, kCommentSortNewestLabel, kCommentSortNewestKey),
+        ],
+      ),
+    );
+  }
+
+  /// 排序词条：当前档走主色 + 加粗，非当前档灰（点它即切过去）。
+  Widget _sortWord(int mode, String label, Key key) {
+    final active = _mode == mode;
+    return Semantics(
+      button: true,
+      selected: active,
+      label: '按$label排序${active ? '（当前）' : ''}',
+      child: InkWell(
+        key: key,
+        onTap: () => _switchSort(mode),
+        borderRadius: BorderRadius.circular(4),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+          child: Text(
+            label,
+            style: TextStyle(
+              fontSize: 13,
+              fontWeight: active ? FontWeight.w600 : FontWeight.w400,
+              color: active
+                  ? Theme.of(context).colorScheme.primary
+                  : kInkGray50,
+            ),
+          ),
+        ),
       ),
     );
   }
