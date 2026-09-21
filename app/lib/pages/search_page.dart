@@ -13,6 +13,15 @@
 /// Tab + 同一个关键词只打一次接口（见 [_searchedKeyword]），「我的白名单」
 /// Tab 是本地过滤、永不发请求。
 ///
+/// 「我的白名单」Tab 的两件事（v2.48.0）：
+/// - **陈旧提示**：快照被确证落后于云端（`SyncResult.stale`）时，Tab 顶部常驻
+///   一条 [StaleSyncBanner]（与首页/合集页共用同一组件），点「立即同步」重跑
+///   一次白名单同步，成功后自己消失。这个 Tab 是"照白名单过滤"的入口，而
+///   「全部 B 站」Tab 的「已加入」判断也走同一份快照——看到旧快照会让用户以为
+///   某个视频"没加进去"；
+/// - **失败 ≠ 空**：四源全失败（`sync()` 抛异常）时显示失败态 + 「重试」，
+///   不再和"白名单真的没有匹配视频"共用一条空态文案（后者是另一条 copyId）。
+///
 /// 搜索历史（v2.17.16+）：本地关键词列表（[SearchHistoryStore]，去重置顶 /
 /// 上限 20 / 单删 / 清空）——输入框为空且在「全部 B 站 / 搜索 UP 主」Tab 时
 /// 显示「搜索历史」面板：每条可点 = 直接填入并搜索，行尾 X 或长按单删，
@@ -83,6 +92,7 @@ import '../widgets/expandable_text.dart';
 import '../widgets/pgc_import_dialog.dart';
 import '../widgets/smoke_silhouette.dart';
 import '../widgets/staggered_entrance.dart';
+import '../widgets/stale_sync_banner.dart';
 import '../widgets/upowner_tile.dart';
 import 'live_player_page.dart';
 import 'player_page.dart';
@@ -212,6 +222,21 @@ class _SearchPageState extends State<SearchPage>
 
   /// 当前白名单快照：「我的白名单」Tab 的数据源 + 「已加入」判断依据。
   WhitelistData? _whitelist;
+
+  /// 白名单同步失败的原因（null = 没失败过）。
+  ///
+  /// 为什么必须把它和 [_whitelist] 分开记：「四源全失败」与「白名单真的是空的」
+  /// 拿到的都是 `_whitelist == null`，只用一个 null 表示会把失败渲染成空态
+  /// （v2.44.0 在首页修掉的是同一个问题，见 `playlist_page.dart` 的 `_EmptyView`）。
+  String? _whitelistError;
+
+  /// 当前展示的白名单快照是否被**确证**陈旧（取 [_loadWhitelist] 拿到的
+  /// `SyncResult.stale`）。
+  ///
+  /// 与首页同一条理由（见 `playlist_page.dart` 的 `_stale`）：那个单例不是
+  /// ChangeNotifier（不 notify），build 时读它拿不到"数据换了、横幅该消失"的
+  /// 信号，所以本页自己存一份 bool 供渲染。
+  bool _stale = false;
 
   /// 搜索状态：null = 尚未搜索（显示提示）；空数组 = 无结果。
   List<SearchResult>? _results;
@@ -383,14 +408,28 @@ class _SearchPageState extends State<SearchPage>
 
   /// 加载白名单快照（与首页同一套同步逻辑：Gist → LAN → 本地文件 → 缓存）。
   /// 测试可注入替身 [widget.syncService]，不触发真实网络。
+  ///
+  /// 成功 → 记下 [SyncResult.stale]（陈旧快照要在 tab 顶部常驻提示）；
+  /// 失败 → **不改陈旧标记**（屏幕上的数据没变，它是不是旧快照与"这次能不能
+  /// 同步上"是两件事，与 `playlist_page.dart` / `inbox_page.dart` 同一约定），
+  /// 只记下失败原因，让「我的白名单」Tab 显示失败态而不是空态。
   Future<void> _loadWhitelist() async {
     try {
       final service = widget.syncService ?? ServiceLocator.syncService;
       final result = await service.sync();
-      if (mounted) setState(() => _whitelist = result.data);
-    } catch (_) {
-      // 白名单加载失败不阻塞搜索；「我的白名单」Tab 显示错误提示
-      if (mounted) setState(() => _whitelist = null);
+      if (!mounted) return;
+      setState(() {
+        _whitelist = result.data;
+        _whitelistError = null;
+        _stale = result.stale;
+      });
+    } catch (e) {
+      // 白名单加载失败不阻塞搜索；「我的白名单」Tab 显示失败态 + 重试入口
+      if (!mounted) return;
+      setState(() {
+        _whitelist = null;
+        _whitelistError = '同步失败：$e';
+      });
     }
   }
 
@@ -1771,8 +1810,46 @@ class _SearchPageState extends State<SearchPage>
 
   // ---- 「我的白名单」Tab ----
 
+  /// 「我的白名单」Tab：顶部常驻陈旧提示 + 内容区。
+  ///
+  /// 横幅与首页/合集页共用 [StaleSyncBanner]，挂在滚动容器**之外**（不随列表
+  /// 滚走）；[stale] 为 false 时组件自己返回 `SizedBox.shrink()`，不占位。
+  ///
+  /// 陈旧在这里有真实语义：这个 Tab 是"照白名单过滤"的入口，而且「全部 B 站」
+  /// Tab 的「已加入」判断也走同一份 [_whitelist]——看到的白名单是旧快照时，
+  /// 用户会以为某个视频"没加进去"（其实是快照里还没有它）。
   Widget _buildWhitelistTab() {
+    return Column(
+      children: [
+        StaleSyncBanner(
+          stale: _stale,
+          onResync: () => unawaited(_loadWhitelist()),
+        ),
+        Expanded(child: _buildWhitelistBody()),
+      ],
+    );
+  }
+
+  /// 「我的白名单」Tab 的内容区（横幅之外的部分）。
+  Widget _buildWhitelistBody() {
     if (_whitelist == null) {
+      // 同步失败 ≠ 白名单为空（v2.48.0）：四源全失败时这里给**失败态 + 重试**，
+      // 不再把"没同步上"渲染成"白名单为空"（用户会把后者读成"我的数据没了"）。
+      // 失败原因不丢：具体异常放在副文案里（本页没有别的红字出口）。
+      if (_whitelistError != null) {
+        return AppStateView(
+          kind: AppStateKind.error,
+          copyId: 'empty.search.whitelist.sync_failed',
+          subtitle: _whitelistError,
+          illustrationSeed: 'search.whitelist.sync_failed',
+          // 与首页那个"同步失败"态同一取舍：副文案是**原始异常**（长度不可控）
+          // → 可滚动，短屏上「重试」才不会被挤出屏幕且够不着。
+          scrollable: true,
+          actionLabel: '重试',
+          onAction: () => unawaited(_loadWhitelist()),
+        );
+      }
+      // 还没同步到任何一份（首次同步在途中）→ 沿用原来的空态文案
       return const AppStateView(
         kind: AppStateKind.empty,
         copyId: 'empty.search.whitelist',
@@ -1787,6 +1864,7 @@ class _SearchPageState extends State<SearchPage>
         illustrationSeed: 'search.whitelist.filter',
       );
     }
+
     final theme = Theme.of(context);
     return ListView.separated(
       itemCount: videos.length,

@@ -76,6 +76,11 @@ class UiCopyStore extends ChangeNotifier {
     'empty.search.result': '没有找到相关视频，换个关键词试试',
     'empty.search.whitelist': '白名单加载失败或暂无数据\n请确认网络后重新进入搜索页',
     'empty.search.whitelist.filter': '白名单里没有匹配的视频',
+    // 同步失败**且无数据**时的空态（v2.48.0）：与上面两条并置——「四源全失败」
+    // 原本也走 `empty.search.whitelist`，用户读到的却是"暂无数据"，会把
+    // "没同步上"看成"白名单空了"。排在最后是为了不动前几行的可视位置（测试锚点）。
+    'empty.search.whitelist.sync_failed':
+        '白名单同步失败，可能是离线\n请确认网络后点「重试」',
 
     // ---------- 收件箱 ----------
     'empty.inbox': '暂未有白名单 UP 主的新视频\n在「搜索」→「搜索 UP 主」中加入 UP 主后，\nTA 发布的新视频会出现在这里',

@@ -444,7 +444,13 @@ void main() {
       expect(UiCopyStore.kDefaultCopies['empty.playlist'],
           '白名单为空\n下拉刷新重新同步');
       expect(UiCopyStore.kDefaultCopies['footer.no_more'], '没有更多了');
-      expect(UiCopyStore.kDefaultCopies.length, 48);
+      // 新加的文案只**追加**，既有各条的键与值都没动
+      expect(UiCopyStore.kDefaultCopies['empty.search.whitelist.sync_failed'],
+          '白名单同步失败，可能是离线\n请确认网络后点「重试」');
+      // ★ 条数：新增一条文案 → 这个数字**必然**要跟着 +1。这不是"放宽断言"，
+      //   而是它本就是"出厂表有几条"的记账（48 → 49，与
+      //   `ui_copy_store_test.dart` 里逐条锚点分开：那边管值，这边管条数）。
+      expect(UiCopyStore.kDefaultCopies.length, 49);
     });
   });
 }

@@ -788,7 +788,17 @@ class UpdateService {
   }
 
   /// 日志文本脱敏：文本里出现的 URL 一律截成 host + path，并把 token 形态的串
-  /// 换成占位符。dio 的异常 message 常带**整条请求 URL**，不能原样落日志。
+  /// 换成占位符。
+  ///
+  /// 为什么这里是**防御性**的（而不是"dio 一定会带 URL"）：dio 5.x 默认的
+  /// `defaultDioExceptionReadableStringBuilder` 只在少数分支（`type: message`
+  /// 下的 `Error: …`）自己拼句子，**不**拼 `requestOptions.uri` —— 所以今天多数
+  /// 异常的 message 里其实没有 URL。但 message 与 `error` 的内容取决于 dio 版本
+  /// 以及可被替换的 `DioException.readableStringBuilder`（构造 `DioException` 时
+  /// 能换一套拼装规则），而下载地址是 GitHub 302 到签名 CDN、
+  /// `?X-Amz-Signature=…` 就在 query 里：一旦漏进 logcat，下载凭据是**收不回
+  /// 来**的。这种"发生一次就不可挽回"的事，按防御性处理，比按当前版本的实现
+  /// 细节处理划算。
   static String sanitizeLogText(Object? raw) {
     if (raw == null) return '—';
     var text = raw.toString();

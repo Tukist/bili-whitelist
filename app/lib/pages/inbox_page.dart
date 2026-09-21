@@ -65,6 +65,14 @@
 /// 队列被清空（用户划完最后一张）而检查还在跑时，显示**空态**而不是整页加载态
 /// （[_loadedOnce] 区分「划完了」与「还没加载出来」）。
 ///
+/// ## 陈旧白名单提示（v2.48.0）
+/// 信箱**消费白名单快照**（`InboxService.checkAll` 内部走 `syncService.sync()`
+/// 拿 `data.upowners`）：快照陈旧 = 名单里少几个 UP 主 → 他们的新视频不会被
+/// 发现。所以检查完一轮后，若 `WhitelistFreshness.instance.isStale` 为真，
+/// 页面顶部常驻一条 [StaleSyncBanner]（挂在滚动容器之外，不随队列滚走）。
+/// 它的「立即同步」接的是 [_resyncWhitelistOnly]（**只跑白名单同步**），
+/// 刻意不复用 [_checkNow] —— 后者是一轮几分钟的全量检查。
+///
 /// ## 空态也保留撤销入口
 /// 划掉最后一张后底部栏整体消失、撤销不回来是可用性缺陷：空态下改为
 /// 「细线插画 + 一行只有『撤销上一张』的底栏」（[_buildBottomBar] `hasCards: false`）。
@@ -130,6 +138,7 @@ import '../services/inbox_card_style_store.dart';
 import '../services/inbox_service.dart';
 import '../services/service_locator.dart';
 import '../services/whitelist_writer.dart';
+import '../sync/whitelist_freshness.dart';
 import '../theme/app_palette.dart';
 import '../theme/app_tokens.dart';
 import '../theme/motion_control.dart';
@@ -139,6 +148,7 @@ import '../widgets/inbox_card_stack.dart';
 import '../widgets/inbox_card_styles.dart';
 import '../widgets/inbox_swipe_card.dart';
 import '../widgets/staggered_entrance.dart';
+import '../widgets/stale_sync_banner.dart';
 import 'live_player_page.dart';
 import 'player_page.dart';
 import 'upowner_page.dart' show LiveNowBadge;
@@ -337,6 +347,19 @@ class _InboxPageState extends State<InboxPage>
   /// 用户照样能划卡、点卡、撤销（见文件头「后台检查不阻塞交互」）。
   String? _busyNote;
   String? _error;
+
+  /// 上一轮检查时白名单快照是否被**确证**陈旧（v2.48.0）。
+  ///
+  /// 信箱**确实消费白名单快照**（`InboxService.checkAll` 内部的
+  /// `syncService.sync()` 拿 `data.upowners`）：快照陈旧 = 少几个 UP 主 →
+  /// 他们的新视频根本不会被发现，所以"这份白名单是旧的"值得常驻提示。
+  ///
+  /// 取值只能读单例 [WhitelistFreshness]（[InboxCheckResult] 里没有 `stale`
+  /// 字段，透传不过去）；页面存一份 bool 是因为那个单例不是 ChangeNotifier
+  /// （build 时读它拿不到"判定变了、横幅该消失"的信号）——与首页 `_stale`
+  /// 同一套理由。`checkAll` 命中"缓存够新"的节流分支时会早退、不再 sync，
+  /// 此时单例保留上一次的判定，与"屏幕上这份快照是哪一份"仍然一致。
+  bool _stale = false;
 
   /// 检查进行中周期性回读本地未读的定时器（见 [_pollProgress]；dispose 取消）。
   Timer? _progressTimer;
@@ -638,6 +661,10 @@ class _InboxPageState extends State<InboxPage>
         _busyNote = null;
         _loadedOnce = true;
         _error = result.failed ? result.message : null;
+        // 这一轮用到的白名单快照新不新（判据由服务打标，这里只搬进 state）。
+        // ★ 失败分支**不改**它：屏幕上的队列没变，"这份快照旧不旧"与"这次
+        //   检查成不成"是两件事（与首页 `_load` 的同一约定）。
+        _stale = WhitelistFreshness.instance.isStale;
         _items = _mergeChecked(result.items);
       });
       if (result.failed && _items.isNotEmpty) {
@@ -658,6 +685,37 @@ class _InboxPageState extends State<InboxPage>
       });
     } finally {
       _stopProgressPolling();
+    }
+  }
+
+  /// 陈旧横幅上的「立即同步」：**只跑白名单同步**（v2.48.0）。
+  ///
+  /// ★ 为什么不复用 [_checkNow]：那一轮是**全量信箱检查**——串行遍历白名单
+  /// UP 主、每个之间间隔 ≥1.5s，100 个 UP 主要跑几分钟（见文件头「后台检查
+  /// 不阻塞交互」）。用户此刻的意图是"把白名单这份数据拉新"（好让下一次检查
+  /// 依据的是新名单），点一下却触发几分钟的后台遍历是过度反应。
+  ///
+  /// 同步是**只读**操作，一条 `syncService.sync()` 就够：它同时也把
+  /// [WhitelistFreshness] 的判定刷新了（服务内部会打标），横幅据此消失。
+  /// 这里不顺手刷新卡片栈：队列内容由 `checkAll` 决定，而这一路刻意**不**跑它
+  /// （要立刻看新视频 → 下拉刷新，那是用户明确的动作）。
+  Future<void> _resyncWhitelistOnly() async {
+    try {
+      final result = await ServiceLocator.syncService.sync();
+      // 与首页/合集页同一约定：判据只由服务给（[SyncResult.stale]），页面只是
+      // 把它搬进 state；这里显式再标一次是为了覆盖**测试替身直接改写 sync()**
+      // 的路径（替身不会自己打标，读单例会读到上一条）。
+      WhitelistFreshness.instance
+          .markSync(sourceName: result.sourceName, stale: result.stale);
+      if (!mounted) return;
+      setState(() => _stale = result.stale);
+      _showSnack(
+        result.stale ? '仍然同步失败：请确认网络后重试' : '白名单已同步到最新',
+        kind: result.stale ? SnackKind.error : SnackKind.info,
+      );
+    } catch (e) {
+      // 失败**不改**陈旧标记（数据没换，它还是那份），横幅继续挂着
+      if (mounted) _showSnack('同步失败：$e', kind: SnackKind.error);
     }
   }
 
@@ -1468,8 +1526,21 @@ class _InboxPageState extends State<InboxPage>
       body: ListenableBuilder(
         // 卡片样式 store：切换风格 → 卡片栈立即换版式（尺寸固定，不跳动）
         listenable: InboxCardStyleStore.instance,
-        builder: (context, _) =>
-            RefreshIndicator(onRefresh: _checkNow, child: _buildBody()),
+        builder: (context, _) => Column(
+          children: [
+            // 陈旧快照常驻提示（v2.48.0）：挂在滚动容器**之外**（不随队列
+            // 滚走），与合集页 `CollectionPage` 同一种形状。用的是**只跑白名单
+            // 同步**的轻回调，不是 [_checkNow]（理由见 [_resyncWhitelistOnly]）。
+            // 不陈旧时组件自己返回 SizedBox.shrink()，不占位。
+            StaleSyncBanner(
+              stale: _stale,
+              onResync: () => unawaited(_resyncWhitelistOnly()),
+            ),
+            Expanded(
+              child: RefreshIndicator(onRefresh: _checkNow, child: _buildBody()),
+            ),
+          ],
+        ),
       ),
     );
   }

@@ -13,6 +13,15 @@
 // ④ 信息条第三条分支：无错误、无来源、无时间（**还没同步到任何一份**）→
 //    「暂无数据，下拉刷新同步」（不能显示成"时间未知"，那是"有数据但不知道
 //    什么时候取的"）。
+// ⑤ 搜索页「我的白名单」tab（v2.48.0）：
+//    - 陈旧横幅（点「立即同步」重跑一次白名单同步，成功后消失；同步失败**不**
+//      清陈旧标记 → 横幅继续挂着）；
+//    - **失败 ≠ 空**：四源全失败 → 失败态 + 「重试」（原先和"白名单为空"共用
+//      一条文案，用户会把"没同步上"读成"我的白名单空了"）；
+//    - "白名单真的空"仍是原来的空态。
+// ⑥ 信箱（v2.48.0）：陈旧横幅（信箱消费白名单快照 → 陈旧 = 少几个 UP 主的新
+//    视频），且它的「立即同步」**只跑白名单同步**——不复用一轮几分钟的全量
+//    `checkAll`（断言：全量检查的调用次数没有增加）。
 //
 // 复用既有模式：`ServiceLocator.overrideSyncService` 注入假同步服务 + 内存版
 // secure storage（不碰原生插件/网络）；「local 快照没有 fetchedAt」那条刻意
@@ -28,10 +37,14 @@ import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'package:bili_whitelist_app/api/bilibili_api.dart';
 import 'package:bili_whitelist_app/api/github_api.dart';
 import 'package:bili_whitelist_app/models/whitelist_video.dart';
 import 'package:bili_whitelist_app/pages/collection_page.dart';
+import 'package:bili_whitelist_app/pages/inbox_page.dart';
 import 'package:bili_whitelist_app/pages/playlist_page.dart';
+import 'package:bili_whitelist_app/pages/search_page.dart';
+import 'package:bili_whitelist_app/services/inbox_service.dart';
 import 'package:bili_whitelist_app/services/service_locator.dart';
 import 'package:bili_whitelist_app/sync/whitelist_freshness.dart';
 import 'package:bili_whitelist_app/sync/whitelist_source.dart';
@@ -292,6 +305,92 @@ Future<void> _pumpCollection(
     ),
   );
   await tester.pumpAndSettle();
+}
+
+/// 不触网的 dio（所有请求都返回空 JSON 200）。
+///
+/// 搜索页/信箱都会**构造**真实 [BiliApi]（测试里不该真发请求）：本批要测的
+/// 两个 tab / 页面都不需要 B 站接口，给它一个哑适配器即可——真发了请求也不会
+/// 触网，而且返回的空 body 会让那条路径立刻失败而不是静默通过。
+Dio _deadDio() {
+  final dio = Dio();
+  dio.httpClientAdapter = _NullAdapter();
+  return dio;
+}
+
+/// 直接打开搜索页的「我的白名单」tab（不经过首页导航）。
+///
+/// `initialTab: 1` = 「我的白名单」：本 tab 是**纯本地过滤**，不会发搜索请求。
+Future<void> _pumpSearchWhitelistTab(
+  WidgetTester tester,
+  WhitelistSyncService sync,
+) async {
+  _store.clear();
+  _mockSecureStorage();
+  await tester.pumpWidget(
+    MaterialApp(
+      home: SearchPage(
+        initialTab: 1,
+        syncService: sync,
+        api: BiliApi(dio: _deadDio()),
+      ),
+    ),
+  );
+  await tester.pump(); // _loadWhitelist 完成（假服务同步返回）
+  await tester.pump();
+}
+
+/// 信箱服务替身：只数「全量检查跑了几轮」。
+///
+/// [staleAfterCheck] 为真时，在 [checkAll] 里给 [WhitelistFreshness] 打标——
+/// 真实服务就是这么做的（`checkAll` 内部 `syncService.sync()` → 服务打标），
+/// 页面随后读单例拿到"这一轮用的快照旧不旧"。
+class _CountingInboxService extends InboxService {
+  _CountingInboxService({required this.staleAfterCheck});
+
+  /// 本轮检查用到的白名单快照是否为陈旧快照。
+  final bool staleAfterCheck;
+
+  /// [checkAll] 被调用的次数（=「全量检查跑了几轮」）。
+  int checkCalls = 0;
+
+  @override
+  Future<List<InboxItem>> getItems() async => const [];
+
+  @override
+  Future<InboxCheckResult> checkAll({bool force = false}) async {
+    checkCalls++;
+    WhitelistFreshness.instance.markSync(
+      sourceName: staleAfterCheck ? 'cache' : 'gist',
+      stale: staleAfterCheck,
+    );
+    return InboxCheckResult(total: 0, unseen: 0, items: const []);
+  }
+
+  @override
+  Future<void> markAllRead() async {}
+}
+
+/// 打开信箱页；返回的服务替身用来数「全量检查跑了几轮」。
+///
+/// 队列**刻意留空**（本批测的是顶部横幅与它的动作，不是卡片栈——卡片栈的
+/// 用例在 `test/inbox_swipe_test.dart`）：空队列也走完 `_checkNow` 整条路径，
+/// 横幅与「立即同步」照常渲染。
+Future<_CountingInboxService> _pumpInbox(
+  WidgetTester tester, {
+  required WhitelistSyncService sync,
+  required bool stale,
+}) async {
+  _store.clear();
+  _mockSecureStorage();
+  ServiceLocator.overrideSyncService(sync);
+  final inbox = _CountingInboxService(staleAfterCheck: stale);
+  ServiceLocator.overrideInboxService(inbox);
+  await tester.pumpWidget(
+    MaterialApp(home: InboxPage(api: BiliApi(dio: _deadDio()))),
+  );
+  await tester.pumpAndSettle();
+  return inbox;
 }
 
 void main() {
@@ -612,6 +711,261 @@ void main() {
 
       expect(find.text('暂无数据，下拉刷新同步'), findsNothing);
       expect(find.text('数据时间 2020-01-02 03:04（来源: gist）'), findsOneWidget);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // ⑤ 搜索页「我的白名单」tab：陈旧横幅 + 失败不伪装成空
+  // -------------------------------------------------------------------------
+  //
+  // 这一处是 v2.44.0 明确记下的已知限制：首页「合集」tab 与合集内部页有了
+  // 常驻陈旧提示，搜索页的「我的白名单」tab 还没有；而它同样消费白名单快照
+  // （这个 tab 就是"照白名单过滤"的入口，「全部 B 站」tab 的「已加入」判断
+  // 也走同一份快照 → 看旧快照的人会以为某个视频"没加进去"）。
+  // 顺带修同一个 tab 里的误导：同步失败原先被渲染成"白名单加载失败或暂无
+  // 数据"，用户会读成"我的白名单空了"。
+  group('⑤ 搜索页「我的白名单」tab', () {
+    testWidgets('stale == true → 顶部出现陈旧横幅，列表照常渲染', (tester) async {
+      final sync = _ScriptedSync([
+        _result(_homeData(),
+            source: 'cache', fetchedAt: _kFetchedAt, stale: true),
+      ]);
+      await _pumpSearchWhitelistTab(tester, sync);
+
+      expect(sync.calls, 1);
+      expect(find.text(kStaleSnapshotBannerMessage), findsOneWidget);
+      expect(find.byType(StaleSyncBanner), findsOneWidget);
+      expect(tester.getSize(find.byType(StaleSyncBanner)).height, greaterThan(0));
+      expect(find.text('立即同步'), findsOneWidget);
+      // 横幅是**加在列表上面**的，不是替换列表
+      expect(find.text('视频BV1'), findsOneWidget);
+    });
+
+    testWidgets('stale == false → 没有横幅，也不占位（防误报成离线）',
+        (tester) async {
+      final sync = _ScriptedSync([
+        _result(_homeData(), source: 'gist', fetchedAt: _kFetchedAt),
+      ]);
+      await _pumpSearchWhitelistTab(tester, sync);
+
+      expect(find.text(kStaleSnapshotBannerMessage), findsNothing);
+      expect(tester.getSize(find.byType(StaleSyncBanner)).height, 0,
+          reason: '非陈旧态必须零占位（组件留在树上但渲染成 SizedBox.shrink）');
+      expect(find.text('立即同步'), findsNothing);
+      expect(find.text('视频BV1'), findsOneWidget);
+    });
+
+    testWidgets('点横幅「立即同步」→ 真的又同步一次，成功后横幅消失',
+        (tester) async {
+      final sync = _ScriptedSync([
+        _result(_homeData(),
+            source: 'cache', fetchedAt: _kFetchedAt, stale: true),
+        _result(_wl('2026-09-25T00:00:00Z', ['BV9'], collections: ['动画']),
+            source: 'gist', fetchedAt: _kFetchedAt),
+      ]);
+      await _pumpSearchWhitelistTab(tester, sync);
+
+      expect(find.text(kStaleSnapshotBannerMessage), findsOneWidget);
+
+      await tester.tap(find.text('立即同步'));
+      await tester.pumpAndSettle();
+
+      expect(sync.calls, 2, reason: '横幅上的动作必须真的触发一次同步');
+      expect(find.text(kStaleSnapshotBannerMessage), findsNothing,
+          reason: '同步成功（stale=false）→ 横幅自己消失');
+      // 数据也换成了新的一份（不是只把提示藏了）
+      expect(find.text('视频BV9'), findsOneWidget);
+      expect(find.text('视频BV1'), findsNothing);
+    });
+
+    testWidgets('首次同步就失败 → 失败态 + 「重试」，不再说"白名单为空"',
+        (tester) async {
+      final sync = _FlakySync(
+        failTimes: 99,
+        result: _result(_homeData(), source: 'gist', fetchedAt: _kFetchedAt),
+      );
+      await _pumpSearchWhitelistTab(tester, sync);
+
+      expect(sync.calls, 1);
+      // 四源全失败 ≠ 白名单为空：走的是错误态，文案也是另一条
+      final state = tester.widget<AppStateView>(find.byType(AppStateView));
+      expect(state.kind, AppStateKind.error);
+      expect(state.copyId, 'empty.search.whitelist.sync_failed');
+      expect(find.text('白名单同步失败，可能是离线\n请确认网络后点「重试」'),
+          findsOneWidget);
+      // 两条"像是空"的文案都不该出现（"加载失败或暂无数据" / "没有匹配的视频"）
+      expect(find.textContaining('白名单加载失败或暂无数据'), findsNothing);
+      expect(find.text('白名单里没有匹配的视频'), findsNothing);
+      // 具体报错不丢（本页没有别的红字出口 → 挂在副文案上）
+      expect(find.textContaining('所有白名单源都不可用'), findsOneWidget);
+      // 原始异常可能很长 → 这个态必须是可滚动的，短屏上「重试」才够得着
+      expect(state.scrollable, isTrue,
+          reason: '副文案长度不可控（原始异常）→ 走可滚动形态');
+      // 「重试」入口必须在（失败态要能自救）。⚠️ 测试默认屏幕是 800×600，比
+      // 真机矮：插画 + 两行标题 + 原始异常把按钮顶到了首屏之外（真机 360×800
+      // 上它在首屏内），所以这里先滚进视野再断言——断言的是"入口存在且可点"，
+      // 与用户在短屏上要做的动作一致（与首页那条同样的写法）。
+      final retry = find.text('重试', skipOffstage: false);
+      expect(retry, findsOneWidget);
+      await tester.ensureVisible(retry);
+      await tester.pump();
+      expect(find.text('重试'), findsOneWidget);
+    });
+
+    testWidgets('失败态点「重试」→ 再同步一次，成功后切回列表', (tester) async {
+      final sync = _FlakySync(
+        failTimes: 1,
+        result: _result(_homeData(), source: 'gist', fetchedAt: _kFetchedAt),
+      );
+      await _pumpSearchWhitelistTab(tester, sync);
+
+      expect(sync.calls, 1);
+      final retry = find.text('重试', skipOffstage: false);
+      expect(retry, findsOneWidget);
+      await tester.ensureVisible(retry);
+      await tester.pump();
+
+      await tester.tap(find.text('重试'));
+      await tester.pumpAndSettle();
+
+      expect(sync.calls, 2, reason: '「重试」必须真的再跑一次同步');
+      expect(find.text('重试', skipOffstage: false), findsNothing);
+      expect(find.textContaining('白名单同步失败'), findsNothing);
+      expect(find.text('视频BV1'), findsOneWidget, reason: '成功后显示真实列表');
+    });
+
+    testWidgets('白名单真的空 → 仍是原来的空态（不是失败态、也没有「重试」）',
+        (tester) async {
+      final sync = _ScriptedSync([
+        _result(WhitelistData.empty(), source: 'gist', fetchedAt: _kFetchedAt),
+      ]);
+      await _pumpSearchWhitelistTab(tester, sync);
+
+      final state = tester.widget<AppStateView>(find.byType(AppStateView));
+      expect(state.kind, AppStateKind.empty, reason: '同步成功但没数据 = 空，不是错');
+      expect(state.copyId, 'empty.search.whitelist.filter');
+      expect(find.text('白名单里没有匹配的视频'), findsOneWidget);
+      expect(find.text('重试'), findsNothing);
+      expect(find.textContaining('同步失败'), findsNothing);
+    });
+
+    testWidgets('同步还在途中 → 沿用原来的空态文案，不会被误报成失败',
+        (tester) async {
+      final sync = _PendingSync();
+      await _pumpSearchWhitelistTab(tester, sync);
+
+      expect(sync.calls, 1);
+      final state = tester.widget<AppStateView>(find.byType(AppStateView));
+      expect(state.kind, AppStateKind.empty);
+      expect(state.copyId, 'empty.search.whitelist');
+      expect(find.text('重试'), findsNothing);
+
+      // 同步回来 → 换成真实列表（顺带证明上面那条只属于"还没拿到数据"）
+      sync.completer
+          .complete(_result(_homeData(), source: 'gist', fetchedAt: _kFetchedAt));
+      await tester.pumpAndSettle();
+      expect(find.text('视频BV1'), findsOneWidget);
+    });
+
+    testWidgets('陈旧 + 同步失败**不**清陈旧标记 → 横幅与失败态同屏',
+        (tester) async {
+      final sync = _FailsAfterFirstSync(_result(_homeData(),
+          source: 'cache', fetchedAt: _kFetchedAt, stale: true));
+      await _pumpSearchWhitelistTab(tester, sync);
+
+      expect(find.text(kStaleSnapshotBannerMessage), findsOneWidget);
+
+      // 点横幅「立即同步」→ 这次同步失败
+      await tester.tap(find.text('立即同步'));
+      await tester.pumpAndSettle();
+
+      expect(sync.calls, 2);
+      // ★ 失败**不清**陈旧标记：屏幕上的数据没变，"这份快照旧不旧"与"这次能不能
+      //   同步上"是两件事（与首页/合集页/信箱同一约定）
+      expect(find.text(kStaleSnapshotBannerMessage), findsOneWidget,
+          reason: '同步失败后横幅必须还在（不能被失败顶掉）');
+      // 失败态同时出现：横幅说"你看的是旧数据"，失败态说"这次没同步上"
+      expect(find.text('重试', skipOffstage: false), findsOneWidget);
+      expect(find.textContaining('所有白名单源都不可用'), findsOneWidget);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // ⑥ 信箱：陈旧横幅 + 「立即同步」只跑白名单同步
+  // -------------------------------------------------------------------------
+  //
+  // 信箱确实消费白名单快照（`InboxService.checkAll` 内部 `syncService.sync()`
+  // 拿 `data.upowners`）：快照陈旧 = 名单里少几个 UP 主 → 他们的新视频不会被
+  // 发现。而它的「立即同步」**不能**复用页面的一轮全量检查（那一轮要串行遍历
+  // 白名单 UP 主、每个间隔 ≥1.5s，可能跑几分钟）——本组把这个约定钉住。
+  group('⑥ 信箱：陈旧横幅 + 轻量重同步', () {
+    testWidgets('本轮检查用的快照陈旧 → 顶部出现横幅（队列空也照常渲染）',
+        (tester) async {
+      final sync = _ScriptedSync([
+        _result(_homeData(), source: 'gist', fetchedAt: _kFetchedAt),
+      ]);
+      final inbox = await _pumpInbox(tester, sync: sync, stale: true);
+
+      expect(inbox.checkCalls, 1, reason: '进页面跑了一轮检查');
+      expect(find.text(kStaleSnapshotBannerMessage), findsOneWidget);
+      expect(find.byType(StaleSyncBanner), findsOneWidget);
+      expect(tester.getSize(find.byType(StaleSyncBanner)).height, greaterThan(0));
+      expect(find.text('立即同步'), findsOneWidget);
+      // 横幅挂在滚动容器之外：空队列的空态照常显示
+      expect(find.textContaining('暂未有白名单 UP 主的新视频'), findsOneWidget);
+    });
+
+    testWidgets('快照不陈旧 → 没有横幅，也不占位', (tester) async {
+      final sync = _ScriptedSync([
+        _result(_homeData(), source: 'gist', fetchedAt: _kFetchedAt),
+      ]);
+      await _pumpInbox(tester, sync: sync, stale: false);
+
+      expect(find.text(kStaleSnapshotBannerMessage), findsNothing);
+      expect(tester.getSize(find.byType(StaleSyncBanner)).height, 0);
+      expect(find.text('立即同步'), findsNothing);
+    });
+
+    testWidgets('点「立即同步」→ 只跑白名单同步，**不再跑一轮全量检查**',
+        (tester) async {
+      final sync = _ScriptedSync([
+        _result(_homeData(), source: 'gist', fetchedAt: _kFetchedAt),
+      ]);
+      final inbox = await _pumpInbox(tester, sync: sync, stale: true);
+
+      expect(inbox.checkCalls, 1);
+      expect(sync.calls, 0,
+          reason: '页面的检查走 inboxService，页面自己不直接调 syncService');
+
+      await tester.tap(find.text('立即同步'));
+      await tester.pumpAndSettle();
+
+      expect(sync.calls, 1, reason: '「立即同步」必须真的同步一次白名单');
+      expect(inbox.checkCalls, 1,
+          reason: '★ 只跑白名单同步：一轮几分钟的全量 checkAll 不许被顺带触发');
+      expect(find.text(kStaleSnapshotBannerMessage), findsNothing,
+          reason: '同步成功 → 横幅自己消失');
+      expect(find.textContaining('白名单已同步到最新'), findsOneWidget);
+    });
+
+    testWidgets('轻同步仍失败 → 横幅不消失（不清陈旧标记）+ 给出错误提示',
+        (tester) async {
+      final sync = _FlakySync(
+        failTimes: 99,
+        result: _result(_homeData(), source: 'gist', fetchedAt: _kFetchedAt),
+      );
+      final inbox = await _pumpInbox(tester, sync: sync, stale: true);
+
+      expect(find.text(kStaleSnapshotBannerMessage), findsOneWidget);
+
+      await tester.tap(find.text('立即同步'));
+      await tester.pumpAndSettle();
+
+      expect(sync.calls, 1);
+      expect(inbox.checkCalls, 1, reason: '失败也一样不许顺带跑全量检查');
+      expect(find.text(kStaleSnapshotBannerMessage), findsOneWidget,
+          reason: '同步仍失败 → 快照还是那份旧的，横幅不能消失');
+      expect(find.textContaining('同步失败：'), findsOneWidget);
     });
   });
 }

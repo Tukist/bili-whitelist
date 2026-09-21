@@ -1196,8 +1196,9 @@ const Map<String, String> _kCopyNotes = <String, String>{
   // 搜索
   'empty.search': '搜索页初始提示',
   'empty.search.result': '全网搜索无结果',
-  'empty.search.whitelist': '搜索页白名单加载失败',
+  'empty.search.whitelist': '搜索页白名单还没加载出来',
   'empty.search.whitelist.filter': '白名单内搜索无结果',
+  'empty.search.whitelist.sync_failed': '搜索页白名单同步失败（无数据时）',
   // 收件箱
   'empty.inbox': '收件箱没有新视频',
   // 评论
@@ -1262,7 +1263,7 @@ List<({String label, List<String> ids})> groupCopyIds() {
   return out;
 }
 
-/// 界面文案编辑弹层：按场景分组列出**全部出厂文案**（约 48 条），
+/// 界面文案编辑弹层：按场景分组列出**全部出厂文案**（约 49 条），
 /// 逐条可改、可单条恢复默认；顶部可「全部恢复默认」（二次确认）。
 ///
 /// ## 写入策略：输入框 `onChanged` 直接写，**改一个字符就全局生效**
@@ -1414,7 +1415,7 @@ class _CopyEditorSheetState extends State<_CopyEditorSheet> {
               ),
             ),
             const Divider(height: 1),
-            // 47 条 + 分组标题：列表自己滚，弹层高度上限 85% 屏高
+            // 48 条 + 分组标题：列表自己滚，弹层高度上限 85% 屏高
             Flexible(
               child: ListenableBuilder(
                 listenable: UiCopyStore.instance,
