@@ -45,7 +45,14 @@ class _RoutingAdapter implements HttpClientAdapter {
   final Map<String, Map<String, dynamic> Function()> handlers;
   final List<RequestOptions> requests = [];
 
-  _RoutingAdapter(this.handlers);
+  /// path → **按顺序消费**的响应队列（队首优先，用完后回落 [handlers]）。
+  ///
+  /// 用来造「第 1 次失败、第 2 次成功」这种一次性响应（-412 自愈、取 key
+  /// 失败后重新尝试等），只靠静态 handlers 造不出来。
+  final Map<String, List<Map<String, dynamic> Function()>> queue;
+
+  _RoutingAdapter(this.handlers, {Map<String, List<Map<String, dynamic> Function()>>? queue})
+    : queue = queue ?? const {};
 
   @override
   Future<ResponseBody> fetch(
@@ -54,6 +61,17 @@ class _RoutingAdapter implements HttpClientAdapter {
     Future<void>? cancelFuture,
   ) async {
     requests.add(options);
+    final pending = queue[options.path];
+    if (pending != null && pending.isNotEmpty) {
+      final next = pending.removeAt(0);
+      return ResponseBody.fromString(
+        jsonEncode(next()),
+        200,
+        headers: {
+          'content-type': ['application/json; charset=utf-8'],
+        },
+      );
+    }
     final handler = handlers[options.path];
     if (handler == null) {
       return ResponseBody.fromString(
@@ -187,6 +205,29 @@ Map<String, dynamic> _upownerInfoBody({
   'code': code,
   'message': code == 0 ? 'OK' : '业务错误',
   'data': {'name': name, 'face': face, 'fans': fans, 'sign': sign},
+};
+
+/// `seasons_series_list` 响应（一条合集；合集接口不带 WBI 签名）。
+Map<String, dynamic> _seasonsSeriesBody() => {
+  'code': 0,
+  'message': 'OK',
+  'data': {
+    'items_lists': {
+      'page': {'page_num': 1, 'page_size': 20, 'total': 1},
+      'seasons_list': [
+        {
+          'meta': {
+            'season_id': 1001,
+            'name': '合集·A',
+            'cover': '',
+            'description': '',
+            'total': 3,
+          },
+        },
+      ],
+      'series_list': <Map<String, dynamic>>[],
+    },
+  },
 };
 
 void main() {
@@ -716,6 +757,289 @@ void main() {
         () => BiliApi(dio: dio).fetchUpownerFollower(1),
         throwsA(isA<DioException>()),
       );
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // v2.47.0：UP 主页首屏这条链的风控自愈 + spi/nav 在途去重
+  // （用户报「进 UP 主页经常网络请求失败，重试几次才正常 / 粉丝数读不到」）
+  // -------------------------------------------------------------------------
+
+  group('UP 主页风控自愈（-412 刷 WBI key 重签重试）', () {
+    test('fetchUpownerVideos 首次 -412 → 刷 key 重签重试后成功（不再直接抛）',
+        () async {
+      final adapter = _RoutingAdapter(
+        {
+          '/x/frontend/finger/spi': _spiBody,
+          '/x/web-interface/nav': _navBody,
+          '/x/space/wbi/arc/search': () =>
+              _videoListBody(vlist: [_oneVideo(bvid: 'BVok')]),
+        },
+        queue: {
+          // 第一次 arc/search 回 -412（key 过期），之后回落正常响应
+          '/x/space/wbi/arc/search': [() => _videoListBody(code: -412)],
+        },
+      );
+      final page = await _api(adapter).fetchUpownerVideos(100);
+
+      expect(page.videos.single.bvid, 'BVok', reason: '-412 应自愈成成功');
+      expect(
+        adapter.requests.where((r) => r.path == '/x/space/wbi/arc/search').length,
+        2,
+        reason: '首次 -412 → 重签重试一次（共 2 次请求）',
+      );
+      expect(
+        adapter.requests.where((r) => r.path == '/x/web-interface/nav').length,
+        2,
+        reason: '刷新 WBI key = 再取一次 nav（首次那份 key 已过期）',
+      );
+    });
+
+    test('fetchUpownerVideos 刷 key 后仍 -412 → 抛风控文案（分类不退化）',
+        () async {
+      final adapter = _RoutingAdapter({
+        '/x/frontend/finger/spi': _spiBody,
+        '/x/web-interface/nav': _navBody,
+        '/x/space/wbi/arc/search': () => _videoListBody(code: -412),
+      });
+      await expectLater(
+        _api(adapter).fetchUpownerVideos(100),
+        throwsA(
+          isA<BiliApiException>()
+              .having((e) => e.code, 'code', -412)
+              .having((e) => e.message, 'message', contains('风控')),
+        ),
+      );
+      expect(
+        adapter.requests.where((r) => r.path == '/x/space/wbi/arc/search').length,
+        2,
+        reason: '重试一次后仍 -412 才抛（不是一上来就抛）',
+      );
+    });
+
+    test('fetchUpownerInfo 首次 -412 → 刷 key 重签重试后成功', () async {
+      final adapter = _RoutingAdapter(
+        {
+          '/x/frontend/finger/spi': _spiBody,
+          '/x/web-interface/nav': _navBody,
+          '/x/space/wbi/acc/info': () => _upownerInfoBody(name: '自愈成功'),
+        },
+        queue: {
+          '/x/space/wbi/acc/info': [() => _upownerInfoBody(code: -412)],
+        },
+      );
+      final info = await _api(adapter).fetchUpownerInfo(100);
+      expect(info.name, '自愈成功');
+      expect(
+        adapter.requests.where((r) => r.path == '/x/space/wbi/acc/info').length,
+        2,
+      );
+    });
+
+    test('fetchUpownerFollower 首次 -412 → 短退避重试后成功（本接口无 WBI 签名，'
+        '不刷 key）', () async {
+      final adapter = _RoutingAdapter(
+        {
+          '/x/frontend/finger/spi': _spiBody,
+          '/x/relation/stat': () => {
+            'code': 0,
+            'message': 'OK',
+            'data': {'mid': 546195, 'follower': 20766601},
+          },
+        },
+        queue: {
+          '/x/relation/stat': [
+            () => {'code': -412, 'message': '风控校验失败', 'data': {}},
+          ],
+        },
+      );
+      final fans = await _api(adapter).fetchUpownerFollower(546195);
+      expect(fans, 20766601, reason: '-412 应退避重试后自愈');
+      expect(
+        adapter.requests.where((r) => r.path == '/x/relation/stat').length,
+        2,
+        reason: '退避重试一次（共 2 次请求）',
+      );
+      expect(
+        adapter.requests.where((r) => r.path == '/x/web-interface/nav').length,
+        0,
+        reason: 'relation/stat 不带 WBI 签名 → 不该为了它去刷 key（无谓请求）',
+      );
+    });
+
+    test('fetchUpownerFollower 一直 -412 → 重试后仍抛风控文案（不吞错）',
+        () async {
+      final adapter = _RoutingAdapter({
+        '/x/frontend/finger/spi': _spiBody,
+        '/x/relation/stat': () =>
+            {'code': -412, 'message': '风控校验失败', 'data': {}},
+      });
+      await expectLater(
+        _api(adapter).fetchUpownerFollower(1),
+        throwsA(
+          isA<BiliApiException>()
+              .having((e) => e.code, 'code', -412)
+              .having((e) => e.message, 'message', contains('风控')),
+        ),
+      );
+      expect(
+        adapter.requests.where((r) => r.path == '/x/relation/stat').length,
+        2,
+        reason: '只多试 1 次（重试本身也计入频率，不能堆量）',
+      );
+    });
+
+    test('fetchUpownerCollections 首次 -412 → 短退避重试后成功（无 WBI 签名）',
+        () async {
+      final adapter = _RoutingAdapter(
+        {
+          '/x/frontend/finger/spi': _spiBody,
+          '/x/polymer/web-space/seasons_series_list': () =>
+              _seasonsSeriesBody(),
+        },
+        queue: {
+          '/x/polymer/web-space/seasons_series_list': [
+            () => {'code': -412, 'message': '风控校验失败', 'data': {}},
+          ],
+        },
+      );
+      final r = await _api(adapter).fetchUpownerCollections(1);
+      expect(r.seasons.single.id, 1001);
+      expect(
+        adapter.requests
+            .where((r) => r.path == '/x/polymer/web-space/seasons_series_list')
+            .length,
+        2,
+      );
+      expect(
+        adapter.requests.where((r) => r.path == '/x/web-interface/nav').length,
+        0,
+        reason: '合集接口无签名 → 不刷 key，只退避重发',
+      );
+    });
+  });
+
+  group('spi / nav 在途请求去重（一次进页各只打 1 次）', () {
+    test('并发两条链（视频 + 详情）→ spi 与 nav 各只请求 1 次', () async {
+      final adapter = _RoutingAdapter({
+        '/x/frontend/finger/spi': _spiBody,
+        '/x/web-interface/nav': _navBody,
+        '/x/space/wbi/arc/search': () => _videoListBody(vlist: [_oneVideo()]),
+        '/x/space/wbi/acc/info': () => _upownerInfoBody(),
+      });
+      final api = _api(adapter);
+      // 与页面 initState 同款：几条链同时起跑
+      final results = await Future.wait([
+        api.fetchUpownerVideos(100),
+        api.fetchUpownerInfo(100),
+      ]);
+      expect(results, hasLength(2));
+
+      int count(String path) =>
+          adapter.requests.where((r) => r.path == path).length;
+      expect(count('/x/frontend/finger/spi'), 1,
+          reason: '进页瞬间多条链共用同一次 spi（以前是 2~3 次）');
+      expect(count('/x/web-interface/nav'), 1,
+          reason: '进页瞬间多条链共用同一次 nav（以前是 2 次）');
+    });
+
+    test('nav 三次并发（视频/详情/合集）也只打 1 次 nav', () async {
+      final adapter = _RoutingAdapter({
+        '/x/frontend/finger/spi': _spiBody,
+        '/x/web-interface/nav': _navBody,
+        '/x/space/wbi/arc/search': () => _videoListBody(vlist: [_oneVideo()]),
+        '/x/space/wbi/acc/info': () => _upownerInfoBody(),
+        '/x/polymer/web-space/seasons_series_list': () => _seasonsSeriesBody(),
+      });
+      final api = _api(adapter);
+      await Future.wait([
+        api.fetchUpownerVideos(100),
+        api.fetchUpownerInfo(100),
+        api.fetchUpownerCollections(100),
+      ]);
+      expect(
+        adapter.requests.where((r) => r.path == '/x/web-interface/nav').length,
+        1,
+      );
+      expect(
+        adapter.requests.where((r) => r.path == '/x/frontend/finger/spi').length,
+        1,
+      );
+    });
+
+    test('nav 没给 wbi_img → 抛 WbiKeyUnavailableException（仍可当 DioException '
+        '捕获，老分支不破）', () async {
+      final adapter = _RoutingAdapter({
+        '/x/frontend/finger/spi': _spiBody,
+        '/x/web-interface/nav': () => {'code': -101, 'data': {}},
+        '/x/space/wbi/acc/info': () => _upownerInfoBody(),
+      });
+      Object? caught;
+      try {
+        await _api(adapter).fetchUpownerInfo(100);
+      } catch (e) {
+        caught = e;
+      }
+      expect(caught, isA<WbiKeyUnavailableException>());
+      expect(caught, isA<DioException>(),
+          reason: '继承 DioException：既有 on DioException 兜底分支行为不变');
+    });
+
+    test('nav 失败不缓存：下一次调用会重新取 key（第 2 次拿到就成功）',
+        () async {
+      final adapter = _RoutingAdapter(
+        {
+          '/x/frontend/finger/spi': _spiBody,
+          '/x/web-interface/nav': _navBody,
+          '/x/space/wbi/acc/info': () => _upownerInfoBody(name: '第二次成功'),
+        },
+        queue: {
+          // 第一次 nav 服务端风控降级：JSON 里没有 wbi_img
+          '/x/web-interface/nav': [() => {'code': -101, 'data': {}}],
+        },
+      );
+      final api = _api(adapter);
+      await expectLater(
+        api.fetchUpownerInfo(100),
+        throwsA(isA<WbiKeyUnavailableException>()),
+      );
+      final info = await api.fetchUpownerInfo(100);
+      expect(info.name, '第二次成功', reason: '失败的 nav 不该被当成「已缓存」');
+      expect(
+        adapter.requests.where((r) => r.path == '/x/web-interface/nav').length,
+        2,
+      );
+    });
+
+    test('spi 失败不缓存：下一次调用会重新取指纹，成功后请求带上 buvid Cookie',
+        () async {
+      final adapter = _RoutingAdapter(
+        {
+          '/x/frontend/finger/spi': _spiBody,
+          '/x/relation/stat': () => {
+            'code': 0,
+            'message': 'OK',
+            'data': {'mid': 1, 'follower': 7},
+          },
+        },
+        queue: {
+          // 第一次 spi 直接 404（拿不到指纹）
+          '/x/frontend/finger/spi': [
+            () => {'code': -1, 'message': 'spi 挂了'},
+          ],
+        },
+      );
+      final api = _api(adapter);
+      await api.fetchUpownerFollower(1);
+      await api.fetchUpownerFollower(1);
+      expect(
+        adapter.requests.where((r) => r.path == '/x/frontend/finger/spi').length,
+        2,
+        reason: '指纹失败不缓存 → 第二次调用重新尝试',
+      );
+      final last =
+          adapter.requests.lastWhere((r) => r.path == '/x/relation/stat');
+      expect(last.headers['Cookie'], contains('buvid3=buvid3test'));
     });
   });
 }

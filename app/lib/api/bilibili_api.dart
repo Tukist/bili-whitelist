@@ -50,6 +50,24 @@ class BiliApiException implements Exception {
       'BiliApiException(code=$code, message=$message, path=$path)';
 }
 
+/// 拿不到 WBI 签名参数（`nav` 响应里没有 `wbi_img`）。
+///
+/// 这不是网络故障——HTTP 通了、JSON 也解析了，只是服务端那张 nav 响应里
+/// 没有 key（匿名/风控降级时会出现）。但它以前是用一个「伪造的」
+/// [DioException] 抛出的，页面层据此显示「网络请求失败，请检查网络后重试」，
+/// 把用户往「你的网不好」上引（实际网是好的）。
+///
+/// 单独成类型后 UI 能按真实原因提示；**仍继承 [DioException]**，所以既有的
+/// `on DioException` 兜底分支行为不变（老代码一处都不用改）。
+class WbiKeyUnavailableException extends DioException {
+  WbiKeyUnavailableException({required super.requestOptions, super.message});
+
+  @override
+  String toString() =>
+      'WbiKeyUnavailableException(message=${message ?? ''}, '
+      'path=${requestOptions.path})';
+}
+
 /// 搜索结果分页响应（v2.12.1+ 起）。
 ///
 /// 把单页结果 + 总条数 + 是否还有下一页打包，让 UI 层不用关心 numResults
@@ -692,6 +710,15 @@ class BiliApi {
   /// WBI key 会话内缓存（img_key, sub_key）。
   (String, String)? _wbiKeys;
 
+  /// **在途**的 nav 请求（拿 WBI key 用）。
+  ///
+  /// 进 UP 主页时首屏有多条链并发起跑（信息/视频/合集…），它们各自都会先
+  /// 要 WBI key。以前这里只判「缓存里有没有」、不判「有没有请求在飞」，
+  /// 于是一次进页会打 2~3 次 nav（B 站 space 接口对匿名突发很敏感，这批
+  /// 重复请求本身就是触发风控的一部分）。挂在途 Future 后，并发调用复用
+  /// 同一次 HTTP；请求一结束（成功或失败）就置空，不会把「失败」也缓存住。
+  Future<(String, String)>? _wbiKeysInflight;
+
   /// 我的 mid（nav 接口 data.mid，会话内缓存；v2.17.5+ 收藏夹导入用）。
   ///
   /// 与 wbi key 同源（nav 一次可同时拿 key 与 mid），但 _ensureWbiKeys
@@ -705,6 +732,10 @@ class BiliApi {
   /// （playurl 返回 code=0 但无任何流）。补上指纹后显著降低触发概率。
   String? _buvid3;
   String? _buvid4;
+
+  /// **在途**的 spi 请求（拿 buvid3/buvid4 指纹用）。理由同 [_wbiKeysInflight]：
+  /// 并发调用复用同一个 Future，一次进页只打 1 次 spi（以前是 2~3 次）。
+  Future<void>? _buvidInflight;
 
   /// 字幕内容内存缓存（key = `bvid_cid_lan`，见 [SubtitleTrack.cacheKey]），
   /// 避免同一轨道重复下载字幕文件。
@@ -922,9 +953,20 @@ class BiliApi {
 
   /// 获取浏览器指纹 buvid3/buvid4（spi 接口，匿名可得，会话内缓存）。
   ///
+  /// **在途去重**：已有请求在飞时复用同一个 Future（一次进页的多条链只会
+  /// 打 1 次 spi）。失败不缓存——`whenComplete` 会把在途 Future 清掉，下一次
+  /// 调用重新发请求（不会因为一次失败就永久拿不到指纹）。
+  ///
   /// 失败静默忽略（不阻塞主流程，只是少了指纹更容易触发 v_voucher 风控）。
-  Future<void> _ensureBuvid() async {
-    if (_buvid3 != null) return;
+  Future<void> _ensureBuvid() {
+    if (_buvid3 != null) return Future<void>.value();
+    return _buvidInflight ??= _fetchBuvid().whenComplete(() {
+      _buvidInflight = null;
+    });
+  }
+
+  /// 真正发 spi 请求的那一步（[_ensureBuvid] 的在途去重壳子里用）。
+  Future<void> _fetchBuvid() async {
     try {
       final resp = await _dio.get<Map<String, dynamic>>(
         '/x/frontend/finger/spi',
@@ -944,8 +986,19 @@ class BiliApi {
   // -------------------------------------------------------------------------
 
   /// 从 nav 接口拿 wbi 签名 key（匿名可得、长期不变，会话内缓存）。
-  Future<(String, String)> _ensureWbiKeys() async {
-    if (_wbiKeys != null) return _wbiKeys!;
+  ///
+  /// **在途去重**同 [_ensureBuvid]：并发调用复用同一次 nav 请求。失败不缓存
+  /// （`whenComplete` 清在途），下次调用会重新尝试。
+  Future<(String, String)> _ensureWbiKeys() {
+    final cached = _wbiKeys;
+    if (cached != null) return Future<(String, String)>.value(cached);
+    return _wbiKeysInflight ??= _fetchWbiKeys().whenComplete(() {
+      _wbiKeysInflight = null;
+    });
+  }
+
+  /// 真正发 nav 请求并解析 wbi_img 的那一步（[_ensureWbiKeys] 的壳子里用）。
+  Future<(String, String)> _fetchWbiKeys() async {
     await _injectAuth();
     final resp = await _dio.get<Map<String, dynamic>>('/x/web-interface/nav');
     final data = resp.data;
@@ -956,7 +1009,9 @@ class BiliApi {
     final imgKey = WbiSigner.getKeyFromUrl(wbiImg['img_url'] as String? ?? '');
     final subKey = WbiSigner.getKeyFromUrl(wbiImg['sub_url'] as String? ?? '');
     if (imgKey.isEmpty || subKey.isEmpty) {
-      throw DioException(
+      // 不是网络故障（HTTP 通了、JSON 也解析了，只是没有 wbi_img）→ 用
+      // 可区分的类型抛，页面层才不会误报「请检查网络」
+      throw WbiKeyUnavailableException(
         requestOptions: resp.requestOptions,
         message: 'nav 未返回 wbi_img，无法生成 WBI 签名',
       );
@@ -974,6 +1029,47 @@ class BiliApi {
   // -------------------------------------------------------------------------
   // 业务接口
   // -------------------------------------------------------------------------
+
+  /// 非 WBI 接口「风控/限流」码重试前的等待（见 [_getWithRiskRetry]）。
+  ///
+  /// 短：只是给风控判定一个「这是一次新请求」的时间差，不是退避——长退避
+  /// 留给页面层（页面层才知道用户等不等得起）。
+  static const Duration _riskRetryDelay = Duration(milliseconds: 700);
+
+  /// 发一次 GET；`code` 为风控/限流码时**短退避后重试一次**。
+  ///
+  /// 专给**不带 WBI 签名**的接口用（`relation/stat`、`seasons_series_list`、
+  /// `seasons_archives_list`、`x/series/archives`）：它们的 -412 不是「key
+  /// 过期」（本来就没签名可签），而是「匿名 + 频率」触发的间歇风控，刷新 key
+  /// 对它们毫无用处——退避重发才有意义。带 WBI 签名的接口走另一套
+  /// （`-412` → [_refreshWbiKeys] 换 key 重签，见 [fetchVideoMeta]）。
+  ///
+  /// 只重试 **1 次**：重试本身也会被计入频率，多加次数反而更容易被风控。
+  /// 之后仍失败就把原始响应交回调用方按既有分类抛异常（文案不变）。
+  /// 网络失败（[DioException]）原样上抛、不在这里重试（页面层有网络退避）。
+  Future<Response<Map<String, dynamic>>> _getWithRiskRetry(
+    String path,
+    Map<String, String> queryParameters,
+  ) async {
+    for (var attempt = 0; attempt < 2; attempt++) {
+      final resp = await _dio.get<Map<String, dynamic>>(
+        path,
+        queryParameters: queryParameters,
+      );
+      final code = resp.data?['code'] as int?;
+      if ((code == -412 || code == -352) && attempt == 0) {
+        debugPrint(
+          '[bili_api] $path code=$code（非 WBI 接口，刷新 key 无意义）'
+          '→ ${_riskRetryDelay.inMilliseconds}ms 后退避重试一次',
+        );
+        await Future<void>.delayed(_riskRetryDelay);
+        continue;
+      }
+      return resp;
+    }
+    // 理论不可达：循环内要么 return，要么在第二次尝试时 return
+    throw StateError('$path 风控重试后仍未返回响应');
+  }
 
   /// 视频信息（view 接口），返回 `data` 对象：
   /// bvid/cid/title/pic/duration/owner.name/pages[]。
@@ -2169,6 +2265,9 @@ class BiliApi {
   ///   `order = 0`，**不写 Gist**（UP 主视频不入库，仅供点播用）
   /// - 缺 cid 时填 0：播放页 [PlayerPage] 会用 view 接口补 cid
   /// - 错误分类与 [searchVideo] 一致
+  /// - `-412` 与 [fetchVideoMeta] 同款自愈：**刷新 WBI key 后重新签名重试一次**
+  ///   （这条链以前是直接抛，UP 主页首屏「网络请求失败」多半出自这里）；
+  ///   换 key 后仍 `-412` 才抛既有风控文案。
   Future<UpownerVideosPage> fetchUpownerVideos(
     int mid, {
     int pn = 1,
@@ -2176,76 +2275,94 @@ class BiliApi {
     String order = 'pubdate',
     String keyword = '',
   }) async {
-    await _injectAuth();
-    final (imgKey, subKey) = await _ensureWbiKeys();
     final cleanKeyword = keyword.trim();
-    final params = WbiSigner.encodeWbi(
-      {
-        'mid': '$mid',
-        'pn': '$pn',
-        'ps': '$ps',
-        'order': order,
-        if (cleanKeyword.isNotEmpty) 'keyword': cleanKeyword,
-      },
-      imgKey: imgKey,
-      subKey: subKey,
-    );
-    debugPrint(
-      '[bili_api] fetchUpownerVideos mid=$mid pn=$pn ps=$ps order=$order keyword=$cleanKeyword',
-    );
-    final resp = await _dio.get<Map<String, dynamic>>(
-      '/x/space/wbi/arc/search',
-      queryParameters: params,
-    );
-    final data = resp.data;
-    final code = data?['code'] as int?;
-    if (code == -412) {
-      throw const BiliApiException(
-        code: -412,
-        message: 'UP 主视频列表接口被风控拦截，请稍后再试',
-        path: '/x/space/wbi/arc/search',
+    // 同一次调用里只刷一次 key：下面 -412 分支已经刷过了，attempt=1 再刷一遍
+    // 只是白白多打一次 nav（B 站按频率判风控，无谓请求越多越容易被拦）。
+    var refreshed = false;
+    for (var attempt = 0; attempt < 2; attempt++) {
+      if (attempt > 0 && !refreshed) {
+        await _refreshWbiKeys(); // 换 key 后重签（wts 同步刷新）
+        refreshed = true;
+      }
+      await _injectAuth();
+      final (imgKey, subKey) = await _ensureWbiKeys();
+      final params = WbiSigner.encodeWbi(
+        {
+          'mid': '$mid',
+          'pn': '$pn',
+          'ps': '$ps',
+          'order': order,
+          if (cleanKeyword.isNotEmpty) 'keyword': cleanKeyword,
+        },
+        imgKey: imgKey,
+        subKey: subKey,
       );
-    }
-    if (code == -352) {
-      throw const BiliApiException(
-        code: -352,
-        message: 'UP 主视频列表接口被限流，请稍后再试',
-        path: '/x/space/wbi/arc/search',
+      debugPrint(
+        '[bili_api] fetchUpownerVideos mid=$mid pn=$pn ps=$ps order=$order '
+        'keyword=$cleanKeyword',
       );
-    }
-    if (code != 0) {
-      throw BiliApiException(
-        code: code ?? -1,
-        message: data?['message'] as String? ?? 'UP 主视频列表获取失败',
-        path: '/x/space/wbi/arc/search',
+      final resp = await _dio.get<Map<String, dynamic>>(
+        '/x/space/wbi/arc/search',
+        queryParameters: params,
       );
-    }
-    final d = data?['data'] as Map<String, dynamic>?;
-    final list = d?['list'] as Map<String, dynamic>?;
-    final vlist = list?['vlist'];
-    // 2026-09 实测：总数在 `data.page.count`（list.count 不存在，旧解析恒为
-    // null → hasMore 只能走「装满 20」兜底，末尾多打一次空页）。page.count
-    // 优先，list.count 兜底（兼容历史 mock/响应）。
-    final page = d?['page'] as Map<String, dynamic>?;
-    final totalRaw = page?['count'] ?? list?['count'];
-    final totalCount = (totalRaw is num) ? totalRaw.toInt() : null;
-    if (vlist is! List) {
+      final data = resp.data;
+      final code = data?['code'] as int?;
+      if (code == -412 && attempt == 0) {
+        debugPrint('[bili_api] fetchUpownerVideos -412 风控，刷新 WBI key 重试');
+        await _refreshWbiKeys();
+        refreshed = true;
+        continue;
+      }
+      if (code == -412) {
+        throw const BiliApiException(
+          code: -412,
+          message: 'UP 主视频列表接口被风控拦截，请稍后再试',
+          path: '/x/space/wbi/arc/search',
+        );
+      }
+      if (code == -352) {
+        throw const BiliApiException(
+          code: -352,
+          message: 'UP 主视频列表接口被限流，请稍后再试',
+          path: '/x/space/wbi/arc/search',
+        );
+      }
+      if (code != 0) {
+        throw BiliApiException(
+          code: code ?? -1,
+          message: data?['message'] as String? ?? 'UP 主视频列表获取失败',
+          path: '/x/space/wbi/arc/search',
+        );
+      }
+      final d = data?['data'] as Map<String, dynamic>?;
+      final list = d?['list'] as Map<String, dynamic>?;
+      final vlist = list?['vlist'];
+      // 2026-09 实测：总数在 `data.page.count`（list.count 不存在，旧解析恒为
+      // null → hasMore 只能走「装满 20」兜底，末尾多打一次空页）。page.count
+      // 优先，list.count 兜底（兼容历史 mock/响应）。
+      final page = d?['page'] as Map<String, dynamic>?;
+      final totalRaw = page?['count'] ?? list?['count'];
+      final totalCount = (totalRaw is num) ? totalRaw.toInt() : null;
+      if (vlist is! List) {
+        return UpownerVideosPage(
+          videos: const [],
+          totalCount: totalCount,
+          hasMore: false,
+        );
+      }
+      final videos = vlist
+          .whereType<Map<String, dynamic>>()
+          .map((j) => _videoFromVlist(j, mid))
+          .where((v) => v.bvid.isNotEmpty)
+          .toList();
       return UpownerVideosPage(
-        videos: const [],
+        videos: videos,
         totalCount: totalCount,
-        hasMore: false,
+        hasMore: _computeHasMore(loaded: videos.length, totalCount: totalCount),
       );
     }
-    final videos = vlist
-        .whereType<Map<String, dynamic>>()
-        .map((j) => _videoFromVlist(j, mid))
-        .where((v) => v.bvid.isNotEmpty)
-        .toList();
-    return UpownerVideosPage(
-      videos: videos,
-      totalCount: totalCount,
-      hasMore: _computeHasMore(loaded: videos.length, totalCount: totalCount),
-    );
+    // 理论不可达：循环内要么 return，要么抛
+    throw StateError('fetchUpownerVideos 重试后仍失败（mid=$mid）');
   }
 
   /// 从 `x/space/wbi/arc/search` 返回的 vlist[] 单项构造 [WhitelistVideo]。
@@ -2303,58 +2420,76 @@ class BiliApi {
   /// 字段：`name` / `face` / `sign`（**不含 fans**——2026-09 实测该接口的
   /// data 无 fans 字段，粉丝数请用 [fetchUpownerFollower]（relation/stat））。
   /// 解析保留对 `data.fans` 的容错读取：若 B 站未来回归该字段可直接读到。
+  ///
+  /// `-412` 与 [fetchVideoMeta] 同款自愈：刷新 WBI key 后重签重试一次。
   Future<UpownerInfo> fetchUpownerInfo(int mid) async {
-    await _injectAuth();
-    final (imgKey, subKey) = await _ensureWbiKeys();
-    final params = WbiSigner.encodeWbi(
-      {'mid': '$mid'},
-      imgKey: imgKey,
-      subKey: subKey,
-    );
-    debugPrint('[bili_api] fetchUpownerInfo mid=$mid');
-    final resp = await _dio.get<Map<String, dynamic>>(
-      '/x/space/wbi/acc/info',
-      queryParameters: params,
-    );
-    final data = resp.data;
-    final code = data?['code'] as int?;
-    if (code == -412) {
-      throw const BiliApiException(
-        code: -412,
-        message: 'UP 主详情接口被风控拦截，请稍后再试',
-        path: '/x/space/wbi/acc/info',
+    // 同一次调用里只刷一次 key（理由同 fetchUpownerVideos）
+    var refreshed = false;
+    for (var attempt = 0; attempt < 2; attempt++) {
+      if (attempt > 0 && !refreshed) {
+        await _refreshWbiKeys(); // 换 key 后重签（wts 同步刷新）
+        refreshed = true;
+      }
+      await _injectAuth();
+      final (imgKey, subKey) = await _ensureWbiKeys();
+      final params = WbiSigner.encodeWbi(
+        {'mid': '$mid'},
+        imgKey: imgKey,
+        subKey: subKey,
+      );
+      debugPrint('[bili_api] fetchUpownerInfo mid=$mid');
+      final resp = await _dio.get<Map<String, dynamic>>(
+        '/x/space/wbi/acc/info',
+        queryParameters: params,
+      );
+      final data = resp.data;
+      final code = data?['code'] as int?;
+      if (code == -412 && attempt == 0) {
+        debugPrint('[bili_api] fetchUpownerInfo -412 风控，刷新 WBI key 重试');
+        await _refreshWbiKeys();
+        refreshed = true;
+        continue;
+      }
+      if (code == -412) {
+        throw const BiliApiException(
+          code: -412,
+          message: 'UP 主详情接口被风控拦截，请稍后再试',
+          path: '/x/space/wbi/acc/info',
+        );
+      }
+      if (code == -352) {
+        throw const BiliApiException(
+          code: -352,
+          message: 'UP 主详情接口被限流，请稍后再试',
+          path: '/x/space/wbi/acc/info',
+        );
+      }
+      if (code != 0) {
+        throw BiliApiException(
+          code: code ?? -1,
+          message: data?['message'] as String? ?? 'UP 主详情获取失败',
+          path: '/x/space/wbi/acc/info',
+        );
+      }
+      final d = data?['data'] as Map<String, dynamic>?;
+      if (d == null) {
+        throw const BiliApiException(
+          code: -1,
+          message: 'UP 主详情接口未返回数据',
+          path: '/x/space/wbi/acc/info',
+        );
+      }
+      var face = d['face'] as String? ?? '';
+      if (face.startsWith('//')) face = 'https:$face';
+      return UpownerInfo(
+        name: d['name'] as String? ?? '',
+        face: face,
+        fans: (d['fans'] as num?)?.toInt(),
+        sign: d['sign'] as String? ?? '',
       );
     }
-    if (code == -352) {
-      throw const BiliApiException(
-        code: -352,
-        message: 'UP 主详情接口被限流，请稍后再试',
-        path: '/x/space/wbi/acc/info',
-      );
-    }
-    if (code != 0) {
-      throw BiliApiException(
-        code: code ?? -1,
-        message: data?['message'] as String? ?? 'UP 主详情获取失败',
-        path: '/x/space/wbi/acc/info',
-      );
-    }
-    final d = data?['data'] as Map<String, dynamic>?;
-    if (d == null) {
-      throw const BiliApiException(
-        code: -1,
-        message: 'UP 主详情接口未返回数据',
-        path: '/x/space/wbi/acc/info',
-      );
-    }
-    var face = d['face'] as String? ?? '';
-    if (face.startsWith('//')) face = 'https:$face';
-    return UpownerInfo(
-      name: d['name'] as String? ?? '',
-      face: face,
-      fans: (d['fans'] as num?)?.toInt(),
-      sign: d['sign'] as String? ?? '',
-    );
+    // 理论不可达：循环内要么 return，要么抛
+    throw StateError('fetchUpownerInfo 重试后仍失败（mid=$mid）');
   }
 
   /// UP 主粉丝数（`x/relation/stat?vmid=`，返回 `data.follower`）。
@@ -2363,15 +2498,16 @@ class BiliApi {
   /// buvid 指纹更稳）——acc/info 不含粉丝字段且匿名易 -352，粉丝数改由
   /// 本接口提供（B 站网页 UP 主页的粉丝数同样取自 relation/stat）。
   ///
+  /// 本接口**不带 WBI 签名** → `-412` 基本是「匿名 + 频率」的间歇风控而不是
+  /// key 过期（没有 key 可刷），因此走 [_getWithRiskRetry]（短退避重试一次），
+  /// 而不是换 key 重签。
+  ///
   /// 错误分类与 [fetchUpownerVideos] 一致：code=-412 / -352 / 其他业务码抛
   /// [BiliApiException]，网络失败（[DioException]）原样上抛。
   Future<int> fetchUpownerFollower(int mid) async {
     await _injectAuth();
     debugPrint('[bili_api] fetchUpownerFollower mid=$mid');
-    final resp = await _dio.get<Map<String, dynamic>>(
-      '/x/relation/stat',
-      queryParameters: {'vmid': '$mid'},
-    );
+    final resp = await _getWithRiskRetry('/x/relation/stat', {'vmid': '$mid'});
     final data = resp.data;
     final code = data?['code'] as int?;
     if (code == -412) {
@@ -2565,6 +2701,9 @@ class BiliApi {
   /// - 其他业务码 → [BiliApiException]（带接口 message）
   /// - code=0 但无 data → [BiliApiException]「未返回数据」
   /// - 网络失败（[DioException]）→ 原样上抛
+  ///
+  /// 本接口不带 WBI 签名 → 风控/限流码走 [_getWithRiskRetry]（短退避重试一次，
+  /// 换 key 无意义）。上面那套文案是**重试后仍失败**时的最终分类，不变。
   Future<UpownerCollectionsResult> fetchUpownerCollections(
     int mid, {
     int pageNum = 1,
@@ -2573,9 +2712,9 @@ class BiliApi {
     await _injectAuth();
     debugPrint('[bili_api] fetchUpownerCollections mid=$mid '
         'page_num=$pageNum page_size=$pageSize');
-    final resp = await _dio.get<Map<String, dynamic>>(
+    final resp = await _getWithRiskRetry(
       '/x/polymer/web-space/seasons_series_list',
-      queryParameters: {'mid': '$mid', 'page_num': '$pageNum', 'page_size': '$pageSize'},
+      {'mid': '$mid', 'page_num': '$pageNum', 'page_size': '$pageSize'},
     );
     final data = resp.data;
     final code = data?['code'] as int?;
@@ -2964,7 +3103,8 @@ class BiliApi {
   /// 因此解析出的 [WhitelistVideo] cid=0，进播放页时由 view 接口实时补 cid
   /// （与 UP 主全部视频、信箱同款流程）。
   ///
-  /// 错误分类与 [fetchUpownerCollections] 一致。
+  /// 错误分类与 [fetchUpownerCollections] 一致（风控/限流码先经
+  /// [_getWithRiskRetry] 短退避重试一次，仍失败才按上述分类抛）。
   Future<UpownerVideosPage> fetchSeasonArchives(
     int seasonId, {
     int page = 1,
@@ -2973,9 +3113,9 @@ class BiliApi {
     await _injectAuth();
     debugPrint('[bili_api] fetchSeasonArchives season_id=$seasonId '
         'page_num=$page page_size=$pageSize');
-    final resp = await _dio.get<Map<String, dynamic>>(
+    final resp = await _getWithRiskRetry(
       '/x/polymer/web-space/seasons_archives_list',
-      queryParameters: {
+      {
         'season_id': '$seasonId',
         'page_num': '$page',
         'page_size': '$pageSize',
@@ -2991,7 +3131,8 @@ class BiliApi {
   /// seasons_archives_list 不同：num/size/total）；archives[] 项同无 cid /
   /// 无 upper 名（比 season 多 upMid 字段），cid 同样由播放时补。
   ///
-  /// 错误分类与 [fetchUpownerCollections] 一致。
+  /// 错误分类与 [fetchUpownerCollections] 一致（同 [fetchSeasonArchives]，
+  /// 风控/限流码先短退避重试一次）。
   Future<UpownerVideosPage> fetchSeriesArchives(
     int mid,
     int seriesId, {
@@ -3001,9 +3142,9 @@ class BiliApi {
     await _injectAuth();
     debugPrint('[bili_api] fetchSeriesArchives mid=$mid series_id=$seriesId '
         'pn=$page ps=$pageSize');
-    final resp = await _dio.get<Map<String, dynamic>>(
+    final resp = await _getWithRiskRetry(
       '/x/series/archives',
-      queryParameters: {
+      {
         'mid': '$mid',
         'series_id': '$seriesId',
         'pn': '$page',
@@ -3016,6 +3157,10 @@ class BiliApi {
   /// 合集/列表视频分页响应的公共解析：
   /// `data.archives[]` → [WhitelistVideo]（[._videoFromArchive]），
   /// `data.page.total` → 总条数（无 page 时回退「本页装满即还有」）。
+  ///
+  /// 两个调用方（[fetchSeasonArchives] / [fetchSeriesArchives]）都已先过
+  /// [_getWithRiskRetry]（短退避重试一次），所以这里 `-412` / `-352` 是
+  /// **重试后仍失败**的最终分类——文案不变，只是不再一次就放弃。
   UpownerVideosPage _parseArchivesPage(
     Response<Map<String, dynamic>> resp,
     String path,

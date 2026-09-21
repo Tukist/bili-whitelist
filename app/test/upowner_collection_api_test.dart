@@ -45,7 +45,12 @@ class _RoutingAdapter implements HttpClientAdapter {
   final Map<String, Map<String, dynamic> Function()> handlers;
   final List<RequestOptions> requests = [];
 
-  _RoutingAdapter(this.handlers);
+  /// path → **按顺序消费**的一次性响应（队首优先，用完后回落 [handlers]）。
+  /// 用来造「第 1 次 -412、第 2 次成功」这种链路（风控自愈）。
+  final Map<String, List<Map<String, dynamic> Function()>> queue;
+
+  _RoutingAdapter(this.handlers, {Map<String, List<Map<String, dynamic> Function()>>? queue})
+    : queue = queue ?? {};
 
   @override
   Future<ResponseBody> fetch(
@@ -54,6 +59,17 @@ class _RoutingAdapter implements HttpClientAdapter {
     Future<void>? cancelFuture,
   ) async {
     requests.add(options);
+    final pending = queue[options.path];
+    if (pending != null && pending.isNotEmpty) {
+      final next = pending.removeAt(0);
+      return ResponseBody.fromString(
+        jsonEncode(next()),
+        200,
+        headers: {
+          'content-type': ['application/json; charset=utf-8'],
+        },
+      );
+    }
     final handler = handlers[options.path];
     if (handler == null) {
       return ResponseBody.fromString(
@@ -555,6 +571,84 @@ void main() {
       final page = await _api(adapter).fetchSeriesArchives(1, 2);
       expect(page.videos, isEmpty);
       expect(page.hasMore, isFalse);
+    });
+  });
+
+  // v2.47.0：合集/列表内视频（`_parseArchivesPage` 那条链）也接入风控自愈
+  // ——这两个接口同样不带 WBI 签名，所以是「短退避重发」而不是刷 key。
+  group('合集内视频的风控自愈（v2.47.0）', () {
+    test('fetchSeasonArchives 首次 -412 → 短退避重试后成功（不再一次就抛）',
+        () async {
+      final adapter = _RoutingAdapter(
+        {
+          '/x/frontend/finger/spi': _spiBody,
+          '/x/polymer/web-space/seasons_archives_list': () =>
+              _archivesListBody(archives: [_archive()], total: 1),
+        },
+        queue: {
+          '/x/polymer/web-space/seasons_archives_list': [
+            () => {'code': -412, 'message': '风控校验失败', 'data': {}},
+          ],
+        },
+      );
+      final page = await _api(adapter).fetchSeasonArchives(3993361);
+      expect(page.videos.single.bvid, 'BV1aa');
+      expect(
+        adapter.requests
+            .where((r) => r.path == '/x/polymer/web-space/seasons_archives_list')
+            .length,
+        2,
+        reason: '退避重试一次（共 2 次请求）',
+      );
+      expect(
+        adapter.requests.map((r) => r.path),
+        isNot(contains('/x/web-interface/nav')),
+        reason: '无 WBI 签名 → 不刷 key',
+      );
+    });
+
+    test('fetchSeriesArchives 首次 -412 → 短退避重试后成功', () async {
+      final adapter = _RoutingAdapter(
+        {
+          '/x/frontend/finger/spi': _spiBody,
+          '/x/series/archives': () =>
+              _archivesListBody(archives: [_archive()], total: 1),
+        },
+        queue: {
+          '/x/series/archives': [
+            () => {'code': -412, 'message': '风控校验失败', 'data': {}},
+          ],
+        },
+      );
+      final page = await _api(adapter).fetchSeriesArchives(546195, 1614048);
+      expect(page.videos.single.bvid, 'BV1aa');
+      expect(
+        adapter.requests.where((r) => r.path == '/x/series/archives').length,
+        2,
+      );
+    });
+
+    test('fetchSeasonArchives -412 一直失败 → 重试后仍抛风控文案（不变）',
+        () async {
+      final adapter = _RoutingAdapter({
+        '/x/frontend/finger/spi': _spiBody,
+        '/x/polymer/web-space/seasons_archives_list': () =>
+            {'code': -412, 'message': '风控校验失败', 'data': {}},
+      });
+      await expectLater(
+        _api(adapter).fetchSeasonArchives(1),
+        throwsA(
+          isA<BiliApiException>()
+              .having((e) => e.code, 'code', -412)
+              .having((e) => e.message, 'message', contains('风控')),
+        ),
+      );
+      expect(
+        adapter.requests
+            .where((r) => r.path == '/x/polymer/web-space/seasons_archives_list')
+            .length,
+        2,
+      );
     });
   });
 }

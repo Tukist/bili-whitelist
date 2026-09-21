@@ -104,6 +104,47 @@ const List<({String value, String label})> _kUpownerVideoOrders = [
 /// 「专栏」区每页条数（`x/space/article` 的 `ps`）。
 const int _kUpownerArticlePageSize = 10;
 
+/// 网络/传输类失败（超时、断连、`DioException`）的重试节奏：1s → 2s，共 3 次
+/// 尝试（v2.17.8 起的既有行为，本批不动）。网络抖动跟 B 站风控是两回事，
+/// 多试几次不会加剧风控。
+const List<Duration> _netRetryDelays = [
+  Duration(seconds: 1),
+  Duration(seconds: 2),
+];
+
+/// **业务风控类**里 `-412`（风控）的重试节奏：只再试 1 次、等 2s。
+///
+/// 为什么只一次：API 层遇到 `-412` 已经「刷新 WBI key → 重新签名 → 重试」
+/// 走过一轮了（见 `BiliApi.fetchUpownerVideos` / 非 WBI 接口的短退避），页面
+/// 层这一下是「再给一个机会」，而不是把 3 次重试各乘一遍——那样首屏的请求量
+/// 会翻倍，反而更容易被风控盯上（本批的核心约束）。
+/// 为什么等 2s 而不是 1s：风控是按时间窗判定的，间隔太短常常还在同一个窗里。
+const List<Duration> _riskRetryDelays412 = [Duration(seconds: 2)];
+
+/// **业务风控类**里 `-352`（限流）/ `-509`（过于频繁）的重试节奏：
+/// 1.5s → 3s，共 3 次尝试（次数与旧行为一致 = 不新增请求量，只是等得更准）。
+/// 这两个码是纯频率问题，没有 key 可刷，等够时间比多打请求有效。
+const List<Duration> _riskRetryDelaysLimited = [
+  Duration(milliseconds: 1500),
+  Duration(seconds: 3),
+];
+
+/// 按失败类型选重试节奏（见上三条常量）。
+///
+/// - 业务码风控类（`BiliApiException` 的 -412/-352/-509）→ 风控节奏
+/// - 「nav 没给 wbi_img」（[WbiKeyUnavailableException]）→ 按风控节奏：
+///   它不是网络问题（HTTP 通了、JSON 也解析了），多半是服务端风控降级，
+///   等 2s 再试一次；仍不成就按「签名参数获取失败」提示，不误导成网络故障
+/// - 其余（网络/传输/未知）→ 既有网络退避 1s → 2s
+List<Duration> _retryDelaysFor(Object e) {
+  if (e is WbiKeyUnavailableException) return _riskRetryDelays412;
+  if (e is BiliApiException) {
+    if (e.code == -412) return _riskRetryDelays412;
+    if (e.code == -352 || e.code == -509) return _riskRetryDelaysLimited;
+  }
+  return _netRetryDelays;
+}
+
 /// 时长格式化（与搜索页一致）：秒 → `4:45` / `1:02:03`。
 String _fmtDuration(int seconds) {
   if (seconds < 0) return '?';
@@ -243,6 +284,9 @@ class _UpownerPageState extends State<UpownerPage> {
 
   /// 头部信息是否在加载/自动重试中（防并发重复触发）。
   bool _loadingInfo = false;
+
+  /// 缓存命中后的粉丝数补拉是否在途（防并发重复触发）。
+  bool _refreshingFans = false;
 
   /// 「全部视频」列表代际号：搜索/排序/清空触发的每次全新加载 +1；在途
   /// 请求（含失败后的自动重试）发现代际不一致即放弃，防止过期结果串入
@@ -518,7 +562,8 @@ class _UpownerPageState extends State<UpownerPage> {
   ///    缓存里恰好缺粉丝数时补拉一次 stat（不影响展示）
   /// 2. 粉丝数走 [BiliApi.fetchUpownerFollower]（relation/stat——acc/info
   ///    实测不含 fans 字段且匿名易 -352，2026-09 验证）：失败自动重试
-  ///    （1s → 2s）后仍失败则保留 initial 值或显示 '—'，不阻塞页面
+  ///    （按失败类型分流，见 [_retryDelaysFor]）后仍失败则保留 initial 值或
+  ///    显示 '—'，不阻塞页面
   /// 3. 资料（名字/头像/简介）走 [BiliApi.fetchUpownerInfo]（acc/info）：
   ///    匿名可能被 -352 拦截——同样自动重试，最终失败静默降级（标题/头像
   ///    回退 initial 或列表作者名），不弹整页错误
@@ -533,7 +578,9 @@ class _UpownerPageState extends State<UpownerPage> {
     if (cached != null) {
       _loadingInfo = false;
       setState(() => _info = cached);
-      // 上次进页 stat 恰好失败 → 缓存缺粉丝数：补拉一次 stat 不影响展示
+      // 缓存里 fans 为 null = 「上次进页 stat 没拿到」而不是「这个 UP 主
+      // 没有粉丝数」——所以每次命中都要再补拉一次（带退避重试，见
+      // [_refreshCachedFans]）。补拉失败不改缓存，下次进页还会再试。
       if (cached.fans == null) unawaited(_refreshCachedFans());
       return;
     }
@@ -563,6 +610,11 @@ class _UpownerPageState extends State<UpownerPage> {
     } on BiliApiException catch (e) {
       if (!mounted) return;
       setState(() => _infoError = e.message);
+    } on WbiKeyUnavailableException {
+      // 不是网络问题（nav 通了、只是没给 wbi_img：服务端风控降级）——
+      // 别把用户往「检查网络」上引
+      if (!mounted) return;
+      setState(() => _infoError = 'B 站签名参数获取失败');
     } on DioException {
       if (!mounted) return;
       setState(() => _infoError = '网络请求失败');
@@ -570,24 +622,32 @@ class _UpownerPageState extends State<UpownerPage> {
     if (!mounted) return;
     _loadingInfo = false;
 
-    // 4) 资料成功 = 完整信息（资料 + stat 粉丝数）→ 写会话缓存
+    // 4) 资料成功 = 完整信息（资料 + stat 粉丝数）→ 写会话缓存。
+    //    ⚠️ fans 可能仍为 null（stat 那一步被风控）：这不是「有效缓存值」，
+    //    而是「粉丝数还没拿到」的标记——缓存命中分支据此每次进页补拉
+    //    （见上面第 1 步），所以不会出现「一次失败就永久显示 —」。
     if (profileOk) {
       final best = _info;
       if (best != null) _upInfoCache[widget.mid] = best;
     }
   }
 
-  /// 短退避自动重试：失败后等 1s → 2s 再试，最多重试 2 次（共 3 次尝试）。
+  /// 短退避自动重试（节奏**按失败类型分流**，见 [_retryDelaysFor]）：
   ///
-  /// 吸收 B 站 space wbi 接口对匿名/高频请求的间歇风控（-352/-412，实测
-  /// 等待后重试即恢复）——用户手动「重试几次才正常」在此被自动吸收。
-  /// 页面已销毁时放弃退避与后续重试（不无限循环、不并发重复）。
+  /// - 业务的 `-352/-509`（限流/过于频繁）：1.5s → 3s，共 3 次尝试——吸收
+  ///   B 站 space 接口对匿名/高频请求的间歇风控（实测等待后重试即恢复）
+  /// - 业务的 `-412`（风控）与「nav 没给 wbi_img」：等 2s 只再试 1 次——API
+  ///   层已经刷过 key 重签试过一轮，页面再叠更多请求只会把量堆高
+  /// - 网络/传输类：既有 1s → 2s（行为不变）
+  ///
+  /// 用户手动「重试几次才正常」在此被自动吸收。页面已销毁时放弃退避与后续
+  /// 重试（不无限循环、不并发重复）。
   Future<T> _retryWithBackoff<T>(Future<T> Function() op) async {
-    const delays = [Duration(seconds: 1), Duration(seconds: 2)];
     for (var attempt = 0; ; attempt++) {
       try {
         return await op();
-      } catch (_) {
+      } catch (e) {
+        final delays = _retryDelaysFor(e);
         if (attempt >= delays.length) rethrow;
         if (!mounted) rethrow; // 页面已销毁：不再等退避/重试
         await Future<void>.delayed(delays[attempt]);
@@ -689,10 +749,20 @@ class _UpownerPageState extends State<UpownerPage> {
     AppSnack.show(context, message);
   }
 
-  /// 缓存命中但缺粉丝数时补拉一次 stat（单次、不重试，失败静默）。
+  /// 缓存命中但缺粉丝数时补拉 stat。
+  ///
+  /// v2.47.0 修：以前是**单次、不重试、失败静默**——缓存里 fans=null 的 UP
+  /// 主一旦遇到风控，此后每次进页都只补拉一次就放弃，粉丝数就一直显示 `—`。
+  /// 现在走 [_retryWithBackoff]（按失败类型分流：-352 1.5s→3s，-412 等 2s 再
+  /// 试一次），并且**失败不改缓存**——缓存里保持 fans=null，下次进页继续补拉，
+  /// 不会把「这次没拿到」当成「已缓存」。
   Future<void> _refreshCachedFans() async {
+    if (_refreshingFans) return; // 防并发：补拉在途时不重复触发
+    _refreshingFans = true;
     try {
-      final fans = await _api.fetchUpownerFollower(widget.mid);
+      final fans = await _retryWithBackoff(
+        () => _api.fetchUpownerFollower(widget.mid),
+      );
       final cur = _info;
       if (!mounted || cur == null) return;
       final merged = UpownerInfo(
@@ -702,9 +772,12 @@ class _UpownerPageState extends State<UpownerPage> {
         sign: cur.sign,
       );
       setState(() => _info = merged);
-      _upInfoCache[widget.mid] = merged;
+      _upInfoCache[widget.mid] = merged; // 拿到粉丝数才算「有效缓存」
     } catch (e) {
+      // 重试后仍失败：缓存保持 fans=null（下次进页再补拉），界面继续显示 '—'
       debugPrint('[upowner] 缓存粉丝数补拉失败 mid=${widget.mid}: $e');
+    } finally {
+      _refreshingFans = false;
     }
   }
 
@@ -747,12 +820,13 @@ class _UpownerPageState extends State<UpownerPage> {
 
   /// 加载指定页视频（page=1 时也走这里，_videos 已在 _loadFirstPage 清空）。
   ///
-  /// 失败自动重试（v2.17.8）：B 站 space wbi 接口对匿名/高频请求有间歇
-  /// 风控（-352/-412，实测等待后重试即恢复）——指数退避（失败后等 1s →
-  /// 再失败等 2s）最多重试 2 次，仍失败才落错误态（首屏整页错误+重试 /
-  /// 翻页静默），把用户手动「重试几次才正常」吸收掉。重试期间 [_loadingMore]
-  /// 保持 true（转圈），不会并发重复；[gen] 代际变化（用户切搜索/排序）或
-  /// 页面销毁时放弃在途重试。
+  /// 失败自动重试（v2.17.8，v2.47.0 起**按失败类型分流节奏**）：B 站 space
+  /// 接口对匿名/高频请求有间歇风控（-352/-412，实测等待后重试即恢复）——
+  /// `-352/-509` 走 1.5s → 3s（次数不变），`-412` 与「nav 没给 wbi_img」等 2s
+  /// 只再试一次（API 层已刷 key 重签），网络类仍是 1s → 2s。仍失败才落错误态
+  /// （首屏整页错误+重试 / 翻页静默），把用户手动「重试几次才正常」吸收掉。
+  /// 重试期间 [_loadingMore] 保持 true（转圈），不会并发重复；[gen] 代际变化
+  /// （用户切搜索/排序）或页面销毁时放弃在途重试。
   Future<void> _loadPage(int pn, {int? gen}) async {
     final current = gen ?? _listGen;
     if (!_loadingMore) setState(() => _loadingMore = true);
@@ -803,6 +877,14 @@ class _UpownerPageState extends State<UpownerPage> {
         _loadingMore = false;
         _error = e.message;
       });
+    } on WbiKeyUnavailableException {
+      // nav 通了但没给 wbi_img（服务端风控降级）：不是网络故障，
+      // 别显示「请检查网络」（那会把用户往错误方向引）
+      if (!mounted || current != _listGen) return;
+      setState(() {
+        _loadingMore = false;
+        _error = 'B 站签名参数获取失败，请稍后重试';
+      });
     } on DioException {
       if (!mounted || current != _listGen) return;
       setState(() {
@@ -812,12 +894,15 @@ class _UpownerPageState extends State<UpownerPage> {
     }
   }
 
-  /// 视频列表请求 + 自动重试（指数退避 1s → 2s，共 3 次尝试）。
+  /// 视频列表请求 + 自动重试（节奏**按失败类型分流**，见 [_retryDelaysFor]）：
+  ///
+  /// - `-352/-509`：1.5s → 3s，共 3 次尝试（次数与旧行为一致，不新增请求量）
+  /// - `-412` / nav 没给 wbi_img：等 2s 只再试 1 次（API 层已刷 key 重签试过）
+  /// - 网络/传输类：既有 1s → 2s（行为不变）
   ///
   /// [gen] 代际不一致（用户在此期间切了搜索/排序，或重进首屏）或页面销毁
   /// 时不再等退避，直接抛出（由 [_loadPage] 按代际丢弃，不落错误态）。
   Future<UpownerVideosPage> _fetchVideosWithRetry(int pn, int gen) async {
-    const delays = [Duration(seconds: 1), Duration(seconds: 2)];
     for (var attempt = 0; ; attempt++) {
       try {
         return await _api.fetchUpownerVideos(
@@ -826,7 +911,8 @@ class _UpownerPageState extends State<UpownerPage> {
           order: _order,
           keyword: _currentKeyword,
         );
-      } catch (_) {
+      } catch (e) {
+        final delays = _retryDelaysFor(e);
         if (attempt >= delays.length) rethrow;
         if (!mounted || gen != _listGen) rethrow; // 放弃在途重试
         await Future<void>.delayed(delays[attempt]);
