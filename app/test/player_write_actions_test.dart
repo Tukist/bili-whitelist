@@ -30,6 +30,7 @@ import 'package:bili_whitelist_app/models/whitelist_video.dart';
 import 'package:bili_whitelist_app/pages/player_page.dart';
 import 'package:bili_whitelist_app/services/ui_prefs_store.dart';
 import 'package:bili_whitelist_app/theme/motion_control.dart';
+import 'package:bili_whitelist_app/widgets/comment_list.dart';
 
 /// 每条用例一个**独立 bvid**：播放页把 view 的 owner/desc/req_user/stat/aid
 /// 按 bvid 做**会话内全局缓存**（`_upMetaCache` / `_reqUserCache` 等都是
@@ -505,6 +506,70 @@ void main() {
     expect(find.text('点赞 1.2万'), findsOneWidget);
     expect(find.text('投币'), findsOneWidget);
     expect(find.text('收藏'), findsOneWidget);
+  });
+
+  testWidgets('总开关默认关：播放页内嵌评论区也没有发表入口（评论同样归总闸管）',
+      (tester) async {
+    tester.view.devicePixelRatio = 1.0;
+    tester.view.physicalSize = const Size(400, 800);
+    addTearDown(tester.view.reset);
+    _installMocks(tester);
+
+    await _pumpPlayer(tester);
+
+    expect(UiPrefsStore.instance.writeActionsEnabled, isFalse, reason: '默认关');
+    // 直接读组件参数而不是 find：入口在列表的懒加载区里，视口小的时候
+    // 不一定被构建 —— 但"有没有交给它发表能力"与视口无关，读参数才准
+    final list =
+        tester.widget<CommentListView>(find.byType(CommentListView));
+    expect(list.enableCompose, isFalse,
+        reason: 'v2.42.0 的评论发表与点赞/投币/收藏共用同一道总开关');
+    expect(find.byKey(kCommentComposeEntryKey), findsNothing);
+  });
+
+  testWidgets('总开关打开：内嵌评论区拿到发表能力（enableCompose = true）',
+      (tester) async {
+    tester.view.devicePixelRatio = 1.0;
+    tester.view.physicalSize = const Size(400, 800);
+    addTearDown(tester.view.reset);
+    _installMocks(tester);
+    UiPrefsStore.instance
+        .resetForTest(writeActionsEnabled: true, loaded: true);
+
+    await _pumpPlayer(tester);
+
+    final list =
+        tester.widget<CommentListView>(find.byType(CommentListView));
+    expect(list.enableCompose, isTrue);
+    expect(list.enableSortSwipe, isTrue,
+        reason: '排序横滑（v2.40.0）仍在：两者同时开，互不冲突');
+  });
+
+  testWidgets('总开关在播放页活着时被改（关→开）→ 评论区跟着拿到发表能力',
+      (tester) async {
+    tester.view.devicePixelRatio = 1.0;
+    tester.view.physicalSize = const Size(400, 800);
+    addTearDown(tester.view.reset);
+    _installMocks(tester);
+
+    await _pumpPlayer(tester);
+    expect(
+        tester
+            .widget<CommentListView>(find.byType(CommentListView))
+            .enableCompose,
+        isFalse);
+
+    // 设置页可能在播放页（路由栈下层）还活着的时候改开关 → 监听 store
+    // 才能在回来时对上（与信息块三个按钮同一套理由）
+    await UiPrefsStore.instance.setWriteActionsEnabled(true);
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 200));
+
+    expect(
+        tester
+            .widget<CommentListView>(find.byType(CommentListView))
+            .enableCompose,
+        isTrue);
   });
 
   testWidgets('番剧集（epId != null）：总开关打开也不显示写操作行', (tester) async {

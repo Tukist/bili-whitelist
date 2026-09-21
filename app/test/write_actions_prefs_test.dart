@@ -147,11 +147,14 @@ void main() {
     final sw = find.byKey(kWriteActionsSwitchKey);
     expect(sw, findsOneWidget);
     expect(tester.widget<SwitchListTile>(sw).value, isFalse);
-    expect(find.text('已关闭：播放页一个写操作按钮都不显示'), findsOneWidget);
+    expect(find.text('已关闭：一个写操作入口都不显示'), findsOneWidget);
     // 默认关的**理由**必须在页面上，不能只写在代码注释里
     expect(find.textContaining('默认关闭'), findsOneWidget);
     expect(find.textContaining('不支持撤回'), findsOneWidget);
-    expect(find.textContaining('评论与投稿不在这里'), findsOneWidget);
+    // v2.42.0：评论区也归这道总闸 → 文案必须把"发评论会怎样"说清（它是四件
+    // 写操作里唯一一件"立刻公开给第三方"的）
+    expect(find.textContaining('评论会立刻出现在对方评论区'), findsOneWidget);
+    expect(find.textContaining('投稿/发视频不在这里'), findsOneWidget);
   });
 
   testWidgets('设置页：点一下开关 → store 变 true 且副标题跟着改', (tester) async {
@@ -169,7 +172,7 @@ void main() {
 
     expect(UiPrefsStore.instance.writeActionsEnabled, isTrue);
     expect(tester.widget<SwitchListTile>(sw).value, isTrue);
-    expect(find.text('已开启：播放页信息块显示三个写操作按钮（投币会二次确认）'),
+    expect(find.text('已开启：信息块显示三个按钮，评论区可发表与回复'),
         findsOneWidget);
 
     // 再点回去

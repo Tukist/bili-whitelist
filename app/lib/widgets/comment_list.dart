@@ -39,10 +39,12 @@
 ///   更密的节奏）——楼中楼**不参与** stagger（嵌套延迟不可预测）；
 /// - 底部翻页加载态 = [SmokeSilhouette] + 一句 [kLoadingPoolFooter] 文案。
 ///
-/// 只读：本组件不做任何点赞/发评论等写操作。id 解析失败 / 首屏失败均给
-/// 重试入口。正文过长（v2.17.3+ 折叠）：超 5 行折叠省略 + 「展开」点击
-/// 看全文、「收起」复原（纯文本/链接混排都支持；无链接短评保持可直接
-/// 选择复制，见 _LinkifiedBody 说明）。
+/// 只读为主：本组件不做点赞/投币/收藏（那是播放页信息块的三个按钮）。
+/// v2.42.0 起可选支持**发表评论 / 回复**（[CommentListView.enableCompose]，
+/// 默认关、受写操作总开关门控，仅播放页内嵌评论区开启）。
+/// id 解析失败 / 首屏失败均给重试入口。正文过长（v2.17.3+ 折叠）：超 5 行
+/// 折叠省略 + 「展开」点击看全文、「收起」复原（纯文本/链接混排都支持；
+/// 无链接短评保持可直接选择复制，见 _LinkifiedBody 说明）。
 library;
 
 import 'dart:async';
@@ -69,6 +71,7 @@ import '../pages/player_page.dart';
 import '../pages/upowner_page.dart';
 import 'animated_copy_line.dart';
 import 'app_block.dart';
+import 'app_snack.dart';
 import 'app_state_view.dart';
 import 'expandable_text.dart';
 import 'smoke_silhouette.dart';
@@ -126,6 +129,35 @@ const Key kCommentSortNewestKey = Key('comment-sort-newest');
 /// 切换后浮层提示的锚点（测试用；仅短暂存在）。
 const Key kCommentSortHintKey = Key('comment-sort-hint');
 
+// ---------------------------------------------------------------------------
+// 发表评论 / 回复（v2.42.0+）：入口行 + 底部弹层
+// ---------------------------------------------------------------------------
+
+/// 「说点什么…」发表入口行的锚点（仅 [CommentListView.enableCompose] 为 true
+/// 时构建）。
+const Key kCommentComposeEntryKey = Key('comment-compose-entry');
+
+/// 发表弹层根节点的锚点（测试用；挂在弹层的 `Padding` 上）。
+const Key kCommentComposeSheetKey = Key('comment-compose-sheet');
+
+/// 弹层里多行 [TextField] 的锚点。
+const Key kCommentComposeFieldKey = Key('comment-compose-field');
+
+/// 弹层「发送」按钮的锚点（发送中/失败重试都是它）。
+const Key kCommentComposeSendKey = Key('comment-compose-send');
+
+/// 弹层内联错误文案的锚点（null = 没有错误）。
+///
+/// 为什么除了 [AppSnack] 还要在弹层里写一份错误：底部弹层**盖住的正是
+/// SnackBar 出现的位置**，只弹 SnackBar 的话用户根本看不见"为什么没发出去"。
+/// 内联文字是"留在屏幕上直到修好"的那一份，SnackBar 是"通知到了"的那一份。
+const Key kCommentComposeErrorKey = Key('comment-compose-error');
+
+/// 单条评论「回复」按钮的锚点：按被回复那条的 rpid 区分（一条一 Key）。
+///
+/// 用函数而不是常量表：评论是动态数据，Key 只能按 rpid 现算。
+Key commentReplyKey(int rpid) => ValueKey('comment-reply-$rpid');
+
 /// 评论内视频链接点击回调：把目标视频交给宿主打开，可携带链接 ?p/?t 定位
 /// 参数（v2.17.6+；来源见 utils/comment_links.dart 的 CommentLink.pageIndex /
 /// positionMs）。
@@ -138,6 +170,15 @@ typedef OpenCommentVideo = void Function(
   int? pageIndex,
   int? positionMs,
 });
+
+/// 发起回复的回调：把「被回复的那条」+「它所属的根评论 rpid」交给宿主。
+///
+/// 为什么两个都传而不是只传被回复的那条：`x/v2/reply/add` 的 `root` 是
+/// **根评论**的 rpid、`parent` 是**直接父级**的 rpid，两者在"回复楼中楼里的
+/// 某条子回复"时并不相同——而子回复自己身上虽然带 `root` 字段，脏数据/旧数据
+/// 未必可信（服务端给的 `root` 也可能为 0），所以由**列表层按它自己维护的
+/// 楼层归属**给出根 rpid（[rootRpid]）：根评论回复自己时 `rootRpid == target.rpid`。
+typedef CommentReplyIntent = void Function(CommentReply target, int rootRpid);
 
 /// 楼中楼展开的一页状态：已加载子回复 + 是否还有下一页 + 下次请求的 pn。
 class _ChildrenState {
@@ -271,6 +312,32 @@ class CommentListView extends StatefulWidget {
   /// 明确支持的两档，不是猜的。
   final int sortMode;
 
+  /// 是否允许**发表评论 / 回复**（v2.42.0+，可选，**默认 false**）。
+  ///
+  /// 为 false 时组件**一个发表入口都不构建**：没有「说点什么…」那一行、每条
+  /// 评论右侧没有「回复」——渲染树与改动前逐节点一致。专栏阅读页 / 动态详情页
+  /// / 独立评论页三个使用点因此行为零变化，只有播放页内嵌评论区显式打开
+  /// （与 [enableSortSwipe] 同一个决策：写操作先从"用户真正在看视频"的位置上，
+  /// 不一次性改动四个使用点的交互形态）。
+  ///
+  /// ⚠️ 打开它只表示"允许渲染入口"，**不代表现在就能发**：真正发得出去还要
+  /// ① 归属 id（aid/cvid）已解析出来，② 这个评论区没被关闭（12002）——
+  /// 两个条件任一不满足就把入口**置灰**（见 [CommentListView] 的
+  /// `_canCompose`）。关评论区是常见情况（UP 主随手就能关），置灰比"点了才
+  /// 报错"诚实。
+  ///
+  /// ⚠️ 为什么入口是"一行像输入框的按钮 + 底部弹层"而不是常驻输入框：
+  /// 常驻输入框会**和列表抢同一块屏幕**——键盘一弹，可视高度骤降、列表被挤
+  /// 变形，而且它与本区域已有的 `Listener`（整片横滑切排序，[enableSortSwipe]）
+  /// 共享触摸区：手指想在输入框上挪光标，横向那几像素的抖动就可能被判成"切
+  /// 排序"。弹层是**点开才占用屏幕**的独立路由，与列表的滚动、横滑、长按选字
+  /// 完全不在同一个手势竞技场里。
+  ///
+  /// ⚠️ 写操作**统一门控**：宿主还必须在传 [enableCompose] 之前先判
+  /// `UiPrefsStore.instance.writeActionsEnabled`（与点赞/投币/收藏同一道总
+  /// 开关，默认关）——本组件不认识那个 store，门控由宿主完成。
+  final bool enableCompose;
+
   const CommentListView({
     super.key,
     this.video,
@@ -290,6 +357,7 @@ class CommentListView extends StatefulWidget {
     this.api,
     this.enableSortSwipe = false,
     this.sortMode = kCommentSortHot,
+    this.enableCompose = false,
   });
 
   @override
@@ -329,6 +397,15 @@ class _CommentListViewState extends State<CommentListView> {
 
   /// 浮层提示的自动消失计时器（切换时重置）。
   Timer? _sortHintTimer;
+
+  // --- 发表评论（v2.42.0+，仅 enableCompose 时可见/可用）-------------------
+
+  /// 这个评论区**已被关闭**（读到/写到 12002）。
+  ///
+  /// 单独记一个状态而不是复用 [_error]：12002 只是"发表不了"，**看评论完全
+  /// 正常**（[fetchVideoComments] 在它之前就返回过内容了）。把它当整块错误态
+  /// 会把评论藏起来，那是另一回事。它只影响发表入口——置灰 + 一句原因。
+  bool _commentClosed = false;
 
   /// 是否带登录态（SESSDATA）：B 站对未登录访客的 reply/main 只折叠返回
   /// 前几条热门评论（is_end=true），登录后才会给全量分页——据此决定
@@ -447,6 +524,8 @@ class _CommentListViewState extends State<CommentListView> {
       _isEnd = false;
       // 区头计数先把宿主给的初值（如专栏 stats.reply）顶上去，真值到货覆盖
       _total = widget.initialTotal;
+      // 换数据源 → 评论区是否关闭要重新判（上一个内容关了、这个未必）
+      _commentClosed = false;
       // 换数据源：代次 +1、批次归零、账本清空 → 新的 entryKey 重新排队入场
       _reloadToken++;
       _batchStart = 0;
@@ -564,18 +643,24 @@ class _CommentListViewState extends State<CommentListView> {
         debugPrint('[comment_list] 首屏样本: ${samples.join(' || ')}');
       }
     } on BiliApiException catch (e) {
-      _onLoadMainError(e.message, reset: reset);
+      _onLoadMainError(e.message, reset: reset, code: e.code);
     } on DioException {
       _onLoadMainError('网络请求失败，请检查网络后重试', reset: reset);
     }
   }
 
-  void _onLoadMainError(String message, {required bool reset}) {
+  void _onLoadMainError(String message, {required bool reset, int? code}) {
     if (!mounted) return;
+    // 12002：主评论**读得到**（错误是另有原因），但它说明这个评论区关了 →
+    // 把发表入口置灰（见 _canCompose）。放在这里而不是只放在 addComment 的
+    // 失败分支：绝大多数用户不会去点那个必然失败的入口，让他们一眼看到
+    // "已关闭"比让他们自己撞一次墙好。
+    final closed = code == BiliApi.kCommentClosedCode;
     if (reset) {
       setState(() {
         _loading = false;
         _error = message;
+        if (closed) _commentClosed = true;
       });
       return;
     }
@@ -583,6 +668,7 @@ class _CommentListViewState extends State<CommentListView> {
     setState(() {
       _loadingMore = false;
       _moreFailed = true;
+      if (closed) _commentClosed = true;
     });
     ScaffoldMessenger.of(context)
         .showSnackBar(SnackBar(content: Text('加载失败：$message')));
@@ -682,6 +768,95 @@ class _CommentListViewState extends State<CommentListView> {
     });
     if (_scrollCtrl.hasClients) _scrollCtrl.jumpTo(0);
     _loadMain(reset: true);
+  }
+
+  // -------------------------------------------------------------------------
+  // 发表评论 / 回复（v2.42.0+，仅 enableCompose 时可用）
+  // -------------------------------------------------------------------------
+
+  /// 现在能不能发表：**开了入口 + 归属 id 到手 + 评论区没关**。
+  ///
+  /// - 归属 id（[_aid]）没到手：连"发给谁"都不知道，不能给可点的入口；
+  /// - [_commentClosed]：12002 是持久状态，点了也必然失败——置灰 + 说原因
+  ///   （[_buildComposeEntry] 的提示文案），比让用户自己撞一次墙诚实。
+  bool get _canCompose =>
+      widget.enableCompose && _aid != null && !_commentClosed;
+
+  /// 点「说点什么…」/ 点某条评论的「回复」→ 弹发表弹层。
+  ///
+  /// [target] 为 null = 顶层评论（不带 root/parent）；非 null = 回复它，
+  /// [rootRpid] 是它所属根评论的 rpid（根评论回复自己时两者相同）。
+  ///
+  /// **弹层自己发请求**（而不是"弹层回传文本、外面再发"）是必须的：要求
+  /// "失败不关弹层、让用户能重试"——如果外面拿到文本就 pop，失败时用户打的
+  /// 字已经没了，只剩一条错误提示和一个空输入框。
+  Future<void> _openCompose({CommentReply? target, int? rootRpid}) async {
+    final aid = _aid;
+    if (aid == null || _commentClosed) return;
+    final isReply = target != null;
+    // 预填 `@某人 `：与网页端一致，也让楼中楼里的收信人一眼知道在回谁。
+    // 用 runes 取长度的地方（接口层）不受影响——前缀本身也算在 1000 字里。
+    final prefix = (isReply && target.uname.isNotEmpty) ? '@${target.uname} ' : '';
+    final root = isReply ? (rootRpid ?? target.rpid) : null;
+    // 根评论回复自己：root 与 parent 同值（网页端就是这么发的，见 addComment
+    // 的文档）；子回复才是 root=根、parent=它自己。
+    final parent = isReply ? target.rpid : null;
+    debugPrint('[comment_list] 打开发表弹层 oid=$aid type=${widget.commentType} '
+        '回复=${isReply ? target.rpid : '-'} root=${root ?? '-'} '
+        'parent=${parent ?? '-'}');
+    final sent = await showModalBottomSheet<bool>(
+      context: context,
+      isScrollControlled: true, // 键盘弹起时弹层要能跟着长高
+      useSafeArea: true,
+      builder: (sheetCtx) => _CommentComposeSheet(
+        title: isReply ? '回复 ${target.uname}' : '发表评论',
+        initialText: prefix,
+        onSend: (message) => _sendComment(
+          oid: aid,
+          message: message,
+          root: root,
+          parent: parent,
+        ),
+      ),
+    );
+    if (!mounted || sent != true) return;
+    // 成功后：重拉第一页而不是本地插一条。理由：服务端排序（热门/最新）与
+    // 置顶是它说了算，本地插进去的位置十有八九和刷新后不一致——与其让新评论
+    // 先出现在一个"错误"的位置再跳走，不如直接以服务端为准（与 [_switchSort]
+    // 同一个取舍）。
+    await _loadMain(reset: true);
+    if (!mounted) return;
+    AppSnack.show(context, isReply ? '回复已发表' : '评论已发表');
+  }
+
+  /// 真正发出去（弹层里的「发送」按钮 await 它）。
+  ///
+  /// **异常原样上抛**给弹层：文案要说在用户正看着的那一层（弹层内联 +
+  /// [AppSnack]），列表这边只负责把 12002 记成持久状态。
+  Future<void> _sendComment({
+    required int oid,
+    required String message,
+    int? root,
+    int? parent,
+  }) async {
+    try {
+      await _api.addComment(
+        oid: oid,
+        // 归属口径**原样透传**宿主给的 commentType：本组件不猜类型（视频 1 /
+        // 专栏 12 / 动态取服务端 basic.comment_type）——猜错不会报错，会把
+        // 评论挂到别的内容名下（v2.31.0 的动态 -404 就是这个坑）。
+        type: widget.commentType,
+        message: message,
+        root: root,
+        parent: parent,
+      );
+    } on BiliApiException catch (e) {
+      if (e.code == BiliApi.kCommentClosedCode && mounted) {
+        // 记成持久状态：入口从这一刻起置灰，用户不必再撞一次
+        setState(() => _commentClosed = true);
+      }
+      rethrow;
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -1134,7 +1309,26 @@ class _CommentListViewState extends State<CommentListView> {
     final state = _bodyState();
     // 无自定义头 → 老行为：状态视图直接占满整块（_fitState 兼容矮容器）
     if (pageHeader == null) {
-      if (state != null) return _wrapSortSwipe(_fitState(state));
+      if (state != null) {
+        if (!widget.enableCompose) return _wrapSortSwipe(_fitState(state));
+        // 开了发表能力时，入口行**在状态视图之上也保留**。为什么必须：
+        // ① 发表后要重拉第一页（[_openCompose]），那一瞬间 `_loading` 为真、
+        //    返回的正是这条分支——入口跟着消失会让刚发完评论的人以为功能没了；
+        // ② 「12002 → 入口置灰 + 写原因」这条要求在这里才有落点：读接口回
+        //    12002 时整块就是状态视图，若不带上入口行，连"置灰"的对象都没有。
+        // 用 [_fitState] 包住两者（而不是自己拼 Column + Expanded）：这块容器
+        // 高度不确定（横屏小窗可能很矮），单滚动的现成适配比再写一套稳。
+        return _wrapSortSwipe(_fitState(Padding(
+          padding: const EdgeInsets.symmetric(horizontal: kPagePadH),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _buildComposeEntry(canCompose: _canCompose),
+              state,
+            ],
+          ),
+        )));
+      }
     }
     final hasHeader = pageHeader != null;
     // 有自定义头但评论还没内容/出错 → 列表只有「头 + 一块状态」
@@ -1143,6 +1337,11 @@ class _CommentListViewState extends State<CommentListView> {
     final rootCount = _roots.length;
     final headerCount = widget.showCountHeader ? 1 : 0;
     final headerSlot = hasHeader ? 1 : 0;
+    // 发表入口行（v2.42.0+）：默认关时恒为 0 → 下标与渲染树逐节点不变
+    final composeCount = widget.enableCompose ? 1 : 0;
+    // 「常驻可见」的固定槽位：区头 + 发表入口（都排在置顶/根评论之前）
+    final fixedSlots = headerCount + composeCount;
+    final composeEnabled = _canCompose;
     // 翻页追加批次：本批条目用更短更密的入场节奏（见 app_motion.dart）
     final appendBatch = _batchStart > 0;
     final list = NotificationListener<ScrollNotification>(
@@ -1166,22 +1365,32 @@ class _CommentListViewState extends State<CommentListView> {
           // （删除了原先条目尾部的 Divider）
           padding: const EdgeInsets.fromLTRB(kPagePadH, 0, kPagePadH, kSpace12),
           itemCount: onlyHeaderAndState
-              ? headerSlot + 1 // 头 + 一块状态
-              : headerSlot + headerCount + pinnedCount + rootCount + 1, // +1 脚部
+              ? headerSlot + composeCount + 1 // 头 + 入口行 + 一块状态
+              : headerSlot + fixedSlots + pinnedCount + rootCount + 1, // +1 脚部
           itemBuilder: (context, index) {
             if (hasHeader) {
               if (index == 0) return pageHeader;
-              if (onlyHeaderAndState) return _embeddedState(state);
+              if (onlyHeaderAndState) {
+                // 「头 + 入口行 + 状态」：入口行在状态块**之前** —— 加载/空/错误
+                // 时它照样在（这正是"12002 置灰 + 写原因"要出现的位置）
+                if (composeCount > 0 && index == 1) {
+                  return _buildComposeEntry(canCompose: composeEnabled);
+                }
+                return _embeddedState(state);
+              }
             }
             // 去掉自定义头占用的下标（没有头时 headerSlot == 0，下标不变）
             final at = index - headerSlot;
-            if (at == headerCount + pinnedCount + rootCount) {
-              return _buildFooter();
-            }
             if (headerCount > 0 && at == 0) {
               return _buildCountHeader();
             }
-            final i = at - headerCount;
+            if (composeCount > 0 && at == headerCount) {
+              return _buildComposeEntry(canCompose: composeEnabled);
+            }
+            final i = at - fixedSlots;
+            if (i == pinnedCount + rootCount) {
+              return _buildFooter();
+            }
             final bool pinned = i < pinnedCount;
             final reply = pinned ? _pinned[i] : _roots[i - pinnedCount];
             // 入场序号：
@@ -1209,6 +1418,12 @@ class _CommentListViewState extends State<CommentListView> {
                 onLinkTap: _onCommentLinkTap,
                 onImageTap: _openImageGallery,
                 onAvatarTap: _openCommentAuthor,
+                // 只有开了发表能力才把「回复」按钮和回调传下去：默认关时
+                // 这两个参数是 false/null → 渲染树里连按钮都不存在
+                canReply: widget.enableCompose,
+                replyEnabled: composeEnabled,
+                onReply: (target, rootRpid) =>
+                    _openCompose(target: target, rootRpid: rootRpid),
               ),
             );
           },
@@ -1249,6 +1464,85 @@ class _CommentListViewState extends State<CommentListView> {
             _buildSortToggle(),
           ],
         ],
+      ),
+    );
+  }
+
+  /// 「说点什么…」发表入口行（v2.42.0+，**仅** [CommentListView.enableCompose]
+  /// 为 true 时构建；紧跟在区头下方，与区头同为"常驻可见"的行）。
+  ///
+  /// 形态是一行**像输入框的按钮**（不是真输入框，点击才弹底部弹层）：
+  /// - 常驻真输入框会跟列表抢同一块屏幕——键盘一弹可视高度骤降，列表被挤
+  ///   变形，而且它与整片横滑（[CommentListView.enableSortSwipe]）共享触摸区，
+  ///   想在输入框上挪光标时横向那几像素抖动就可能被判成"切排序"；
+  /// - 点击才打开的弹层是独立路由，与列表的滚动 / 横滑 / 长按选字互不干扰。
+  ///
+  /// 置灰的两种情况（[canCompose] 为 false）都会**把原因写在行里**，不只是
+  /// 变灰。三种文案（见下面 [hint] 的取值）：
+  /// - 12002 → 「该评论区已关闭」（常见情况，UP 主随手就能关）；
+  /// - 归属 id 还没到手（还在加载）→ 「评论加载中…」（暂时状态，不该说成错误）；
+  /// - 归属 id 压根没解析出来 → 「无法发表评论（未取到内容信息）」（这时整块
+  ///   已经是错误态，入口行照旧置灰，不假装能用）。
+  Widget _buildComposeEntry({required bool canCompose}) {
+    final theme = Theme.of(context);
+    // 三种"不能发"的文案分开写：12002 是持久状态（说清是评论区的事）、
+    // 归属 id 还没到手是**暂时的**（说"加载中"而不是当成错误）、归属 id
+    // 压根没解析出来才是真错误（那时整块已经是错误态，入口行照旧被置灰）。
+    final String hint;
+    if (_commentClosed) {
+      hint = '该评论区已关闭';
+    } else if (canCompose) {
+      hint = '说点什么…';
+    } else if (_loading) {
+      hint = '评论加载中…';
+    } else {
+      hint = '无法发表评论（未取到内容信息）';
+    }
+    return Padding(
+      key: kCommentComposeEntryKey,
+      // 与评论块同左右边距（列表已有 kPagePadH，这里只留块自身的呼吸）
+      padding: const EdgeInsets.only(bottom: kListGap),
+      child: Material(
+        // 透明 Material 承载水波纹（与 _buildSortToggle 同一个坑：外层
+        // AppBlock/Container 的底色会盖掉更外层 Material 上的涟漪）
+        type: MaterialType.transparency,
+        child: InkWell(
+          onTap: canCompose
+              ? () => _openCompose()
+              : null,
+          borderRadius: BorderRadius.circular(kRadiusMd),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: kSpace12, vertical: 11),
+            decoration: BoxDecoration(
+              color: theme.colorScheme.surface,
+              borderRadius: BorderRadius.circular(kRadiusMd),
+              border: Border.all(
+                color: canCompose
+                    ? theme.dividerColor
+                    : theme.dividerColor.withValues(alpha: 0.6),
+              ),
+            ),
+            child: Row(
+              children: [
+                Icon(
+                  Icons.edit_outlined,
+                  size: 16,
+                  color: canCompose ? kInkGray70 : kInkGray30,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    hint,
+                    style: TextStyle(
+                      fontSize: 13.5,
+                      color: canCompose ? kInkGray50 : kInkGray30,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
       ),
     );
   }
@@ -1383,6 +1677,17 @@ class _CommentRootTile extends StatelessWidget {
   /// 头像点击（进作者个人主页；mid 无效时头像不挂手势，不会回调）。
   final ValueChanged<CommentReply> onAvatarTap;
 
+  /// 是否**渲染**「回复」按钮（v2.42.0+，[CommentListView.enableCompose] 原样
+  /// 透传）。false 时按钮连构建都不构建 —— 默认关时渲染树逐节点不变。
+  final bool canReply;
+
+  /// 按钮是否**可点**（归属 id 到手 + 评论区没关；见 [_CommentListViewState
+  /// 的 _canCompose]）。与 [canReply] 分开：可以"摆着但置灰"。
+  final bool replyEnabled;
+
+  /// 点「回复」→ 交给列表层弹发表弹层（带着它自己维护的楼层归属）。
+  final CommentReplyIntent onReply;
+
   const _CommentRootTile({
     required this.reply,
     required this.pinned,
@@ -1395,6 +1700,9 @@ class _CommentRootTile extends StatelessWidget {
     required this.onLinkTap,
     required this.onImageTap,
     required this.onAvatarTap,
+    this.canReply = false,
+    this.replyEnabled = false,
+    required this.onReply,
   });
 
   @override
@@ -1508,6 +1816,17 @@ class _CommentRootTile extends StatelessWidget {
             style: TextStyle(fontSize: 12, color: kInkGray50),
           ),
           const Spacer(),
+          // 「回复」入口（v2.42.0+，仅开启发表能力时构建；放在右端、楼中楼
+          // 展开按钮的**左侧**——展开是"看更多"，回复是"写一句"，两者都属
+          // 于"对这条评论做什么"，成组更顺手，也不与左端的点赞/时间挤一起）
+          if (canReply) ...[
+            _ReplyAffordance(
+              rpid: reply.rpid,
+              enabled: replyEnabled,
+              onTap: () => onReply(reply, reply.rpid),
+            ),
+            if (reply.count > 0) const SizedBox(width: 12),
+          ],
           if (reply.count > 0)
             // 无障碍标签：回复折叠/展开按钮可被读屏/自动化识别
             MergeSemantics(
@@ -1595,6 +1914,12 @@ class _CommentRootTile extends StatelessWidget {
                 reply: child,
                 onLinkTap: onLinkTap,
                 onImageTap: onImageTap,
+                // 楼中楼里的「回复」：被回复的是这条子回复（parent=它自己），
+                // 但它挂在 `reply`（构造本 tile 的那条根评论）名下 → root 用
+                // **根评论**的 rpid。这两个值不相等正是"楼中楼回复"的定义。
+                onReply: canReply && replyEnabled
+                    ? () => onReply(child, reply.rpid)
+                    : null,
                 onAvatarTap: onAvatarTap,
               ),
           if (state != null && state.hasMore)
@@ -1615,6 +1940,59 @@ class _CommentRootTile extends StatelessWidget {
                     ),
             ),
         ],
+      ),
+    );
+  }
+}
+
+/// 单条评论右侧的「回复」入口（v2.42.0+）。
+///
+/// 为什么不用 `TextButton`：评论行本身只有一条元信息行（~30dp）高，按钮自
+/// 带的默认最小尺寸会把整行撑高、改动既有排版；这里用与右侧「N 条回复」
+/// 同款的小号文字 + 图标 + 同样的热区内边距（[kSpace4]/2dp）——**与邻居保持
+/// 一致**比单独给这一个入口放大热区更重要（同一个元信息行里两个大小不一的
+/// 可点区域，看起来就是没做完）。
+///
+/// [enabled] 为 false（归属 id 没取到 / 评论区已关闭）时**不只是变灰**：
+/// 用 `Semantics(enabled: false)` 让读屏也读得出来，且 `onTap: null` 保证
+/// 点了不会有任何请求发出去。
+class _ReplyAffordance extends StatelessWidget {
+  final int rpid;
+  final bool enabled;
+  final VoidCallback onTap;
+
+  const _ReplyAffordance({
+    required this.rpid,
+    required this.enabled,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    final primary = Theme.of(context).colorScheme.primary;
+    final color = enabled ? primary : kInkGray30;
+    return Semantics(
+      button: true,
+      enabled: enabled,
+      label: '回复这条评论',
+      child: InkWell(
+        key: commentReplyKey(rpid),
+        onTap: enabled ? onTap : null,
+        borderRadius: BorderRadius.circular(kRadiusSm),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 4, vertical: 2),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.chat_bubble_outline, size: 13, color: color),
+              const SizedBox(width: 3),
+              Text(
+                '回复',
+                style: TextStyle(fontSize: 12.5, color: color),
+              ),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -1693,11 +2071,16 @@ class _SubReplyRow extends StatelessWidget {
   /// 头像点击（进作者个人主页；mid 无效时头像不挂手势）。
   final ValueChanged<CommentReply> onAvatarTap;
 
+  /// 点「回复」这条**子回复**（v2.42.0+）。null = 不构建回复入口
+  /// （默认关 / 归属 id 没到手 / 评论区已关闭）。
+  final VoidCallback? onReply;
+
   const _SubReplyRow({
     required this.reply,
     required this.onLinkTap,
     required this.onImageTap,
     required this.onAvatarTap,
+    this.onReply,
   });
 
   @override
@@ -1746,6 +2129,17 @@ class _SubReplyRow extends StatelessWidget {
                       style: TextStyle(
                           fontSize: 11, color: kInkGray50),
                     ),
+                    // 楼中楼内的「回复」（v2.42.0+，仅开启发表能力时给回调）：
+                    // 回复这条**子回复** → root 用根评论 rpid、parent 用它自己
+                    // （值由 _buildChildrenArea 组装，见那里的注释）。
+                    if (onReply != null) ...[
+                      const SizedBox(width: 8),
+                      _ReplyAffordance(
+                        rpid: reply.rpid,
+                        enabled: true,
+                        onTap: onReply!,
+                      ),
+                    ],
                   ],
                 ),
                 if (reply.message.isNotEmpty)
@@ -2116,4 +2510,187 @@ String _fmtCtime(int ctime) {
   if (diff.inDays < 30) return '${diff.inDays} 天前';
   if (t.year == now.year) return '${t.month}月${t.day}日';
   return '${t.year}年${t.month}月${t.day}日';
+}
+
+// ---------------------------------------------------------------------------
+// 发表评论弹层（v2.42.0+）
+// ---------------------------------------------------------------------------
+
+/// 发表评论 / 回复的底部弹层：多行输入 + 字数上限 + 发送。
+///
+/// **弹层自己持有"发送中/失败"状态并自己发请求**（[onSend]），只有成功才
+/// `pop(true)`。为什么不是"弹层回传文本、外面再发"：要求失败不关弹层——外面
+/// 发的话弹层在拿到文本时就关了，失败时用户打的字已经丢了，只剩一条错误提示
+/// 和一个空输入框，"重试"实际等于重打一遍。
+///
+/// **失败提示两处都给**（不是重复）：
+/// - 弹层内联红字（[kCommentComposeErrorKey]）：留在屏幕上直到用户改好，是
+///   用户真正会看到的那一份——底部弹层盖住的正是 SnackBar 的位置，只弹
+///   SnackBar 的话提示会被弹层自己挡住；
+/// - [AppSnack]（[SnackKind.error]）：满足全 App 的"错误不可被静默"约定
+///   （设置里关掉底部提示条也照样弹），并负责"这一下没发出去"的即时反馈。
+class _CommentComposeSheet extends StatefulWidget {
+  /// 标题（发表评论 / 回复 某人）。
+  final String title;
+
+  /// 初始正文（回复时是 `@某人 ` 前缀）。
+  final String initialText;
+
+  /// 真正发送；抛出（[BiliApiException] / [DioException]）即失败，弹层不关。
+  final Future<void> Function(String message) onSend;
+
+  const _CommentComposeSheet({
+    required this.title,
+    required this.initialText,
+    required this.onSend,
+  });
+
+  @override
+  State<_CommentComposeSheet> createState() => _CommentComposeSheetState();
+}
+
+class _CommentComposeSheetState extends State<_CommentComposeSheet> {
+  late final TextEditingController _ctrl =
+      TextEditingController(text: widget.initialText);
+
+  /// 输入框焦点：弹层一出现就聚焦（省一次点击；用户点进来就是要打字）。
+  final FocusNode _focus = FocusNode();
+
+  bool _busy = false;
+  String? _error;
+
+  @override
+  void initState() {
+    super.initState();
+    // 回复时把光标放在 `@某人 ` 之后：预填文案是"前缀"不是"要改的内容"
+    _ctrl.selection = TextSelection.collapsed(offset: _ctrl.text.length);
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    _focus.dispose();
+    super.dispose();
+  }
+
+  /// 当前能否发送：非空（去掉空白后）+ 不忙 + 没超字数。
+  bool get _canSend {
+    final text = _ctrl.text.trim();
+    return !_busy &&
+        text.isNotEmpty &&
+        _ctrl.text.runes.length <= kCommentMaxLength;
+  }
+
+  Future<void> _send() async {
+    if (!_canSend) return;
+    final text = _ctrl.text;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    try {
+      await widget.onSend(text);
+      if (!mounted) return;
+      // 只有成功才关：关弹层 → 外面 _openCompose 负责刷新 + 成功提示
+      Navigator.of(context).pop(true);
+    } on BiliApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        _error = e.message;
+      });
+      AppSnack.show(context, '发表失败：${e.message}', kind: SnackKind.error);
+    } on DioException {
+      if (!mounted) return;
+      // ⚠️ 网络失败**不能**当成功：请求可能已经到服务端了（超时/断连），
+      // 所以文案是"可能没成功"，而不是"失败"——让用户自己到评论区确认。
+      const message = '网络请求失败：评论可能没发出去，请到评论区确认后再决定要不要重发';
+      setState(() {
+        _busy = false;
+        _error = message;
+      });
+      AppSnack.show(context, message, kind: SnackKind.error);
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final err = _error;
+    return Padding(
+      key: kCommentComposeSheetKey,
+      // viewInsets 把键盘高度让出来（isScrollControlled 的弹层必须自己让位）
+      padding: EdgeInsets.only(
+        left: kPagePadH,
+        right: kPagePadH,
+        top: kSpace12,
+        bottom: MediaQuery.viewInsetsOf(context).bottom + kSpace12,
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Text(
+                widget.title,
+                style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w600),
+              ),
+              const Spacer(),
+              TextButton(
+                onPressed: _busy ? null : () => Navigator.of(context).pop(false),
+                child: const Text('取消'),
+              ),
+              TextButton(
+                key: kCommentComposeSendKey,
+                onPressed: _canSend ? _send : null,
+                child: Text(_busy ? '发送中…' : '发送'),
+              ),
+            ],
+          ),
+          const SizedBox(height: kSpace4),
+          TextField(
+            key: kCommentComposeFieldKey,
+            controller: _ctrl,
+            focusNode: _focus,
+            autofocus: true,
+            enabled: !_busy,
+            minLines: 3,
+            maxLines: 6,
+            // 服务端上限与 UI 提示同一个常量（见 kCommentMaxLength 的注释）；
+            // maxLength 自带右下角 `N/1000` 计数，就是"字数上限提示"
+            maxLength: kCommentMaxLength,
+            textInputAction: TextInputAction.newline,
+            keyboardType: TextInputType.multiline,
+            decoration: InputDecoration(
+              hintText: '说点什么…',
+              border: const OutlineInputBorder(),
+              contentPadding: const EdgeInsets.symmetric(
+                  horizontal: kSpace12, vertical: 10),
+            ),
+            onChanged: (_) => setState(() {}), // 驱动发送按钮可用态与计数
+          ),
+          if (err != null)
+            Padding(
+              padding: const EdgeInsets.only(bottom: kSpace4),
+              child: Row(
+                children: [
+                  Icon(Icons.error_outline,
+                      size: 14, color: theme.colorScheme.error),
+                  const SizedBox(width: 6),
+                  Expanded(
+                    child: Text(
+                      err,
+                      key: kCommentComposeErrorKey,
+                      style: TextStyle(
+                          fontSize: 12.5, color: theme.colorScheme.error),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
 }

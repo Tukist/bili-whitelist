@@ -7051,19 +7051,30 @@ class _PlayerPageState extends State<PlayerPage>
   /// **push 新播放页**（v2.17.1+：push 前显式暂停本页防双音轨、返回时
   /// 恢复本视频续播），不再走 playVideo 换源。
   Widget _buildEmbeddedComments() {
-    return CommentListView(
-      key: ValueKey('embedded-comments-${_video.bvid}-$_currentPageIndex'),
-      video: _video,
-      controller: _commentScroll,
-      countHeaderKey: _commentCountHeaderKey,
-      showCountHeader: true,
-      onOpenVideo: openVideoInNewPlayer,
-      // v2.40.0+：本处（且只有本处）开启「评论区左右滑切换热门/最新排序」。
-      // 为什么只在这里开：用户是在**看视频时**抱怨"评论区不能左右划"，
-      // 而播放页内嵌评论区是唯一有"继续看下去"语境的位置；专栏 / 动态 /
-      // 独立评论页的横向手势位将来另有用途（单条左滑等），现在不占。
-      // 两者不能同时上：同一片区域只能有一套横滑手势（见参数注释）。
-      enableSortSwipe: true,
+    // 发表评论（v2.42.0+）与点赞/投币/收藏共用**同一道写操作总开关**
+    // （UiPrefsStore.writeActionsEnabled，默认关）：一个总闸管全部写操作，
+    // 不做"评论单独一个开关"——用户要的是"别碰我账号"这一个决定。
+    // 套 ListenableBuilder 的理由同信息块那行：设置页可能在播放页还活着时
+    // 改开关（播放页在路由栈下层），监听 store 才能一回来就对上。
+    return ListenableBuilder(
+      listenable: UiPrefsStore.instance,
+      builder: (context, _) => CommentListView(
+        key: ValueKey('embedded-comments-${_video.bvid}-$_currentPageIndex'),
+        video: _video,
+        controller: _commentScroll,
+        countHeaderKey: _commentCountHeaderKey,
+        showCountHeader: true,
+        onOpenVideo: openVideoInNewPlayer,
+        // v2.40.0+：本处（且只有本处）开启「评论区左右滑切换热门/最新排序」。
+        // 为什么只在这里开：用户是在**看视频时**抱怨"评论区不能左右划"，
+        // 而播放页内嵌评论区是唯一有"继续看下去"语境的位置；专栏 / 动态 /
+        // 独立评论页的横向手势位将来另有用途（单条左滑等），现在不占。
+        // 两者不能同时上：同一片区域只能有一套横滑手势（见参数注释）。
+        enableSortSwipe: true,
+        // v2.42.0+：同样只在本处开「说点什么… / 回复」。另外三个使用点
+        // （专栏 / 动态 / 独立评论页）保持默认 false → 渲染树逐节点不变。
+        enableCompose: UiPrefsStore.instance.writeActionsEnabled,
+      ),
     );
   }
 

@@ -23,6 +23,13 @@ import '../models/whitelist_video.dart';
 import '../services/secure_store.dart';
 import '../wbi/wbi_signer.dart';
 
+/// 评论正文的字数上限（B 站网页端的「0/1000」就是它）。
+///
+/// 放在接口层而不是 UI 层：**服务端约束**由接口层兜底（[BiliApi.addComment]
+/// 用它拦下超长正文），UI 的 `TextField.maxLength` 只是提前告知用户，两处
+/// 必须同一个数（各写一份迟早会漂）。
+const int kCommentMaxLength = 1000;
+
 /// B 站业务接口错误（带业务 code）。
 ///
 /// 常见 code：0=成功、-101=未登录/登录失效、-412=风控（WBI key 过期）需重试、
@@ -3302,10 +3309,9 @@ class BiliApi {
   //      没登录 / [-111] csrf 失效 / [-412] 风控 / [34005] 超过投币上限…），
   //      见 [_throwWriteError]。
   //
-  // 未做（有意）：**评论**（要输入框 UI，且与"评论区横滑"抢同一片区域，
-  // 下一轮）、**投稿/发视频**（需 up 权限校验 + 分片上传 + 封面 + 分区 +
+  // 未做（有意）：**投稿/发视频**（需 up 权限校验 + 分片上传 + 封面 + 分区 +
   // 审核轮询 + 后台传输，量级是独立大版本，也与本 App"看白名单视频"的定位
-  // 无关）。
+  // 无关）。**评论**在 v2.42.0 补上（见下面「写操作第二阶段」分区）。
   // -------------------------------------------------------------------------
 
   /// 写操作的统一出口：注入登录态 → 取 csrf → POST 表单 → 分类业务码。
@@ -3405,6 +3411,11 @@ class BiliApi {
       -412 => '操作被风控拦截，请稍后再试',
       -509 => '操作过于频繁，请稍后再试',
       -352 => '操作被限流，请稍后再试',
+      // 评论专属（v2.42.0+）：12002 是"评论区关了"这一**持久状态**，不是
+      // "这次没成功"——UI 见到它要把发表入口整个置灰（见 kCommentClosedCode），
+      // 所以文案必须说清是"这个评论区不行"而不是"你再试一次"。
+      12002 => '该评论区已关闭',
+      12015 => (raw == null || raw.isEmpty) ? '评论内容被拦截，请修改后再发' : raw,
       _ => (raw == null || raw.isEmpty) ? '操作失败' : raw,
     };
     throw BiliApiException(code: code, message: message, path: path);
@@ -3558,6 +3569,137 @@ class BiliApi {
       // 只带一个时服务端行为未实测，按已知可用的形状发。
       'add_media_ids': adding ? '$addFid' : '',
       'del_media_ids': removing ? '$delFid' : '',
+    });
+  }
+
+  // -------------------------------------------------------------------------
+  // 写操作第二阶段（v2.42.0+）：发表评论 / 回复 / 删除自己的评论
+  //
+  // 与前三个（点赞/投币/收藏）同走 [_postAuth] 那三条纪律（csrf、不重试、
+  // 错误可读），这里只补一条**本类操作特有**的：
+  //   ★ **归属口径（oid/type）必须由调用方给，本层不做任何猜测**。
+  //     `x/v2/reply/add` 与 `x/v2/reply/main` 是同一套 (oid, type) 寻址：
+  //     视频是 `type=1 + oid=aid`、专栏是 `type=12 + oid=cvid`、
+  //     **动态必须用服务端给的 `basic.comment_type` + `basic.comment_id_str`**
+  //     （不能用 `type=17 + 动态 id`——v2.31.0 已实测那是 -404）。
+  //     口径传错**不报错**，会静默把评论挂到另一类内容（或另一个人）的
+  //     名下——所以本层拒绝"按内容 id 反推 type"这种方便但危险的写法，
+  //     两个参数都要求显式传入（见 [addComment] 的 [type]）。
+  // -------------------------------------------------------------------------
+
+  /// `x/v2/reply/add` 返回的「评论区已关闭」业务码。
+  ///
+  /// 单列一个常量给 UI 用：它不是一个"失败"而是一种**持久状态**——
+  /// 遇到它要做的不是让用户重试，而是把发表入口置灰（见 comment_list）。
+  static const int kCommentClosedCode = 12002;
+
+  /// 发表评论 / 回复（`POST x/v2/reply/add`）。
+  ///
+  /// [oid] / [type]：**归属，调用方必须给对**（口径见上方分区注释；视频
+  /// 传 `aid` + 1、专栏传 `cvid` + 12、动态传 `basic.comment_id_str` +
+  /// `basic.comment_type`）。本层校验 `oid > 0`，但**不校验二者搭配**——
+  /// 服务端不会告诉你配错了（配错拿到的多半是别人的评论区）。
+  ///
+  /// [root] / [parent]：**回复楼中楼时才给**（顶层评论两者都留 null）：
+  /// - 根评论自己（`rpid=R`）→ `root=R`、`parent=R`；
+  /// - 楼中楼里的某条子回复（`rpid=C`，它挂在根评论 `R` 下）→ `root=R`、
+  ///   `parent=C`。
+  ///
+  /// ⚠️ 这是**真实的公开写操作**：评论会立刻出现在对方的评论区、进对方的
+  /// 消息通知。所以本方法绝不自动重试（[BiliApi._postAuth] 那条纪律在这里
+  /// 与投币同等要紧——重试就是多发一条评论），失败由调用方给可读提示并让
+  /// 用户自己决定要不要再发。
+  ///
+  /// 【返回】成功返回新评论的 `rpid`（服务端没给就返回 null）。
+  /// 错误码：12002 评论区已关闭 / -101 未登录或登录失效 / -111 csrf 失效 /
+  /// **12015 评论内容被拦截**（含敏感词或被风控） / -412 风控 / -509 频繁——
+  /// 见 [BiliApi._throwWriteError]（12002 与 12015 由它按码给中文）。
+  Future<int?> addComment({
+    required int oid,
+    required int type,
+    required String message,
+    int? root,
+    int? parent,
+  }) async {
+    if (oid <= 0) {
+      throw const BiliApiException(
+        code: -400,
+        message: '内容 id 无效，无法发表评论',
+        path: '/x/v2/reply/add',
+      );
+    }
+    if (type <= 0) {
+      throw const BiliApiException(
+        code: -400,
+        message: '评论归属类型无效，无法发表评论',
+        path: '/x/v2/reply/add',
+      );
+    }
+    // 空内容在本机拦下：少一次会"发出去但看不见"的往返（B 站对空 message
+    // 回的是笼统的 -400，用户看不懂）
+    if (message.trim().isEmpty) {
+      throw const BiliApiException(
+        code: -400,
+        message: '评论内容不能为空',
+        path: '/x/v2/reply/add',
+      );
+    }
+    // 字数上限的本机兜底（UI 的 TextField 另有 maxLength 挡在前头）；
+    // 用 runes 而不是 length：中文在 UTF-16 里也是 1，但 emoji 是 2 ——
+    // 按 code point 数才和 B 站网页端的"1000 字"一致。
+    if (message.runes.length > kCommentMaxLength) {
+      throw const BiliApiException(
+        code: -400,
+        message: '评论最多 $kCommentMaxLength 字',
+        path: '/x/v2/reply/add',
+      );
+    }
+    // ⚠️ 日志只打目标与长度，**不打正文**（正文是用户内容，日志会被 adb
+    // 抓走；排查"为什么发失败"只需要知道发给谁、多长）
+    debugPrint('[bili_api] addComment oid=$oid type=$type '
+        'len=${message.runes.length} root=${root ?? '-'} '
+        'parent=${parent ?? '-'}');
+    final data = await _postAuth('/x/v2/reply/add', {
+      'oid': '$oid',
+      'type': '$type',
+      'message': message,
+      // 顶层评论不带这两个字段（空串会被服务端当成非法的 root=0）
+      if (root != null && root > 0) 'root': '$root',
+      if (parent != null && parent > 0) 'parent': '$parent',
+    });
+    final rpid = _looseInt(data?['rpid']);
+    debugPrint('[bili_api] addComment ok rpid=${rpid ?? '-'}');
+    return (rpid != null && rpid > 0) ? rpid : null;
+  }
+
+  /// 删除**自己发的**评论（`POST x/v2/reply/del`）。
+  ///
+  /// 为什么 v2.42.0 就要它：发表是不可逆的公开动作，UI 里却没有"撤回"——
+  /// 本方法目前**只在开发期用来清理真机验证时发的测试评论**（自证 + 善后），
+  /// 不在界面上暴露（删别人的评论是另一件事，B 站也只允许删自己发的）。
+  ///
+  /// [rpid] 是被删的那条评论 id（顶层评论是它自己的 rpid；楼中楼子回复同样
+  /// 直接给子回复的 rpid）。[oid] / [type] 口径与 [addComment] 完全一致。
+  ///
+  /// 失败常见码：-101 未登录 / -403 不是自己的评论 / -404 已经不存在
+  /// （重复删除会落到这里——对调用方而言"目标状态已达成"，可当成功看待）。
+  Future<void> deleteComment({
+    required int oid,
+    required int type,
+    required int rpid,
+  }) async {
+    if (oid <= 0 || rpid <= 0) {
+      throw const BiliApiException(
+        code: -400,
+        message: '评论 id 无效，无法删除',
+        path: '/x/v2/reply/del',
+      );
+    }
+    debugPrint('[bili_api] deleteComment oid=$oid type=$type rpid=$rpid');
+    await _postAuth('/x/v2/reply/del', {
+      'oid': '$oid',
+      'type': '$type',
+      'rpid': '$rpid',
     });
   }
 
