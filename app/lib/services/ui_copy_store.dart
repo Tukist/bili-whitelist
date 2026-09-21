@@ -45,6 +45,11 @@ class UiCopyStore extends ChangeNotifier {
     // ---------- 白名单 / 首页（playlist_page） ----------
     'empty.playlist': '白名单为空\n下拉刷新重新同步',
     'empty.playlist.upowner': '还没有白名单 UP 主',
+    // 同步失败**且无数据**时的空态（v2.43.1）：与上面那条"真空"必须分开——
+    // 四源全失败被渲染成"白名单为空"会让用户以为白名单被清空了。
+    // 排在 upowner 之后是为了不动编辑器里前两条的可视位置（测试锚点）。
+    'empty.playlist.sync_failed':
+        '同步失败，可能是离线\n下拉刷新或点「重试」重新同步',
     'empty.syncing': '正在同步白名单…',
 
     // ---------- 合集 ----------

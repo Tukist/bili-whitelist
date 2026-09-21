@@ -1175,6 +1175,7 @@ const String _kCopyGroupFallback = '其他';
 const Map<String, String> _kCopyNotes = <String, String>{
   // 白名单 / 首页
   'empty.playlist': '首页白名单为空',
+  'empty.playlist.sync_failed': '首页白名单同步失败（无数据时）',
   'empty.playlist.upowner': '白名单里还没有 UP 主',
   'empty.syncing': '正在同步白名单',
   // 合集
@@ -1261,7 +1262,7 @@ List<({String label, List<String> ids})> groupCopyIds() {
   return out;
 }
 
-/// 界面文案编辑弹层：按场景分组列出**全部出厂文案**（约 47 条），
+/// 界面文案编辑弹层：按场景分组列出**全部出厂文案**（约 48 条），
 /// 逐条可改、可单条恢复默认；顶部可「全部恢复默认」（二次确认）。
 ///
 /// ## 写入策略：输入框 `onChanged` 直接写，**改一个字符就全局生效**
@@ -1274,7 +1275,7 @@ List<({String label, List<String> ids})> groupCopyIds() {
 /// 就是「这条改回默认」，输入框下方会提示当前生效的默认文案是什么。
 ///
 /// ## 控制器
-/// 47 条各一个 [TextEditingController]，进弹层时一次性按当前生效文案预填并
+/// 48 条各一个 [TextEditingController]，进弹层时一次性按当前生效文案预填并
 /// 由本 State 持有到关闭（列表滚出视口再回来不会丢光标 / 丢未提交输入）。
 /// 程序化改 `.text` 不触发 `onChanged`，所以「恢复默认」回填不会二次写盘。
 class _CopyEditorSheet extends StatefulWidget {

@@ -195,8 +195,18 @@ class SyncResult {
   /// 实际生效的数据源名称（gist / lan / local / cache）。
   final String sourceName;
 
-  /// 缓存数据获取时间（缓存源时来自文件里的 fetched_at；网络源为本次同步时间）。
-  final DateTime fetchedAt;
+  /// 这份数据的**真实取得时间**；`null` = 不知道（不是"刚刚"）。
+  ///
+  /// - 网络源（gist / lan）：本次同步的时间；
+  /// - cache 源：缓存文件里的 `fetched_at`；
+  /// - local 源（本地手动导入的快照）：**没有**这个时间——文件 mtime 是"用户
+  ///   导入那一刻"，不代表数据本身多新，所以只能是 null。
+  ///
+  /// ⚠️ v2.43.1 起**不许再拿 `DateTime.now()` 兜底**：那会让几周前的导入
+  /// 快照在界面上显示成"数据时间 今天"，比不显示时间更坏（用户会以为这份
+  /// 数据是刚同步来的）。显示侧对 null 的约定见 `playlist_page.dart` 的
+  /// `_CacheBar`（「数据时间未知（来源: local）」）。
+  final DateTime? fetchedAt;
 
   /// 是否发生了网络同步（gist/lan 成功）。
   final bool fromNetwork;
@@ -295,7 +305,9 @@ class WhitelistSyncService {
       final result = SyncResult(
         data: snapshot.data,
         sourceName: snapshot.name,
-        fetchedAt: snapshot.fetchedAt ?? now,
+        // 原样透传：local 源没有真实抓取时间 → null（**不再回退成"现在"**，
+        // 见 [SyncResult.fetchedAt]）。
+        fetchedAt: snapshot.fetchedAt,
         fromNetwork: false,
         stale: stale,
       );
@@ -446,7 +458,8 @@ class _OfflineSnapshot {
   final WhitelistData data;
 
   /// 本机取得这份数据的时间（cache 源 = 缓存文件里的 fetched_at；local 源没有，
-  /// 因为"导入那一刻"不是数据新鲜度，由调用方回退到当前时间）。
+  /// 因为"导入那一刻"不是数据新鲜度）→ **null = 时间未知**，由调用方原样透传
+  /// 进 [SyncResult.fetchedAt]，绝不回退成当前时间。
   final DateTime? fetchedAt;
 
   const _OfflineSnapshot(this.name, this.data, this.fetchedAt);

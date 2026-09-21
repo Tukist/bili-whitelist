@@ -20,6 +20,10 @@
 /// - AppBar：标题是本合集的**局部名**（路径最后一段），下面一行是**可点的
 ///   上级路径**（顶层/未分类没有上级，不显示）
 /// - [collectionName] 空串表示「未分类」（它不是容器，没有上级也没有子合集）
+/// - **陈旧快照提示（v2.43.1）**：列表顶部常驻一条 [StaleSyncBanner]（由上一层
+///   传下来的 [stale] 驱动），因为本页的写操作同样被门禁拦——用户必须**动手
+///   之前**就知道"这份数据可能是旧的、改了不会保存"，而不是点完才收到一句
+///   「这次修改没有保存」。本页没有"数据时间/来源"的出口，那些信息仍在首页。
 library;
 
 import 'dart:async';
@@ -43,6 +47,7 @@ import '../widgets/app_snack.dart';
 import '../widgets/app_state_view.dart';
 import '../widgets/collection_dialogs.dart';
 import '../widgets/season_tile.dart';
+import '../widgets/stale_sync_banner.dart';
 import '../widgets/swipe_action_box.dart';
 import '../widgets/video_tile.dart';
 import 'player_page.dart';
@@ -219,11 +224,19 @@ class CollectionPage extends StatefulWidget {
   /// 失败时首页已提示，这里约定回调不抛异常（内部 catch）。
   final Future<void> Function(WhitelistData next) saveAndRefresh;
 
+  /// 这份 [data] 是否被**确证**陈旧（= 首页 `SyncResult.stale`）。
+  ///
+  /// 由上一层**跟着数据一起传下来**（而不是本页去读全局单例）：本页没有同步
+  /// 动作、数据是外面给的，新鲜度也只能是外面给的。默认 false（老调用点 /
+  /// 测试直接构造本页时不显示提示，不误报）。
+  final bool stale;
+
   const CollectionPage({
     super.key,
     required this.collectionName,
     required this.data,
     required this.saveAndRefresh,
+    this.stale = false,
   });
 
   @override
@@ -232,6 +245,10 @@ class CollectionPage extends StatefulWidget {
 
 class _CollectionPageState extends State<CollectionPage> {
   late WhitelistData _data = widget.data;
+
+  /// 当前展示的数据是否陈旧（初值来自 [CollectionPage.stale]，本页点「立即
+  /// 同步」成功后自己更新；子合集下钻时继续往下传）。
+  late bool _stale = widget.stale;
 
   /// 多选模式状态：true 时列表项显示勾选框、点按切换勾选、底部出现批量操作栏。
   bool _selectMode = false;
@@ -341,6 +358,7 @@ class _CollectionPageState extends State<CollectionPage> {
           collectionName: path,
           data: _data,
           saveAndRefresh: _saveAndRefresh,
+          stale: _stale,
         ),
       ),
     );
@@ -362,6 +380,7 @@ class _CollectionPageState extends State<CollectionPage> {
           collectionName: parent,
           data: _data,
           saveAndRefresh: _saveAndRefresh,
+          stale: _stale,
         ),
       ),
     );
@@ -686,6 +705,9 @@ class _CollectionPageState extends State<CollectionPage> {
   /// 直接调 [ServiceLocator] 即可。成功后本页数据一起换成最新（否则用户看到
   /// 的还是那份让他卡住的旧数据），门禁随之解除。
   ///
+  /// 也是顶部陈旧横幅上「立即同步」的动作（v2.43.1）：同步成功 → [_stale] 归
+  /// false → 横幅自己消失。
+  ///
   /// 不自动重放刚才那次修改：理由与首页一致（见 `PlaylistPage._resyncAfterStaleBlock`）。
   Future<void> _resyncAfterStaleBlock() async {
     try {
@@ -693,7 +715,11 @@ class _CollectionPageState extends State<CollectionPage> {
       WhitelistFreshness.instance
           .markSync(sourceName: result.sourceName, stale: result.stale);
       if (!mounted) return;
-      setState(() => _data = result.data);
+      setState(() {
+        _data = result.data;
+        // 判据仍只有服务/门禁那一份，这里只是把结论搬进 state 供渲染
+        _stale = WhitelistFreshness.instance.isStale;
+      });
       final stale = WhitelistFreshness.instance.isStale;
       _showSnack(
         stale ? '仍然同步失败：请确认网络后重试' : '已同步到最新，请重新操作一次',
@@ -1130,105 +1156,118 @@ class _CollectionPageState extends State<CollectionPage> {
                     ),
                   ],
       ),
-      body: (subs.isEmpty && videos.isEmpty)
-          ? AppStateView(
-              kind: AppStateKind.empty,
-              // 合集名是动态的（「未分类」/ 用户自建名）→ 直给文案，无 copyId
-              title: '「$_label」暂无视频',
-              illustrationSeed: 'collection',
-              // 旧空态是 ListView(AlwaysScrollableScrollPhysics) → 保持同一结构
-              scrollable: true,
-            )
-          : ReorderableListView.builder(
-              physics: const AlwaysScrollableScrollPhysics(),
-              // 拖拽排序入口 = 每条视频尾部「拖拽把手」（按下即拖，Reorderable-
-              // DragStartListener）；列表头部的子合集卡片与「整季卡」都没有
-              // 把手 → 天然不可拖（折叠卡代表 N 条视频，拖它 = 整季一起搬，
-              // 是另一个语义；要精确排序就左滑展开逐集拖）
-              buildDefaultDragHandles: false,
-              itemCount: subs.length + rows.length,
-              onReorder: _onReorderVideos,
-              itemBuilder: (context, i) {
-                // 先子合集，再「折叠后的行」
-                if (i < subs.length) {
-                  return Padding(
-                    key: ValueKey('sub-row-$i'),
-                    padding: const EdgeInsets.fromLTRB(kSpace12, kSpace8,
-                        kSpace12, 0),
-                    child: _subCard(subs[i]),
-                  );
-                }
-                final ri = i - subs.length;
-                final row = rows[ri];
-                final Widget child = switch (row) {
-                  CollectionSeasonRow r => _seasonRow(r),
-                  // 逐集平铺：与改动前**逐字符一致**（含长按进多选、
-                  // 点按从这一集连播、尾部拖拽把手与「更多」菜单）
-                  CollectionVideoRow r => VideoTile(
-                      video: r.video,
-                      cachedCount: _downloads.cachedCount(r.video.bvid),
-                      // 全是仅音频缓存 → 角标显示「已缓存音频」（点进去没画面）
-                      cachedAudioOnly:
-                          _downloads.cachedAllAudioOnly(r.video.bvid),
-                      selectMode: _selectMode,
-                      selected: _selectedBvids.contains(r.video.bvid),
-                      // 同合集上下集（v2.30.0+）：把**整个合集**按用户在本页
-                      // 看到的顺序交下去，「下一集」就是列表里的下一条
-                      // （[_videos] = sortedVideos 的 order 升序 + addedAt
-                      // 倒序兜底，与列表渲染用的是同一个 getter，不会出现
-                      // 两套顺序）。只接这一条「点单条视频播放」的路径：多选/
-                      // 批量/子合集下钻都不是「从某个列表开始连播」的语义。
-                      //
-                      // v2.37.0 修「番剧上下集跨番」（用户需求）：整季导入的
-                      // 集全是 order=0 + added_at 递增 → 在合集里排成
-                      // 「第43话 → 第1话」一块，走到块末的「下一集」就跳到
-                      // **别的番剧**了。所以这里换成「**只取当前这部的分集**、
-                      // 组内按集号正序」：末集天然 `_canPlayNext == false`
-                      // （播放页不循环），永远跨不出去。
-                      // 普通视频（epId == null）拿到的是**原列表本身**，
-                      // 行为与改动前逐字符一致（见 sortedSeasonEpisodes）。
-                      // v2.41.0 起与「整季卡点开选集」共用 [_playFrom]：
-                      // 两条路走同一个函数，不会分叉。
-                      onTap: _selectMode
-                          ? () => _toggleSelect(r.video.bvid)
-                          : () => _playFrom(r.video),
-                      onLongPress: _selectMode
-                          ? () => _toggleSelect(r.video.bvid)
-                          : () => _enterSelect(r.video),
-                      onMore: _selectMode
-                          ? null
-                          : () => _showVideoMenu(r.video),
-                      dragHandle: _selectMode
-                          ? null
-                          : ReorderableDragStartListener(
-                              index: i,
-                              child: Padding(
-                                padding:
-                                    const EdgeInsets.symmetric(horizontal: 4),
-                                child: Icon(
-                                  Icons.drag_indicator,
-                                  size: 20,
-                                  color: theme.colorScheme.outline
-                                      .withValues(alpha: .55),
-                                ),
-                              ),
-                            ),
-                    ),
-                };
-                return Column(
-                  key: switch (row) {
-                    CollectionSeasonRow r => ValueKey('season-${r.key}'),
-                    CollectionVideoRow r =>
-                      ValueKey('${r.video.bvid}#${r.video.cid}'),
-                  },
-                  children: [
-                    child,
-                    if (ri < rows.length - 1)
-                      const Divider(height: 1, indent: 88),
-                  ],
-                );
-              },
-            ),
+      body: Column(
+        children: [
+          // 陈旧快照常驻提示（v2.43.1）：本页的写操作同样被门禁拦（见
+          // [_blockWriteOnStaleSnapshot]），所以「你看的可能是旧数据、改不了」
+          // 必须在**动手之前**就看得见。点「立即同步」成功后横幅自己消失。
+          StaleSyncBanner(
+            stale: _stale,
+            onResync: () => unawaited(_resyncAfterStaleBlock()),
+          ),
+          Expanded(
+            child: (subs.isEmpty && videos.isEmpty)
+                ? AppStateView(
+                    kind: AppStateKind.empty,
+                    // 合集名是动态的（「未分类」/ 用户自建名）→ 直给文案，无 copyId
+                    title: '「$_label」暂无视频',
+                    illustrationSeed: 'collection',
+                    // 旧空态是 ListView(AlwaysScrollableScrollPhysics) → 保持同一结构
+                    scrollable: true,
+                  )
+                : ReorderableListView.builder(
+                    physics: const AlwaysScrollableScrollPhysics(),
+                    // 拖拽排序入口 = 每条视频尾部「拖拽把手」（按下即拖，Reorderable-
+                    // DragStartListener）；列表头部的子合集卡片与「整季卡」都没有
+                    // 把手 → 天然不可拖（折叠卡代表 N 条视频，拖它 = 整季一起搬，
+                    // 是另一个语义；要精确排序就左滑展开逐集拖）
+                    buildDefaultDragHandles: false,
+                    itemCount: subs.length + rows.length,
+                    onReorder: _onReorderVideos,
+                    itemBuilder: (context, i) {
+                      // 先子合集，再「折叠后的行」
+                      if (i < subs.length) {
+                        return Padding(
+                          key: ValueKey('sub-row-$i'),
+                          padding: const EdgeInsets.fromLTRB(kSpace12, kSpace8,
+                              kSpace12, 0),
+                          child: _subCard(subs[i]),
+                        );
+                      }
+                      final ri = i - subs.length;
+                      final row = rows[ri];
+                      final Widget child = switch (row) {
+                        CollectionSeasonRow r => _seasonRow(r),
+                        // 逐集平铺：与改动前**逐字符一致**（含长按进多选、
+                        // 点按从这一集连播、尾部拖拽把手与「更多」菜单）
+                        CollectionVideoRow r => VideoTile(
+                            video: r.video,
+                            cachedCount: _downloads.cachedCount(r.video.bvid),
+                            // 全是仅音频缓存 → 角标显示「已缓存音频」（点进去没画面）
+                            cachedAudioOnly:
+                                _downloads.cachedAllAudioOnly(r.video.bvid),
+                            selectMode: _selectMode,
+                            selected: _selectedBvids.contains(r.video.bvid),
+                            // 同合集上下集（v2.30.0+）：把**整个合集**按用户在本页
+                            // 看到的顺序交下去，「下一集」就是列表里的下一条
+                            // （[_videos] = sortedVideos 的 order 升序 + addedAt
+                            // 倒序兜底，与列表渲染用的是同一个 getter，不会出现
+                            // 两套顺序）。只接这一条「点单条视频播放」的路径：多选/
+                            // 批量/子合集下钻都不是「从某个列表开始连播」的语义。
+                            //
+                            // v2.37.0 修「番剧上下集跨番」（用户需求）：整季导入的
+                            // 集全是 order=0 + added_at 递增 → 在合集里排成
+                            // 「第43话 → 第1话」一块，走到块末的「下一集」就跳到
+                            // **别的番剧**了。所以这里换成「**只取当前这部的分集**、
+                            // 组内按集号正序」：末集天然 `_canPlayNext == false`
+                            // （播放页不循环），永远跨不出去。
+                            // 普通视频（epId == null）拿到的是**原列表本身**，
+                            // 行为与改动前逐字符一致（见 sortedSeasonEpisodes）。
+                            // v2.41.0 起与「整季卡点开选集」共用 [_playFrom]：
+                            // 两条路走同一个函数，不会分叉。
+                            onTap: _selectMode
+                                ? () => _toggleSelect(r.video.bvid)
+                                : () => _playFrom(r.video),
+                            onLongPress: _selectMode
+                                ? () => _toggleSelect(r.video.bvid)
+                                : () => _enterSelect(r.video),
+                            onMore: _selectMode
+                                ? null
+                                : () => _showVideoMenu(r.video),
+                            dragHandle: _selectMode
+                                ? null
+                                : ReorderableDragStartListener(
+                                    index: i,
+                                    child: Padding(
+                                      padding:
+                                          const EdgeInsets.symmetric(horizontal: 4),
+                                      child: Icon(
+                                        Icons.drag_indicator,
+                                        size: 20,
+                                        color: theme.colorScheme.outline
+                                            .withValues(alpha: .55),
+                                      ),
+                                    ),
+                                  ),
+                          ),
+                      };
+                      return Column(
+                        key: switch (row) {
+                          CollectionSeasonRow r => ValueKey('season-${r.key}'),
+                          CollectionVideoRow r =>
+                            ValueKey('${r.video.bvid}#${r.video.cid}'),
+                        },
+                        children: [
+                          child,
+                          if (ri < rows.length - 1)
+                            const Divider(height: 1, indent: 88),
+                        ],
+                      );
+                    },
+                  ),
+          ),
+        ],
+      ),
       // 多选模式：底部批量操作栏（移动到合集 / 删除）
       bottomNavigationBar: _selectMode
           ? SafeArea(

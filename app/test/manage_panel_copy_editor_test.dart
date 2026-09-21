@@ -444,7 +444,7 @@ void main() {
       expect(UiCopyStore.kDefaultCopies['empty.playlist'],
           '白名单为空\n下拉刷新重新同步');
       expect(UiCopyStore.kDefaultCopies['footer.no_more'], '没有更多了');
-      expect(UiCopyStore.kDefaultCopies.length, 47);
+      expect(UiCopyStore.kDefaultCopies.length, 48);
     });
   });
 }

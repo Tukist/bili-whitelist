@@ -34,6 +34,7 @@ import '../widgets/collection_dialogs.dart';
 import '../widgets/favorites_import_dialog.dart';
 import '../widgets/manage_panel.dart';
 import '../widgets/pgc_import_dialog.dart';
+import '../widgets/stale_sync_banner.dart';
 import '../widgets/swipe_action_box.dart';
 import 'collection_page.dart';
 import 'favorites_page.dart';
@@ -160,6 +161,15 @@ class _PlaylistPageState extends State<PlaylistPage> {
   String? _sourceName;
   String? _error;
   bool _syncing = false;
+
+  /// 当前展示的数据是否被**确证**陈旧（取 [_load] 拿到的 `SyncResult.stale`）。
+  ///
+  /// 页面自己存一份、而不是每次读 [WhitelistFreshness.instance]：那个单例是
+  /// 普通类**不是 ChangeNotifier**（不 notify），build 时读它拿不到"数据换了、
+  /// 横幅该消失"的信号。判据仍然只有服务里那一份（[SyncResult.stale]），
+  /// 这里只是把它搬进 state 以便渲染常驻提示。
+  bool _stale = false;
+
   late final GithubApi _github = widget.github ?? GithubApi();
 
   /// 乐观写入队列（v2.35.0）：管理写操作本地立刻生效，远端 PATCH 串行后台写。
@@ -720,7 +730,16 @@ class _PlaylistPageState extends State<PlaylistPage> {
     unawaited(FollowingsAutoSyncService().rememberManualRemoval(mid));
   }
 
-  /// 读取本地缓存 + 尝试网络同步（两者并行，UI 立即展示缓存）。
+  /// 跑一次白名单同步（[ServiceLocator.syncService] 内部按 Gist → Lan → local
+  /// → cache 回退），结果落到本页 state。
+  ///
+  /// ⚠️ 这里**不是**"缓存先展示、网络再覆盖"的并行加载（旧注释这么写，代码里
+  /// 从来没有过）：就是一个 await，同步回来才 setState。所以同步慢的时候界面
+  /// 保持上一份数据不变（`_syncing` 只驱动空态里的加载画面）。
+  ///
+  /// 失败只记 [_error]（不抛）：下拉刷新的 [RefreshIndicator] 会照常收起，所以
+  /// **失败的样子只能靠界面说**——信息条的红字 + 空态的"同步失败"态（见
+  /// `_CacheBar` / `_EmptyView`），否则用户会把"没同步上"看成"刷新成功了"。
   Future<void> _load() async {
     setState(() => _syncing = true);
     try {
@@ -737,6 +756,8 @@ class _PlaylistPageState extends State<PlaylistPage> {
           _fetchedAt = result.fetchedAt;
           _sourceName = result.sourceName;
           _error = null;
+          // 陈旧 → 顶部常驻提醒（`StaleSyncBanner`），同步成功后自动消失。
+          _stale = result.stale;
         });
         // 数据换了 → 合集卡的「已看 X/Y + N 天前更新」跟着重算。
         // 不 await：统计是本地读表，慢一点也不该拖住列表刷新。
@@ -746,6 +767,8 @@ class _PlaylistPageState extends State<PlaylistPage> {
       if (mounted) {
         setState(() {
           _error = '同步失败：$e';
+          // 同步失败**不改**陈旧标记：屏幕上的数据没变，它是不是旧快照与
+          // "这次能不能同步上"是两件事（上次判定的结论继续有效）。
         });
       }
     } finally {
@@ -1393,6 +1416,9 @@ class _PlaylistPageState extends State<PlaylistPage> {
           collectionName: name == kUncategorizedLabel ? '' : name,
           data: _data,
           saveAndRefresh: _saveAndRefresh,
+          // 陈旧快照：本页顶上那条横幅要在合集页里继续挂着（本页的写操作
+          // 同样被门禁拦）。传的是**这份数据**的新鲜度，跟着数据走。
+          stale: _stale,
         ),
       ),
     );
@@ -1685,6 +1711,13 @@ class _PlaylistPageState extends State<PlaylistPage> {
               ),
             ),
           ),
+        // 陈旧快照常驻提示（v2.43.1）：挂在信息条**上面**——它比"数据时间
+        // 是哪天"更要紧（先说清"你看的可能是旧数据、改也改不动"，再给细节）。
+        // 不陈旧时组件自己返回 SizedBox.shrink()，不占位。
+        StaleSyncBanner(
+          stale: _stale,
+          onResync: () => unawaited(_resyncAfterStaleBlock()),
+        ),
         _CacheBar(
           fetchedAt: _fetchedAt,
           sourceName: _sourceName,
@@ -1758,6 +1791,10 @@ class _PlaylistPageState extends State<PlaylistPage> {
                   )
                 : _EmptyView(
                     syncing: _syncing,
+                    // 同步失败（且没数据）→ 失败态而不是"白名单为空"；
+                    // 「重试」= 再跑一次 [_load]。
+                    error: _error,
+                    onRetry: () => unawaited(_load()),
                     onCreateCollection: _showCreateCollectionDialog,
                   ),
           ),
@@ -2636,7 +2673,21 @@ class _ImportDialogState extends State<_ImportDialog> {
   }
 }
 
-/// 缓存数据条（时间 + 来源 + 错误提示）。
+/// 数据信息条：同步错误 + 数据时间 + 数据来源。
+///
+/// ## 为什么是"多行"而不是 if/else 三选一（v2.43.1 修）
+/// 旧实现是三选一，副作用有两个，都在用户反馈里露过面：
+/// 1. `error != null` 时**"数据时间（来源）"整行被挤掉** —— 同步失败恰恰是
+///    用户最需要知道"我现在看的这份是哪来的、什么时候的"的时候；
+/// 2. `fetchedAt == null` 时只剩"暂无数据" —— 而来源是 local（本地导入快照）
+///    时 fetchedAt 本来就是**不存在**的，于是"这份数据有多旧"这个关键信息
+///    被这句话抹掉了。
+/// 现在三条信息各占一行、互不排斥：错误照旧是红字，时间/来源照旧在下面。
+///
+/// ## 「数据时间未知」是硬要求
+/// [SyncResult.fetchedAt] 为 null = **没有真实取得时间**（local 源就是这种），
+/// 这里必须显示"未知"，**绝不许用当前时间冒充**。旧实现拿 `DateTime.now()`
+/// 兜底，于是几周前导入的快照在界面上显示成"数据时间 今天"——比不显示更坏。
 class _CacheBar extends StatelessWidget {
   final DateTime? fetchedAt;
   final String? sourceName;
@@ -2647,54 +2698,94 @@ class _CacheBar extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    final Widget content;
-    if (error != null) {
-      content = Text(
-        error!,
-        style: theme.textTheme.bodySmall?.copyWith(
-          color: theme.colorScheme.error,
+    final palette = context.palette;
+    final hasSource = (sourceName ?? '').isNotEmpty;
+    final hasTime = fetchedAt != null;
+    final rows = <Widget>[
+      if (error != null)
+        Text(
+          error!,
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: theme.colorScheme.error,
+          ),
+          maxLines: 2,
+          overflow: TextOverflow.ellipsis,
         ),
-        maxLines: 2,
-        overflow: TextOverflow.ellipsis,
-      );
-    } else if (fetchedAt != null) {
-      content = Text(
-        '数据时间 ${_fmt(fetchedAt!)}（来源: ${sourceName ?? '?'}）',
-        style: theme.textTheme.bodySmall?.copyWith(
-          color: theme.colorScheme.onSurfaceVariant,
-        ),
-      );
-    } else {
-      content = Text('暂无数据，下拉刷新同步', style: theme.textTheme.bodySmall);
-    }
+      // 有来源（或时间）就说明"这份数据是从哪儿来的"，一行说清；
+      // 两者都没有（还没同步过任何一份）才落到"暂无数据"。
+      if (hasSource || hasTime)
+        hasTime
+            ? Text(
+                '数据时间 ${_fmtDataTime(fetchedAt!)}'
+                '（来源: ${sourceName ?? '?'}）',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              )
+            : Row(
+                children: [
+                  Icon(Icons.help_outline, size: 14, color: palette.accentDeep),
+                  const SizedBox(width: 4),
+                  // 点缀墨（赤陶）= "时间与新鲜度"的墨：这句说的正是"时间不知道"
+                  Expanded(
+                    child: Text(
+                      '数据时间未知（来源: ${sourceName ?? '?'}）',
+                      style: theme.textTheme.bodySmall?.copyWith(
+                        color: palette.accentDeep,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+      if (error == null && !hasSource && !hasTime)
+        Text('暂无数据，下拉刷新同步', style: theme.textTheme.bodySmall),
+    ];
     return Container(
       width: double.infinity,
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
       color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: .4),
-      child: content,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: rows,
+      ),
     );
   }
 }
 
-/// 空态视图（首次启动且无缓存/同步失败）。
+/// 信息条上的时间格式：`yyyy-MM-dd HH:mm`（本地时区）。
+String _fmtDataTime(DateTime t) => t.toLocal().toString().substring(0, 16);
+
+/// 空态视图（无数据时的三种画面）。
 ///
-/// 两种情况画面语言不同（本轮统一）：
+/// 三种情况画面语言不同，**必须分得开**（v2.43.1 修第三种）：
 /// - [syncing] == true：**冷启动同步中**，整页走 [AppLoadingHero]（风衣男剪影
 ///   + 加载闲话），与本版本其它整页加载态同一气质；主文案「正在同步白名单…」
 ///   逐字保留（测试锚点），只换画面不换文案。此态**不显示「新建合集」**——
 ///   白名单还没同步回来，此时建合集是误导。
-/// - [syncing] == false：白名单确实为空，给醒目行动按钮「新建合集」（新建合集
-///   入口从设置区移到了合集页；合集非空时该入口在列表上方常驻，不重复出现在
-///   这里）。主文案「白名单为空\n下拉刷新重新同步」逐字保留（widget 测试锚点）。
+/// - [error] != null：**同步失败**（四源全失败 / 离线）。旧实现把它渲染成
+///   "白名单为空\n下拉刷新重新同步"，用户会以为自己的白名单被清空了（这正是
+///   历史上"白名单 UP 主会时不时自动清空"那类投诉的画面来源）。现在改走
+///   [AppStateView] 的错误态 + 「重试」，文案在文案库里可编辑。
+/// - 其余：白名单**确实**为空，给醒目行动按钮「新建合集」（新建合集入口从
+///   设置区移到了合集页；合集非空时该入口在列表上方常驻，不重复出现在这里）。
+///   主文案「白名单为空\n下拉刷新重新同步」逐字保留（widget 测试锚点）。
 class _EmptyView extends StatelessWidget {
   final bool syncing;
+
+  /// 同步失败文案（页面的 `_error`）；非空且无数据 → 走"同步失败"态。
+  final String? error;
 
   /// 「新建合集」回调（页面弹输入框 → 复用页面的 `_createCollection`）。
   final VoidCallback onCreateCollection;
 
+  /// 「重试」回调（重跑一次同步）；为空 → 失败态不给按钮。
+  final VoidCallback? onRetry;
+
   const _EmptyView({
     required this.syncing,
     required this.onCreateCollection,
+    this.error,
+    this.onRetry,
   });
 
   @override
@@ -2705,6 +2796,19 @@ class _EmptyView extends StatelessWidget {
         title: '正在同步白名单…',
         seed: 'playlist.sync',
         scrollable: true,
+      );
+    }
+    if (error != null) {
+      // 原始异常信息**不在这里重复**：信息条（`_CacheBar`）就在上面一行，
+      // 红字已经把具体原因说了；这里要回答的是"我的白名单是不是没了"。
+      return AppStateView(
+        kind: AppStateKind.error,
+        copyId: 'empty.playlist.sync_failed',
+        illustrationSeed: 'playlist.sync_failed',
+        // 宿主是 RefreshIndicator → 与上面两个态同一约定。
+        scrollable: true,
+        actionLabel: '重试',
+        onAction: onRetry,
       );
     }
     return ListView(
@@ -2929,7 +3033,4 @@ class _CollectionManageSheetState extends State<_CollectionManageSheet> {
     );
   }
 }
-
-String _fmt(DateTime t) => t.toLocal().toString().substring(0, 16);
-
 
