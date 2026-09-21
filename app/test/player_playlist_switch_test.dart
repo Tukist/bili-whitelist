@@ -42,6 +42,7 @@ import 'package:bili_whitelist_app/models/whitelist_video.dart';
 import 'package:bili_whitelist_app/pages/collection_page.dart';
 import 'package:bili_whitelist_app/pages/player_page.dart';
 import 'package:bili_whitelist_app/pages/upowner_page.dart';
+import 'package:bili_whitelist_app/widgets/season_tile.dart';
 
 const String _kBvA = 'BV1PL0000001';
 const String _kBvB = 'BV1PL0000002';
@@ -1209,6 +1210,12 @@ void main() {
   //
   // 这里 1:1 复刻那个合集：43 集高达（倒序块）+ 另一部番 2 集 + 2 条普通视频，
   // 全部在「アニメ」合集里，展示序 = 高达43..高达1 → 芙莉莲2,1 → 普通1,2。
+  //
+  // v2.41.0 补丁：同一季 ≥2 集在合集页**默认折成一张整季卡**（用户那半句
+  // 「不要让收藏一个剧或者番的时候需要把每集都收藏」），所以本组用例在点某
+  // 一集之前要多走一步 `expandSeason`（左滑卡 → 点「展开」）—— 这就是用户
+  // 真实的路：折叠卡点开是选集连播，要按集点就展开。断言本身（playlist 只含
+  // 同部且正序、下标对、不跨番）一个字没改。
   group('番剧整季：同部上下集、不跨番（v2.37.0）', () {
     const String kSeason = 'アニメ';
 
@@ -1305,6 +1312,25 @@ void main() {
       await _settle(tester);
     }
 
+    /// 把「整季卡」左滑露出「展开」并点它 → 该季回到逐集平铺。
+    ///
+    /// v2.41.0 起番剧集默认**折成一张整季卡**（用户需求："一个 43 集的高达
+    /// 不该占 43 行"），要按"第 N 话"逐集点开就得先展开 —— 这正是"要精细
+    /// 操作就展开"的那个入口，本组用例走的也就是用户真实会走的路。
+    Future<void> expandSeason(WidgetTester tester, String season) async {
+      final card = find.byWidgetPredicate(
+          (w) => w is SeasonTile && w.seasonName == season);
+      expect(card, findsOneWidget, reason: '「$season」应折成 1 张整季卡');
+      final gesture = await tester.startGesture(tester.getCenter(card));
+      await tester.pump(const Duration(milliseconds: 16));
+      await gesture.moveBy(const Offset(-160, 0)); // 越过 touch slop
+      await tester.pump(const Duration(milliseconds: 16));
+      await gesture.up();
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('展开'));
+      await tester.pumpAndSettle();
+    }
+
     testWidgets('合集页展示序确实是「高达43 → 高达1 → 芙莉莲2 → 芙莉莲1 → 普通」',
         (tester) async {
       await pumpCollection(tester, seasonData());
@@ -1324,6 +1350,7 @@ void main() {
       final rec = _PlayerRec();
       _installMocks(tester, rec);
       await pumpCollection(tester, seasonData());
+      await expandSeason(tester, '高达'); // v2.41.0：折叠卡 → 展开才逐集可见
       await enterPlayer(tester, '高达 第23话');
 
       final page = tester.widget<PlayerPage>(find.byType(PlayerPage));
@@ -1347,6 +1374,7 @@ void main() {
       await pumpCollection(tester, seasonData());
       // 第1话在合集展示序里是第 43 条（倒序块的末条），改动前点它再点
       // 「下一集」会切到「芙莉莲 第2话」。
+      await expandSeason(tester, '高达');
       await enterPlayer(tester, '高达 第1话');
 
       expect(find.textContaining('1/43'), findsOneWidget);
@@ -1363,6 +1391,7 @@ void main() {
       final rec = _PlayerRec();
       _installMocks(tester, rec);
       await pumpCollection(tester, seasonData());
+      await expandSeason(tester, '高达');
       await enterPlayer(tester, '高达 第43话');
 
       expect(find.textContaining('43/43'), findsOneWidget);
@@ -1380,6 +1409,7 @@ void main() {
       final rec = _PlayerRec();
       _installMocks(tester, rec);
       await pumpCollection(tester, seasonData());
+      await expandSeason(tester, '芙莉莲');
       await enterPlayer(tester, '芙莉莲 第2话');
 
       final page = tester.widget<PlayerPage>(find.byType(PlayerPage));

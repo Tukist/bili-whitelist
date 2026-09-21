@@ -116,6 +116,45 @@ Future<Map<String, CollectionStat>> loadCollectionStats(
   return computeCollectionStats(data, history);
 }
 
+/// 单个视频是否**已看**（口径与 [computeCollectionStats] 完全一致）：
+/// [history] 里有它的记录、且存在一条 `pageIndex ∈ [0, pageCount)` ——
+/// 越界的历史（分 P 数变少后的陈旧记录）不算，避免"看过的是已经不存在的 P"。
+///
+/// 同一个视频看多集只回一个 true（调用方要的是"这条看没看过"）。
+/// bvid 归一化后比较（理由见 [_normBvid]）。
+bool isVideoWatched(WhitelistVideo v, List<HistoryEntry> history) {
+  final key = _normBvid(v.bvid);
+  if (key.isEmpty) return false;
+  final pages = v.pageCount;
+  for (final h in history) {
+    if (_normBvid(h.bvid) != key) continue;
+    if (h.pageIndex < 0 || h.pageIndex >= pages) continue;
+    return true;
+  }
+  return false;
+}
+
+/// 一组视频里**已看**的条数（v2.41.0+，合集页「整季卡」用）。
+///
+/// 逐条按 [isVideoWatched] 判，保证两个函数**永远是同一个口径**（不会出现
+/// 卡片说"已看 3"、选集层只标了 2 集已看这种自相矛盾）。
+///
+/// 为什么不复用 `computeCollectionStats(data, history)['某合集']`：整季卡要的是
+/// **一季**的已看集数，而不是**一个合集**的；合集里可能同时躺着好几部番，
+/// 拿合集口径会把隔壁那部番的进度算到这一季头上。
+///
+/// [videos] 空 → 0。
+int watchedVideoCount(
+  List<WhitelistVideo> videos,
+  List<HistoryEntry> history,
+) {
+  var watched = 0;
+  for (final v in videos) {
+    if (isVideoWatched(v, history)) watched++;
+  }
+  return watched;
+}
+
 /// bvid 归一化：去首尾空白 + 转小写。
 ///
 /// 容错理由：同一个视频的 bvid 在不同代码路径 / 脏历史里可能被写成

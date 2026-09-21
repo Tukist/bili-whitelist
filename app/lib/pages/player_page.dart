@@ -538,6 +538,14 @@ final Map<String, String> _viewDescCache = {};
 /// 会话内「我的互动态」缓存（bvid → req_user；值可为 null = 接口没下发）。
 final Map<String, VideoReqUser?> _reqUserCache = {};
 
+/// 会话内真实互动态缓存（bvid → relation；v2.41.0+）。
+///
+/// 与 [_reqUserCache] 的关系：`req_user` 是 **view 接口**给的那份（实测
+/// 匿名/登录都不下发，恒 null），[VideoRelation] 是 **archive/relation
+/// 接口**给的那份（要登录，是真值）。两者都可能为 null；用 `containsKey`
+/// 区分"探过了但没有"与"还没探"。取值优先级：relation > req_user。
+final Map<String, VideoRelation?> _relationCache = {};
+
 /// 会话内公开计数缓存（bvid → stat{like,coin,favorite}）。
 final Map<String, ({int like, int coin, int favorite})> _viewStatCache = {};
 
@@ -1128,14 +1136,18 @@ class _PlayerPageState extends State<PlayerPage>
 
   // 写操作（点赞 / 投币 / 收藏，v2.40.0+）
   // ---------------------------------------------------------------------
-  // 全部状态都搭 [_refreshUpownerMeta] 那次 view 请求的顺风车（零额外请求）：
-  // - _reqUser：view 的 `data.req_user`（我点过赞没/投过币没/收藏过没），
-  //   **未登录时接口根本不下发这个键** → 为 null，此时只做"本次会话内乐观
-  //   切换"，UI 会如实标注"重启后显示可能不准"（见 api 里 parseVideoReqUser）；
+  // 初始态来自两路请求：view 那次（owner/desc/stat/aid）与 **v2.41.0 新增的
+  // `archive/relation`**（真实互动态）。view **不下发 `req_user`**（匿名与
+  // 登录都不下发，v2.40.0 三处实测），所以真实态只能靠 relation：
+  // - _relation：relation 接口给的**真实**互动态（拿到 → 按钮显示真值、
+  //   不显示降级标注）；null = 没取到（未登录/失败），此时退回 [_reqUser]，
+  //   两者都没有就只做"本次会话内乐观切换"，UI 如实标注"重启后可能显示不准"；
+  // - _reqUser：view 的 `data.req_user`（保留给旧路径与既有测试夹具）；
   // - _viewStat：view 的 `data.stat`（公开展示计数），按钮上的数字用它；
   // - _writeAid：view 的 `data.aid`——写接口只认 aid。它同时也被下面三个
   //   按钮的可用性依赖（拿不到 aid 的番剧集/接口失败时不显示按钮）。
   // 换源（playVideo 换 _video）后必须复位，防止把上一个视频的点赞态带过来。
+  VideoRelation? _relation;
   VideoReqUser? _reqUser;
   int? _writeAid;
 
@@ -6552,12 +6564,17 @@ class _PlayerPageState extends State<PlayerPage>
   }
 
   /// 信息行 UP 主入口的元数据拉取（阶段 C）+ 简介运行时补拉（v2.17.3+）
-  /// + 写操作初始态（v2.40.0+）：
+  /// + 写操作初始态（v2.40.0+，v2.41.0 起改走 relation 接口）：
   /// fetchVideoMeta 拿 view 接口 data.owner{mid,name,face} 补齐头像与 UP 主页
-  /// 入口，同时拿 data.desc 补旧数据缺的简介、拿 data.req_user / data.stat /
-  /// data.aid 给点赞·投币·收藏三个按钮（**同一次响应，零额外请求**；结果按
-  /// bvid 分别缓存在 [_upMetaCache]/[_viewDescCache]/[_reqUserCache]/
-  /// [_viewStatCache]/[_viewAidCache]，多播放页/切集不重复请求）。
+  /// 入口，同时拿 data.desc 补旧数据缺的简介、拿 data.stat / data.aid 给
+  /// 点赞·投币·收藏三个按钮；**互动态**（我赞没赞/投没投/收没收藏）另发一次
+  /// `archive/relation`（v2.41.0+），与 view **并发**发出、同一批收口。
+  ///
+  /// 为什么互动态不能继续搭 view 的顺风车：view 实测**不下发 `req_user`**
+  /// （匿名与登录都不下发），搭不上。见 [BiliApi.fetchVideoRelation] 的说明。
+  ///
+  /// 结果按 bvid 分别缓存在 [_upMetaCache]/[_viewDescCache]/[_reqUserCache]/
+  /// [_relationCache]/[_viewStatCache]/[_viewAidCache]，多播放页/切集不重复请求。
   ///
   /// 番剧（epId != null）**不拉取**——阶段 C 取舍为弱化展示（见
   /// [_buildVideoInfoBar] 注释），避免为官方号做无意义请求；简介同理
@@ -6576,61 +6593,84 @@ class _PlayerPageState extends State<PlayerPage>
       _restoreWriteCache(bvid);
       return; // 会话内缓存命中（无需 setState：build 前同步赋值即可）
     }
+    // 互动态与 view **并发**发出：两者互不依赖，串行会白白多等一个 RTT
+    // （进入播放页的观感就是这么一点点攒起来的）。relation 内部自己吞异常、
+    // 失败返回 null，所以这里不会因为它多出一个失败路径。
+    final relationFuture = _api.fetchVideoRelation(bvid);
+    final Map<String, dynamic> data;
     try {
-      final data = await _api.fetchVideoMeta(bvid);
-      final parsed = parseViewOwner(data);
-      final desc = viewDescOf(data);
-      final reqUser = parseVideoReqUser(data);
-      final stat = viewStatCounts(data);
-      final aid = resolveAidForVideo(_video, meta: data);
-      if (parsed != null) _upMetaCache[bvid] = parsed;
-      if (desc.isNotEmpty) _viewDescCache[bvid] = desc;
-      // 写操作相关一律**按 bvid 记账**（含"probed 但接口没给 req_user"这种
-      // 情况：也要记下来，否则每次进同一视频都要等一次 view 请求才敢渲染）
-      _reqUserCache[bvid] = reqUser;
-      _viewStatCache[bvid] = stat;
-      if (aid != null) _viewAidCache[bvid] = aid;
-      // 拉取期间可能换源/退出：按 bvid 对账，防把旧视频的 UP 信息串到新视频
-      if (!mounted || _video.bvid != bvid) return;
-      setState(() {
-        _ownerMeta = parsed;
-        _runtimeDesc = desc;
-        _reqUser = reqUser;
-        _likeCount = stat.like;
-        if (aid != null) _writeAid = aid;
-        // 初始态：拿到 req_user 就用真的，没拿到就维持"未点赞/未投币/未收藏"
-        // （即本次会话内的乐观态起点，见 [_writeStateKnown] 的降级标注）
-        if (reqUser != null) {
-          _liked = reqUser.like;
-          _coined = reqUser.coin;
-          _faved = reqUser.favorite;
-        }
-      });
-      debugPrint('[player_page] UP 主信息 bvid=$bvid '
-          'mid=${parsed?.mid} name=${parsed?.name}');
-      debugPrint('[player_page] 写操作初始态 bvid=$bvid aid=$aid '
-          'reqUser=$reqUser stat=$stat');
+      data = await _api.fetchVideoMeta(bvid);
     } catch (e) {
       // 失败静默：信息行保持 up_name 文本展示；点击时提示无法获取；
       // 简介区保持隐藏（desc 空时不占位）；写操作三个按钮此时 tap 会各自
       // 再兜底解析一次 aid（见 [_ensureWriteAid]），不必在这里拦
       debugPrint('[player_page] 拉取 UP 主信息失败 bvid=$bvid error=$e');
+      // 收口并发的那次 relation：不让它悬着（失败路径也用不上它的值）
+      await relationFuture;
+      return;
+    }
+    final relation = await relationFuture;
+    final parsed = parseViewOwner(data);
+    final desc = viewDescOf(data);
+    final reqUser = parseVideoReqUser(data);
+    final stat = viewStatCounts(data);
+    final aid = resolveAidForVideo(_video, meta: data);
+    if (parsed != null) _upMetaCache[bvid] = parsed;
+    if (desc.isNotEmpty) _viewDescCache[bvid] = desc;
+    // 写操作相关一律**按 bvid 记账**（含"probed 但接口没给"这种情况：
+    // 也要记下来，否则每次进同一视频都要等一次网络请求才敢渲染）
+    _reqUserCache[bvid] = reqUser;
+    _relationCache[bvid] = relation;
+    _viewStatCache[bvid] = stat;
+    if (aid != null) _viewAidCache[bvid] = aid;
+    // 拉取期间可能换源/退出：按 bvid 对账，防把旧视频的 UP 信息串到新视频
+    if (!mounted || _video.bvid != bvid) return;
+    setState(() {
+      _ownerMeta = parsed;
+      _runtimeDesc = desc;
+      _reqUser = reqUser;
+      _relation = relation;
+      _likeCount = stat.like;
+      if (aid != null) _writeAid = aid;
+      _applyWriteInitialState();
+    });
+    debugPrint('[player_page] UP 主信息 bvid=$bvid '
+        'mid=${parsed?.mid} name=${parsed?.name}');
+    debugPrint('[player_page] 写操作初始态 bvid=$bvid aid=$aid '
+        'relation=$relation reqUser=$reqUser stat=$stat');
+  }
+
+  /// 把刚拿到的真实互动态落到三个按钮的初始态上。
+  ///
+  /// 优先级：**relation > req_user**——前者是专门回答这个问题的接口（要登录、
+  /// 是真值），后者是 view 顺带给的（实测根本不下发，只为兼容既有夹具保留）。
+  /// 两个都没有 → **一个字都不改**（维持"未点赞/未投币/未收藏"这个乐观起点，
+  /// 同时 [_writeStateKnown] 为 false → UI 保留"状态未取到"的降级标注）。
+  void _applyWriteInitialState() {
+    final rel = _relation;
+    if (rel != null) {
+      _liked = rel.like;
+      _coined = rel.coined;
+      _faved = rel.fav;
+      return;
+    }
+    final ru = _reqUser;
+    if (ru != null) {
+      _liked = ru.like;
+      _coined = ru.coin;
+      _faved = ru.favorite;
     }
   }
 
   /// 从会话内缓存恢复当前 bvid 的写操作态（[bvid] 命中 [_upMetaCache] 时走）。
   void _restoreWriteCache(String bvid) {
     if (_reqUserCache.containsKey(bvid)) _reqUser = _reqUserCache[bvid];
+    if (_relationCache.containsKey(bvid)) _relation = _relationCache[bvid];
     final stat = _viewStatCache[bvid];
     if (stat != null) _likeCount = stat.like;
     final aid = _viewAidCache[bvid];
     if (aid != null) _writeAid = aid;
-    final ru = _reqUserCache[bvid];
-    if (ru != null) {
-      _liked = ru.like;
-      _coined = ru.coin;
-      _faved = ru.favorite;
-    }
+    _applyWriteInitialState();
   }
 
   // -------------------------------------------------------------------------
@@ -6645,12 +6685,15 @@ class _PlayerPageState extends State<PlayerPage>
   bool get _writeActionsAvailable =>
       UiPrefsStore.instance.writeActionsEnabled && _video.epId == null;
 
-  /// 是否拿到了**真实的**初始态（view 的 `data.req_user`）。
+  /// 是否拿到了**真实的**初始态（`archive/relation` 的互动态，或退一步的
+  /// view `data.req_user`）。
   ///
-  /// false = 未登录 / 接口没下发 → 页面上的点赞态是"本次会话内的乐观切换"，
-  /// 重启后可能与真实状态不一致。这种情况**必须在界面上说出来**，不能让
-  /// 用户以为看到的就是账号里的真实状态（见 [_buildWriteActionsRow] 尾部标注）。
-  bool get _writeStateKnown => _reqUser != null;
+  /// false = 未登录 / 两个接口都没给出互动态 → 页面上的点赞态是"本次会话内的
+  /// 乐观切换"，重启后可能与真实状态不一致。这种情况**必须在界面上说出来**，
+  /// 不能让用户以为看到的就是账号里的真实状态（见 [_buildWriteActionsRow]
+  /// 尾部标注）。true 就不用标注了——v2.41.0 起 relation 接口能带回真值，
+  /// 标注从"永远挂着"变成"只在真拿不到时挂着"。
+  bool get _writeStateKnown => _relation != null || _reqUser != null;
 
   /// 写操作行：`点赞 N · 投币 · 收藏` 三个轻量按钮 + （降级时）一句如实标注。
   ///
@@ -6921,6 +6964,7 @@ class _PlayerPageState extends State<PlayerPage>
 
   /// 换源时复位写操作态（被 [playVideo] 调用）。
   void _resetWriteActions() {
+    _relation = null;
     _reqUser = null;
     _writeAid = null;
     _likeCount = 0;
@@ -6930,23 +6974,37 @@ class _PlayerPageState extends State<PlayerPage>
     _writeBusy = false;
   }
 
-  /// 把本页刚做成功的写操作写回会话内缓存（v2.40.0+）。
+  /// 把本页刚做成功的写操作写回会话内缓存（v2.40.0+，v2.41.0 起同时更新
+  /// relation）。
   ///
-  /// 为什么需要：[_reqUserCache] 缓存的是"服务端某次 view 报给我的互动态"，
-  /// 而这里的点赞/投币/收藏是**我们刚刚真实改掉的状态**。不写回去的话，
-  /// 「点赞 → 返回 → 再进同一条视频」（同会话命中缓存、不再打 view）会显示
-  /// 旧的"未点赞"，用户会以为没生效。
+  /// 为什么需要：缓存里存的是"服务端某次告诉我的互动态"，而这里的点赞/投币/
+  /// 收藏是**我们刚刚真实改掉的状态**。不写回去的话，「点赞 → 返回 → 再进
+  /// 同一条视频」（同会话命中缓存、不再打接口）会显示旧的"未点赞"，用户会
+  /// 以为没生效。
   ///
-  /// 只在**原本就拿到过真实态**（[_reqUser] != null）时写回：未知时强行造一个
-  /// `req_user` 会把"猜的"伪装成"服务端说的"，比显示旧值更糟——那条"状态未取到"
+  /// 只在**原本就拿到过真实态**（[_writeStateKnown]）时写回：未知时强行造一个
+  /// relation 会把"猜的"伪装成"服务端说的"，比显示旧值更糟——那条"状态未取到"
   /// 的降级标注必须继续说真话。
+  ///
+  /// 只改本地、**不重拉接口**：用户刚点完的那一下，本地就知道结果（写成功的
+  /// 前提就是服务端接受了这个目标态），再发一次 GET 只是把一个确定的答案问一遍。
   void _rememberWriteState() {
-    if (_reqUser == null) return;
+    if (!_writeStateKnown) return;
     _reqUserCache[_video.bvid] = VideoReqUser(
       like: _liked,
       coin: _coined,
       favorite: _faved,
     );
+    // 投币枚数：原本拿到的枚数保留（B 站上限 2，我们只会往上加 1），
+    // 原本没拿到（0 或未知）时按"投过 1 枚"记——UI 只用 coined，枚数仅备查。
+    final prevCoin = _relation?.coin ?? 0;
+    final next = VideoRelation(
+      like: _liked,
+      coin: _coined ? (prevCoin > 0 ? prevCoin : 1) : 0,
+      fav: _faved,
+    );
+    _relation = next;
+    _relationCache[_video.bvid] = next;
   }
 
   /// 点击信息行 UP 主区（仿 B 站 → 进 UP 主主页 [UpownerPage]）。

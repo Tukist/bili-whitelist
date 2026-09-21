@@ -267,6 +267,22 @@ String? _seasonKeyFromList(List<WhitelistVideo> list, WhitelistVideo current) {
   return best;
 }
 
+/// 「这一条属于哪一季」的**公开**判据（v2.41.0+，合集页折叠用）。
+///
+/// = [seasonGroupKeyOf]（标题自带 `第N话` → 季名前缀）**或**退一步借
+/// 「同列表里已识别出来的季名」归位（[current] 自己认不出标签时，如
+/// `XX 14(OVA)`）。两者都推不出 → null（**不属于任何季**，调用方不得折叠）。
+///
+/// 为什么把它公开：合集页要按「同一季」把列表**折成一张整季卡**，而
+/// 「哪些集算同一季」这件事已经有两个内部判据（前者看自己的标题，后者看
+/// 邻居的标题）——页面层各写一份必然漂移。这里只做**一次** `??` 的取舍，
+/// 与 [sortedSeasonEpisodes] 内部的取键顺序**逐字一致**：
+/// `seasonGroupKeyOf(current) ?? _seasonKeyFromList(list, current)`。
+///
+/// `epId == null`（普通视频 / 旧数据）→ null：不受影响，与改动前一致。
+String? seasonKeyOf(List<WhitelistVideo> list, WhitelistVideo current) =>
+    seasonGroupKeyOf(current) ?? _seasonKeyFromList(list, current);
+
 /// 取 [current] **所属那一部番剧**的分集，**组内正序**返回。
 ///
 /// 三种输入三类结果：

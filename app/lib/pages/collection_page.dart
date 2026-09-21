@@ -10,6 +10,11 @@
 /// - 视频列表：order 升序优先，order 相同（旧数据全 0）按 added_at 倒序兜底；
 ///   点视频进播放页；长按进入多选模式（批量移动/删除）；每条尾部「更多」弹
 ///   单视频管理菜单（移动到合集/删除）
+/// - **整季折叠（v2.41.0+）**：同一部番在同一列表里 ≥2 集时**折成一张整季卡**
+///   （点开选集连播、左滑展开回逐集平铺）——用户原话「不要让收藏一个剧或者番
+///   的时候需要把每集都收藏」。**折叠只是视图**：数据模型 / Gist / PC 端一个字
+///   都没改（见 [buildCollectionListRows] 的取舍说明）。未分类页用的就是本页
+///   （[collectionName] 为空串），所以那批「是，大臣 第一季」同样折
 /// - 子合集管理：卡片左滑露出「移动 / 重命名 / 删除」（沿用首页那套左滑语言）；
 ///   本层新建成子合集的入口在 AppBar（「新建子合集」）
 /// - AppBar：标题是本合集的**局部名**（路径最后一段），下面一行是**可点的
@@ -26,6 +31,8 @@ import '../cache/download_manager.dart';
 import '../config.dart';
 import '../models/playlist_context.dart';
 import '../models/whitelist_video.dart';
+import '../services/collection_stats.dart';
+import '../services/history_store.dart';
 import '../services/whitelist_writer.dart';
 import '../theme/app_palette.dart';
 import '../theme/app_tokens.dart';
@@ -33,6 +40,7 @@ import '../widgets/app_block.dart';
 import '../widgets/app_snack.dart';
 import '../widgets/app_state_view.dart';
 import '../widgets/collection_dialogs.dart';
+import '../widgets/season_tile.dart';
 import '../widgets/swipe_action_box.dart';
 import '../widgets/video_tile.dart';
 import 'player_page.dart';
@@ -42,6 +50,161 @@ import 'player_page.dart';
 /// 字符串本体定义在模型层 [kUncategorizedCollectionName]：合名校验要用到它，
 /// 而页面层不该被模型层反向依赖 —— 这里只做一次别名，两处永远是同一个值。
 const String kUncategorizedLabel = kUncategorizedCollectionName;
+
+// -----------------------------------------------------------------------------
+// 列表行：整季折叠（v2.41.0+）
+//
+// 用户原话：「不要让收藏一个剧或者番的时候需要把每集都收藏。现在比如说在
+// アニメ合集里面一个 43 集的高达…」——v2.37.0 只修了"上下集乱跳"（识别出同一
+// 部、组内正序），"43 集占 43 行"这半边一直欠着。
+//
+// **为什么折叠是「视图」而不是「数据结构」**（这一条决定了下面所有取舍）：
+// - 白名单是**一份跨端协议**：Gist 里的 `whitelist.json` 同时被 PC 端
+//   `whitelist.py` 和油猴脚本读写。往里加一个 `season_id` / `folded` 字段，
+//   PC 端与脚本只会原样保留它看不懂的字段，但**谁都不会去维护它** ——
+//   于是"同一部番"这件事就有了两份真相（标题里的季名 + 新字段），
+//   导入路径每多一条就得记得写一次；
+// - 折叠与**渲染顺序、屏幕宽窄、用户此刻想看什么**有关（43 集折起来、
+//   5 集展开着），这些都不是"数据"的属性。落库 = 把一次临时选择永久化，
+//   还会在 PC 端变成看不懂的噪声；
+// - 所以折叠态只活在**本页的内存里**（`_expandedSeasons`），进程退出即忘；
+//   换设备、换端看到的都是"按季折起来"的默认视图 —— 这一致性正是我们要的。
+//
+// 唯一的判据来自**标题自带的信息**（`第N话` 之前的季名），复用 v2.37.0 的
+// [seasonKeyOf] / [sortedSeasonEpisodes]：同一套函数既管"上下集不跨番"，
+// 也管"同一季折一张卡"，两处永远不会对不上。
+// -----------------------------------------------------------------------------
+
+/// 列表里的一行（**视图层概念**，不进数据模型、不写 Gist）。
+///
+/// 抽象基类只有一件事要做：告诉拖拽排序「这一行对应 [_videos] 里的哪个下标」
+/// —— 折叠卡一个人代表 N 条视频，拖拽落点只能按它的**首集**换算。
+///
+/// `sealed`（而不是 `abstract`）：两个子类就在本文件里，`switch` 因此是
+/// **穷尽**的 —— 以后再加一种行（比如"UP 主分组"）编译器会立刻指出所有要
+/// 补的地方，而不是在运行期掉进一个 `default` 里悄悄不渲染。
+sealed class CollectionListRow {
+  const CollectionListRow();
+
+  /// 本行在原始视频列表里的**锚点下标**（拖拽落点按它换算）。
+  int get anchor;
+}
+/// 一行 = 一条视频（逐集平铺；既有行为一字未改）。
+class CollectionVideoRow extends CollectionListRow {
+  const CollectionVideoRow(this.video, this.index);
+
+  final WhitelistVideo video;
+
+  /// 该视频在 [WhitelistData.sortedVideos] 结果里的下标。
+  final int index;
+
+  @override
+  int get anchor => index;
+}
+
+/// 一行 = 一季（折叠卡；[collapsed] 时它下面**不列**任何集）。
+///
+/// 展开态的语义（[collapsed] == false）：这一行是**季头**，宿主紧接着逐集
+/// 平铺它 [episodes] 里的每一集 —— 于是"左滑展开后拖拽 / 多选 / 批量移动 /
+/// 删除照旧可用"是**结构上**成立的，不需要为折叠态另做一套操作。
+/// 季头留在原位（而不是被删掉）是为了给「收起」一个落点：展开后总得有个
+/// 地方能点回去，否则折叠就成了一次性的。
+class CollectionSeasonRow extends CollectionListRow {
+  const CollectionSeasonRow({
+    required this.key,
+    required this.episodes,
+    required this.firstIndex,
+    this.collapsed = true,
+  });
+
+  /// 季名（= 折叠前每集标题里 `第N话` 之前那段），同时是展开态的**记忆键**。
+  final String key;
+
+  /// 这一季的全部集，**组内正序**（第 1 话在前，OVA 挂在最后）。
+  final List<WhitelistVideo> episodes;
+
+  /// 该季**首集**在原始列表里的下标 = 这张卡的显示位置。
+  ///
+  /// 用它而不是"给这一季一个 order"：卡片的位置就是它第一集的原有位置，
+  /// **不重排语义** —— 折叠前后用户看到的顺序完全一致，只是行数变少了。
+  final int firstIndex;
+
+  /// 是否折叠（true = 卡下面不列集；false = 卡当季头，下面逐集平铺）。
+  final bool collapsed;
+
+  @override
+  int get anchor => firstIndex;
+}
+
+/// 视频身份键（bvid + cid）：同一 bvid 的多 P 是两个不同条目，
+/// 与 [CollectionPage] 里 `ValueKey('bvid#cid')` 的粒度一致。
+String _videoKey(WhitelistVideo v) => '${v.bvid}#${v.cid}';
+
+/// 把一份视频列表折成「列表行」（纯函数，可单测）。
+///
+/// 规则（三条，逐条对应一处设计取舍）：
+/// 1. **同一季 ≥2 集才折**：只有 1 集的季（含"单条 OVA"这种情况）**原样平铺**。
+///    理由：把孤零零一条视频换成一张内容一模一样的卡，只是换了张皮 ——
+///    多一层"点开选集"的动作，一个像素的好处都没有。更要紧的是，绝大多数
+///    既有数据（普通视频、只收了一集的新番）与全部既有测试夹具都落在这一支，
+///    "不折"意味着它们的渲染**逐像素不变**；
+/// 2. **卡的显示位置 = 该季首集的原有位置**（[CollectionSeasonRow.firstIndex]）：
+///    折叠前第一集排在哪，折叠后那张卡就排在哪。不重排、不搬家；
+/// 3. **认不出季的一律平铺**：[seasonKeyOf] 返回 null（普通视频、标题里没有
+///    `第N话` 又不属于任何已知季）→ 不折。宁可不折，也不把两个不相干的视频
+///    硬塞进一张卡。
+///
+/// [expandedSeasons] 里点名的季**不折**：季头保留，集紧接着逐集平铺（见
+/// [CollectionSeasonRow] 的说明）。这个集合是**纯会话内**的（调用方持有），
+/// 传进来只为让这个函数保持无副作用、可单测。
+///
+/// 已折进去的集会被**消费掉**（`consumed`），所以一张卡恰好对应一组集：
+/// 既不会漏渲染，也不会同一条视频出现两次。
+List<CollectionListRow> buildCollectionListRows(
+  List<WhitelistVideo> videos, {
+  Set<String> expandedSeasons = const {},
+}) {
+  final rows = <CollectionListRow>[];
+  final consumed = <String>{};
+  // 视频 → 它在 [videos] 里的下标（展开态要按正序逐集平铺，得知道每集
+  // 原本排在哪，拖拽落点也要用它）。O(n) 建表，避免循环里反复 indexOf。
+  final indexOf = <String, int>{};
+  for (var i = 0; i < videos.length; i++) {
+    indexOf.putIfAbsent(_videoKey(videos[i]), () => i);
+  }
+  for (var i = 0; i < videos.length; i++) {
+    final v = videos[i];
+    if (consumed.contains(_videoKey(v))) continue;
+    if (v.epId != null) {
+      final key = seasonKeyOf(videos, v);
+      if (key != null) {
+        final episodes = sortedSeasonEpisodes(videos, v); // 组内正序
+        if (episodes.length >= 2) {
+          final expanded = expandedSeasons.contains(key);
+          rows.add(CollectionSeasonRow(
+            key: key,
+            episodes: episodes,
+            firstIndex: i,
+            collapsed: !expanded,
+          ));
+          for (final e in episodes) {
+            consumed.add(_videoKey(e));
+            if (expanded) {
+              // 展开态：季头下面按**集号正序**逐集平铺（不是列表序）——
+              // 整季导入的 order 恒 0 + added_at 递增会把这一块排成
+              // 「第43话 → 第1话」，展开后照那个顺序列出来没有意义。
+              rows.add(CollectionVideoRow(e, indexOf[_videoKey(e)] ?? i));
+            }
+          }
+          continue;
+        }
+      }
+    }
+    consumed.add(_videoKey(v));
+    rows.add(CollectionVideoRow(v, i));
+  }
+  return rows;
+}
 
 class CollectionPage extends StatefulWidget {
   /// 合集**路径**；空串 = 未分类。
@@ -77,6 +240,18 @@ class _CollectionPageState extends State<CollectionPage> {
   /// 离线缓存管理器（列表页显示已缓存标记；缓存状态变化时刷新）。
   final DownloadManager _downloads = DownloadManager.instance;
 
+  /// **已展开**的季名集合（v2.41.0+）。
+  ///
+  /// ⚠️ 只在内存里、**绝不落库**（Gist / 本地缓存都不写）：折叠是"此刻怎么看"，
+  /// 不是"这份数据是什么"。理由见文件头那段。
+  final Set<String> _expandedSeasons = {};
+
+  /// 本机播放历史（整季卡上的「已看 X/N」与选集层的已看标记）。
+  ///
+  /// 异步读一次本地存储（不是网络），读不到就当空 —— 卡片退化成「N 集 ·
+  /// 已看 0/N」，不影响列表本身。
+  List<HistoryEntry> _history = const [];
+
   /// 是否「未分类」页（空串路径）。
   bool get _isUncategorized => widget.collectionName.isEmpty;
 
@@ -97,6 +272,15 @@ class _CollectionPageState extends State<CollectionPage> {
   /// 子孙合集的视频不在其中；UI 直接消费）。
   List<WhitelistVideo> get _videos => _data.sortedVideos(widget.collectionName);
 
+  /// 本页真正渲染的**行**（整季折叠后）：子合集卡片之外的那一段。
+  ///
+  /// 计算纯函数 [buildCollectionListRows]，与 [_videos] 是同一个输入 ——
+  /// 点单条视频进播放页时用的仍然是 [_videos]（折叠不改播放列表的语义）。
+  List<CollectionListRow> get _rows => buildCollectionListRows(
+        _videos,
+        expandedSeasons: _expandedSeasons,
+      );
+
   @override
   void initState() {
     super.initState();
@@ -104,6 +288,22 @@ class _CollectionPageState extends State<CollectionPage> {
     _downloads.cached.addListener(_onCacheChanged);
     // 异步加载缓存索引（完成后通过 notifier 触发刷新，不阻塞首帧）
     unawaited(_downloads.init());
+    // 播放历史（整季卡的「已看 X/N」）同样异步、不阻塞首帧
+    unawaited(_loadHistory());
+  }
+
+  /// 读一次本机播放历史（整季卡上的「已看 X/N」用）。
+  ///
+  /// 失败静默（历史读不到就按"一集没看"渲染）：这一行副信息是**锦上添花**，
+  /// 不该因为本地存储读失败让整个合集页打不开。
+  Future<void> _loadHistory() async {
+    try {
+      final history = await HistoryStore.instance.getAll();
+      if (!mounted) return;
+      setState(() => _history = history);
+    } catch (e) {
+      debugPrint('[collection_page] 读取播放历史失败: $e');
+    }
   }
 
   @override
@@ -457,12 +657,26 @@ class _CollectionPageState extends State<CollectionPage> {
   ///
   /// 列表头部还有子合集卡片（不可拖）→ 索引要减掉这段偏移；拖到偏移区里
   /// （把手拖到子合集卡片上）按落到最前面处理。
+  ///
+  /// 整季折叠（v2.41.0+）之后**列表行下标 ≠ 视频下标**了，所以两个下标都要
+  /// 经过 [_rows] 换算：
+  /// - 拖起的行必须是**单条视频行**（折叠卡没有把手，[CollectionSeasonRow]
+  ///   一个人代表 N 条，拖它意味着"整季一起搬"，那是另一个语义，本版不做
+  ///   —— 想精确调整顺序就左滑展开，逐集拖）；
+  /// - 落点按**该行的锚点**换算成视频下标（折叠卡 = 它首集的下标），于是
+  ///   拖到折叠卡前面 = 插到这一季整块之前，拖到它后面 = 插到整块之后。
+  ///
+  /// 没有折叠（最常见的既有数据：全部 `epId == null`）时 `_rows` 与 `_videos`
+  /// **一一对应**，两个换算都是恒等映射，行为与改动前逐字符一致。
   void _onReorderVideos(int oldIndex, int newIndex) {
     final offset = _subs.length;
     if (oldIndex < offset) return; // 子合集卡片没有拖拽把手，不该走到这
     final videos = _videos; // 排序后的当前展示顺序
-    var oi = oldIndex - offset;
-    var ni = newIndex - offset;
+    final rows = _rows;
+    final oldRow = rows[oldIndex - offset];
+    if (oldRow is! CollectionVideoRow) return; // 折叠卡不可拖（见上面说明）
+    final oi = oldRow.index;
+    var ni = _anchorVideoIndex(rows, newIndex - offset, videos.length);
     if (oi < 0 || oi >= videos.length) return;
     if (ni < 0) ni = 0;
     if (ni > videos.length) ni = videos.length;
@@ -478,6 +692,109 @@ class _CollectionPageState extends State<CollectionPage> {
       after,
     );
     unawaited(_saveAndRefresh(next));
+  }
+
+  /// 拖拽落点（**行下标**）→ 视频下标：取这一行的锚点。
+  ///
+  /// [rowIndex] 落到列表末尾（拖到底部空白）→ 返回 [total]（= 追加到最后）；
+  /// 落到折叠卡 → 返回它的首集下标（= 插到这一季整块的前/后）。
+  int _anchorVideoIndex(
+    List<CollectionListRow> rows,
+    int rowIndex,
+    int total,
+  ) {
+    if (rowIndex < 0) return 0;
+    if (rowIndex >= rows.length) return total;
+    return rows[rowIndex].anchor;
+  }
+
+  // ---------------------------------------------------------------------------
+  // 整季折叠（v2.41.0+）：展开 / 收起 / 选集连播 / 整季勾选
+  // ---------------------------------------------------------------------------
+
+  /// 展开一季（左滑「展开」）：季头保留，下面逐集平铺。
+  void _expandSeason(String key) {
+    setState(() => _expandedSeasons.add(key));
+  }
+
+  /// 收起一季（展开态左滑「收起」）：回到一张整季卡。
+  void _collapseSeason(String key) {
+    setState(() => _expandedSeasons.remove(key));
+  }
+
+  /// 从某一集开始连播：`playlist` = **这一部**的正序（[sortedSeasonEpisodes]）。
+  ///
+  /// 与"点单条视频"走**同一个函数**：v2.37.0 那条"上下集只在本部内走"的保证
+  /// 在两条路径上是同一份实现，不会出现"从整季卡进去会跨番"这种分叉。
+  /// 组内找不到 [video] 时下标给 0（播放页也会兜底），但正常路径下必定命中。
+  void _playFrom(WhitelistVideo video, {String? label}) {
+    final playlistVideos = sortedSeasonEpisodes(_videos, video);
+    final playlistIndex = playlistVideos.indexOf(video);
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        settings: const RouteSettings(name: kPlayerRouteName),
+        builder: (_) => PlayerPage(
+          video: video,
+          playlist: PlaylistContext(
+            videos: playlistVideos,
+            label: label ?? _label,
+          ),
+          playlistIndex: playlistIndex < 0 ? 0 : playlistIndex,
+        ),
+      ),
+    );
+  }
+
+  /// 点整季卡 → 弹「选集」层：列出这一季的全部集，点某一集就从它开始连播。
+  ///
+  /// 这正是用户要的那件事的落点：「每集不用单独收藏，进整季卡就是这一部」。
+  void _openSeasonSheet(CollectionSeasonRow row) {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      // 43 集的番剧会顶满屏幕：限高 70% + 内部滚动（与倍速/移动弹窗同款兜底）
+      constraints: BoxConstraints(
+        maxHeight: MediaQuery.sizeOf(context).height * 0.7,
+      ),
+      builder: (sheetCtx) => _SeasonEpisodeSheet(
+        seasonName: row.key,
+        episodes: row.episodes,
+        history: _history,
+        onPick: (video) {
+          Navigator.pop(sheetCtx);
+          // 连播的 label 用**季名**（不是合集名）：进播放页后"第 N/M 集"
+          // 旁边那句来源提示说的是这一部番，而不是"未分类"
+          _playFrom(video, label: row.key);
+        },
+      ),
+    );
+  }
+
+  /// 多选模式下点/长按整季卡 = **整季一起勾上 / 取消**。
+  ///
+  /// 不做"多选模式下自动展开"那个退路（虽然更省事）：用户在多选里想删的往往
+  /// 就是"这一部番"，逼他先展开再逐集勾 43 次，正是这条需求要消灭的体验。
+  /// 整季勾上之后，既有的「移动到合集」「删除」按钮直接可用——批量操作一个
+  /// 字都不用改。
+  void _toggleSeasonSelection(Iterable<WhitelistVideo> episodes) {
+    final bvids = episodes.map((e) => e.bvid).toSet();
+    if (bvids.isEmpty) return;
+    setState(() {
+      if (_selectedBvids.containsAll(bvids)) {
+        _selectedBvids.removeAll(bvids);
+      } else {
+        _selectedBvids.addAll(bvids);
+      }
+    });
+  }
+
+  /// 普通模式下长按整季卡 = 进入多选 + 整季勾上（与单条视频的长按同义）。
+  void _enterSelectSeason(Iterable<WhitelistVideo> episodes) {
+    setState(() {
+      _selectMode = true;
+      _selectedBvids.addAll(episodes.map((e) => e.bvid));
+    });
   }
 
   // ---------------------------------------------------------------------------
@@ -671,11 +988,64 @@ class _CollectionPageState extends State<CollectionPage> {
     );
   }
 
+  /// 「整季卡」：点开选集连播；左滑「展开 / 收起」；多选模式整体勾选。
+  ///
+  /// 几个取舍：
+  /// - **左滑用 [SwipeActionBox]**（而不是自定义"滑过即展开"）：这一页的子合集
+  ///   卡就是"左滑露出操作块再点"的语言，两种卡摆在同一屏，手势必须同义；
+  ///   而且 [SwipeActionBox] 已经处理好了跨卡联动（同屏只开一张）、列表一滚就
+  ///   收回、关动效时零 ticker、右圆角垫片这些坑，自己再写一套只会更脆。
+  /// - **收起也放在这张卡上**：展开后季头仍然留在原位（见
+  ///   [CollectionSeasonRow]），左滑它就变成「收起」。没有这个落点，展开
+  ///   就是一次性的——用户回不去折叠态。
+  /// - 多选模式下**不给左滑**（`enabled: false`，与子合集卡一致）：手势在
+  ///   多选里只会挡着勾选。
+  Widget _seasonRow(CollectionSeasonRow row) {
+    final first = row.episodes.first; // 组内正序的第一集 = 第 1 话
+    final bvids = row.episodes.map((e) => e.bvid).toSet();
+    final card = SeasonTile(
+      seasonName: row.key,
+      episodeCount: row.episodes.length,
+      // 「已看 X/N」口径与首页合集卡一致（见 watchedVideoCount）
+      watchedCount: watchedVideoCount(row.episodes, _history),
+      cover: first.cover,
+      selectMode: _selectMode,
+      selected:
+          _selectMode && bvids.isNotEmpty && _selectedBvids.containsAll(bvids),
+      onTap: _selectMode
+          ? () => _toggleSeasonSelection(row.episodes)
+          : () => _openSeasonSheet(row),
+      onLongPress: _selectMode
+          ? () => _toggleSeasonSelection(row.episodes)
+          : () => _enterSelectSeason(row.episodes),
+    );
+    return SwipeActionBox(
+      key: ValueKey('season-swipe-${row.key}'),
+      enabled: !_selectMode,
+      // 只一块：60dp 与子合集卡那块同宽（同屏两种卡的手势区域一致）
+      actionWidth: 60,
+      actions: [
+        SwipeAction(
+          label: row.collapsed ? '展开' : '收起',
+          icon: row.collapsed ? Icons.unfold_more : Icons.unfold_less,
+          color: kInkBlack,
+          textColor: kPaper,
+          onTap: () => row.collapsed
+              ? _expandSeason(row.key)
+              : _collapseSeason(row.key),
+        ),
+      ],
+      child: card,
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final videos = _videos;
     final subs = _subs;
+    // 整季折叠后的**行**（子合集卡片之外的那一段）；没有折叠时与 videos 一一对应
+    final rows = _rows;
     final selectAllVisible = _selectMode &&
         videos.isNotEmpty &&
         _selectedBvids.containsAll(videos.map((v) => v.bvid));
@@ -719,12 +1089,14 @@ class _CollectionPageState extends State<CollectionPage> {
           : ReorderableListView.builder(
               physics: const AlwaysScrollableScrollPhysics(),
               // 拖拽排序入口 = 每条视频尾部「拖拽把手」（按下即拖，Reorderable-
-              // DragStartListener）；列表头部的子合集卡片没有把手 → 天然不可拖
+              // DragStartListener）；列表头部的子合集卡片与「整季卡」都没有
+              // 把手 → 天然不可拖（折叠卡代表 N 条视频，拖它 = 整季一起搬，
+              // 是另一个语义；要精确排序就左滑展开逐集拖）
               buildDefaultDragHandles: false,
-              itemCount: subs.length + videos.length,
+              itemCount: subs.length + rows.length,
               onReorder: _onReorderVideos,
               itemBuilder: (context, i) {
-                // 先子合集，再直属视频
+                // 先子合集，再「折叠后的行」
                 if (i < subs.length) {
                   return Padding(
                     key: ValueKey('sub-row-$i'),
@@ -733,68 +1105,46 @@ class _CollectionPageState extends State<CollectionPage> {
                     child: _subCard(subs[i]),
                   );
                 }
-                final vi = i - subs.length;
-                final video = videos[vi];
-                return Column(
-                  key: ValueKey('${video.bvid}#${video.cid}'),
-                  children: [
-                    VideoTile(
-                      video: video,
-                      cachedCount: _downloads.cachedCount(video.bvid),
+                final ri = i - subs.length;
+                final row = rows[ri];
+                final Widget child = switch (row) {
+                  CollectionSeasonRow r => _seasonRow(r),
+                  // 逐集平铺：与改动前**逐字符一致**（含长按进多选、
+                  // 点按从这一集连播、尾部拖拽把手与「更多」菜单）
+                  CollectionVideoRow r => VideoTile(
+                      video: r.video,
+                      cachedCount: _downloads.cachedCount(r.video.bvid),
                       // 全是仅音频缓存 → 角标显示「已缓存音频」（点进去没画面）
                       cachedAudioOnly:
-                          _downloads.cachedAllAudioOnly(video.bvid),
+                          _downloads.cachedAllAudioOnly(r.video.bvid),
                       selectMode: _selectMode,
-                      selected: _selectedBvids.contains(video.bvid),
+                      selected: _selectedBvids.contains(r.video.bvid),
+                      // 同合集上下集（v2.30.0+）：把**整个合集**按用户在本页
+                      // 看到的顺序交下去，「下一集」就是列表里的下一条
+                      // （[_videos] = sortedVideos 的 order 升序 + addedAt
+                      // 倒序兜底，与列表渲染用的是同一个 getter，不会出现
+                      // 两套顺序）。只接这一条「点单条视频播放」的路径：多选/
+                      // 批量/子合集下钻都不是「从某个列表开始连播」的语义。
+                      //
+                      // v2.37.0 修「番剧上下集跨番」（用户需求）：整季导入的
+                      // 集全是 order=0 + added_at 递增 → 在合集里排成
+                      // 「第43话 → 第1话」一块，走到块末的「下一集」就跳到
+                      // **别的番剧**了。所以这里换成「**只取当前这部的分集**、
+                      // 组内按集号正序」：末集天然 `_canPlayNext == false`
+                      // （播放页不循环），永远跨不出去。
+                      // 普通视频（epId == null）拿到的是**原列表本身**，
+                      // 行为与改动前逐字符一致（见 sortedSeasonEpisodes）。
+                      // v2.41.0 起与「整季卡点开选集」共用 [_playFrom]：
+                      // 两条路走同一个函数，不会分叉。
                       onTap: _selectMode
-                          ? () => _toggleSelect(video.bvid)
-                          : () {
-                              // 同合集上下集（v2.30.0+）：把**整个合集**按
-                              // 用户在本页看到的顺序交下去，「下一集」就是
-                              // 列表里的下一条（[_videos] = sortedVideos
-                              // 的 order 升序 + addedAt 倒序兜底，与列表
-                              // 渲染用的是同一个 getter，不会出现两套顺序）。
-                              // 只接这一条「点单条视频播放」的路径：多选/
-                              // 批量/子合集下钻都不是「从某个列表开始连播」
-                              // 的语义。
-                              //
-                              // v2.37.0 修「番剧上下集跨番」（用户需求）：
-                              // 整季导入的集全是 order=0 + added_at 递增 →
-                              // 在合集里排成「第43话 → 第1话」一块，走到块末
-                              // 的「下一集」就跳到**别的番剧**了。所以这里换成
-                              // 「**只取当前这部的分集**、组内按集号正序」：
-                              // 末集天然 `_canPlayNext == false`（播放页不
-                              // 循环），永远跨不出去。
-                              // 普通视频（epId == null）拿到的是**原列表本身**，
-                              // 行为与改动前逐字符一致（见 sortedSeasonEpisodes）。
-                              final playlistVideos =
-                                  sortedSeasonEpisodes(videos, video);
-                              // 组内下标：找不到时给 -1 也无妨，播放页会
-                              // 回退到 0（见 player_page 初始化下标那段）。
-                              final playlistIndex =
-                                  playlistVideos.indexOf(video);
-                              Navigator.of(context).push(
-                                MaterialPageRoute<void>(
-                                  settings: const RouteSettings(
-                                      name: kPlayerRouteName),
-                                  builder: (_) => PlayerPage(
-                                    video: video,
-                                    playlist: PlaylistContext(
-                                      videos: playlistVideos,
-                                      label: _label,
-                                    ),
-                                    playlistIndex:
-                                        playlistIndex < 0 ? 0 : playlistIndex,
-                                  ),
-                                ),
-                              );
-                            },
+                          ? () => _toggleSelect(r.video.bvid)
+                          : () => _playFrom(r.video),
                       onLongPress: _selectMode
-                          ? () => _toggleSelect(video.bvid)
-                          : () => _enterSelect(video),
+                          ? () => _toggleSelect(r.video.bvid)
+                          : () => _enterSelect(r.video),
                       onMore: _selectMode
                           ? null
-                          : () => _showVideoMenu(video),
+                          : () => _showVideoMenu(r.video),
                       dragHandle: _selectMode
                           ? null
                           : ReorderableDragStartListener(
@@ -811,7 +1161,16 @@ class _CollectionPageState extends State<CollectionPage> {
                               ),
                             ),
                     ),
-                    if (vi < videos.length - 1)
+                };
+                return Column(
+                  key: switch (row) {
+                    CollectionSeasonRow r => ValueKey('season-${r.key}'),
+                    CollectionVideoRow r =>
+                      ValueKey('${r.video.bvid}#${r.video.cid}'),
+                  },
+                  children: [
+                    child,
+                    if (ri < rows.length - 1)
                       const Divider(height: 1, indent: 88),
                   ],
                 );
@@ -1055,4 +1414,111 @@ class _SubCollectionCard extends StatelessWidget {
           color: theme.colorScheme.onSecondaryContainer,
         ),
       );
+}
+
+/// 「选集」弹层（v2.41.0+）：整季卡点开后列出这一季的**全部集**。
+///
+/// 与 B 站播放页的选集面板同一个意图：用户点的是"这一部番"，进来看见的是
+/// 第 1 话…第 N 话，点哪一集就从哪一集开始往下连播（[onPick] 的调用方把
+/// playlist 交给 [sortedSeasonEpisodes] 的正序结果）。
+///
+/// 每一行 = 标题 + 时长 + 已看标记。**标题原样展示**（集号/副标题都在里面，
+/// 再单列一个序号是重复信息）；已看的判据与整季卡上的「已看 X/N」同源
+/// （[isVideoWatched]），两处不会一个说看过、一个说没看过。
+class _SeasonEpisodeSheet extends StatelessWidget {
+  const _SeasonEpisodeSheet({
+    required this.seasonName,
+    required this.episodes,
+    required this.history,
+    required this.onPick,
+  });
+
+  /// 季名（弹层标题）。
+  final String seasonName;
+
+  /// 这一季的全部集，**组内正序**（调用方已排好）。
+  final List<WhitelistVideo> episodes;
+
+  /// 本机播放历史（算已看标记用）。
+  final List<HistoryEntry> history;
+
+  /// 点了某一集：调用方负责关弹层 + push 播放页。
+  final ValueChanged<WhitelistVideo> onPick;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return SafeArea(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          ListTile(
+            title: Text(
+              seasonName,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: theme.textTheme.titleSmall,
+            ),
+            // 「从这一集开始连播」这件事必须写在明面上：否则用户会以为点了
+            // 只是"单独播这一集"，而实际上后面会按集号一路播下去
+            subtitle: Text(
+              '共 ${episodes.length} 集 · 点某一集从它开始连播',
+              style: theme.textTheme.bodySmall,
+            ),
+            dense: true,
+          ),
+          const Divider(height: 1),
+          Flexible(
+            child: ListView(
+              shrinkWrap: true,
+              children: [
+                for (final e in episodes)
+                  _episodeTile(context, theme, e),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _episodeTile(
+    BuildContext context,
+    ThemeData theme,
+    WhitelistVideo episode,
+  ) {
+    final watched = isVideoWatched(episode, history);
+    return ListTile(
+      // 锚点用 bvid（不是下标）：列表将来若加"续播/最新"排序，下标会变、
+      // bvid 不会，测试也就不会因为一个无关的排序改动而红
+      key: ValueKey('season-ep-${episode.bvid}'),
+      title: Text(
+        episode.title,
+        maxLines: 2,
+        overflow: TextOverflow.ellipsis,
+        style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+      ),
+      subtitle: Text(
+        fmtDuration(episode.duration),
+        style: theme.textTheme.bodySmall
+            ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
+      ),
+      trailing: watched
+          ? Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.check_circle,
+                    size: 16, color: theme.colorScheme.primary),
+                const SizedBox(width: kSpace4),
+                Text(
+                  '已看',
+                  style: theme.textTheme.labelSmall
+                      ?.copyWith(color: theme.colorScheme.primary),
+                ),
+              ],
+            )
+          : null,
+      onTap: () => onPick(episode),
+    );
+  }
 }

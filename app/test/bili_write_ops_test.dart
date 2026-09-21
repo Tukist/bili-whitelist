@@ -544,4 +544,119 @@ void main() {
     final missing = viewStatCounts(null);
     expect([missing.like, missing.coin, missing.favorite], [0, 0, 0]);
   });
+
+  // -------------------------------------------------------------------------
+  // 纯函数：archive/relation 的互动态（v2.41.0+，写按钮的真实初始态）
+  // -------------------------------------------------------------------------
+
+  test('parseVideoRelation：data 缺失 / 三个键一个都没有 → null（按"没取到"处理）',
+      () {
+    expect(parseVideoRelation(null), isNull);
+    // 空 data：不是"三个都是 false"，而是"这个响应没回答我的互动态"
+    expect(parseVideoRelation(const {}), isNull);
+    // 有 data 但一个相关键都没有（风控改写 / 结构变了）
+    expect(parseVideoRelation(const {'aid': 2, 'bvid': 'BV1'}), isNull);
+  });
+
+  test('parseVideoRelation：bool 形态（真机实测的字段名与类型）', () {
+    // 2026-09 真机探针的原始响应形状，逐键照抄
+    final r = parseVideoRelation(const {
+      'attention': true,
+      'favorite': false,
+      'season_fav': false,
+      'like': true,
+      'dislike': false,
+      'coin': 2,
+    })!;
+    expect(r.like, isTrue);
+    expect(r.coin, 2, reason: 'coin 是**枚数**不是布尔');
+    expect(r.coined, isTrue);
+    expect(r.fav, isFalse, reason: '键名是 favorite（不是 fav），这里为 false');
+  });
+
+  test('parseVideoRelation：favorite=true → 已收藏；旧写法的 fav 也认', () {
+    expect(
+      parseVideoRelation(const {'like': false, 'favorite': true})!.fav,
+      isTrue,
+      reason: '真机给的是 favorite',
+    );
+    expect(
+      parseVideoRelation(const {'like': false, 'fav': 1})!.fav,
+      isTrue,
+      reason: '防御性兜底：万一哪天变体用 fav 也不至于"永远未收藏"',
+    );
+  });
+
+  test('parseVideoRelation：0/1 与布尔混搭都认（B 站两套形态都给过）', () {
+    final numeric = parseVideoRelation(const {
+      'like': 1,
+      'coin': 0,
+      'favorite': 1,
+    })!;
+    expect([numeric.like, numeric.coined, numeric.fav], [true, false, true]);
+
+    final booleanCoin = parseVideoRelation(const {
+      'like': false,
+      'coin': true,
+      'favorite': false,
+    })!;
+    expect(booleanCoin.coin, 1, reason: '布尔 true 当"投过 1 枚"');
+    expect(booleanCoin.coined, isTrue);
+  });
+
+  test('parseVideoRelation：单个字段脏/缺失 → 该字段安全默认，其余照常', () {
+    final r = parseVideoRelation(const {'like': 'yes', 'favorite': 1})!;
+    expect(r.like, isFalse, reason: '认不出的值按"没有"处理，不猜');
+    expect(r.coin, 0, reason: '缺 coin = 没投过');
+    expect(r.fav, isTrue, reason: '一个字段脏不该把另一个有效字段也丢掉');
+
+    final negative = parseVideoRelation(const {'coin': -3})!;
+    expect(negative.coin, 0, reason: '负数夹到 0（不显示"已投 -3 枚"）');
+  });
+
+  test('fetchVideoRelation：解析 data、失败返回 null 不抛', () async {
+    final adapter = _WriteAdapter({
+      '/x/web-interface/archive/relation': () => {
+            'code': 0,
+            'message': 'OK',
+            'data': {
+              'attention': true,
+              'favorite': false,
+              'like': true,
+              'coin': 2,
+            },
+          },
+    });
+    final r = await _api(adapter).fetchVideoRelation('BV1TEST');
+    expect(r, isNotNull);
+    expect([r!.like, r.coin, r.fav], [true, 2, false]);
+    final req = adapter.forPath('/x/web-interface/archive/relation').single;
+    expect(req.method, 'GET');
+    expect(req.uri.queryParameters['bvid'], 'BV1TEST');
+    expect(req.uri.queryParameters.containsKey('csrf'), isFalse,
+        reason: '只读接口：不带 csrf、不发 POST');
+  });
+
+  test('fetchVideoRelation：未登录（-101）/ 认不出数据 / 网络失败 → 一律 null',
+      () async {
+    final notLoggedIn = _WriteAdapter({
+      '/x/web-interface/archive/relation': () =>
+          {'code': -101, 'message': '账号未登录'},
+    });
+    expect(await _api(notLoggedIn).fetchVideoRelation('BV1'), isNull);
+
+    final emptyData = _WriteAdapter({
+      '/x/web-interface/archive/relation': () => {'code': 0, 'data': <String, dynamic>{}},
+    });
+    expect(await _api(emptyData).fetchVideoRelation('BV1'), isNull,
+        reason: '空 data 当"没取到"，UI 保留降级标注');
+
+    expect(await _api(_NetFailAdapter()).fetchVideoRelation('BV1'), isNull,
+        reason: '网络失败不抛：初始态请求失败不该让播放页报错');
+
+    // bvid 空 → 一个请求都不发
+    final none = _WriteAdapter(const {});
+    expect(await _api(none).fetchVideoRelation(''), isNull);
+    expect(none.requests, isEmpty);
+  });
 }

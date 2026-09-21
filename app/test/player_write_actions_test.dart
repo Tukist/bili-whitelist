@@ -53,6 +53,9 @@ const String _kCoinPath = '/x/web-interface/coin/add';
 const String _kFavDealPath = '/x/v3/fav/resource/deal';
 const String _kFavListPath = '/x/v3/fav/folder/created/list-all';
 
+/// 互动态只读接口（v2.41.0+）。
+const String _kRelationPath = '/x/web-interface/archive/relation';
+
 WhitelistVideo _video({int? epId}) => WhitelistVideo(
       bvid: _bvid,
       cid: 1001,
@@ -553,6 +556,123 @@ void main() {
     expect(find.text('点赞 1.2万'), findsOneWidget, reason: '按键存在（带计数）');
     expect(find.byKey(_kStateUnknown), findsOneWidget);
     expect(find.text('状态未取到，重启后可能显示不准'), findsOneWidget);
+  });
+
+  // -------------------------------------------------------------------------
+  // v2.41.0：archive/relation 给的真实互动态（view 不下发 req_user 的补丁）
+  // -------------------------------------------------------------------------
+
+  /// 让 relation 接口返回给定的 `data`（null = 返回空 data，即"没回答"）。
+  void stubRelation(Map<String, dynamic>? data) {
+    _overrideHandlers[_kRelationPath] =
+        () => {'code': 0, 'data': data ?? <String, dynamic>{}};
+  }
+
+  testWidgets('拿到 relation → 三个按钮显示真实态，且**去掉**降级标注',
+      (tester) async {
+    tester.view.devicePixelRatio = 1.0;
+    tester.view.physicalSize = const Size(400, 800);
+    addTearDown(tester.view.reset);
+    _installMocks(tester);
+    _reqUser = null; // view 照旧不下发 req_user（现实就是这样）
+    stubRelation({'like': true, 'coin': 0, 'favorite': true});
+    UiPrefsStore.instance
+        .resetForTest(writeActionsEnabled: true, loaded: true);
+
+    await _pumpPlayer(tester);
+
+    expect(find.text('已赞 1.2万'), findsOneWidget, reason: 'relation.like=1 → 已赞');
+    expect(find.text('收藏'), findsNothing);
+    expect(find.text('已收藏'), findsOneWidget, reason: 'relation.fav=true → 已收藏');
+    expect(find.text('投币'), findsOneWidget, reason: '没投过');
+    expect(find.byKey(_kStateUnknown), findsNothing,
+        reason: '拿到真实互动态 → 那句"状态未取到"必须消失');
+    // 真的打了 relation 接口（不是靠猜）
+    expect(_recorded.any((r) => r.uri.path.endsWith(_kRelationPath)), isTrue);
+    expect(_writes(_kLikePath), isEmpty, reason: '只读探针，一个写请求都不许发');
+  });
+
+  testWidgets('relation 只给了 like 字段 → 该字段真、另两个按未做处理（仍算"取到了"）',
+      (tester) async {
+    tester.view.devicePixelRatio = 1.0;
+    tester.view.physicalSize = const Size(400, 800);
+    addTearDown(tester.view.reset);
+    _installMocks(tester);
+    _reqUser = null;
+    stubRelation({'like': 1});
+    UiPrefsStore.instance
+        .resetForTest(writeActionsEnabled: true, loaded: true);
+
+    await _pumpPlayer(tester);
+
+    expect(find.text('已赞 1.2万'), findsOneWidget);
+    expect(find.byKey(_kStateUnknown), findsNothing,
+        reason: '响应回答了互动态（有一个键在），就不算"没取到"');
+  });
+
+  testWidgets('relation 拿不到（未登录/失败/空 data）→ 保留降级标注', (tester) async {
+    tester.view.devicePixelRatio = 1.0;
+    tester.view.physicalSize = const Size(400, 800);
+    addTearDown(tester.view.reset);
+    _installMocks(tester);
+    _reqUser = null;
+    stubRelation(null); // data 是空的：接口没回答我的互动态
+    UiPrefsStore.instance
+        .resetForTest(writeActionsEnabled: true, loaded: true);
+
+    await _pumpPlayer(tester);
+
+    expect(find.text('点赞 1.2万'), findsOneWidget, reason: '退回乐观起点（未赞）');
+    expect(find.text('状态未取到，重启后可能显示不准'), findsOneWidget,
+        reason: '拿不到就必须继续说真话');
+  });
+
+  testWidgets('relation 优先于 req_user（两个都给时以 relation 为准）', (tester) async {
+    tester.view.devicePixelRatio = 1.0;
+    tester.view.physicalSize = const Size(400, 800);
+    addTearDown(tester.view.reset);
+    _installMocks(tester);
+    _reqUser = {'like': 0, 'coin': 0, 'favorite': 0}; // view 说"没赞"
+    stubRelation({'like': 1, 'coin': 0, 'favorite': 0}); // relation 说"赞了"
+    UiPrefsStore.instance
+        .resetForTest(writeActionsEnabled: true, loaded: true);
+
+    await _pumpPlayer(tester);
+
+    expect(find.text('已赞 1.2万'), findsOneWidget,
+        reason: 'relation 是专门回答这个问题的接口，优先于 view 顺带给的');
+  });
+
+  testWidgets('点赞成功后本地 relation 更新：同会话重进不再显示"未赞"',
+      (tester) async {
+    tester.view.devicePixelRatio = 1.0;
+    tester.view.physicalSize = const Size(400, 800);
+    addTearDown(tester.view.reset);
+    _installMocks(tester);
+    _reqUser = null;
+    stubRelation({'like': false, 'coin': 0, 'favorite': false});
+    UiPrefsStore.instance
+        .resetForTest(writeActionsEnabled: true, loaded: true);
+
+    await _pumpPlayer(tester);
+    expect(find.text('点赞 1.2万'), findsOneWidget);
+
+    await _tapAndSettle(tester, find.byKey(_kLike));
+    expect(find.text('已赞 1.2万'), findsOneWidget);
+    expect(_writes(_kLikePath), hasLength(1));
+
+    // 同一条视频**再进一次**播放页：会话内缓存命中 → 不该再打 relation，
+    // 也不该把刚点上的赞显示成"未赞"（_rememberWriteState 的回写）
+    final relationHits =
+        _recorded.where((r) => r.uri.path.endsWith(_kRelationPath)).length;
+    await _pumpPlayer(tester);
+    expect(find.text('已赞 1.2万'), findsOneWidget,
+        reason: '本地 relation 已更新 → 重进显示已赞');
+    expect(
+      _recorded.where((r) => r.uri.path.endsWith(_kRelationPath)).length,
+      relationHits,
+      reason: '缓存命中：不重拉 relation（"不要每次重拉"）',
+    );
   });
 
   // -------------------------------------------------------------------------

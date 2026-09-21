@@ -1,0 +1,68 @@
+{
+  "probe": "archive/relation 只读探针（v2.41.0）",
+  "conclusion": {
+    "endpoint": "GET /x/web-interface/archive/relation?bvid=...",
+    "auth": "必须登录（SESSDATA）；无有效 cookie → code=-101 账号未登录",
+    "wbi": "不需要 WBI 签名",
+    "fields": {
+      "like": "bool（true = 已赞）",
+      "coin": "int 枚数（0 = 未投，上限 2）——不是布尔",
+      "favorite": "bool（true = 已收藏）。⚠️ 键名是 favorite，不是 fav",
+      "attention": "bool 是否关注 UP（本版不用）",
+      "dislike": "bool 是否点踩（本版不用）",
+      "season_fav": "bool 是否追番（本版不用）"
+    },
+    "impl_note": "第一版按文档把收藏字段写成 fav → 真机探针发现真实键名是 favorite；已改为优先读 favorite、fav 兜底"
+  },
+  "pass1_host_curl": {
+    "note": "cookie.txt / cookie_new.txt 的 SESSDATA 已过期（两文件内容一致）→ 两条请求都只拿到 -101，判断不了字段。故改走真机内置探针（见 pass2_device_logcat）。",
+    "requests": 2,
+    "cookie_len": 1362,
+    "results": [
+      {
+        "tag": "user_own",
+        "bvid": "BV1ok8F6BENj",
+        "http": 200,
+        "raw": "{\"code\":-101,\"message\":\"账号未登录\",\"ttl\":1}",
+        "url": "https://api.bilibili.com/x/web-interface/archive/relation?bvid=BV1ok8F6BENj"
+      },
+      {
+        "tag": "control",
+        "bvid": "BV1xx411c7mD",
+        "http": 200,
+        "raw": "{\"code\":-101,\"message\":\"账号未登录\",\"ttl\":1}",
+        "url": "https://api.bilibili.com/x/web-interface/archive/relation?bvid=BV1xx411c7mD"
+      }
+    ]
+  },
+  "pass2_device_logcat": {
+    "note": "模拟器（已登录）跑 v2.41.0 debug 包，打开视频后取 fetchVideoRelation 的 debugPrint 原文。只读 GET，零写请求。",
+    "samples": [
+      {
+        "bvid": "BV1zkYe6EEM8",
+        "raw_data": "{attention: true, favorite: false, season_fav: false, like: false, dislike: false, coin: 0}",
+        "parsed": "VideoRelation(like=false, coin=0, fav=false)",
+        "meaning": "未赞/未投/未收藏的零值形态"
+      },
+      {
+        "bvid": "BV1uVem6zEBY",
+        "raw_data": "{attention: true, favorite: false, season_fav: false, like: false, dislike: false, coin: 0}",
+        "parsed": "VideoRelation(like=false, coin=0, fav=false)",
+        "meaning": "点赞前基线"
+      },
+      {
+        "bvid": "BV1uVem6zEBY",
+        "raw_data": "{attention: true, favorite: false, season_fav: false, like: false, dislike: false, coin: 0}",
+        "parsed": "VideoRelation(like=false, coin=0, fav=false)",
+        "meaning": "点赞→取消点赞（还原）→force-stop 重进（新进程真拉一次）仍 like=false：取消点赞在服务端确实生效、已还原"
+      },
+      {
+        "bvid": "BV1W14AzYEiy",
+        "raw_data": "{attention: false, favorite: true, season_fav: false, like: false, dislike: false, coin: 0}",
+        "parsed": "VideoRelation(like=false, coin=0, fav=true)",
+        "meaning": "**正例**：来自用户自己的收藏夹「奇怪工具」→ favorite=true 被正确解析成「已收藏」"
+      }
+    ],
+    "coin_positive_sample": "无。投币一律不真测（不可撤回、扣真硬币）→ `coin` 的非零形态没有实测样本；解析对「数字即枚数」与「bool → 1/0」两种形态都兜住。"
+  }
+}

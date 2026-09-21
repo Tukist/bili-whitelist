@@ -3166,6 +3166,43 @@ class BiliApi {
     }
   }
 
+  /// 只读拉取「我对这个视频的互动态」（`GET /x/web-interface/archive/relation`）。
+  ///
+  /// 给播放页的点赞 / 投币 / 收藏三个按钮做**真实初始态**（为什么另开一个接口
+  /// 而不是继续等 view 的 `req_user`，见 [parseVideoRelation] 上面那段）。
+  ///
+  /// 与 [fetchVideoMeta] 一样注入登录态：这个接口的返回值本身要登录才准
+  /// （匿名调用实测 `code=-101 账号未登录`）。
+  ///
+  /// [bvid] 空 → 直接 null（不发请求）。其余**任何失败都返回 null、不抛**：
+  /// 未登录 / 无权限 / 风控 / 网络异常 / 响应里认不出互动态 —— 调用方一律按
+  /// "没取到"处理（保留"状态未取到"的降级标注），而不是让播放页因为一个
+  /// 装饰性的初始态请求失败而报错。
+  Future<VideoRelation?> fetchVideoRelation(String bvid) async {
+    if (bvid.isEmpty) return null;
+    try {
+      await _injectAuth();
+      final resp = await _dio.get<Map<String, dynamic>>(
+        '/x/web-interface/archive/relation',
+        queryParameters: {'bvid': bvid},
+      );
+      final body = resp.data;
+      final raw = body?['data'];
+      final data = raw is Map<String, dynamic>
+          ? raw
+          : (raw is Map ? raw.map((k, v) => MapEntry('$k', v)) : null);
+      final relation = parseVideoRelation(data);
+      // 原始响应整条打出来：探针复核 / 线上归因都靠它（成功与失败都打）
+      debugPrint('[bili_api] fetchVideoRelation bvid=$bvid '
+          'code=${body?['code']} msg=${body?['message']} '
+          'data=$raw → $relation');
+      return relation;
+    } catch (e) {
+      debugPrint('[bili_api] fetchVideoRelation bvid=$bvid 失败: $e');
+      return null;
+    }
+  }
+
   /// 解析 reply 接口返回的 `replies[]`/`top_replies[]` 原始列表为模型列表。
   ///
   /// 防御：`oid` 存在且 != [aid] 的脏条目丢弃；rpid <= 0 的丢弃。
@@ -3852,3 +3889,112 @@ VideoReqUser? parseVideoReqUser(Map<String, dynamic>? meta) {
 
   return (like: pick('like'), coin: pick('coin'), favorite: pick('favorite'));
 }
+
+// ---------------------------------------------------------------------------
+// 写操作初始态（v2.41.0+）：`x/web-interface/archive/relation` 补上 view 缺的
+// 「我的互动态」
+//
+// 为什么另开一个接口而不是继续等 view 的 `req_user`：v2.40.0 已三处确认
+// （匿名 curl + 真机登录 logcat + 真实浏览器）**view 接口不下发 `req_user`**，
+// 于是三个写按钮只能显示"未点赞" + 一句"状态未取到"的降级标注。这个只读接口
+// 实测**带登录态就返回真实互动态**（探针原始响应见 relation_probe_out.json），
+// 所以初始态改为「view 那次 + relation 这次」两路并发取。
+//
+// 代价与取舍：这是本页**唯一**一次有意新增的请求（view 不给的东西搭不了它的
+// 顺风车）。只读、无副作用、响应体极小；换成"每次进来都重拉"才是要避免的。
+// ---------------------------------------------------------------------------
+
+/// 当前登录用户对某个视频的互动态（`archive/relation` 的 `data`）。
+///
+/// 与 [VideoReqUser] 的差别只有一点：这里的 [coin] 保留**枚数**（0 = 没投过），
+/// 因为该接口给的就是枚数；[VideoReqUser.coin] 是 view 口径的"投没投过"。
+class VideoRelation {
+  /// 我是否已点赞。
+  final bool like;
+
+  /// 我已投的硬币枚数（0 = 未投币；B 站单稿件上限 2）。
+  final int coin;
+
+  /// 我是否已收藏（在任意一个收藏夹里即 true）。
+  final bool fav;
+
+  const VideoRelation({required this.like, required this.coin, required this.fav});
+
+  /// 我是否已投过币（UI 只关心有没有，枚数只作展示/调试）。
+  bool get coined => coin > 0;
+
+  /// 互动态的**可见形态**：`已赞 / 已投币 / 已收藏` 三态合成一个字符串，
+  /// 供日志与测试断言（不参与 UI 文案）。
+  @override
+  String toString() => 'VideoRelation(like=$like, coin=$coin, fav=$fav)';
+}
+
+/// `like` / `fav` 这类"有没有"字段的容错读法：bool 直接用；数字按 != 0 判；
+/// 其余（缺失、字符串、null）→ false。
+bool _relationFlag(Object? v) {
+  if (v is bool) return v;
+  if (v is num) return v != 0;
+  return false;
+}
+
+/// `coin` 的容错读法：数字就是枚数（负数/脏值夹到 0）；bool → 1/0；
+/// 其余 → 0（= 未投币，与"接口没给"同解，都是安全默认）。
+int _relationCoin(Object? v) {
+  if (v is num) {
+    final n = v.toInt();
+    return n > 0 ? n : 0;
+  }
+  if (v is bool) return v ? 1 : 0;
+  return 0;
+}
+
+/// 从 relation 接口的 `data` 解析 [VideoRelation]。
+///
+/// **字段名以 2026-09 真机探针为准**（原始响应见下），不是照社区文档写：
+/// ```json
+/// {"code":0,"message":"OK","data":{
+///   "attention":true,"favorite":false,"season_fav":false,
+///   "like":false,"dislike":false,"coin":0}}
+/// ```
+/// - `like`   → **bool**（`true` = 已赞）；
+/// - `coin`   → **int 枚数**（`0` = 未投；B 站单稿件上限 2）——**不是布尔**；
+/// - `favorite` → **bool**（`true` = 已收藏）。⚠️ 键名是 **`favorite`**，
+///   不是 `fav`（探针前按文档写成 `fav` 会让"已收藏"永远显示成"未收藏"——
+///   这比不显示更糟，因为它看起来像确定的事实）。两个名字都认，防变体；
+/// - `attention`（关注 UP）/ `dislike`（点踩）/ `season_fav`（追番）本版不用。
+///
+/// **拿不到就返回 null**（调用方据此保留"状态未取到"的降级标注）：
+/// - [data] 不是 Map（`data` 缺失 / 是数组 / 是 null）；
+/// - `data` 里**三个键一个都没有** —— 这不是"三个都是 false"，而是"这个响应
+///   根本没回答我的互动态"（典型：风控改写、未登录被静默降级）。把这种情况
+///   当成 `false/false/0` 会**把"猜的"伪装成"服务端说的"**，正是 v2.40.0
+///   要避免的那件事。
+///
+/// 单个键缺失 / 类型脏（但另两个键在）→ 该字段安全默认（false / 0）：
+/// 一个字段脏不该把另外两个有效信息也丢掉（与 [parseVideoReqUser] 同一条）。
+VideoRelation? parseVideoRelation(Map<String, dynamic>? data) {
+  if (data == null) return null;
+  const keys = ['like', 'coin', 'favorite', 'fav'];
+  if (!keys.any(data.containsKey)) return null;
+  return VideoRelation(
+    like: _relationFlag(data['like']),
+    coin: _relationCoin(data['coin']),
+    // 键名是 `favorite`（真机实测）；`fav` 只是防御性兜底，防哪天有变体
+    fav: _relationFlag(
+      data.containsKey('favorite') ? data['favorite'] : data['fav'],
+    ),
+  );
+}
+
+/// 只读拉取「我对这个视频的互动态」（`GET /x/web-interface/archive/relation`）。
+///
+/// 实现在 [BiliApi.fetchVideoRelation]（要走 [_dio] / [_injectAuth]，只能是
+/// 类的方法）；这里的注释只说明**为什么另开一个接口**：v2.40.0 已三处确认
+/// （匿名 curl + 真机登录 logcat + 真实浏览器）view 接口不下发 `req_user`，
+/// 于是三个写按钮只能显示"未点赞" + 一句"状态未取到"的降级标注。这个只读
+/// 接口**2026-09 真机探针**实测带登录态就返回真实互动态（原始响应见
+/// [parseVideoRelation] 的注释），所以初始态改为「view 那次 + relation 这次」
+/// 两路并发取。
+///
+/// 代价与取舍：这是播放页**唯一**一次有意新增的请求（view 不给的东西搭不了它
+/// 的顺风车）。只读、无副作用、响应体极小；要避免的是"每次进来都重拉"。
