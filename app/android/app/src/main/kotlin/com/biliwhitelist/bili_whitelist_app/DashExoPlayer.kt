@@ -116,11 +116,17 @@ class DashExoPlayer(
     /** 共享数据源工厂：video/audio 两个 ProgressiveMediaSource 共用防盗链头。
      *
      * 超时取值（v2.17.14）：Media3 DefaultHttpDataSource 默认 connect/read 均为 8s，
-     * 弱网/抖动（慢速读流、秒级断流）容易在 8s 处被误判超时 → 弹「播放失败（2001）」
+     * 弱网/抖动（慢速读流、秒级断流）容易在 8s 处被误判超时 → 弹「播放失败」
      * 打断观看。调大为 connect 15s / read 20s：
      * - connect 15s：弱网建连、首字节慢时不再误判连接失败；
      * - read 20s：单次 socket 读超时——正常传输数据是连续的，超过 20s 收不到任何
      *   字节 ≈ 连接已死；宁可多等，配合原生重试/自动续播兜底，不在慢网上误弹错。
+     *
+     * ⚠️ 错误码别写错（曾是本文件的错注释）：读超时（`SocketTimeoutException`）
+     * 报的是 2002 `ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT`；2001 是
+     * `ERROR_CODE_IO_NETWORK_CONNECTION_FAILED`（`HttpDataSourceException`
+     * 的 IOException 兜底桶，见 [isRecoverableSourceError]）；1003
+     * `ERROR_CODE_TIMEOUT` 才是「超时」这个名字，但网络读超时不会走它。
      */
     private val dataSourceFactory = DefaultHttpDataSource.Factory()
         .setAllowCrossProtocolRedirects(true)
@@ -197,7 +203,7 @@ class DashExoPlayer(
             }
 
             override fun onPlayerError(error: PlaybackException) {
-                if (isRecoverableSourceError(error)) {
+                if (isRecoverableSourceError(error.errorCode, error.cause)) {
                     // URL 过期或瞬时网络错误（超时/断连/5xx 等）：交给 Dart 侧重取
                     // playurl 续播（保留位置），不弹错误打断观看
                     listener.onUrlExpired()
@@ -332,38 +338,6 @@ class DashExoPlayer(
         listener.onPrepared(size.width, size.height, duration, player.playWhenReady)
     }
 
-    /**
-     * 可自动恢复的数据源错误判定：URL 过期或瞬时网络错误 → true（Dart 重取流续播）。
-     *
-     * 沿 cause 链查找两类特征：
-     * 1) URL 过期/被拦：HttpDataSource 403/404/410（流地址 deadline/upsig 过期、
-     *    防盗链）；429/5xx 属 CDN/网关瞬时故障，重取流（换新签名地址）同样可自愈；
-     * 2) 瞬时网络错误：读/建连超时（SocketTimeoutException）、域名解析失败
-     *    （UnknownHostException）、连接被重置/拒绝/断开（SocketException 及其子类
-     *    ConnectException）——网络抖动多属此类。
-     *    Media3 1.5.x 已移除 HttpDataSource.TimeoutException，超时以
-     *    HttpDataSourceException 包装 SocketTimeoutException 呈现（本函数沿 cause
-     *    链可达内层），因此按 java.net 原生异常判定，不依赖 media3 具体包装类型。
-     *
-     * 其余（格式损坏/解码失败/本地文件缺失等）为真失败 → 走 onError 弹错误。
-     */
-    private fun isRecoverableSourceError(error: PlaybackException): Boolean {
-        var cause: Throwable? = error.cause ?: error
-        while (cause != null) {
-            if (cause is HttpDataSource.InvalidResponseCodeException) {
-                val code = cause.responseCode
-                if (code in setOf(403, 404, 410, 429) || code in 500..599) return true
-            }
-            if (cause is SocketTimeoutException || cause is UnknownHostException ||
-                cause is SocketException
-            ) {
-                return true
-            }
-            cause = cause.cause
-        }
-        return false
-    }
-
     fun dispose() {
         player.release()
         surface.release()
@@ -371,3 +345,80 @@ class DashExoPlayer(
         surfaceTextureEntry.release()
     }
 }
+
+/**
+ * 可自动恢复的数据源错误判定：URL 过期或瞬时网络错误 → true（Dart 侧换源续播：
+ * 先轮转备用线路，候选耗尽才重取 playurl）。
+ *
+ * 输入刻意只要 [errorCode] + [cause]（而不是 `PlaybackException` 本身）：这样它是
+ * **纯函数**，JVM 单测（`android/app/src/test/...`）不需要构造 media3 的
+ * `PlaybackException`（那个构造器内部要 `Clock.DEFAULT.elapsedRealtime()`，
+ * 依赖 Android 的 `SystemClock`，纯 JVM 下跑不起来）就能覆盖分类逻辑。
+ *
+ * 两类特征（**先看错误码，再看 cause 链**）：
+ * 1) media3 的 IO 错误码：`ERROR_CODE_IO_NETWORK_CONNECTION_FAILED`(2001) /
+ *    `ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT`(2002)。**只看 cause 类型会漏**——
+ *    media3 1.5.1 的 `HttpDataSourceException.createForIOException` 里
+ *    `SocketTimeoutException`→2002、`InterruptedIOException`→1004、
+ *    cleartext 文案→2007，**其余一切 IOException（EOFException、SSLException、
+ *    通用 IOException）全归一成 2001**：2001 是「IO 兜底桶」，只有按错误码才认得住。
+ *    ⚠️ 故意**不含** `ERROR_CODE_IO_UNSPECIFIED`(2000)：HTTP 取流路径上它会被
+ *    `HttpDataSourceException.assignErrorCode` 就地改写成 2001（type=OPEN）本就走
+ *    上面这条；真保持 2000 的是本地/其它数据源（FileDataSource 等），把它们也当
+ *    可恢复只会「重取 playurl 再打开同一个坏文件」空转，把错误页推迟几秒。
+ *    同理不含 `ERROR_CODE_IO_FILE_NOT_FOUND`(2005) 与解析/解码类（4001+）。
+ * 2) cause 链上的 Java 原生异常（保留原有白名单，覆盖不走 HttpDataSource 包装
+ *    或包装类型变化的历史/边界形态）：
+ *    - URL 过期/被拦：`HttpDataSource.InvalidResponseCodeException` 的
+ *      403/404/410/429 或 5xx（流地址 deadline/upsig 过期、防盗链、CDN/网关瞬时故障）；
+ *    - 瞬时网络错误：读/建连超时（`SocketTimeoutException`）、域名解析失败
+ *      （`UnknownHostException`）、连接被重置/拒绝/断开（`SocketException` 及其
+ *      子类 `ConnectException`）。Media3 1.5.x 已移除 `HttpDataSource.TimeoutException`，
+ *      超时以 `HttpDataSourceException` 包装 `SocketTimeoutException` 呈现（本函数沿
+ *      cause 链可达内层），因此按 java.net 原生异常判定，不依赖 media3 具体包装类型。
+ *
+ * 其余（格式损坏/解码失败/本地文件缺失等）为真失败 → 走 onError 弹错误。
+ *
+ * ⚠️ Dart 侧有一份**等价的错误码镜像判定**（`lib/pages/player_page.dart` 的
+ * `kRecoverableNativeErrorCodes`，用于「原生报错也先试一次自动续播」的兜底），
+ * 两边改动必须同步。
+ */
+internal fun isRecoverableSourceError(errorCode: Int, cause: Throwable?): Boolean {
+    // ① 先按 media3 的错误码判：2001/2002 是网络 IO 的两只「兜底桶」
+    //    （2001 收 EOF/SSL/通用 IOException，2002 收 SocketTimeoutException）
+    if (errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED ||
+        errorCode == PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT
+    ) {
+        return true
+    }
+    // ② 再沿 cause 链按 java.net 原生异常 / HTTP 状态码判
+    var c: Throwable? = cause
+    while (c != null) {
+        if (c is HttpDataSource.InvalidResponseCodeException &&
+            isRecoverableHttpStatus(c.responseCode)
+        ) {
+            return true
+        }
+        if (c is SocketTimeoutException || c is UnknownHostException ||
+            c is SocketException
+        ) {
+            return true
+        }
+        c = c.cause
+    }
+    return false
+}
+
+/**
+ * HTTP 状态码是否属于「可自动恢复」的数据源错误：403/404/410（流地址
+ * deadline/upsig 过期、防盗链）+ 429/5xx（CDN/网关瞬时故障，重取流换新签名地址
+ * 同样可自愈）；其余（400/401/402/418…）是真失败，不重试。
+ *
+ * 单独抽成纯函数是为了可单测：`HttpDataSource.InvalidResponseCodeException`
+ * 在纯 JVM 单测里造不出来（它的构造参数要 `DataSpec`，而 `DataSpec` 对
+ * `android.net.Uri` 做了 `checkNotNull`，JVM 单测里 `Uri` 恒为 null），所以把
+ * **状态码策略**和**类型分派**分开——策略（本函数）有测试覆盖，分派那行是
+ * 一眼可读的 `is` 判断。
+ */
+internal fun isRecoverableHttpStatus(code: Int): Boolean =
+    code in setOf(403, 404, 410, 429) || code in 500..599

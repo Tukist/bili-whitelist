@@ -103,6 +103,23 @@ class PlayUrlResult {
   /// 134kbps ≈30MB），见 [pickLowestBandwidthAudio]。
   final List<int> dashAudioBandwidths;
 
+  /// DASH 视频轨的**候选线路表**（v2.45.0+）：与 [dashVideoUrls] 一一对应，
+  /// 同一下标 = 同一档清晰度；每条线路表首条 = `baseUrl`（当前使用），其后 =
+  /// 该档的 `backupUrl`（备用 CDN 线路，按出现顺序去重）。解析规则见
+  /// [streamLinesOf]。
+  ///
+  /// **纯附加字段**：[dashVideoUrls] 的含义与顺序不受影响，下载管理器
+  /// （`cache/download_manager.dart`）/ 仅音频转写（`services/sherpa_audio.dart`）
+  /// 继续取 `.first`。
+  final List<List<String>> dashVideoLines;
+
+  /// DASH 音频轨的候选线路表（含义同 [dashVideoLines]，与 [dashAudioUrls] 一一对应）。
+  final List<List<String>> dashAudioLines;
+
+  /// 传统 mp4（`durl`）的候选线路表：与响应的 `durl` 一一对应，首条 = `url`，
+  /// 其后 = `backup_url`。播放取第 0 条（= [mp4Url]）。
+  final List<List<String>> mp4Lines;
+
   const PlayUrlResult({
     required this.quality,
     this.mp4Url,
@@ -110,10 +127,55 @@ class PlayUrlResult {
     this.dashAudioUrls = const [],
     this.dashAudioIds = const [],
     this.dashAudioBandwidths = const [],
+    this.dashVideoLines = const [],
+    this.dashAudioLines = const [],
+    this.mp4Lines = const [],
   });
 
   /// 是否拿到至少一条可播放的流。
   bool get hasStream => mp4Url != null || dashVideoUrls.isNotEmpty;
+}
+
+/// 取一条流条目（playurl 的 `dash.video[i]` / `dash.audio[i]` / `durl[i]`）的
+/// **候选线路表**：首条 = 主线路（`baseUrl`，durl 为 `url`），其后 = 备用线路
+/// （`backupUrl`，durl 只有 snake_case 的 `backup_url`），**按出现顺序去重**、
+/// 跳过空值。主线路缺失的畸形条目 → 空表（不做「拿备用线路顶替主线路」的猜测，
+/// 保证「候选首条 == 正在播的那条 URL」）。
+///
+/// 为什么需要备用线路：B 站同一条流会下发多台 CDN 的地址，实测（2026-09，
+/// `dash.video[0]` / `dash.audio[0]`）主线路与备用线路**不在同一台 CDN** 上——
+/// 如 baseUrl `cn-bj-fx-01-02.bilivideo.com` vs backupUrl
+/// `upos-sz-mirrorhw.bilivideo.com`。播放中「单台 CDN / 单条连接坏了」时换到
+/// 备用线路往往立刻就好，比重新取一批 playurl 更快，也不多打接口（风控友好）。
+///
+/// ⚠️ 实测同一次响应里 `baseUrl` 与各 `backupUrl` 的 `deadline` **完全相同**
+/// （同批下发的签名）→ 换备用线路**不能**延长 URL 有效期，只解决「线路级」故障；
+/// URL 快到期该走「重取 playurl」，见 player_page 的换源策略注释。
+///
+/// 只解析实测确证存在的字段（2026-09 实测：dash 条目 `baseUrl`/`base_url` +
+/// `backupUrl`/`backup_url`；durl 条目 `url` + `backup_url`）。
+List<String> streamLinesOf(Map<String, dynamic> entry) {
+  // 主线路：dash 用 baseUrl（部分渠道给 base_url），durl 用 url。
+  // 主线路缺失（畸形条目）→ 直接返回空表：**首条永远是主线路**这条不变量
+  // 比「拿备用线路顶替」重要（播放侧 `候选.first` 必须等于正在播的那条 URL）。
+  final Object? primary = entry['baseUrl'] ??
+      entry['base_url'] ??
+      entry['url'];
+  if (primary is! String || primary.isEmpty) return const [];
+  final out = <String>[primary];
+  void add(Object? url) {
+    if (url is! String || url.isEmpty || out.contains(url)) return;
+    out.add(url);
+  }
+
+  // 备用线路：dash 是 backupUrl（备用 backup_url），durl 是 backup_url
+  final backups = entry['backupUrl'] ?? entry['backup_url'];
+  if (backups is List) {
+    for (final url in backups) {
+      add(url);
+    }
+  }
+  return out;
 }
 
 /// 从 DASH 音频流里挑**码率最低**的那条的 URL（没有音频流 → null）。
@@ -157,6 +219,9 @@ class PgcPlayUrlResult extends PlayUrlResult {
     super.dashAudioUrls = const [],
     super.dashAudioIds = const [],
     super.dashAudioBandwidths = const [],
+    super.dashVideoLines = const [],
+    super.dashAudioLines = const [],
+    super.mp4Lines = const [],
     required this.isPreview,
   });
 }
@@ -1625,7 +1690,9 @@ class BiliApi {
   /// 解析 playurl 响应 `data`/`result` 里的流信息（普通接口与 pgc 接口共用，
   /// 两者 dash/durl 结构一致）。
   ///
-  /// 返回：quality（下发清晰度）+ durl[0].url（mp4 单流）+ dash 双流列表。
+  /// 返回：quality（下发清晰度）+ durl[0].url（mp4 单流）+ dash 双流列表；
+  /// 另附各轨的**候选线路表**（[PlayUrlResult.dashVideoLines] 等，v2.45.0+：
+  /// 主线路 + backupUrl 备用线路，供播放中换 CDN 用），既有字段语义不变。
   static PlayUrlResult _parsePlayUrlData(Map<String, dynamic> d) {
     final quality = (d['quality'] as num?)?.toInt() ?? 0;
     // 传统 mp4：durl[0].url
@@ -1641,20 +1708,35 @@ class BiliApi {
     final audioUrls = <String>[];
     final audioIds = <int>[];
     final audioBandwidths = <int>[];
+    // 候选线路表：与上面的 urls 一一对应（同一下标 = 同一条流），见 streamLinesOf
+    final videoLines = <List<String>>[];
+    final audioLines = <List<String>>[];
     if (dash != null) {
       for (final v in (dash['video'] as List? ?? const [])) {
-        final url = (v as Map<String, dynamic>)['baseUrl'] as String?;
-        if (url != null && url.isNotEmpty) videoUrls.add(url);
+        final m = v as Map<String, dynamic>;
+        final url = m['baseUrl'] as String?;
+        if (url != null && url.isNotEmpty) {
+          videoUrls.add(url);
+          videoLines.add(streamLinesOf(m));
+        }
       }
       for (final a in (dash['audio'] as List? ?? const [])) {
         final m = a as Map<String, dynamic>;
         final url = m['baseUrl'] as String?;
         if (url == null || url.isEmpty) continue;
         audioUrls.add(url);
+        audioLines.add(streamLinesOf(m));
         // 档位 id / 码率与 url 一一对应（缺字段填 0）——「仅缓存音频」靠
         // 码率挑最低档，顺序不可信（见 PlayUrlResult.dashAudioUrls 注释）
         audioIds.add((m['id'] as num?)?.toInt() ?? 0);
         audioBandwidths.add((m['bandwidth'] as num?)?.toInt() ?? 0);
+      }
+    }
+    // mp4 的候选线路表（附加；mp4Url 仍严格取 durl[0].url，语义不变）
+    final mp4Lines = <List<String>>[];
+    if (durl != null) {
+      for (final e in durl) {
+        if (e is Map<String, dynamic>) mp4Lines.add(streamLinesOf(e));
       }
     }
     return PlayUrlResult(
@@ -1664,6 +1746,9 @@ class BiliApi {
       dashAudioUrls: audioUrls,
       dashAudioIds: audioIds,
       dashAudioBandwidths: audioBandwidths,
+      dashVideoLines: videoLines,
+      dashAudioLines: audioLines,
+      mp4Lines: mp4Lines,
     );
   }
 
@@ -1761,6 +1846,9 @@ class BiliApi {
       dashAudioUrls: result.dashAudioUrls,
       dashAudioIds: result.dashAudioIds,
       dashAudioBandwidths: result.dashAudioBandwidths,
+      dashVideoLines: result.dashVideoLines,
+      dashAudioLines: result.dashAudioLines,
+      mp4Lines: result.mp4Lines,
       isPreview: isPreview,
     );
   }

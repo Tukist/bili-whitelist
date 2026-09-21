@@ -97,4 +97,11 @@ dependencies {
     // HLS 必须由 media3-exoplayer-hls 的 HlsMediaSource 解析。
     // 同为 1.5.1：与上面三个严格同版本（media3 各库必须同版本）。
     implementation("androidx.media3:media3-exoplayer-hls:1.5.1")
+
+    // JVM 单测（android/app/src/test/）：只测纯函数——目前是 DashExoPlayer.kt 的
+    // isRecoverableSourceError 错误分类（决定「弹播放失败」还是「自动换源续播」，
+    // 正是用户抱怨的 2001 那条路径的核心判定）。用 JUnit4 而非 Robolectric：
+    // 被测函数只吃 int + Throwable，不需要 Android 运行时，不起设备、跑得飞快
+    // （门禁加一条 ./gradlew :app:testDebugUnitTest）。
+    testImplementation("junit:junit:4.13.2")
 }

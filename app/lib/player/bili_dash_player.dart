@@ -276,9 +276,12 @@ class BiliDashErrorEvent extends BiliDashEvent {
   });
 }
 
-/// 流 URL 过期（403/404/410/429/5xx）或瞬时网络错误（超时/断连，如 2001
-/// timeout）——原生判定为**可自动恢复**的数据源错误，播放页负责重取 playurl
-/// 后 setDataSource 续播（保留位置），不弹错误打断观看。
+/// 流 URL 过期（403/404/410/429/5xx）或瞬时网络错误（网络连接失败 2001 /
+/// 连接超时 2002——⚠️ 2001 是 media3 的 IO 兜底桶
+/// `ERROR_CODE_IO_NETWORK_CONNECTION_FAILED`，**不是** timeout；见
+/// DashExoPlayer.isRecoverableSourceError）——原生判定为**可自动恢复**的数据源
+/// 错误，播放页负责换源后 setDataSource 续播（保留位置），不弹错误打断观看
+/// （先轮转 backupUrl 备用线路，候选耗尽才重取 playurl，v2.45.0+）。
 class BiliDashUrlExpiredEvent extends BiliDashEvent {
   const BiliDashUrlExpiredEvent({required super.textureId});
 }

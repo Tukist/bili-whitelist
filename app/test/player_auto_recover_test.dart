@@ -3,9 +3,11 @@
 // - 退避表/放弃文案与决策逻辑见 lib/pages/player_page.dart 顶部的纯函数
 //
 // 背景：原生把「可自动恢复的数据源错误」（流 URL 过期 403/404/410/429/5xx、
-// 瞬时网络错误如 2001 timeout/断连）统一发 onUrlExpired，Dart 侧重取 playurl
-// 续播（保留位置）；续播失败按 1s/2s/4s 退避**有限次**，仍失败才显示错误
-// （保留手动重试兜底），避免网络抖动弹「播放失败」打断观看。
+// 瞬时网络错误如 2001 网络连接失败 / 2002 连接超时——⚠️ 2001 是 media3 的 IO
+// 兜底桶，**不是** timeout）统一发 onUrlExpired，Dart 侧换源续播（保留位置；
+// 先轮转备用线路、候选耗尽才重取 playurl，v2.45.0+）；续播失败按 1s/2s/4s
+// 退避**有限次**，仍失败才显示错误（保留手动重试兜底），避免网络抖动弹
+// 「播放失败」打断观看。
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:bili_whitelist_app/pages/player_page.dart';

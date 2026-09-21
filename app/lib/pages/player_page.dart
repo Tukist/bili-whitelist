@@ -147,6 +147,37 @@ int? autoRecoverDelayMs(int attempt) =>
 /// 自动续播耗尽（连续失败超过上限）后的错误文案（保留「重试」按钮兜底）。
 const String kAutoRecoverGiveUpMessage = '播放中断（网络或视频流异常），请重试';
 
+/// **可恢复类**的 ExoPlayer 错误码（media3 `PlaybackException` 常量值，v2.45.0+）。
+///
+/// 用途：原生报「致命错误」时（[BiliDashErrorEvent]）再给一次自动续播机会——
+/// 原生分类（Kotlin `DashExoPlayer.isRecoverableSourceError`）是**白名单**，
+/// 万一漏判，Dart 侧还有一层兜底（见 `_onNativeError`）。
+///
+/// ⚠️ **必须与原生侧同步**（两处判定描述的是同一件事）：
+/// - [kExoErrorIoNetworkConnectionFailed] = `ERROR_CODE_IO_NETWORK_CONNECTION_FAILED`。
+///   media3 1.5.x 的 `HttpDataSourceException.createForIOException` 把**其余一切
+///   IOException**（EOFException / SSLException / 通用 IOException）都归到这里：
+///   2001 是「IO 兜底桶」，**不是**超时；`ERROR_CODE_TIMEOUT` 是 1003（网络读超时
+///   不会走它）。
+/// - [kExoErrorIoNetworkConnectionTimeout] = `ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT`
+///   由 `SocketTimeoutException` 映射而来（读/建连超时）。
+///
+/// 故意**不含** `ERROR_CODE_IO_UNSPECIFIED`(2000) / `ERROR_CODE_IO_FILE_NOT_FOUND`
+/// (2005) / 解析(4001+)、解码(3001+) 类：见原生函数注释里「HTTP 取流路径上 2000
+/// 会被 `assignErrorCode` 改写成 2001，真留在 2000 的多是本地文件」的说明。
+const Set<int> kRecoverableNativeErrorCodes = {
+  kExoErrorIoNetworkConnectionFailed,
+  kExoErrorIoNetworkConnectionTimeout,
+};
+
+/// media3 `PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_FAILED`（网络连接失败，
+/// HTTP 取流的 IOException 兜底桶）。
+const int kExoErrorIoNetworkConnectionFailed = 2001;
+
+/// media3 `PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT`（读/建连超时，
+/// `SocketTimeoutException` 映射而来）。
+const int kExoErrorIoNetworkConnectionTimeout = 2002;
+
 // -------------------------------------------------------------------------
 // 流 URL deadline 解析 + 主动预取换源决策（v2.17.15+，纯函数，便于单测）
 //
@@ -211,6 +242,68 @@ bool shouldPrefetchSource({
   if (deadlineRemainMs == null || videoRemainMs <= 0) return false;
   return deadlineRemainMs - videoRemainMs < leadMs;
 }
+
+// -------------------------------------------------------------------------
+// 备用线路（backupUrl）轮转决策（v2.45.0+，纯函数，便于单测）
+//
+// 背景：B 站同一条流会下发多台 CDN 的地址（`baseUrl` + `backupUrl[]`，见
+// `api/bilibili_api.dart` 的 streamLinesOf）。改动前换源只有「重取 playurl」
+// 一条路，而重取回来的还是同一批线路（同一台 CDN）→ 单台 CDN/单条连接坏了就
+// 一直坏。现在：**先在本批已拿到的候选线路里轮转到下一条**，本批耗尽才重取
+// playurl 换一批（重取后候选与游标重置）。
+//
+// ⚠️ 实测（2026-09）：同一次响应里 baseUrl 与各 backupUrl 的 `deadline` 签名
+// 完全相同 → 轮转**延长不了 URL 有效期**。所以「URL 快到期」（主动预取）必须
+// 重取 playurl；轮转只解决「线路级故障」（某台 CDN 报错/连不上）。
+// -------------------------------------------------------------------------
+
+/// 换源动因：决定「在本批候选里轮转」还是「重取 playurl」。
+enum StreamSwitchCause {
+  /// 当前线路已经真实报错（原生 `onUrlExpired` / Dart 侧可恢复错误码兜底）。
+  lineError,
+
+  /// 当前 URL 的 deadline 即将到期（主动预取换源）。
+  deadline,
+}
+
+/// 候选线路游标推进（纯函数）：返回**下一条**线路的下标；
+/// null = 本批候选已耗尽（需要重取 playurl 换一批）。
+///
+/// [usedIndex] = 本批已用到的线路下标（**-1** = 本批还没用过任何线路 →
+/// 返回 0，即「首条优先」）。只有一条候选时 `usedIndex=0` 直接返回 null
+/// （没有别的线路可换，必须换批）。
+int? nextStreamLineIndex({required int lineCount, required int usedIndex}) {
+  if (lineCount <= 0) return null;
+  final next = usedIndex + 1;
+  if (next < 0) return 0;
+  return next < lineCount ? next : null;
+}
+
+/// 取第 [index] 条线路；越界时**钳位到该轨最后一条**（负数 → 首条）。
+///
+/// 为什么钳位而不是返回 null：video/audio 两轨来自**同一次** playurl 响应，
+/// 必须成对推进（视频换到第 2 条而音频还在第 1 条 = 混搭两批签名，行为不可预期，
+/// 见 [_PlayerPageState._switchStreamLine]）；而两轨的候选条数不保证相同
+/// （实测 video/audio 各 2 条备用，但接口随时可变）→ 用「同一游标 + 各轨钳位」
+/// 保证同进同退，候选短的那轨停在它最后一条上。
+String? streamLineAt(List<String> lines, int index) {
+  if (lines.isEmpty) return null;
+  if (index < 0) return lines.first;
+  return lines[index < lines.length ? index : lines.length - 1];
+}
+
+/// 是否需要**重取 playurl**（true）；false = 在本批候选里轮转即可。
+///
+/// - [StreamSwitchCause.lineError]：有下一条候选就轮转（当前线路报错多属单台
+///   CDN/单条连接坏了，B 站下发的备用线路正指向另一台 CDN，换过去往往立刻就好，
+///   且省一次 playurl 请求）；候选耗尽才重取。
+/// - [StreamSwitchCause.deadline]：**一律重取**——备用线路与当前线路同批、deadline
+///   相同（见上方实测），轮转延长不了有效期，只有重取才能拿到新签名的 URL。
+bool shouldReloadStreamUrl({
+  required StreamSwitchCause cause,
+  required bool hasNextLine,
+}) =>
+    cause == StreamSwitchCause.deadline || !hasNextLine;
 
 // -------------------------------------------------------------------------
 // B 站式播放快捷手势（v2.16.7+）纯函数（便于单测）
@@ -588,8 +681,11 @@ final Map<String, int> _viewAidCache = {};
 ///   横屏全屏 = 打开独立评论页（原行为）。全屏（横屏）保持整屏播放布局
 ///   （无下方内容区）。
 /// - 播放错误自动续播（v2.17.14+，onUrlExpired）：原生把**可自动恢复**的数据源错误
-///   （流 URL 过期 403/404/410/429/5xx + 瞬时网络错误：超时/断连/解析失败，含
-///   2001 timeout）统一归为 onUrlExpired → Dart 重取 playurl → 记位置 →
+///   （流 URL 过期 403/404/410/429/5xx + 瞬时网络错误：连不上/超时/断连/解析失败，
+///   即 media3 的 2001 `ERROR_CODE_IO_NETWORK_CONNECTION_FAILED` 与 2002
+///   `ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT`——⚠️ 2001 是网络 IO 的兜底桶，
+///   **不是**超时）统一归为 onUrlExpired → Dart 换源续播：先轮转本批备用线路
+///   （backupUrl，v2.45.0+），候选耗尽才重取 playurl → 记位置 →
 ///   setDataSource(新流, 位置) 续播（不弹错误打断观看）；续播失败按退避
 ///   1s→2s→4s 自动重试**有限次**（每段播放独立预算，成功 READY 清零），仍失败
 ///   才显示错误 + 重试按钮（手动兜底）
@@ -917,6 +1013,16 @@ class PlayerPage extends StatefulWidget {
   /// 越界时按 0 处理（防御：列表在别处被改过也不至于崩）。
   final int playlistIndex;
 
+  /// 取流接口（**仅测试注入用**；生产传 null，由 State 自建）。
+  ///
+  /// 与 [LivePlayerPage.api] / [UpownerPage.api] / [InboxPage.api] 同一套注入
+  /// 约定。存在的理由：自动续播 / 备用线路轮转的接线（「重取了几次 playurl」
+  /// 「换到哪条线路」）只能靠可控的取流替身精确断言，而 State 自己 new 了
+  /// BiliApi、测试无法插手（HTTP 层替身能拦请求但数不清「第几次」也不便改
+  /// 响应内容）。
+  @visibleForTesting
+  final BiliApi? api;
+
   const PlayerPage({
     super.key,
     required this.video,
@@ -925,6 +1031,7 @@ class PlayerPage extends StatefulWidget {
     this.videoShotService,
     this.playlist,
     this.playlistIndex = 0,
+    this.api,
   });
 
   @override
@@ -969,7 +1076,8 @@ class _PlayerPageState extends State<PlayerPage>
   bool get _canPlayNext =>
       _hasPlaylistNeighbors && _playlistIndex < _playlistVideos!.length - 1;
 
-  final BiliApi _api = BiliApi();
+  /// 取流接口：`initState` 里按 [PlayerPage.api] 落定（生产 = 自建 [BiliApi]）。
+  late final BiliApi _api;
 
   /// 翻译服务（副字幕「翻译（中文）」；配置在管理面板）。
   final TranslateApi _translateApi = TranslateApi();
@@ -1639,6 +1747,22 @@ class _PlayerPageState extends State<PlayerPage>
   /// playurl；见 [kPrefetchMinIntervalMs]）。
   int _lastPrefetchAttemptMs = 0;
 
+  // 备用线路（backupUrl）轮转（v2.45.0+）
+  // ---------------------------------------------------------------------
+  // 每批 playurl 响应里，正在播的两轨各自的候选线路（首条 = baseUrl）+ 游标。
+  // 换源时先在本批里轮转（躲开坏掉的单台 CDN），本批耗尽才重取 playurl 换一批
+  // （重取走 [_playStream] → 候选与游标一并重置）。决策见 [shouldReloadStreamUrl]。
+  /// 本批视频轨的候选线路（`dashVideoLines[0]`；mp4 降级时 = `mp4Lines[0]`）。
+  /// 空 = 无候选（本地缓存播放 / 还没取到网络流）。
+  List<String> _videoLines = const [];
+
+  /// 本批音频轨的候选线路（`dashAudioLines[0]`；mp4 单流/本地 → 空）。
+  List<String> _audioLines = const [];
+
+  /// 已用到的线路下标（-1 = 本批尚未启用；0 = 正在用首条；与
+  /// [nextStreamLineIndex] 的入参语义一致）。
+  int _lineCursor = -1;
+
   /// 播放器重建代次：_init 每次（首次进入/手动重试/换源/切集后恢复）自增。
   /// 自动续播流程 await 间隙若有重建（_init 必经），凭代次差异安全退出，
   /// 防止向新播放器重复 setDataSource 造成双源竞争。
@@ -1724,6 +1848,8 @@ class _PlayerPageState extends State<PlayerPage>
     }
     // 拖动预览服务：生产自建，测试可注入（见 [PlayerPage.videoShotService]）
     _videoShot = widget.videoShotService ?? VideoShotService();
+    // 取流接口：生产自建，测试可注入（见 [PlayerPage.api]）
+    _api = widget.api ?? BiliApi();
     // 历史记录续播：初始定位到对应分 P（越界 / 单 P 回落第 0 集）。
     // 必须在 _init 之前设置，_maybeRestoreProgress 按 _currentPageIndex 取进度。
     //
@@ -2040,6 +2166,10 @@ class _PlayerPageState extends State<PlayerPage>
       // 不再适用，新流 setDataSource 后由 _playStream 重新记录
       _prefetching = false;
       _netStreamDeadlineMs = null;
+      // 备用线路候选随之作废（旧播放器的流），由 _playStream 在新流上重建
+      _videoLines = const [];
+      _audioLines = const [];
+      _lineCursor = -1;
       // 重新初始化（重试/重进）→ 清空字幕状态，等下次面板打开/切集再拉
       _subtitleTracks = const [];
       _subtitleLoading = false;
@@ -2096,6 +2226,10 @@ class _PlayerPageState extends State<PlayerPage>
   /// 取流并开始播放：**已缓存且源为本地 → 直接播本地文件**（无网络、无 URL
   /// 过期问题）；否则优先 DASH 双流（video+audio），无 dash 则 fnval=0 降级
   /// mp4 单流。
+  ///
+  /// ⚠️ 恢复/预取**换源**不要直接调它：走 [_switchStreamLine]（同为网络流时
+  /// 会先在本批候选线路里轮转，省一次 playurl），它内部才在候选耗尽时落到本方法。
+  /// 起播（[_init] / 切集 / 手动重试 / 本地⇄网络切源）直接调本方法是对的。
   /// cid 取当前集 `_currentCid`（多 P 切换选集后为 pages[index].cid）。
   ///
   /// v2.39.0+ 缓存命中多了一个前提 [PlaySource.local]：源为 [PlaySource.network]
@@ -2138,6 +2272,11 @@ class _PlayerPageState extends State<PlayerPage>
       // 本地缓存播放无 deadline（也不应去取网络流）：主动预取不适用，
       // 标记清除（防上一次网络流的 deadline 残留误触发）
       _netStreamDeadlineMs = null;
+      // 备用线路候选随之清空：本地文件没有「换 CDN」这回事
+      // （不清的话，本批网络流候选残留会让后续错误事件误换回网络流）
+      _videoLines = const [];
+      _audioLines = const [];
+      _lineCursor = -1;
       return;
     }
     // 走网络流：一定不是「仅音频缓存」播放（换源/新集/未缓存），复位标记
@@ -2190,7 +2329,8 @@ class _PlayerPageState extends State<PlayerPage>
   }
 
   /// 把解析好的流交给播放器播放（dash 双流 / mp4 单流），并记录网络流
-  /// URL 的 deadline（主动预取换源判定用，v2.17.15+）。
+  /// URL 的 deadline（主动预取换源判定用，v2.17.15+）与**候选线路表**
+  /// （备用线路轮转用，v2.45.0+）。
   ///
   /// [result] 须 [PlayUrlResult.hasStream] 为真（调用方保证）。
   Future<void> _playStream(PlayUrlResult result,
@@ -2202,10 +2342,29 @@ class _PlayerPageState extends State<PlayerPage>
     if (result.dashVideoUrls.isNotEmpty) {
       videoUrl = result.dashVideoUrls.first;
       audioUrl = result.dashAudioUrls.isEmpty ? null : result.dashAudioUrls.first;
+      // 候选线路表与 dashVideoUrls/dashAudioUrls 一一对应，播放取第 0 条
+      // （== .first，见 api 层 streamLinesOf 与 _parsePlayUrlData 的约定）；
+      // 解析缺失（旧解析/测试手工构造的样本）时退化为「只有主线路」——
+      // 尤其是音频轨：宁可只剩一条（轮转时钳位在它上面）也不能置空，
+      // 置空会让换源把音轨整个丢掉（变成无声画面）
+      _videoLines = result.dashVideoLines.isNotEmpty
+          ? List.unmodifiable(result.dashVideoLines.first)
+          : [videoUrl];
+      _audioLines = audioUrl == null
+          ? const []
+          : (result.dashAudioLines.isNotEmpty
+              ? List.unmodifiable(result.dashAudioLines.first)
+              : [audioUrl]);
     } else {
       videoUrl = result.mp4Url!;
       audioUrl = null;
+      _videoLines = result.mp4Lines.isNotEmpty && result.mp4Lines.first.isNotEmpty
+          ? List.unmodifiable(result.mp4Lines.first)
+          : [videoUrl];
+      _audioLines = const [];
     }
+    // 新一批线路：游标归零（0 = 正在用首条），换源时从下标 1 起轮转
+    _lineCursor = 0;
     await player.setDataSource(videoUrl,
         audioUrl: audioUrl,
         positionMs: positionMs,
@@ -2604,6 +2763,26 @@ class _PlayerPageState extends State<PlayerPage>
   void _onNativeError(int code, String message) {
     debugPrint('[player] onNativeError code=$code msg=$message');
     if (!mounted) return;
+    // 兜底（v2.45.0+）：原生按「错误码 + cause 链」分类（DashExoPlayer.isRecoverableSourceError），
+    // 网络 IO 兜底桶（2001/2002）已在原生侧纳入可恢复；但那套分类本质是白名单，
+    // 将来 media3/插件新增包装类型时仍可能漏。这里对「可恢复类」错误码再给一次
+    // 自动续播机会（受同一个 [_autoRecoverFails] 预算约束，最多 3 次）。
+    //
+    // 与原生侧的分工：**原生优先**（能判可恢复就发 onUrlExpired，根本走不到这里）；
+    // 本分支只在原生把它当致命错误时兜一次。三个前置条件都必要：
+    // - `_error == null`：错误态里再来事件不兜（保持「新错误覆盖旧文案」的旧行为，
+    //   也不会让 [_onAutoRecover] 一进去就因 `_error != null` 直接返回、把事件吞掉）；
+    // - `!_autoRecovering` / `!_prefetching`：换源中不并发插一脚（同样会被它们吞掉）；
+    // - 预算未耗尽：真不可恢复的错误最多多花 1s+2s+4s 退避，仍会落到 [_showFatal]。
+    if (kRecoverableNativeErrorCodes.contains(code) &&
+        _error == null &&
+        !_autoRecovering &&
+        !_prefetching &&
+        autoRecoverDelayMs(_autoRecoverFails) != null) {
+      debugPrint('[player] 可恢复类原生错误 code=$code → 先试一次自动续播');
+      unawaited(_onAutoRecover());
+      return;
+    }
     // 403 = 防盗链异常（流请求 Referer/UA 缺失或被拦）
     final msg = message.contains('403') ? '防盗链异常（403），请稍后重试' : message;
     setState(() {
@@ -2615,9 +2794,60 @@ class _PlayerPageState extends State<PlayerPage>
     unawaited(_syncNowPlaying()); // 通知副标题 → 播放失败
   }
 
+  /// 本批候选线路里是否还有**没用过**的下一条（用于 [shouldReloadStreamUrl]）。
+  bool get _hasNextStreamLine =>
+      nextStreamLineIndex(lineCount: _videoLines.length, usedIndex: _lineCursor) !=
+      null;
+
+  /// 换源（恢复 / 预取**共用**）：能轮转备用线路就轮转（不重取 playurl），
+  /// 本批候选耗尽才重取一批新的（见 [shouldReloadStreamUrl]）。
+  ///
+  /// video/audio **成对推进**：两轨用同一个游标（[_lineCursor] 自增一次），
+  /// 各轨按 [streamLineAt] 钳位——它们来自同一次 playurl 响应，混搭会出现
+  /// 「视频用 A 批签名、音频用 B 批签名」这种不可预期的组合。
+  ///
+  /// 失败（playurl 抛错 / setDataSource 抛错）原样上抛，由调用方按既有退避
+  /// 与预算处理；预算仍由调用方（[_onAutoRecover]）统一预扣。
+  Future<void> _switchStreamLine({
+    required int positionMs,
+    required StreamSwitchCause cause,
+  }) async {
+    final player = _player;
+    if (player == null) return;
+    if (shouldReloadStreamUrl(cause: cause, hasNextLine: _hasNextStreamLine)) {
+      // 重取 playurl 换一批（候选与游标在 _playStream 里一并重置）：
+      // - deadline：备用线路与当前线路同批、deadline 相同，轮转延长不了有效期
+      // - lineError：本批候选已耗尽（含 video/audio 都被钳到末条的情形）
+      debugPrint('[player_page] 重取 playurl 换一批线路'
+          '（原因=$cause，本批候选=${_videoLines.length} 条）');
+      await _loadStreamAndPlay(positionMs: positionMs);
+      return;
+    }
+    final next = nextStreamLineIndex(
+        lineCount: _videoLines.length, usedIndex: _lineCursor)!;
+    final videoUrl = streamLineAt(_videoLines, next)!;
+    final audioUrl = _audioLines.isEmpty ? null : streamLineAt(_audioLines, next);
+    _lineCursor = next; // 成对推进：两轨共用这一个游标
+    debugPrint('[player_page] 轮转备用线路 → 第 ${next + 1}/${_videoLines.length} 条 '
+        '${_hostOf(videoUrl)} 当前位置=${positionMs}ms');
+    await player.setDataSource(videoUrl,
+        audioUrl: audioUrl,
+        positionMs: positionMs,
+        title: _video.title,
+        artist: _video.upName,
+        coverUrl: _video.cover);
+    // 与 _playStream 同款：记录本条线路的 deadline（同批 URL 的 deadline 相同，
+    // 记录是为了「无 deadline」判定不丢；主动预取仍按 remaining 决策重取）
+    _netStreamDeadlineMs = streamDeadlineMs(videoUrl);
+  }
+
+  /// 取 URL 的域名（仅日志用，解析失败回退空串）。
+  String _hostOf(String url) => Uri.tryParse(url)?.host ?? '';
+
   /// 自动续播（流 URL 过期 / 瞬时网络错误，原生已统一归类为可恢复）：
-  /// 重取 playurl → 记当前位置 → setDataSource 续播（保留位置），失败按
-  /// [kAutoRecoverBackoffMs] 退避重试**有限次**（预算 [_autoRecoverFails]，
+  /// 优先在本批候选线路里轮转（备用 CDN，v2.45.0+，见 [_switchStreamLine]），
+  /// 候选耗尽才重取 playurl → 记当前位置 → setDataSource 续播（保留位置），
+  /// 失败按 [kAutoRecoverBackoffMs] 退避重试**有限次**（预算 [_autoRecoverFails]，
   /// 新流成功 READY 后清零），仍失败才显示 [kAutoRecoverGiveUpMessage]——
   /// 保留「重试」按钮手动兜底，网络抖动弹错打断观看成为极少情况。
   Future<void> _onAutoRecover() async {
@@ -2651,7 +2881,9 @@ class _PlayerPageState extends State<PlayerPage>
         if (!mounted || _error != null || session != _initSession) return;
         final position = await _player?.getPosition() ?? 0;
         try {
-          await _loadStreamAndPlay(positionMs: position);
+          // 换源：先轮转本批备用线路（换台 CDN），候选耗尽才重取 playurl
+          await _switchStreamLine(
+              positionMs: position, cause: StreamSwitchCause.lineError);
           // 续播成功：按当前倍速恢复（换源后原生倍速会被重置为 1x）
           await _player?.setPlaybackSpeed(_speed);
           if (mounted) setState(() => _buffering = false);
@@ -2676,9 +2908,11 @@ class _PlayerPageState extends State<PlayerPage>
   ///   播放器未重建（代次一致）；
   /// - 判定：当前网络流 deadline 剩余 < 剩余内容时长 + [kPrefetchLeadMs]
   ///   （[shouldPrefetchSource]，deadline 缺失/时长未知 → 不预取回退被动）；
-  /// - 触发：节流（距上次尝试 ≥ [kPrefetchMinIntervalMs]）后重取 playurl →
-  ///   记位置 → setDataSource 平滑换源（同 [_onAutoRecover] 的续播路径，
-  ///   但此刻 URL 仍有效，不会失败）；
+  /// - 触发：节流（距上次尝试 ≥ [kPrefetchMinIntervalMs]）后换源 →
+  ///   记位置 → setDataSource 平滑换源。**这里一律重取 playurl**：备用线路与
+  ///   当前线路同批、deadline 相同（实测），轮转延长不了有效期（见
+  ///   [shouldReloadStreamUrl]）——但仍与被动续播共用同一个换源入口
+  ///   （[_switchStreamLine]），避免两条路径的策略分叉；
   /// - 失败：静默（不弹错），URL 尚有效则下轮再试；期间原生若因 URL 真过期
   ///   报 onUrlExpired 会被 [_prefetching] 让路并最终走回 [_onAutoRecover]。
   Future<void> _maybePrefetchSource() async {
@@ -2716,7 +2950,11 @@ class _PlayerPageState extends State<PlayerPage>
       if (mounted) setState(() => _buffering = true); // 换源短暂转缓冲
       final posNow = await player.getPosition();
       if (!mounted || session != _initSession) return;
-      await _loadStreamAndPlay(positionMs: posNow); // 同集同清晰度重取流换源
+      // 换源：deadline 将尽时**必须重取 playurl**（备用线路与当前线路同批、
+      // deadline 相同，轮转延长不了有效期）；本方法与被动续播共用同一套
+      // 「轮转 / 重取」决策（见 [_switchStreamLine]），避免两处策略分叉
+      await _switchStreamLine(
+          positionMs: posNow, cause: StreamSwitchCause.deadline);
       await player.setPlaybackSpeed(_speed); // 换源后原生倍速被重置为 1x
       // 新流 READY 时 onPrepared 会把 _buffering 置 false 并续 _playing
     } catch (e) {
