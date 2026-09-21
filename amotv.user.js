@@ -493,7 +493,7 @@
         const tokenInput = document.createElement('input');
         tokenInput.type = 'text';
         tokenInput.value = getToken();
-        tokenInput.placeholder = 'ghp_xxxxxxxxxxxxxxxxxxxx（需 gist 权限）';
+        tokenInput.placeholder = '在此粘贴 GitHub Token（ghp_ 开头、需 gist 权限）';
         tokenInput.style.cssText = [
             'width:100%',
             'box-sizing:border-box',

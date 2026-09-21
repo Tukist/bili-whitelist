@@ -16,6 +16,7 @@ import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart' show debugPrint;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -704,6 +705,235 @@ void main() {
       expect(await apkFile().readAsBytes(), payload); // 本次仍正常续传合并
       expect(_rangeOf(src.requests.single), 'bytes=8-');
     });
+
+    // ---------- 完整性把关（v2.46.0）----------
+
+    test('实收字节 ≠ info.size（流干净结束但被截断）→ 不产出 apk、保留 .part', () async {
+      final src = _DownloadSource(payload); // 只发 20 字节
+      final svc = await buildSvc(src);
+
+      await expectLater(
+        svc.download(info(size: payload.length + 5)), // 声称 25 字节
+        throwsA(
+          isA<UpdateException>().having(
+            (e) => e.message,
+            'message',
+            allOf(
+              contains('下载未完成'),
+              contains('20'),
+              contains('25'),
+              isNot(contains('未知错误')),
+            ),
+          ),
+        ),
+      );
+
+      expect(await apkFile().exists(), isFalse, reason: '截断文件绝不能被 rename 成 apk');
+      final part = partFile();
+      expect(await part.exists(), isTrue, reason: '.part 保留 → 点「重试」还能续传');
+      expect(await part.readAsBytes(), payload);
+      expect(src.requests, hasLength(1)); // 尺寸不符不自动重试（size 可能本身就过时）
+    });
+
+    test('sha256 缺失（旧 Release 资产）时同样按大小把关 → 截断文件不进安装', () async {
+      // 改动前：没有 digest 就完全没人拦，「流干净结束」即被当成完整 APK
+      final src = _DownloadSource(payload);
+      final svc = await buildSvc(src);
+
+      await expectLater(
+        svc.download(info(size: 100, sha256: null)),
+        throwsA(isA<UpdateException>()),
+      );
+
+      expect(await apkFile().exists(), isFalse);
+      expect(await partFile().exists(), isTrue);
+    });
+
+    test('206 续传的 Content-Range 起始偏移 ≠ 请求位置 → 报错且不追加任何字节', () async {
+      // 预置 8 字节半成品 → 本次请求 Range: bytes=8-
+      final dir = partFile().parent;
+      await dir.create(recursive: true);
+      await partFile().writeAsBytes(payload.take(8).toList());
+
+      final src = _DownloadSource(payload)..contentRangeStartOverride = 0; // 服务器从 0 开始发
+      final svc = await buildSvc(src);
+
+      await expectLater(
+        svc.download(info()),
+        throwsA(
+          isA<UpdateException>().having(
+            (e) => e.message,
+            'message',
+            allOf(contains('续传位置不符'), isNot(contains('未知错误'))),
+          ),
+        ),
+      );
+
+      expect(await partFile().readAsBytes(), payload.take(8).toList(),
+          reason: '错位数据一个字节都不许追加');
+      expect(await apkFile().exists(), isFalse);
+      expect(src.requests, hasLength(1)); // 不重试
+    });
+
+    // ---------- 已下好的 APK 复用（v2.46.0）----------
+
+    test('existingApk：大小 + sha256 都对 → 返回已下好的路径（不触网）', () async {
+      await apkFile().create(recursive: true);
+      await apkFile().writeAsBytes(payload);
+      final good = sha256.convert(payload).toString();
+      final src = _DownloadSource(payload);
+      final svc = await buildSvc(src);
+
+      expect(await svc.existingApk(info(sha256: good)), apkFile().path);
+      expect(src.requests, isEmpty, reason: '复用判定是纯本地检查，不该发请求');
+    });
+
+    test('existingApk：大小不符 → null（交给 download 重下），文件留着不动', () async {
+      await apkFile().create(recursive: true);
+      await apkFile().writeAsBytes(payload.take(5).toList()); // 只有 5 字节
+      final svc = await buildSvc(_DownloadSource(payload));
+
+      expect(await svc.existingApk(info()), isNull);
+      expect(await apkFile().exists(), isTrue);
+    });
+
+    test('existingApk：sha256 不符 → null 且删掉这份坏文件', () async {
+      await apkFile().create(recursive: true);
+      await apkFile().writeAsBytes(payload);
+      final svc = await buildSvc(_DownloadSource(payload));
+
+      expect(await svc.existingApk(info(sha256: 'a' * 64)), isNull);
+      expect(await apkFile().exists(), isFalse, reason: '坏包留着只会被误装，直接删');
+    });
+
+    test('existingApk：文件不存在 → null', () async {
+      final svc = await buildSvc(_DownloadSource(payload));
+      expect(await svc.existingApk(info()), isNull);
+    });
+
+    test('existingApk：换版本（versionCode 不同）→ null，绝不拿旧版本文件顶包', () async {
+      final dir = apkFile().parent;
+      await dir.create(recursive: true);
+      final newer = File('${dir.path}/app-update-39.apk');
+      await newer.writeAsBytes(payload);
+      final svc = await buildSvc(_DownloadSource(payload));
+
+      expect(await svc.existingApk(info()), isNull, reason: '本次要的是 code=38');
+      // 同一个文件对 code=39 就是「本版本的已下好文件」
+      expect(
+        await svc.existingApk(const UpdateInfo(
+          version: '2.47.0',
+          code: 39,
+          apkUrl: 'https://example.com/app.apk',
+          size: 20,
+        )),
+        newer.path,
+      );
+    });
+
+    test('existingApk：size / sha256 都未知（旧 Release 资产）→ 有文件即复用', () async {
+      await apkFile().create(recursive: true);
+      await apkFile().writeAsBytes([1, 2, 3]); // 无从核对，只能信
+      final svc = await buildSvc(_DownloadSource(payload));
+      // 注意：size / sha256 真的为 null（不能走 info()，那个 helper 会用
+      // payload.length 兜底 size）
+      const noMeta = UpdateInfo(
+        version: '2.16.8',
+        code: code,
+        apkUrl: 'https://example.com/app.apk',
+      );
+
+      expect(await svc.existingApk(noMeta), apkFile().path);
+    });
+
+    test('用户主动重下（同版本 apk 已存在、无 .part）→ 全量重下并覆盖旧文件', () async {
+      await apkFile().create(recursive: true);
+      await apkFile().writeAsBytes(List.filled(payload.length, 7)); // 旧内容
+      final src = _DownloadSource(payload);
+      final svc = await buildSvc(src);
+
+      await svc.download(info());
+
+      expect(await apkFile().readAsBytes(), payload);
+      expect(_rangeOf(src.requests.single), isNull, reason: '不复用旧文件 → 不带 Range');
+      expect(src.requests, hasLength(1));
+    });
+
+    // ---------- 可观测性（v2.46.0）----------
+
+    test('下载失败确实打了可归因日志：阶段 + 异常类型 + 原始 message', () async {
+      final logs = <String>[];
+      final original = debugPrint;
+      debugPrint = (String? message, {int? wrapWidth}) {
+        if (message != null) logs.add(message);
+      };
+      addTearDown(() => debugPrint = original);
+
+      final src = _DownloadSource(payload)
+        ..breakSpecs = [
+          (3, SocketException('Connection reset by peer')),
+          (3, SocketException('Connection reset by peer')),
+        ];
+      final svc = await buildSvc(src, attempts: 2);
+
+      await expectLater(
+        svc.download(info()),
+        throwsA(isA<UpdateException>()),
+      );
+
+      final joined = logs.join('\n');
+      expect(joined, contains('[update] 下载开始 app-update-$code.apk'));
+      expect(joined, contains('[update] 下载第 1 次尝试失败'));
+      expect(joined, contains('DioExceptionType.unknown'));
+      expect(joined, contains('cause=SocketException'));
+      expect(joined, contains('Connection reset by peer')); // 原始 message 没被丢掉
+      expect(joined, contains('网络中断类'));
+    });
+  });
+
+  group('可观测性（v2.46.0）：日志脱敏 + connectTimeout', () {
+    test('maskUrlForLog 只留 host + path —— 签名参数绝不进日志', () {
+      expect(
+        UpdateService.maskUrlForLog(
+            'https://objects.githubusercontent.com/a/b.apk'
+            '?X-Amz-Signature=SECRET&X-Amz-Credential=KEY'),
+        'objects.githubusercontent.com/a/b.apk',
+      );
+      expect(UpdateService.maskUrlForLog(''), '(空 URL)');
+      expect(UpdateService.maskUrlForLog('gist.github.com'), '<非绝对 URL，已省略>');
+    });
+
+    test('sanitizeLogText：URL 截成 host+path、token 形态串换成占位符', () {
+      // 用拼接构造，避免在仓库里留下「看着像真 token」的字面量
+      final token = 'ghp_${'A' * 24}';
+      final text = UpdateService.sanitizeLogText(
+          'DioException uri=https://cdn.example.com/x.apk?sig=SECRET '
+          'header=Bearer $token');
+      expect(text, contains('cdn.example.com/x.apk'));
+      expect(text, isNot(contains('SECRET')));
+      expect(text, isNot(contains(token)));
+      expect(text, isNot(contains('ghp_')));
+      expect(text, contains('Bearer <已脱敏>'));
+      // 没有 Bearer 前缀的裸 token 也要被换掉（Authorization 之外的出错路径）
+      final bare = UpdateService.sanitizeLogText('token=$token 无效');
+      expect(bare, 'token=<token 已脱敏> 无效');
+    });
+
+    test('sanitizeLogText(null) → 占位符（不是 "null" 字符串）', () {
+      expect(UpdateService.sanitizeLogText(null), '—');
+    });
+
+    test('注入的 dio 会被补上 connectTimeout；自己设过的尊重原值', () async {
+      final fresh = Dio();
+      UpdateService(dio: fresh, storage: UpdateStorage(await _memPrefs()));
+      expect(fresh.options.connectTimeout, UpdateService.connectTimeout);
+      expect(UpdateService.connectTimeout, const Duration(seconds: 15));
+
+      final custom =
+          Dio(BaseOptions(connectTimeout: const Duration(seconds: 3)));
+      UpdateService(dio: custom, storage: UpdateStorage(await _memPrefs()));
+      expect(custom.options.connectTimeout, const Duration(seconds: 3));
+    });
   });
 
   group('UpdateStorage', () {
@@ -776,6 +1006,10 @@ class _DownloadSource implements HttpClientAdapter {
   /// 再抛 err。不覆盖的请求 = 完整返回。
   List<(int, Object)?> breakSpecs = [];
 
+  /// 伪造 `Content-Range` 的起始偏移（null = 按 Range 如实回）。
+  /// 用来模拟「服务器没按 Range 回包、从别处开始发」这种错位响应。
+  int? contentRangeStartOverride;
+
   @override
   Future<ResponseBody> fetch(
     RequestOptions options,
@@ -819,7 +1053,8 @@ class _DownloadSource implements HttpClientAdapter {
       'content-length': [served.length.toString()],
       if (hasRange)
         'content-range': [
-          'bytes $start-${start + served.length - 1}/${_fullBytes.length}',
+          'bytes ${contentRangeStartOverride ?? start}-'
+              '${start + served.length - 1}/${_fullBytes.length}',
         ],
     };
 

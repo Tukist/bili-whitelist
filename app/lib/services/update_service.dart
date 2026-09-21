@@ -24,6 +24,22 @@
 /// - SHA-256：校验整个文件（[UpdateInfo.sha256] 非 null 时）；失败删除文件
 ///   抛「完整性校验失败」（半成品数据可疑，不值得续传）。
 ///
+/// 完整性把关（v2.46.0）：
+/// - 流**干净结束**（无异常）但「实收字节 ≠ [UpdateInfo.size]」（size 已知时）
+///   → **不 rename**、保留 `.part` 抛错。否则一个被悄悄截断的文件会被当成
+///   完整 APK 直接送去安装（`sha256 == null` 的旧 Release 资产完全挡不住）。
+/// - 续传（206）时校验 `Content-Range` 的起始偏移 == 本次请求的 `startBytes`，
+///   不符即报错：绝不把错位数据静默追加进 `.part`（拼出来的文件既不是完整
+///   APK 又无法再续传）。
+/// - [existingApk]：给 UI 复用「已下好且通过同样把关」的 APK —— 安装失败重试
+///   时直接重发安装 Intent，不再整包重下 68MB（用户主动「重新下载」绕过它）。
+///
+/// 可观测性（v2.46.0）：检查 / 取下载地址 / 下载 / 校验各阶段都有 `[update]`
+/// 前缀的 debugPrint 日志（阶段名 + HTTP 状态码 + 异常类型与原始 message）。
+/// **日志里的 URL 一律脱敏成 host + path**（签名令牌就在 query 里，见
+/// [maskUrlForLog]），token / Authorization 绝不落日志。用户可见文案**仍是**
+/// 友好中文（日志归日志，文案归文案）。
+///
 /// 其余设计要点：
 /// - 仓库当前是**私有**的：Release 元数据与资产下载都要带 GitHub token
 ///   （[tokenProvider]，主页接管理页已存的 token）；无 token 时按公开仓库
@@ -42,7 +58,7 @@ import 'dart:io';
 
 import 'package:crypto/crypto.dart';
 import 'package:dio/dio.dart';
-import 'package:flutter/foundation.dart' show visibleForTesting;
+import 'package:flutter/foundation.dart' show debugPrint, visibleForTesting;
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:path_provider/path_provider.dart';
 
@@ -84,7 +100,15 @@ class UpdateService {
   }) : _dio = dio ?? Dio(),
        _storage = storage,
        _tokenProvider = tokenProvider,
-       _rootDirOverride = rootDirOverride;
+       _rootDirOverride = rootDirOverride {
+    // 连接超时（v2.46.0）：dio 默认**不设** connectTimeout（只给 receiveTimeout），
+    // TCP 层黑洞式建连失败时进度条能冻很久且拿不到可归因的错误。15s 足够慢网
+    // 建连，又能及时失败交给「自动断点续传」重试。注入的 dio 自己设过就尊重它。
+    _dio.options.connectTimeout ??= connectTimeout;
+  }
+
+  /// 建连超时（暴露成字段便于单测/调用方核对）。
+  static const Duration connectTimeout = Duration(seconds: 15);
 
   /// 下载根目录：测试注入优先，否则 path_provider 应用支持目录。
   Future<Directory> _rootDir() async {
@@ -108,6 +132,8 @@ class UpdateService {
   Future<UpdateInfo> fetchLatest() async {
     try {
       final token = await _readToken();
+      debugPrint('[update] 检查更新 → ${maskUrlForLog(kReleaseApi)}'
+          '（带 token=${token != null}）');
       final resp = await _dio.get<Map<String, dynamic>>(
         kReleaseApi,
         options: Options(
@@ -121,17 +147,26 @@ class UpdateService {
           sendTimeout: const Duration(seconds: 10),
         ),
       );
-      if (resp.statusCode != 200 || resp.data == null) {
-        throw UpdateException('版本信息接口返回 ${resp.statusCode ?? 'unknown'}');
+      final status = resp.statusCode;
+      debugPrint('[update] 检查更新响应 HTTP ${status ?? 'unknown'}');
+      if (status != 200 || resp.data == null) {
+        throw UpdateException('版本信息接口返回 ${status ?? 'unknown'}');
       }
-      return UpdateInfo.fromGitHubReleaseJson(resp.data!);
+      final info = UpdateInfo.fromGitHubReleaseJson(resp.data!);
+      debugPrint('[update] 远端最新 v${info.version} code=${info.code} '
+          'size=${info.size} sha256=${info.sha256 != null}');
+      return info;
     } on UpdateException {
       rethrow;
     } on DioException catch (e) {
+      _logDioError('检查更新失败', e);
       throw UpdateException(await _mapFetchError(e));
     } on FormatException catch (e) {
+      debugPrint('[update] 检查更新格式异常：${sanitizeLogText(e.message)}');
       throw UpdateException('版本信息格式异常：${e.message}');
     } catch (e) {
+      debugPrint('[update] 检查更新意外异常 ${e.runtimeType}：'
+          '${sanitizeLogText(e)}');
       throw UpdateException('检查更新失败：$e');
     }
   }
@@ -146,6 +181,8 @@ class UpdateService {
     final code = e.response?.statusCode;
     if (code == 404) {
       final token = await _readToken();
+      debugPrint('[update] 检查更新 404：未配 token 或仓库暂无 Release'
+          '（token=${token != null}）');
       return token == null
           ? '检查更新失败：请先在管理面板配置 GitHub token（私有仓库需要）'
           : '已是最新：仓库暂无 Release（没有比当前更新的发布版本）';
@@ -163,6 +200,9 @@ class UpdateService {
     if (!force &&
         lastCheck != null &&
         now.difference(lastCheck) < checkThrottle) {
+      debugPrint('[update] 检查节流命中（距上次检查 '
+          '${now.difference(lastCheck).inMinutes} 分钟 < '
+          '${checkThrottle.inHours}h），本次跳过');
       return null;
     }
     final info = await fetchLatest();
@@ -178,8 +218,12 @@ class UpdateService {
     }
     final currentCode = int.tryParse(pkg.buildNumber) ?? 0;
     if (!info.isNewerThan(pkg.version, currentCode)) {
+      debugPrint('[update] 已是最新：当前 v${pkg.version}+$currentCode，'
+          '远端 v${info.version}+${info.code}');
       return null;
     }
+    debugPrint('[update] 发现新版本：当前 v${pkg.version}+$currentCode → '
+        'v${info.version}+${info.code}');
     return info;
   }
 
@@ -195,8 +239,12 @@ class UpdateService {
     final token = await _readToken();
     final apiUrl = info.apkApiUrl;
     if (token == null || apiUrl == null || apiUrl.isEmpty) {
+      debugPrint('[update] 取下载地址：直连 ${maskUrlForLog(info.apkUrl)}'
+          '（token=${token != null}）');
       return info.apkUrl;
     }
+    debugPrint('[update] 取下载地址：私有仓库走资产 API '
+        '${maskUrlForLog(apiUrl)}');
     Response<ResponseBody>? resp;
     try {
       resp = await _dio.get<ResponseBody>(
@@ -215,8 +263,10 @@ class UpdateService {
         ),
       );
       final status = resp.statusCode ?? 0;
+      debugPrint('[update] 取下载地址响应 HTTP $status');
       if (status >= 300 && status < 400) {
         final location = resp.headers.value('location') ?? '';
+        debugPrint('[update] 资产 API 跳转 → ${maskUrlForLog(location)}');
         if (location.isEmpty) {
           throw const UpdateException('APK 下载地址跳转失败（缺少 location）');
         }
@@ -254,6 +304,7 @@ class UpdateService {
     final apkName = 'app-update-${info.code}.apk';
     final apk = File('${dir.path}/$apkName');
     final part = File('${dir.path}/$apkName.part');
+    final removed = <String>[];
     try {
       await for (final entity in dir.list()) {
         if (entity is! File) continue;
@@ -262,10 +313,14 @@ class UpdateService {
             name != apkName &&
             name != '$apkName.part') {
           await entity.delete();
+          removed.add(name);
         }
       }
     } catch (_) {
       // 清理旧版本残留失败不阻塞下载
+    }
+    if (removed.isNotEmpty) {
+      debugPrint('[update] 清理旧版本残留：${removed.join('、')}');
     }
 
     // 私有仓库先解析真实下载地址；后续下载请求不带鉴权头（302 → 签名 CDN）。
@@ -274,8 +329,12 @@ class UpdateService {
     // 自动重试循环：只对瞬时网络错误重试；重试前重读 .part 大小从断点继续。
     var startBytes = await _partStartBytes(part);
     var attemptsLeft = maxDownloadAttempts;
+    var attemptNo = 0;
     var backoffMs = retryBaseDelay.inMilliseconds;
+    debugPrint('[update] 下载开始 $apkName（续传起点=$startBytes 字节，'
+        '期望大小=${info.size ?? '未知'}，最多尝试 $maxDownloadAttempts 次）');
     while (true) {
+      attemptNo += 1;
       try {
         await _downloadAttempt(
           url: url,
@@ -289,20 +348,27 @@ class UpdateService {
       } on DioException catch (e) {
         if (CancelToken.isCancel(e)) {
           // 用户取消：保留 .part（下次点击更新/重试自动续传）。
+          debugPrint('[update] 下载被用户取消（第 $attemptNo 次尝试），'
+              '.part 保留 $startBytes 字节');
           throw const UpdateException('下载已取消（进度已保留，下次将自动续传）');
         }
         attemptsLeft -= 1;
+        _logDioError('下载第 $attemptNo 次尝试失败', e);
         if (attemptsLeft <= 0 || !_isTransientDownloadError(e)) {
           throw UpdateException(_mapDioError(e, forDownload: true));
         }
+        debugPrint('[update] 下载将重试（剩余 $attemptsLeft 次），'
+            '从 .part 断点继续');
         await Future<void>.delayed(Duration(milliseconds: backoffMs));
         backoffMs *= 2;
         startBytes = await _partStartBytes(part);
       } on UpdateException {
-        rethrow; // 业务错误（HTTP 403/404、跳转失败、416 等）不重试
+        rethrow; // 业务错误（HTTP 403/404、跳转失败、416、尺寸/偏移不符等）不重试
       } catch (e) {
         // 兜底：非 dio 意外错误也重试到次数上限再抛出（.part 保留可续传）。
         attemptsLeft -= 1;
+        debugPrint('[update] 下载第 $attemptNo 次尝试意外异常 '
+            '${e.runtimeType}：${sanitizeLogText(e)}');
         if (attemptsLeft <= 0) throw UpdateException('下载失败：$e');
         await Future<void>.delayed(Duration(milliseconds: backoffMs));
         backoffMs *= 2;
@@ -316,6 +382,8 @@ class UpdateService {
     } catch (e) {
       throw UpdateException('下载完成但保存文件失败：$e');
     }
+    debugPrint('[update] 下载完成（共尝试 $attemptNo 次）→ $apkName '
+        '${await _safeLength(apk)} 字节');
 
     // SHA-256 流式校验整个文件（info.sha256 为 null 时跳过）。
     // 校验失败删文件抛错：数据可疑（网络损坏/拼接错位）不值得续传，全量重下。
@@ -324,12 +392,16 @@ class UpdateService {
         final digest = await sha256.bind(apk.openRead()).first;
         final actual = digest.toString().toLowerCase();
         if (actual != info.sha256!.toLowerCase()) {
+          debugPrint('[update] SHA-256 校验失败：实际 $actual ≠ '
+              '期望 ${info.sha256}（删除文件，下次全量重下）');
           await apk.delete();
           throw const UpdateException('APK 完整性校验失败');
         }
+        debugPrint('[update] SHA-256 校验通过');
       } on UpdateException {
         rethrow;
       } catch (e) {
+        debugPrint('[update] SHA-256 校验出错：${sanitizeLogText(e)}');
         if (await apk.exists()) {
           try {
             await apk.delete();
@@ -337,8 +409,58 @@ class UpdateService {
         }
         throw UpdateException('APK 校验出错：$e');
       }
+    } else {
+      debugPrint('[update] 无 SHA-256 可校验（Release 资产没带 digest），'
+          '本次仅按「实收字节 == 声明大小」把关');
     }
     return apk.path;
+  }
+
+  /// 已下好且**通过同样把关**的 APK 路径（没有 / 不合格 → null）。
+  ///
+  /// 三道关（任一不过就当作没有，交给 [download] 重下）：
+  /// 1. 文件名带 versionCode（`app-update-<code>.apk`）——换版本必然 miss，
+  ///    旧版本残留也会在 [download] 开头被清掉；
+  /// 2. [UpdateInfo.size] 已知时必须与实际字节数一致（截断 / 多出都不复用）；
+  /// 3. [UpdateInfo.sha256] 已知时再流式校验一次（不匹配则删掉这份垃圾）。
+  ///
+  /// 用途：安装失败后点「重试」、或重开弹窗点「立即更新」时直接重发安装
+  /// Intent，不必为一个已经躺在磁盘上的 68MB 文件再下一次。用户主动选
+  /// 「重新下载」时应绕过本方法（见 `update_dialog.dart`）。
+  Future<String?> existingApk(UpdateInfo info) async {
+    final apkName = 'app-update-${info.code}.apk';
+    try {
+      final dir = Directory('${(await _rootDir()).path}/updates');
+      final apk = File('${dir.path}/$apkName');
+      if (!await apk.exists()) return null;
+      final expected = info.size;
+      if (expected != null && expected > 0) {
+        final len = await apk.length();
+        if (len != expected) {
+          debugPrint('[update] 已下好的 $apkName 大小不符'
+              '（$len ≠ $expected），不复用');
+          return null;
+        }
+      }
+      final want = info.sha256;
+      if (want != null) {
+        final actual =
+            (await sha256.bind(apk.openRead()).first).toString().toLowerCase();
+        if (actual != want.toLowerCase()) {
+          debugPrint('[update] 已下好的 $apkName SHA-256 不符，删除后重下');
+          try {
+            await apk.delete();
+          } catch (_) {}
+          return null;
+        }
+      }
+      debugPrint('[update] 复用已下好的 $apkName'
+          '（${await _safeLength(apk)} 字节，跳过下载）');
+      return apk.path;
+    } catch (e) {
+      debugPrint('[update] 复用判定失败（改走下载）：${sanitizeLogText(e)}');
+      return null;
+    }
   }
 
   /// 读 .part 已有字节数作为续传起点。文件不存在/读损坏按 0（全量重下）。
@@ -381,9 +503,27 @@ class UpdateService {
     final isResume = status == 206; // 200 → base=0 全量重写
     final base = isResume ? startBytes : 0;
     final responseTotal = _responseTotal(resp);
+    final contentRange = resp.headers.value('content-range');
+    debugPrint('[update] 下载响应 HTTP $status '
+        'content-length=${resp.headers.value('content-length') ?? '—'} '
+        'content-range=${contentRange ?? '—'}');
+    // 206 必须从「本次请求的起始位置」开始。偏移不符说明服务器没按 Range 回包，
+    // 直接追加会把错位数据拼进 .part —— 拼出来的既不是完整 APK，也没法再续传。
+    if (isResume) {
+      final crStart = _contentRangeStart(contentRange);
+      if (crStart == null) {
+        debugPrint('[update] 206 响应缺 Content-Range，无法核对起始偏移');
+      } else if (crStart != startBytes) {
+        debugPrint('[update] 续传位置不符：响应从 $crStart 开始，'
+            '本次请求 $startBytes（保留 .part，拒不追加错位数据）');
+        throw UpdateException(
+            '续传位置不符（响应从 $crStart 字节开始，本次请求 $startBytes），'
+            '已保留半成品，请重试');
+      }
+    }
     final fullTotal = _fullTotal(
       knownSize: info.size,
-      contentRange: resp.headers.value('content-range'),
+      contentRange: contentRange,
       base: base,
       responseTotal: responseTotal,
     );
@@ -421,6 +561,25 @@ class UpdateService {
         await raf.close();
       } catch (_) {}
     }
+
+    // 完整性把关（v2.46.0）：流「干净结束」（能走到这里说明没抛异常）且期望大小
+    // 已知时，核对实收总字节。不符 → 保留 .part 抛错：绝不把半截文件 rename 成
+    // 正式 APK 送装（旧 Release 资产没带 digest 时，SHA-256 那条完全不设防）。
+    // 为什么不自动重试：尺寸不符也可能是 Release 元数据里的 size 本身过时，
+    // 盲目重下白烧流量；保留 .part 让用户点「重试」还能从断点继续。
+    final expectedTotal = info.size;
+    if (expectedTotal != null && expectedTotal > 0) {
+      final actualTotal = base + received;
+      if (actualTotal != expectedTotal) {
+        debugPrint('[update] 尺寸不符：实收 $actualTotal 字节 ≠ 期望 '
+            '$expectedTotal 字节（未生成 apk，.part 保留）');
+        throw UpdateException(
+            '下载未完成（收到 $actualTotal 字节，期望 $expectedTotal 字节），'
+            '半成品已保留，请点「重试」从断点继续');
+      }
+    }
+    debugPrint('[update] 本次响应收满 $received 字节'
+        '（累计 ${base + received} / ${fullTotal ?? '未知'}）');
   }
 
   /// 手动跟随 3xx 跳转直到拿到最终响应（200/206/416 或抛出）。
@@ -522,6 +681,7 @@ class UpdateService {
   /// 铁律：**不直出底层原始错误/英文**（unknown 兜底给通用「网络异常」），
   /// 任何路径都不出现「未知错误」裸文案。
   String _mapDioError(DioException e, {bool forDownload = false}) {
+    _logDioError(forDownload ? '下载错误归类' : '请求错误归类', e);
     // 下载场景：断网 / 连接被重置 / 接收中断 → 明确中断提示（自动断点续传）。
     // dio 把这些底层 IOException 包成 unknown（message 常为 null/英文）。
     if (forDownload && _isNetworkInterruption(e)) {
@@ -583,5 +743,64 @@ class UpdateService {
       default:
         return true;
     }
+  }
+
+  /// 记录一条可归因的网络错误日志：阶段名 + dio 异常类型 + HTTP 状态码 +
+  /// 原始 message / cause（全部过 [sanitizeLogText] 脱敏）。
+  ///
+  /// 用户可见文案仍由 [_mapDioError] 给友好中文 —— **日志归日志、文案归文案**。
+  void _logDioError(String stage, DioException e) {
+    debugPrint('[update] $stage：type=${e.type} '
+        'status=${e.response?.statusCode} '
+        'message=${sanitizeLogText(e.message)} '
+        'cause=${e.error?.runtimeType} ${sanitizeLogText(e.error)}'
+        '${_isNetworkInterruption(e) ? ' [网络中断类]' : ''}');
+  }
+
+  /// 文件字节数；读不到 → -1（只给日志用，不参与判断）。
+  Future<int> _safeLength(File f) async {
+    try {
+      return await f.length();
+    } catch (_) {
+      return -1;
+    }
+  }
+
+  /// `Content-Range: bytes <start>-<end>/<total>` 里的起始偏移；无/不可解析 → null。
+  int? _contentRangeStart(String? contentRange) {
+    if (contentRange == null) return null;
+    final m = RegExp(r'bytes\s+(\d+)\s*-').firstMatch(contentRange.trim());
+    if (m == null) return null;
+    return int.tryParse(m[1]!);
+  }
+
+  /// 日志用 URL 脱敏：**只留 host + path**。
+  ///
+  /// 为什么必须脱敏：私有仓库的下载地址是 GitHub 302 到签名 CDN，
+  /// `?X-Amz-Signature=…` 这类下载凭据就在 query 里 —— 完整 URL 落日志等于把
+  /// 下载凭据写进 logcat。公开给 UI 层（`update_dialog.dart`）与单测复用。
+  static String maskUrlForLog(String url) {
+    final raw = url.trim();
+    if (raw.isEmpty) return '(空 URL)';
+    final uri = Uri.tryParse(raw);
+    if (uri == null || uri.host.isEmpty) return '<非绝对 URL，已省略>';
+    return '${uri.host}${uri.path}';
+  }
+
+  /// 日志文本脱敏：文本里出现的 URL 一律截成 host + path，并把 token 形态的串
+  /// 换成占位符。dio 的异常 message 常带**整条请求 URL**，不能原样落日志。
+  static String sanitizeLogText(Object? raw) {
+    if (raw == null) return '—';
+    var text = raw.toString();
+    text = text.replaceAllMapped(
+      RegExp(r'''https?://[^\s"'<>]+'''),
+      (m) => maskUrlForLog(m[0]!),
+    );
+    text = text.replaceAll(RegExp(r'Bearer\s+\S+'), 'Bearer <已脱敏>');
+    text = text.replaceAll(
+      RegExp(r'gh[a-z]*_[A-Za-z0-9_]{20,}'),
+      '<token 已脱敏>',
+    );
+    return text;
   }
 }

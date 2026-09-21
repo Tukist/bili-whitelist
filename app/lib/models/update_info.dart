@@ -4,9 +4,10 @@
 /// MVP 简化：只发 arm64-v8a，所以 [apkUrl] 是单值；多 ABI 字段后续扩展。
 ///
 /// 设计要点：
-/// - [isNewerThan] 双保险：先比 semver 三段，再比 [code]（防 semver 字符串
-///   解析误判，比如 `2.10.0` < `2.9.0` 这种字符串比较陷阱）。两者都大才
-///   返回 true；相等或更小都返回 false。
+/// - [isNewerThan] 双保险：**先比 [code]**（Android versionCode 是权威维度）——
+///   只要 code 不等就按数值直接给结论；code 相等才退化为 semver 三段比（任一段
+///   更大即视为更新，防 `2.10.0` < `2.9.0` 这种字符串比较陷阱）。semver 解析
+///   不出来时按「不新」保守处理，避免误弹更新弹窗。
 /// - [isMandatory] 走 [minSupportedCode]（强制更新阈值），首版不启用。
 library;
 
@@ -53,10 +54,9 @@ class UpdateInfo {
     this.size,
   });
 
-  /// 是否比当前版本新。双保险：semver 三段全比 + code 数字比。
-  ///
-  /// 任一比较维度更大即视为更新（避免 semver 字符串被 `2.10.0` 解析异常）。
-  /// 两者都小或相等 → false。
+  /// 是否比当前版本新。双保险：**code 优先**（不等就直接比数值），相等时再比
+  /// semver 三段（任一段更大即视为更新，避免 `2.10.0` 被当字符串比小）。
+  /// code 相等且 semver 解析不出来 → false（保守，不误弹）。
   bool isNewerThan(String currentVersion, int currentCode) {
     if (code != currentCode) return code > currentCode;
     // code 相等时退化为 semver 三段比（任一段更大即视为更新）。

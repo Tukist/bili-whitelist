@@ -342,13 +342,17 @@ B 站部分接口（如 `playurl`）要求 WBI 签名：
   - **启动静默检查**：App 启动 5s 后调 `UpdateService.check(force=false)`，24h 节流；失败 / 已是最新 / 节流命中 → 完全静默；发现新版本且非强制 → 弹 `UpdateDialog`
   - **手动检查**：「个人」页设置区底部 → 「检查更新」按钮，调 `check(force=true)` 跳过节流；三种结果 SnackBar 提示（已是最新 vX.Y.Z / 错误 message / 弹更新弹窗）
 - **私有仓库鉴权（v2.16.1+）**：仓库是私有的，Release 元数据与资产下载都需带管理页已配置的 GitHub token（`UpdateService(tokenProvider:)`；无 token 时按公开仓库匿名请求，向后兼容）。下载走两段式：带 token + `Accept: application/octet-stream` 请求资产 API 地址 → 手动跟随 302 到签名 CDN 地址后下载（鉴权头不随跳转转发，否则 S3 双重鉴权报 400）
-- **下载流程**：`UpdateService.download(info)` 把 APK 下载到 `<应用支持目录>/updates/app-update-<code>.apk`
+- **下载流程**：`UpdateService.download(info)` 把 APK 下载到 `<应用支持目录>/updates/app-update-<code>.apk`；**下载前先问 `UpdateService.existingApk(info)`**（文件名带 versionCode + 大小等于 `info.size` + 有 `digest` 时再校验一次 SHA-256）——合格就直接复用，点「立即更新 / 重试安装」不会为一个已经躺在磁盘上的 68MB 文件再下一次（用户主动点「重新下载」才强制重下）
+- **完整性把关（v2.46.0）**：流干净结束但**实收字节 ≠ `info.size`**（已知时）→ 不 rename、保留 `.part` 报错（`sha256` 缺失的旧资产也挡得住：半截文件不会被当成完整 APK 送装）；206 续传校验 `Content-Range` 起始偏移 == 本次请求位置，不符即报错（绝不把错位数据静默追加进 `.part`）
 - **断点续传 + 网络异常友好提示（v2.16.8+）**：下载先写半成品 `app-update-<code>.apk.part`——存在 `.part` 时按已下载字节数带 `Range: bytes=N-` 续传（服务器 206 追加 / 200 不支持 Range 则全量重写），**下载完成才改名成正式 APK**；跳转手动跟随，保证 Range 命中签名 CDN。**失败 / 取消都保留 `.part`**，下次点「重试 / 立即更新」自动从断点继续；瞬时网络错误（断网 / 连接被重置 / 超时）自动重试 2 次（1s→2s 退避）并附「将自动从断点继续」的友好中文提示——不再出现「未知错误」裸文案（下载一半断网也不会整体重下）。可选 SHA-256 流式校验（`info.sha256 != null` 时启用，校验失败删文件抛「完整性校验失败」）
 - **安装跳转**：下载完成自动调 `ApkInstallerChannel.install(path)` → 原生 `ApkInstaller.kt` 通过 `FileProvider`（authority=`${applicationId}.fileprovider`）暴露 `content://` URI 给系统安装器，触发 `Intent.ACTION_VIEW` + `application/vnd.android.package-archive`；min_sdk=26 强制走 FileProvider（避免 API 24+ `FileUriExposedException`）
+- **归因分离（v2.46.0）**：**下载失败**与**安装失败**是两套文案、两个动作 —— 安装阶段失败显示「安装失败：<原生原因>」（`INSTALL_FAILED` 的 message 如实透出，`e.message` 为空时给异常类名，不再有裸「未知错误」），并给「重试安装」（只重发安装 Intent，不重下）/「重新下载」（真要重下走这条）；下载阶段失败仍是原有的友好中文 + 「重试」（从断点续传）。历史 bug：两者塞在同一个 `try` 里，安装被系统拦下也显示成「下载失败：未知错误」，归因完全错位
+- **「安装未知应用」权限前置检查（v2.46.0）**：安装前调 `ApkInstallerChannel.canInstallUnknownApps()`（原生 `PackageManager.canRequestPackageInstalls`，Android 8+）；未开启时**不调用安装**，直接给引导文案（说明要开哪个开关）+「去开启」（跳 `Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES` + 本应用包名）。查询本身不可用（老包 / 无原生通道）按「允许」处理，由 `install` 那一步兜底报 `NEED_UNKNOWN_SOURCES` 并给同一套引导
+- **日志与超时（v2.46.0）**：检查 / 取下载地址 / 下载 / 校验 / 安装各阶段都有 `[update]` 前缀的 `debugPrint`（阶段名 + HTTP 状态码 + 异常类型与原始 message），logcat 可取证；**URL 一律脱敏成 host + path**（签名 CDN 的令牌在 query 里）、token / Authorization 绝不落日志；下载的 Dio 补 `connectTimeout = 15s`（dio 默认不设，网络黑洞式卡死时进度条能冻很久）
 - **强制更新策略**（`UpdateInfo.minSupported_code`）：当前 code 严格小于该阈值时弹窗屏蔽返回（`PopScope(canPop: false)`），只显示「立即更新」按钮；首版不启用（默认 null），保留机制备用
 - **多 ABI（v2.16.1+）**：Release 同时发 arm64-v8a / armeabi-v7a / x86_64 三 ABI；`UpdateInfo` 按设备 ABI 选资产（`Abi.current()`），无匹配回退 arm64-v8a
 - **Release tag 约定**：tag 必须是 `v主版本号+构建号`（如 `v2.16.1+31`）——App 从 tag 的 `+数字` 解析 versionCode 判新旧；缺构建号会退化为发布日期数字（如 260902），比任何真实 versionCode 都大，导致已装最新版仍反复弹更新
-- **Android 权限**：新增 `android.permission.REQUEST_INSTALL_PACKAGES` + `<provider>` + `res/xml/file_paths.xml`，完整见 `app/android/app/src/main/AndroidManifest.xml`
+- **Android 权限**：新增 `android.permission.REQUEST_INSTALL_PACKAGES` + `<provider>` + `res/xml/file_paths.xml`，完整见 `app/android/app/src/main/AndroidManifest.xml`；系统里「安装未知应用」开关的状态由 `ApkInstaller.kt` 的 `canInstallUnknownApps` 查询（v2.46.0），关闭时 App 不硬撞系统安装器而是先引导用户去开
 
 ### 16. 评论区（v2.16.15+，x/v2/reply/main + x/v2/reply/reply）
 
