@@ -12,12 +12,14 @@ import '../models/update_info.dart';
 import '../models/upowner.dart';
 import '../models/whitelist_video.dart';
 import '../services/apk_installer.dart';
+import '../services/clipboard_link_probe.dart';
 import '../services/collection_stats.dart';
 import '../services/followings_auto_sync.dart';
 import '../services/service_locator.dart';
 import '../services/update_service.dart';
 import '../services/update_storage.dart';
 import '../services/upowner_writer.dart';
+import '../services/whitelist_write_queue.dart';
 import '../services/whitelist_writer.dart';
 import '../theme/app_palette.dart';
 import '../theme/app_tokens.dart';
@@ -37,6 +39,7 @@ import 'followings_import_page.dart';
 import 'history_page.dart';
 import 'inbox_page.dart';
 import 'login_page.dart';
+import 'player_page.dart';
 import 'schedule_page.dart';
 import 'search_page.dart';
 import 'update_dialog.dart';
@@ -127,7 +130,23 @@ class PlaylistPage extends StatefulWidget {
   final Future<void> Function(BuildContext context, {String? banner})?
       openLogin;
 
-  const PlaylistPage({super.key, this.github, this.openLogin});
+  /// 测试注入：冷启动剪贴板探测（默认 [ClipboardLinkProbe] 真实实现）。
+  /// 测试用假剪贴板内容 + 假 B 站接口注入，避免碰系统剪贴板与真实网络。
+  final ClipboardLinkProbe? clipboardProbe;
+
+  /// 测试注入：冷启动剪贴板命中后的开播动作（默认按 [kPlayerRouteName] push
+  /// 真实 [PlayerPage]）。测试注入替身即可断言"跳了什么"而不必构造真实播放页
+  /// （播放页要原生取流通道，测试里得铺一整套 mock）。
+  final Future<void> Function(BuildContext context, ClipboardOpenResult result)?
+      openClipboardVideo;
+
+  const PlaylistPage({
+    super.key,
+    this.github,
+    this.openLogin,
+    this.clipboardProbe,
+    this.openClipboardVideo,
+  });
 
   @override
   State<PlaylistPage> createState() => _PlaylistPageState();
@@ -140,6 +159,17 @@ class _PlaylistPageState extends State<PlaylistPage> {
   String? _error;
   bool _syncing = false;
   late final GithubApi _github = widget.github ?? GithubApi();
+
+  /// 乐观写入队列（v2.35.0）：管理写操作本地立刻生效，远端 PATCH 串行后台写。
+  /// 与页面共用同一个 [GithubApi]（测试注入的替身因此也能观察到 PATCH）。
+  late final WhitelistWriteQueue _writeQueue = WhitelistWriteQueue(
+    github: _github,
+    onError: (message) {
+      if (!mounted) return;
+      // 失败**不回滚**：本地改动保留，只告诉用户「没同步上」
+      _showSnack('未同步到 Gist（本地已生效）：$message');
+    },
+  );
 
   /// 白名单写入服务：导入 / 搜索「加入」共用（构造视频 + 查重 + 写 Gist）。
   final WhitelistWriter _writer = WhitelistWriter();
@@ -225,6 +255,30 @@ class _PlaylistPageState extends State<PlaylistPage> {
   /// 自动登录是否已引导（本次进程只自动引导一次，避免循环/重复弹页）。
   bool _autoLoginGuided = false;
 
+  /// 冷启动「读剪贴板 → 直接播」是否已经读过剪贴板（一个进程只读一次）。
+  bool _clipboardChecked = false;
+
+  /// 已取到视频、但首页此刻被上层压着而**还没跳**的那一个。
+  ///
+  /// 只缓存结果，不重新读剪贴板、也不重新取元数据（接线见
+  /// [_scheduleClipboardOpen]）——真机上"登录引导页 / 更新弹窗正好在取元数据
+  /// 那几秒里盖上来"是常见情形（模拟器实测就撞到了：剪贴板命中、元数据也取到
+  /// 了，但播放页被静默丢掉），直接丢掉会让"进软件就播"时灵时不灵。
+  ClipboardOpenResult? _clipboardPending;
+
+  /// 「等首页就绪」已经用掉的轮数（读剪贴板前、取到视频后共用同一份预算）。
+  int _clipboardRounds = 0;
+
+  /// 「等首页就绪」的等待预算：`[kClipboardOpenDelay] × 这次数` ≈ 7.2 秒。
+  ///
+  /// 取值理由：登录引导 / 更新弹窗这类启动期页面最长也就几秒；超过这个窗口
+  /// 还在别处，说明用户已经在做别的事，再跳就是硬插一脚。
+  static const int _kClipboardWaitAttempts = 8;
+
+  /// 冷启动剪贴板检查的定时器（[dispose] 取消：页面没了就不该再读剪贴板，
+  /// 测试里也不会留下 pending timer）。
+  Timer? _clipboardTimer;
+
   @override
   void initState() {
     super.initState();
@@ -241,6 +295,10 @@ class _PlaylistPageState extends State<PlaylistPage> {
     // 启动 4s 后静默执行一次「B 站关注自动同步」（登录态恢复后延迟执行，
     // 避免启动抢网络；见 _runFollowingsAutoSync / FollowingsAutoSyncService）。
     _scheduleFollowingsAutoSync();
+    // 冷启动读一次剪贴板（v2.35.0）：等首页首帧之后再等一会儿，
+    // 见 [_scheduleClipboardOpen] 的时机说明。
+    WidgetsBinding.instance
+        .addPostFrameCallback((_) => _scheduleClipboardOpen());
   }
 
   @override
@@ -248,8 +306,155 @@ class _PlaylistPageState extends State<PlaylistPage> {
     _startupUpdateTimer?.cancel();
     _inboxCheckTimer?.cancel();
     _followingsSyncTimer?.cancel();
+    _clipboardTimer?.cancel();
     _pageController.dispose();
     super.dispose();
+  }
+
+  // ---------------------------------------------------------------------------
+  // 冷启动剪贴板开播（v2.35.0）
+  //
+  // 用户原话：「进入软件的时候会读取剪切板，如果包含了视频播放链接就直接跳转
+  // 到视频播放页」。只在这一处接线：解析/去重/取元数据都在
+  // [ClipboardLinkProbe] 里（不碰 UI，可单测），这里只管"什么时候读"和"跳"。
+  // ---------------------------------------------------------------------------
+
+  /// 冷启动剪贴板检查的定时器（首帧之后由 post-frame 回调启动）。
+  ///
+  /// 三个为什么：
+  /// - **为什么只读一次（不监听 resume）**：这个行为打扰性很强——每次从后台
+  ///   切回来都跳一次同一个视频会让人想卸载；用户要的是"进软件就播我复制的那
+  ///   个"，那就只在冷启动那一刻看一次。
+  /// - **为什么等首帧 + 延迟**：首帧时首页还在铺列表、恢复登录态，此刻 push
+  ///   播放页会打断加载动画，也可能和自动登录引导抢导航。
+  /// - **为什么用可取消的 Timer**：`Future.delayed` 取消不掉，页面销毁后仍会
+  ///   触发（读剪贴板 + 可能 push 到已卸载的 context），测试里还会留 pending
+  ///   timer。
+  ///
+  /// 这个定时器承担两种"等"，共用 [_kClipboardWaitAttempts] 一份预算：
+  /// 1. 等首页**可以读了**（启动期页面挡住了就先不读剪贴板）；
+  /// 2. 等首页**可以跳了**（[_clipboardPending] 非空 = 视频已取到，只差栈顶）。
+  void _scheduleClipboardOpen() {
+    _clipboardTimer = Timer(kClipboardOpenDelay, () {
+      if (!mounted) return;
+      // 已经取到视频、只差"首页空闲"这一步 → 只做跳转，不重读不重取
+      if (_clipboardPending != null) {
+        _pushPendingClipboardVideo();
+        return;
+      }
+      if (_clipboardChecked) return;
+      // 「等首页就绪」= 等首页回到栈顶。冷启动经常先弹别的东西（自动登录
+      // 引导页 / 更新弹窗 / 用户手快先点进了某个合集），此时**不该**把播放页
+      // 硬压在它上面（用户还没看完引导就被劫持到一个视频里，很唐突）。
+      // 但也不能就此静默放弃——那会让"进软件就播"在真机冷启动上时灵时不灵。
+      // 折中：在预算内持续等待，超预算才彻底放弃（日志里说一句，可查）。
+      if (!_homeIsCurrent) {
+        if (!_waitAnotherRound('首页还没就绪')) return;
+        _scheduleClipboardOpen();
+        return;
+      }
+      unawaited(_openClipboardLinkOnce());
+    });
+  }
+
+  /// 首页（本页所在的路由）此刻是否在栈顶。
+  ///
+  /// 在栈顶 = 现在把播放页 push 上去不会插队（用户没在被别的页面挡着）。
+  bool get _homeIsCurrent => ModalRoute.of(context)?.isCurrent == true;
+
+  /// 记一轮等待。预算用完 → 记日志并返回 false（调用方就此收手，不硬插队）。
+  ///
+  /// 被上层挡住时**不读剪贴板**（那几轮里连剪贴板都没碰过），所以"只读一次"
+  /// 讲的始终是"真正要处理时读的那一次"。
+  bool _waitAnotherRound(String why) {
+    _clipboardRounds++;
+    if (_clipboardRounds >= _kClipboardWaitAttempts) {
+      debugPrint('[clip] $why（等满 $_clipboardRounds 轮 ≈ '
+          '${_kClipboardWaitAttempts * kClipboardOpenDelay.inMilliseconds}ms），'
+          '本次不打扰');
+      _clipboardPending = null;
+      return false;
+    }
+    debugPrint('[clip] $why（第 $_clipboardRounds 轮），'
+        '${kClipboardOpenDelay.inMilliseconds}ms 后再看一次');
+    return true;
+  }
+
+  /// 把已取到的视频跳到播放页（首页仍被压着就先等，见 [_scheduleClipboardOpen]）。
+  void _pushPendingClipboardVideo() {
+    final result = _clipboardPending;
+    if (result == null) return;
+    if (!_homeIsCurrent) {
+      if (!_waitAnotherRound('取到视频但首页还没空闲')) return;
+      _scheduleClipboardOpen();
+      return;
+    }
+    _clipboardPending = null;
+    final open = widget.openClipboardVideo ?? _openClipboardVideo;
+    unawaited(open(context, result));
+  }
+
+  /// 真读一次：命中 → push 播放页；失败 → 一句提示；无链接/已处理过 → 安静。
+  ///
+  /// 防重入与"不强推"：
+  /// - 调用前由 [_scheduleClipboardOpen] 保证首页已在栈顶（启动期页面挡住了
+  ///   就先等，见那里的等待预算）；
+  /// - [_clipboardChecked] 保证剪贴板一个进程只读一次（含"读了但没命中"）；
+  /// - 短链解析 / 取元数据都有网络耗时，期间首页可能又被别的页盖住 → 结果先
+  ///   存进 [_clipboardPending]，由同一套预算继续等它空闲，**不**重新读剪贴板、
+  ///   **不**重新取元数据。
+  Future<void> _openClipboardLinkOnce() async {
+    if (!mounted || _clipboardChecked) return;
+    if (!_homeIsCurrent) {
+      debugPrint('[clip] 首页不在栈顶，本次不读剪贴板');
+      return;
+    }
+    _clipboardChecked = true;
+    debugPrint('[clip] 冷启动检查剪贴板'
+        ' t=${DateTime.now().millisecondsSinceEpoch}');
+    final probe = widget.clipboardProbe ?? ClipboardLinkProbe();
+    final result = await probe.probe();
+    if (!mounted) return;
+    if (result.status == ClipboardOpenStatus.opened && result.video != null) {
+      if (!_homeIsCurrent) {
+        // 实测路径（模拟器冷启动）：剪贴板命中、元数据也取到了，但自动登录
+        // 引导页正好在这几秒里盖上来 → 先存着，等它关掉再跳，别静默丢掉。
+        debugPrint('[clip] 取到视频，但首页被上层压着 → 先存着，等它空闲再跳');
+        _clipboardPending = result;
+        _scheduleClipboardOpen();
+        return;
+      }
+      final open = widget.openClipboardVideo ?? _openClipboardVideo;
+      await open(context, result);
+      return;
+    }
+    if (result.status == ClipboardOpenStatus.failed) {
+      // 失败不静默：解析失败 / 取元数据失败都给一句明确提示（不跳空白页）
+      _showSnack(result.message);
+    }
+    // none（没链接 / 番剧 / 落点非视频）/ duplicate / disabled：什么都不做
+  }
+
+  /// 默认开播动作：按 [kPlayerRouteName] push 真实播放页。
+  ///
+  /// - **push 而不是替换首页**：返回键随时回首页（用户随时能退，符合"可返回"）
+  /// - 带上分享链接的 `?p=` / `?t=` 定位（[ClipboardOpenResult.pageIndex] /
+  ///   [positionMs]，与收藏夹/评论链接同一套语义）
+  Future<void> _openClipboardVideo(
+    BuildContext context,
+    ClipboardOpenResult result,
+  ) {
+    final video = result.video!;
+    return Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        settings: const RouteSettings(name: kPlayerRouteName),
+        builder: (_) => PlayerPage(
+          video: video,
+          initialPageIndex: result.pageIndex ?? 0,
+          initialPositionMs: result.positionMs,
+        ),
+      ),
+    );
   }
 
   /// 读取 App 版本号（插件方案，与 pubspec.yaml version 单源）。
@@ -569,8 +774,10 @@ class _PlaylistPageState extends State<PlaylistPage> {
   }
 
   // ---------------------------------------------------------------------------
-  // 管理写操作：内存副本 → saveToGist 成功 → 写本地缓存 → 刷新 UI；
-  // 失败只提示、不动内存与本地缓存。防沉迷：新增视频入口只有「导入」（与电脑端等价）。
+  // 管理写操作（v2.35.0 起 = 乐观更新）：内存副本 → **立刻**刷新界面 + 落本地
+  // 缓存，远端 PATCH 交给 [WhitelistWriteQueue] 后台串行写；写失败只提示
+  // 「未同步到 Gist（本地已生效）」，**不回滚**。
+  // 防沉迷：新增视频入口只有「导入」（与电脑端等价）。
   // ---------------------------------------------------------------------------
 
   /// 底部提示条。
@@ -590,33 +797,50 @@ class _PlaylistPageState extends State<PlaylistPage> {
       );
   }
 
-  /// 统一落库：先校验配置，再写 Gist，成功后写本地缓存并刷新。
+  /// 统一落库（乐观更新）：
+  ///
+  /// 1. **立刻**把 [next] 落到内存并刷新界面（不等网络）；
+  /// 2. 写本地缓存 + PATCH Gist 交给 [_writeQueue] 后台串行执行；
+  /// 3. 远端失败 → 提示「未同步到 Gist（本地已生效）」，本地改动保留。
+  ///
+  /// 为什么**不回滚**：用户点完就看到结果才对得上他的预期；远端失败时回滚
+  /// 等于把他刚做的事抹掉（"我明明建好了，怎么又没了"），比"没同步上"更难
+  /// 接受——本地已生效，他重试一次操作（或等网络好了再点一次）即可同步。
+  ///
+  /// 为什么不再弹「已保存」：改成后台写之后，这句成功提示会在**几秒后**才回来，
+  /// 而那时界面往往已经显示了更具体的提示（合集页/删除/批量移动各自的
+  /// 「已删除 3 个视频」「已移动 1 个视频到…」）——后到的「已保存」会把它们顶掉
+  /// （同一个 ScaffoldMessenger、hideCurrentSnackBar），用户反而看不到"删了几个"。
+  /// 而且列表/卡片**已经当场变了**，那才是真正的成功反馈。
+  /// 失败则一定会说话（见 [_writeQueue] 的 onError），不会静默。
+  ///
+  /// 为什么去掉 `hasConfig` 前置门禁：未配置 token 时也先本地生效，随后远端
+  /// 写失败的分支会把「尚未配置 GitHub token 与 Gist ID…」原样提示出来——
+  /// 该知道的用户照样知道，但不必"先拒绝一次、让用户配置完再重做一遍"。
+  ///
+  /// 防重入/顺序：队列只保留最后一份快照（见 [WhitelistWriteQueue]），所以
+  /// 连点两次也不会两次 PATCH 互相覆盖。
+  ///
+  /// 页面已销毁（`mounted == false`）时**照写不误**，只是不碰界面：与改动前的
+  /// 实现一致（旧代码也只在 setState 前判 mounted），用户已经做出的操作不该
+  /// 因为"页面刚好被关掉"而静默丢掉——乐观更新最容易踩的坑就是"本地没落、
+  /// 远端也没写"，那才是真的丢数据。
   Future<void> _saveAndRefresh(WhitelistData next) async {
-    try {
-      if (!await _github.hasConfig()) {
-        _showSnack('请先在底部导航「个人」配置 GitHub token 与 Gist ID');
-        return;
-      }
-      final ok = await _github.saveToGist(next);
-      if (!ok) {
-        _showSnack('保存到 Gist 失败，请重试');
-        return;
-      }
-      await ServiceLocator.syncService.saveToCache(next);
-      if (mounted) {
-        setState(() {
-          _data = next;
-        });
-        // 增删改（移动视频 / 新建合集 / 删除合集）会改变各合集的
-        // 「总集数 → 已看 X/Y + 最近更新」→ 统计跟着重算。
-        unawaited(_refreshCollectionStats());
-      }
-      _showSnack('已保存');
-    } on GithubApiException catch (e) {
-      _showSnack('保存失败：${e.message}');
-    } catch (e) {
-      _showSnack('保存失败：$e');
+    debugPrint('[wq] 收到落库请求（用户操作已在内存里）'
+        ' t=${DateTime.now().millisecondsSinceEpoch}');
+    if (mounted) {
+      setState(() {
+        _data = next;
+      });
+      // 增删改（移动视频 / 新建合集 / 删除合集）会改变各合集的「总集数 →
+      // 已看 X/Y + 最近更新」→ 统计跟着重算（本地读表，不挡界面）。
+      // 必须在 `_data = next` 之后：统计读的就是 [_data]。
+      unawaited(_refreshCollectionStats());
     }
+    debugPrint('[wq] 本地已生效（乐观更新/界面已刷新）'
+        ' t=${DateTime.now().millisecondsSinceEpoch}');
+    // 不 await：远端写是后台的事（失败经 onError 提示），界面已经更新完了。
+    unawaited(_writeQueue.submit(next));
   }
 
   /// 新建合集：校验后写入 collections → 持久化。
@@ -1055,8 +1279,10 @@ class _PlaylistPageState extends State<PlaylistPage> {
   ///
   /// 拖拽只影响 [WhitelistData.collections] 顺序，视频归属不变；子合集的顺序
   /// 在各自的合集页里拖（本函数只重排顶层，非顶层的项位置原样保留）。
-  /// 保存失败时不 setState：ReorderableListView 的显示顺序由数据驱动，
-  /// 数据未变 → 列表视觉自动回弹原顺序（失败回滚，不破坏数据）。
+  /// v2.35.0 起走乐观更新：重排后立刻 setState（ReorderableListView 的显示
+  /// 顺序由数据驱动，数据一变列表当场就位，不等 Gist），远端写退到后台。
+  /// 远端失败**不回弹**：回弹会让用户刚拖好的顺序自己跳回去，比"没同步上"
+  /// 更让人不知所措（与 [_saveAndRefresh] 的取舍一致）。
   void _onReorderCollections(int oldIndex, int newIndex) {
     // 首页卡片 = 顶层合集（可拖）+ 未分类（固定最后），索引只在顶层里走动
     final topNames = [

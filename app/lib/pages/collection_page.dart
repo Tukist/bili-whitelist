@@ -390,9 +390,20 @@ class _CollectionPageState extends State<CollectionPage> {
     await _saveAndRefresh(next);
   }
 
-  /// 统一落库：回调上一层（写 Gist + 缓存 + 刷新），成功后同步本页副本。
-  Future<void> _saveAndRefresh(WhitelistData next) async {
-    await widget.saveAndRefresh(next);
+  /// 统一落库（v2.35.0 起 = 乐观更新）：**先**同步本页副本（本页当场看出
+  /// 变化），`next` 再交给上一层去后台写 Gist，全程不等网络。
+  ///
+  /// 为什么 setState **在前**、回调**在后**：上一层（首页）已经是乐观写
+  /// （先内存后网络），但它仍是 `async` —— `await` 一次就至少欠一个微任务，
+  /// "本页立刻生效"就多了一条对上层实现细节的隐式依赖；先 setState 则这条
+  /// 依赖直接消失（哪天上层改成真异步也不会把延迟漏回本页）。
+  ///
+  /// 为什么不等回调返回再 setState：等返回就是在等那次远端写 —— 那正是
+  /// 「创建/加入合集有延迟」本身（用户看到的是点完不动的旧列表）。
+  ///
+  /// 返回值仍是上层回调的 Future（调用方 `await` 它只是为了知道"写已经交给
+  /// 上层了"，而不是"远端写完了"）。
+  Future<void> _saveAndRefresh(WhitelistData next) {
     if (mounted) {
       setState(() {
         _data = next;
@@ -402,10 +413,12 @@ class _CollectionPageState extends State<CollectionPage> {
         _selectedBvids.removeWhere((b) => !alive.contains(b));
       });
     }
+    return widget.saveAndRefresh(next);
   }
 
   /// 视频拖动排序：该合集视频按新顺序赋 order = 0..n-1（其他合集 order
-  /// 不变），落库。失败不 setState → ReorderableListView 视觉自动回弹。
+  /// 不变），落库。v2.35.0 起乐观更新：[_saveAndRefresh] 先 setState，列表
+  /// 当场就位、不等网络（远端失败也不回弹，取舍见 [_saveAndRefresh]）。
   ///
   /// 列表头部还有子合集卡片（不可拖）→ 索引要减掉这段偏移；拖到偏移区里
   /// （把手拖到子合集卡片上）按落到最前面处理。

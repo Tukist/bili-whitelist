@@ -7,6 +7,7 @@ import '../api/github_api.dart';
 import '../api/translate_api.dart';
 import '../cache/download_manager.dart';
 import '../pages/offline_page.dart';
+import '../services/clipboard_link_store.dart';
 import '../services/inbox_card_style_store.dart';
 import '../services/theme_store.dart';
 import '../services/ui_copy_store.dart';
@@ -79,6 +80,9 @@ class ManagePanel extends StatefulWidget {
 
 /// B 站账号登录态（管理面板顶部状态展示）。
 enum _AccountState { loading, loggedIn, expired, none }
+
+/// 「启动时播放剪贴板里的视频」开关的 key（测试锚点；v2.35.0）。
+const Key kClipboardOpenSwitchKey = Key('clipboard-open-switch');
 
 class _ManagePanelState extends State<ManagePanel> {
   final _tokenCtrl = TextEditingController();
@@ -466,6 +470,38 @@ class _ManagePanelState extends State<ManagePanel> {
                 icon: const Icon(Icons.text_fields_outlined, size: 18),
                 label: Text(n == 0 ? '全部为默认' : '已自定义 $n 条'),
               ),
+            );
+          },
+        ),
+        const SizedBox(height: 16),
+        const Divider(height: 1),
+        const SizedBox(height: 16),
+        // ---- 启动行为（v2.35.0：剪贴板里的 B 站链接直接开播）----
+        Text('启动行为', style: theme.textTheme.titleMedium),
+        const SizedBox(height: 4),
+        Text(
+          '冷启动时读一次剪贴板：里面如果有 B 站视频链接（含 b23.tv 短链、'
+          '「【标题】 链接」这种分享文本），就直接打开播放页。'
+          '只在前台读一次、不需要任何权限；同一条链接只会播一次。仅存本机。',
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+        const SizedBox(height: 8),
+        // 开关态要跟着 store 走 → 单独监听 ClipboardLinkStore
+        ListenableBuilder(
+          listenable: ClipboardLinkStore.instance,
+          builder: (context, _) {
+            final on = ClipboardLinkStore.instance.enabled;
+            return SwitchListTile(
+              key: kClipboardOpenSwitchKey,
+              value: on,
+              onChanged: (v) => ClipboardLinkStore.instance.setEnabled(v),
+              contentPadding: EdgeInsets.zero,
+              title: const Text('启动时播放剪贴板里的视频'),
+              subtitle: Text(on
+                  ? '已开启：复制一条 B 站视频链接，下次打开 App 直接播'
+                  : '已关闭：冷启动不读剪贴板'),
             );
           },
         ),
