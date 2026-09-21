@@ -1,5 +1,6 @@
-/// 共享视频列表项组件：封面 + 标题 + 时长 + UP 主 + 发布时间 +
-/// 已缓存/多 P 角标（发布时间仅 pubdate 非空时展示，见 formatPubdate）。
+/// 共享视频列表项组件：封面 + 标题 + 时长 + UP 主 + 发布时间 + 播放量 +
+/// 已缓存/多 P 角标（发布时间仅 pubdate 非空时展示，播放量仅 view 非空时展示，
+/// 见 formatPubdate / fmtVideoSubtitle）。
 ///
 /// 从 playlist_page 原私有 `_VideoTile` 抽出，首页合集视频列表页
 /// （collection_page）复用同一实现，避免两份样式漂移。
@@ -11,6 +12,7 @@ library;
 import 'package:flutter/material.dart';
 
 import '../models/whitelist_video.dart';
+import '../pages/article_page.dart' show fmtArticleCount;
 import '../theme/app_tokens.dart';
 import 'cover_hero.dart';
 import 'cover_image.dart';
@@ -27,10 +29,34 @@ String fmtDuration(int seconds) {
       : '$m:${s.toString().padLeft(2, '0')}';
 }
 
-/// 单条视频：封面 + 标题 + 时长 + UP 主 + 发布时间 + 已缓存角标。
+/// 卡片副信息行文案：`时长 · UP主`，之后**按需**追加 `发布时间`、`N 播放`。
 ///
-/// 副信息行 = `时长 · UP主 · 发布时间`（发布时间 v2.16.16+ 导入的数据才有；
-/// 旧数据无 pubdate 时不显示该段，展示与旧版一致）。
+/// 为什么抽成顶层纯函数：这一行是既有测试的**逐字符**锚点（旧数据必须一字
+/// 不差），抽出来才能把「有/无 view」×「有/无 pubdate」四种组合直接断言，
+/// 不用每次都 pump 一棵树。
+///
+/// 播放量格式复用专栏页的 [fmtArticleCount]（`12345` → `1.2万`、`1.2亿`），
+/// 与搜索页的播放量口径一致——**不**引 search_page（页面互相 import 会成环，
+/// 且它是私有 `_fmtPlay`）。
+/// [view] 为 null = 未知（旧数据、白名单里没存过、接口没给）→ 这一段整段
+/// 不出现，文案与改动前逐字符一致；0 是合法值（真·零播放）照常显示。
+String fmtVideoSubtitle({
+  required String duration,
+  required String upName,
+  String pubdateText = '',
+  int? view,
+}) {
+  final parts = <String>[duration, upName];
+  if (pubdateText.isNotEmpty) parts.add(pubdateText);
+  if (view != null) parts.add('${fmtArticleCount(view)} 播放');
+  return parts.join(' · ');
+}
+
+/// 单条视频：封面 + 标题 + 时长 + UP 主 + 发布时间 + 播放量 + 已缓存角标。
+///
+/// 副信息行 = `时长 · UP主 · 发布时间 · N 播放`，后两段**拿到才拼**
+/// （发布时间 v2.16.16+ / 播放量 v2.37.0+ 导入的数据才有；旧数据没有这两段，
+/// 展示与旧版逐字符一致，见 [fmtVideoSubtitle]）。
 /// 普通模式：点按进播放页、尾部「更多」弹管理菜单、长按进入多选模式；
 /// 多选模式：左侧勾选框 + 点按/长按切换勾选。
 /// 尾部可挂拖拽把手（[dragHandle]，页面用 ReorderableDragStartListener 包
@@ -169,10 +195,15 @@ class VideoTile extends StatelessWidget {
           animated: true,
         ),
         subtitle: Text(
-          // 副信息行：时长 · UP主（· 发布时间；日期为空时与旧版逐字符一致）
-          pubdateText.isEmpty
-              ? '${fmtDuration(video.duration)} · ${video.upName}'
-              : '${fmtDuration(video.duration)} · ${video.upName} · $pubdateText',
+          // 副信息行：时长 · UP主（· 发布时间）（· N 播放，v2.37.0+）。
+          // 后两段都是「拿到才拼」：pubdate / view 为 null（旧数据、未知）时
+          // 与改动前**逐字符一致**（既有断言锚在这句文案上）。
+          fmtVideoSubtitle(
+            duration: fmtDuration(video.duration),
+            upName: video.upName,
+            pubdateText: pubdateText,
+            view: video.view,
+          ),
           style: theme.textTheme.bodySmall
               ?.copyWith(color: theme.colorScheme.onSurfaceVariant),
         ),

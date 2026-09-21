@@ -1199,4 +1199,220 @@ void main() {
       expect(page.playlist, isNull, reason: '合集分区的顺序不是 _videos，宁可不接');
     });
   });
+
+  // 番剧整季：同部上下集，绝不跨番（v2.37.0，用户需求）。
+  //
+  // 用户原话：「在アニメ合集里面一个 43 集的高达，我点上集下一集的时候给我
+  // 切到其他番剧去了」。根因：整季导入逐集 addVideo、order 恒 0、
+  // added_at 逐集递增 → 合集里排成「第43话 → 第1话」的倒序块，走到块末
+  // （第1话）时「下一集」= 列表里的下一条 = 别的番。
+  //
+  // 这里 1:1 复刻那个合集：43 集高达（倒序块）+ 另一部番 2 集 + 2 条普通视频，
+  // 全部在「アニメ」合集里，展示序 = 高达43..高达1 → 芙莉莲2,1 → 普通1,2。
+  group('番剧整季：同部上下集、不跨番（v2.37.0）', () {
+    const String kSeason = 'アニメ';
+
+    /// 整季导入的集：标题 = `季名 第N话`、collection 空在真实数据里，
+    /// 这里放进合集是为了在同一页里同时验「番剧块 + 普通视频混排」。
+    WhitelistVideo seasonEp(
+      String season,
+      int n,
+      String bvid, {
+      required int epId,
+      required String addedAt,
+      List<PageInfo>? pages,
+    }) =>
+        WhitelistVideo(
+          bvid: bvid,
+          cid: 999,
+          title: '$season 第$n话',
+          cover: '',
+          duration: 200,
+          upName: '番剧/官方',
+          addedAt: addedAt,
+          collection: kSeason,
+          pages: pages,
+          epId: epId,
+        );
+
+    /// 普通视频（无 epId）：added_at 显式给（两条**不能同值**——排序在
+    /// order 相同时按 added_at 倒序，同值会落到 Dart 不稳定的 sort 上，
+    /// 展示序不可预期）。
+    WhitelistVideo plainVideo(String title, String bvid, String addedAt) =>
+        WhitelistVideo(
+          bvid: bvid,
+          cid: 999,
+          title: title,
+          cover: '',
+          duration: 200,
+          upName: '某UP主',
+          addedAt: addedAt,
+          collection: kSeason,
+        );
+
+    /// 43 集高达 + 芙莉莲 2 集 + 普通视频 2 条（全部在同一个合集里）。
+    ///
+    /// 展示序（sortedVideos：order 全 0 → added_at 倒序）：
+    ///   高达43 … 高达1 , 芙莉莲2 , 芙莉莲1 , 普通1 , 普通2
+    /// 所以 **高达1 的下一条就是芙莉莲2** —— 这正是用户看到的跨番。
+    WhitelistData seasonData() => WhitelistData(
+          version: 4,
+          updatedAt: '2026-08-20T00:00:00Z',
+          videos: [
+            for (var n = 1; n <= 43; n++)
+              seasonEp('高达', n, 'BVGD${n.toString().padLeft(2, '0')}',
+                  epId: 900000 + n,
+                  addedAt: '2026-08-01T00:00:${n.toString().padLeft(2, '0')}Z'),
+            seasonEp('芙莉莲', 1, 'BVFRI001',
+                epId: 800001, addedAt: '2026-07-01T00:00:01Z'),
+            seasonEp('芙莉莲', 2, 'BVFRI002',
+                epId: 800002, addedAt: '2026-07-01T00:00:02Z'),
+            plainVideo('普通视频1', 'BVPLAIN01', '2026-01-01T00:00:01Z'),
+            plainVideo('普通视频2', 'BVPLAIN02', '2026-01-01T00:00:00Z'),
+          ],
+          collections: const [
+            CollectionInfo(name: kSeason, createdAt: '2026-08-01T00:00:00Z'),
+          ],
+          upowners: const <Upowner>[],
+        );
+
+    /// 列表项在 800×600 的默认视口下装不下 → 临时把视口拉高，让 47 条
+    /// 全部可见（tap 才点得到）；点到播放页之前再恢复成常规竖屏
+    /// （播放页的布局断言口径与既有测试保持一致）。
+    Future<void> pumpCollection(WidgetTester tester, WhitelistData data) async {
+      tester.view.devicePixelRatio = 1.0;
+      tester.view.physicalSize = const Size(600, 6000);
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(
+        MaterialApp(
+          home: CollectionPage(
+            collectionName: kSeason,
+            data: data,
+            saveAndRefresh: (_) async {},
+          ),
+        ),
+      );
+      await tester.pump();
+      await tester.pump();
+    }
+
+    Future<void> enterPlayer(WidgetTester tester, String title) async {
+      expect(find.text(title), findsOneWidget,
+          reason: '目标条目要在（视口已拉高，47 条都渲染出来）');
+      await tester.tap(find.text(title), warnIfMissed: false);
+      await tester.pump();
+      tester.view.physicalSize = const Size(411, 914); // 回常规竖屏
+      await _settle(tester);
+    }
+
+    testWidgets('合集页展示序确实是「高达43 → 高达1 → 芙莉莲2 → 芙莉莲1 → 普通」',
+        (tester) async {
+      await pumpCollection(tester, seasonData());
+      final page = tester.widget<CollectionPage>(find.byType(CollectionPage));
+      final order = page.data
+          .sortedVideos(kSeason)
+          .map((v) => v.title)
+          .toList();
+      expect(order.first, '高达 第43话', reason: 'order 全 0 + added_at 倒序 = 倒序块');
+      expect(order[42], '高达 第1话');
+      expect(order[43], '芙莉莲 第2话',
+          reason: '**改动前**：高达第1话的「下一集」就是这一条（跨番）');
+      expect(order.last, '普通视频2');
+    });
+
+    testWidgets('点中间某集（第23话）→ playlist 只含同部 43 集且正序、下标对', (tester) async {
+      final rec = _PlayerRec();
+      _installMocks(tester, rec);
+      await pumpCollection(tester, seasonData());
+      await enterPlayer(tester, '高达 第23话');
+
+      final page = tester.widget<PlayerPage>(find.byType(PlayerPage));
+      final titles = page.playlist!.videos.map((v) => v.title).toList();
+      expect(titles, hasLength(43), reason: '只取同部（芙莉莲/普通视频都不在）');
+      expect(titles.first, '高达 第1话');
+      expect(titles.last, '高达 第43话');
+      expect(titles[22], '高达 第23话');
+      expect(page.playlistIndex, 22, reason: '组内下标（不是合集里的展示下标）');
+      expect(find.textContaining('23/43'), findsOneWidget);
+
+      // 点下一集 → 同部的下一集（第24话），不是交集里的下一条（第22话）
+      await _tap(tester, _kNextBtn);
+      expect(find.textContaining('24/43'), findsOneWidget);
+      expect(rec.setDataSources.length, 2, reason: '确实换了一集');
+    });
+
+    testWidgets('倒序块的最末（第1话）→ 上一集禁用、下一集 = 同部第2话（**不跨番**）', (tester) async {
+      final rec = _PlayerRec();
+      _installMocks(tester, rec);
+      await pumpCollection(tester, seasonData());
+      // 第1话在合集展示序里是第 43 条（倒序块的末条），改动前点它再点
+      // 「下一集」会切到「芙莉莲 第2话」。
+      await enterPlayer(tester, '高达 第1话');
+
+      expect(find.textContaining('1/43'), findsOneWidget);
+      expect(_enabled(tester, _kPrevBtn), isFalse, reason: '组内第一条没有上一集');
+      expect(_enabled(tester, _kNextBtn), isTrue);
+
+      await _tap(tester, _kNextBtn);
+      expect(find.textContaining('2/43'), findsOneWidget,
+          reason: '下一集 = 同部第 2 话（不是合集里的下一条芙莉莲）');
+      expect(find.textContaining('芙莉莲'), findsNothing);
+    });
+
+    testWidgets('组内末集（第43话）→ 下一集**禁用**（不循环、不跨番）', (tester) async {
+      final rec = _PlayerRec();
+      _installMocks(tester, rec);
+      await pumpCollection(tester, seasonData());
+      await enterPlayer(tester, '高达 第43话');
+
+      expect(find.textContaining('43/43'), findsOneWidget);
+      expect(_enabled(tester, _kNextBtn), isFalse, reason: '末集没有下一集');
+      expect(_enabled(tester, _kPrevBtn), isTrue);
+
+      final before = rec.setDataSources.length;
+      await _tap(tester, _kNextBtn);
+      expect(rec.setDataSources.length, before,
+          reason: '点禁用态无动作 → 永远跨不到别的番');
+      expect(find.textContaining('43/43'), findsOneWidget);
+    });
+
+    testWidgets('同一合集里的另一部番：点它也走自己那一部（互不串）', (tester) async {
+      final rec = _PlayerRec();
+      _installMocks(tester, rec);
+      await pumpCollection(tester, seasonData());
+      await enterPlayer(tester, '芙莉莲 第2话');
+
+      final page = tester.widget<PlayerPage>(find.byType(PlayerPage));
+      expect(page.playlist!.videos.map((v) => v.title).toList(),
+          ['芙莉莲 第1话', '芙莉莲 第2话']);
+      expect(page.playlistIndex, 1);
+      expect(find.textContaining('2/2'), findsOneWidget);
+      expect(_enabled(tester, _kNextBtn), isFalse, reason: '自己那一部的末集');
+      expect(_enabled(tester, _kPrevBtn), isTrue);
+    });
+
+    testWidgets('普通视频（epId == null）→ playlist = 整个合集原顺序（与改动前一致）',
+        (tester) async {
+      final rec = _PlayerRec();
+      _installMocks(tester, rec);
+      final data = seasonData();
+      await pumpCollection(tester, data);
+      await enterPlayer(tester, '普通视频1');
+
+      final page = tester.widget<PlayerPage>(find.byType(PlayerPage));
+      // 改动前的行为：整个合集按 sortedVideos 交下去，下标 = 展示下标
+      expect(page.playlist!.videos.map((v) => v.title).toList(),
+          data.sortedVideos(kSeason).map((v) => v.title).toList(),
+          reason: '普通视频不受番剧分组影响（顺序一字不改）');
+      expect(page.playlist!.videos, hasLength(47));
+      expect(page.playlistIndex, 45, reason: '普通视频1 在展示序里是第 46 条');
+      expect(_enabled(tester, _kPrevBtn), isTrue);
+      expect(_enabled(tester, _kNextBtn), isTrue);
+
+      await _tap(tester, _kNextBtn);
+      // 标签是 1 基：「第 47 条」显示 47/47（普通视频照旧按合集展示序走）
+      expect(find.textContaining('47/47'), findsOneWidget,
+          reason: '普通视频照旧按合集展示序走');
+    });
+  });
 }

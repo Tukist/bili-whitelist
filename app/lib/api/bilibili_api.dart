@@ -2168,8 +2168,16 @@ class BiliApi {
       collection: '',
       order: 0,
       pubdate: created > 0 ? created : null,
+      // v2.37.0：vlist 的 `play` 就是播放量（接口原值，非负才有意义；
+      // 0/缺失/脏类型 → null，卡片不显示这一段）
+      view: _nonNegativeInt(j['play']),
     );
   }
+
+  /// 防御：非负整数才返回（0 也算有值——0 播放量是真的 0），
+  /// 缺失/负数/脏类型 → null。
+  static int? _nonNegativeInt(dynamic raw) =>
+      raw is num && raw >= 0 ? raw.toInt() : null;
 
   /// 解析 B 站 mm:ss / h:mm:ss 时长字符串为秒。空串/非法 → 0。
   int _parseLength(String raw) {

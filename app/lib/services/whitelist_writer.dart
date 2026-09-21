@@ -120,11 +120,16 @@ class WhitelistWriter {
   /// desc = view 接口 data.desc（简介，含 \n 换行；多 P 视频简介是视频级，
   /// 所有分 P 共享同一条）。非 String（脏类型）按字符串化容错处理，
   /// 缺失 → 空串。
+  /// view = view 接口 **data.stat.view**（播放量）。该字段名 2026-09 实测确认
+  /// （`curl /x/web-interface/view?bvid=…` 响应：`"stat":{"aid":…,"view":105989388,…}`），
+  /// 不是猜测；`fetchVideoMeta` 原样返回整个 `data`，所以这里直接读得到。
+  /// 缺失/脏类型/负数 → null（卡片不显示播放量这一段）。
   static WhitelistVideo videoFromMeta(
     Map<String, dynamic> meta, {
     required String fallbackBvid,
   }) {
     final owner = meta['owner'] as Map<String, dynamic>? ?? const {};
+    final stat = meta['stat'] as Map<String, dynamic>? ?? const {};
     final rawPages = meta['pages'] as List? ?? const [];
     final pages = rawPages
         .whereType<Map<String, dynamic>>()
@@ -149,8 +154,17 @@ class WhitelistWriter {
       // view 接口 data.desc = 简介文本；缺失/脏类型 → 空串（不写脏值）。
       // String 原样（保留 \n），非 String（脏类型如数字）toString 容错。
       desc: _stringify(meta['desc']),
+      // view 接口 data.stat.view = 播放量（实测字段名，见方法注释）。
+      // 0 是合法值（真·零播放）→ 用 _nonNegativeInt 而不是 _positiveInt；
+      // 缺失（老接口/降级响应）/脏类型/负数 → null。
+      view: _nonNegativeInt(stat['view']),
     );
   }
+
+  /// 防御：非负整数才返回（0 是有意义的真实值，如播放量 0），
+  /// 缺失/负数/脏类型 → null。
+  static int? _nonNegativeInt(dynamic raw) =>
+      raw is num && raw >= 0 ? raw.toInt() : null;
 
   /// 防御：把任意脏类型转字符串（null/缺省 → ''，其余 toString）。
   /// 简介字段用：view data.desc 正常是 String；接口异常给数字等脏类型时

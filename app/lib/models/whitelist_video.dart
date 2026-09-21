@@ -14,6 +14,8 @@
 /// 删除，视频与子孙结构一起跟着走）。为什么用路径而不是 `parent` 字段、
 /// 为什么级联要有防环，见 [kCollectionSep] 的说明。旧数据不带 `/` = 顶层合集，
 /// 结构不变，**零迁移**。
+/// v2.37.0 起视频带可选 `view`（播放量，视频级附加字段向后兼容：
+/// 旧读者忽略，新读者缺省 null = 未知 → 卡片不显示这一段）。
 library;
 
 import 'upowner.dart';
@@ -60,6 +62,7 @@ class WhitelistVideo {
   final int? epId; // 番剧/电影集 ep_id（v2.16.4+ 番剧导入写入；普通视频/旧数据 = null）
   final int? pubdate; // 发布时间（Unix 秒；v2.16.16+ 导入写入；旧数据/未知 = null）
   final String desc; // 简介（v2.17.3+ 普通视频导入写入 view data.desc，含 \n；旧数据/番剧 = ''）
+  final int? view; // 播放量（v2.37.0+ 能拿到才写：UP 主页 vlist.play / view data.stat.view；旧数据/未知 = null）
 
   const WhitelistVideo({
     required this.bvid,
@@ -75,6 +78,7 @@ class WhitelistVideo {
     this.epId,
     this.pubdate,
     this.desc = '',
+    this.view,
   });
 
   factory WhitelistVideo.fromJson(Map<String, dynamic> json) {
@@ -99,6 +103,11 @@ class WhitelistVideo {
       pubdate: json['pubdate'] is num ? (json['pubdate'] as num).toInt() : null,
       // 旧数据无 desc / 脏类型（非 String）→ 空串（信息行不显示简介，不崩）
       desc: json['desc'] is String ? json['desc'] as String : '',
+      // 旧数据无 view / 脏类型 / 负数 → null（卡片不显示播放量这一段）；
+      // 0 是合法值（真·零播放），照常保留
+      view: json['view'] is num && (json['view'] as num) >= 0
+          ? (json['view'] as num).toInt()
+          : null,
     );
   }
 
@@ -118,6 +127,8 @@ class WhitelistVideo {
         if (pubdate != null) 'pubdate': pubdate,
         // desc 非空才输出（无简介/旧数据不回写多余字段，保持数据干净）
         if (desc.isNotEmpty) 'desc': desc,
+        // view 非空才输出（未知/旧数据不回写多余字段，保持数据干净）
+        if (view != null) 'view': view,
         if (pages != null)
           'pages': pages!.map((p) => p.toJson()).toList(),
       };
@@ -127,10 +138,11 @@ class WhitelistVideo {
 
   /// 复制并修改合集归属（管理操作「移动到合集」用）。
   ///
-  /// epId/pubdate/desc 不被本方法修改：未传时沿用原值（合集移动/重排不丢
-  /// 番剧集标识、发布时间与简介）。
+  /// epId/pubdate/desc/view 不被本方法修改：未传时沿用原值（合集移动/重排不丢
+  /// 番剧集标识、发布时间、简介与播放量）。
   WhitelistVideo copyWith(
-          {String? collection, int? order, int? epId, int? pubdate, String? desc}) =>
+          {String? collection, int? order, int? epId, int? pubdate, String? desc,
+          int? view}) =>
       WhitelistVideo(
         bvid: bvid,
         cid: cid,
@@ -145,6 +157,7 @@ class WhitelistVideo {
         epId: epId ?? this.epId,
         pubdate: pubdate ?? this.pubdate,
         desc: desc ?? this.desc,
+        view: view ?? this.view,
       );
 
   /// 分 P 数量：pages 缺失或为空 → 单 P（1）。
@@ -164,6 +177,146 @@ String formatPubdate(int? unixSec) {
   final m = dt.month.toString().padLeft(2, '0');
   final d = dt.day.toString().padLeft(2, '0');
   return '${dt.year}-$m-$d';
+}
+
+// -----------------------------------------------------------------------------
+// 番剧「同一部」分集识别与组内排序（v2.37.0+）
+//
+// 为什么这么修（用户原话：「不要让收藏一个剧或者番的时候需要把每集都收藏…
+// 在アニメ合集里面一个 43 集的高达，我点上集下一集的时候给我切到其他番剧
+// 去了」）：上下集导航的「列表」就是合集页的展示序（[WhitelistData.sortedVideos]
+// 的 order 升序 + added_at 倒序兜底）。而整季导入（whitelist_writer 的
+// [importPgcSeason] → [videoFromPgcEpisode]）**逐集 addVideo、不写 order
+// （恒 0）**、added_at = DateTime.now() 逐集递增 → 43 集 order 全是 0，
+// 于是一整块被 added_at **倒序**排成「第43话 → 第1话」；走到这一块的**最末**
+// （第1话）时，「下一集」就是列表里的下一条 = **另一个番剧**。
+//
+// 为什么按**标题前缀**分组而不是加 seasonId 字段（取舍说明）：
+// - 加 seasonId 要动数据 schema：只有「以后新导入的集」才有值，用户**现在
+//   已经躺在白名单里的整季**依旧是 null —— 本次要修的恰恰是既存数据，加了
+//   字段也修不了它，还得再补一套「缺字段时的回退」；
+// - 而 `videoFromPgcEpisode` 生成的标题**结构稳定**：`季名 + ' ' + 集数标签
+//   + ' ' + 副标题`，集数标签对纯数字集就是 `第N话`（[episodeLabelOf]）。
+//   所以「`第N话` 之前的整段」就是**季名**，天然是「同一部」的键，
+//   零 schema 变更、零迁移，且对老数据立刻生效；
+// - 代价（已知、可接受）：同一部番的**两季**若季名（前缀）**完全相同**
+//   （罕见）会被并成一组；季名不同的（`XX 第一季` / `XX 第二季`）严格分开。
+
+/// 番剧分集标题里的集数标签（`第1话` / `第12话` / `第5.5话`）。
+///
+/// 与 [episodeLabelOf] 的产出对应：纯数字集 → `第N话`；`第5.5话` 这种
+/// 接口原样给的标签也认（小数集号照常解析）。
+final RegExp kEpisodeLabelRe = RegExp(r'第(\d+(?:\.\d+)?)话');
+
+/// 「同一部番剧」的键：`第N话` **之前**的整段标题（= 季名），trim 后。
+///
+/// - `epId == null`（普通视频 / 旧数据）→ **null**：不属于任何番组，
+///   调用方应保持改动前的行为（合集页照旧整列表排序）。
+/// - `epId != null` 但标题里找不到 `第N话`（如 `剧名 14(OVA)`）→ 也返回
+///   null：**单看这一条**推不出季名，不猜。这种集（OVA / 特别篇）在
+///   [sortedSeasonEpisodes] 里会借「同列表里已识别的季名」归位。
+///
+/// 例：`是，大臣 第一季 第3话` → `是，大臣 第一季`。
+String? seasonGroupKeyOf(WhitelistVideo v) =>
+    v.epId == null ? null : _seasonPrefixOfTitle(v.title);
+
+/// 集号：从 `第N话` 解析（`第12话` → 12、`第5.5话` → 5.5）。
+///
+/// 解析不出（`14(OVA)`、没有 `第N话`、标题是普通视频）→ **null**，
+/// 调用方按 [sortedSeasonEpisodes] 的回退顺序处理（不抛、不崩）。
+double? seasonEpisodeIndexOf(WhitelistVideo v) {
+  final m = kEpisodeLabelRe.firstMatch(v.title);
+  if (m == null) return null;
+  return double.tryParse(m.group(1)!);
+}
+
+/// 标题里 `第N话` 之前的整段（季名）；找不到标签 / 前缀为空 → null。
+String? _seasonPrefixOfTitle(String title) {
+  final m = kEpisodeLabelRe.firstMatch(title);
+  if (m == null) return null;
+  final prefix = title.substring(0, m.start).trim();
+  // 前缀为空（标题自己就叫 `第1话`）→ 认不出季名，不猜
+  return prefix.isEmpty ? null : prefix;
+}
+
+/// [v] 是否属于季名为 [key] 的那一部番剧。
+///
+/// - 自己标题里有 `第N话` → **前缀严格相等**才算（`XX 第二季 第3话` 的键是
+///   `XX 第二季`，不会并进 `XX` 那一组——两季各走各自的正序）；
+/// - 自己识别不出标签（OVA / 特别篇 / 正片，如 `XX 14(OVA)`）→ 按
+///   「季名 + 空格」开头判定，归到那一部里（它的集号解析不出，排序走回退）。
+/// - `epId == null`（普通视频）→ 永远不属于任何番组（标题像番剧也不猜）。
+bool _belongsToSeason(WhitelistVideo v, String key) {
+  if (v.epId == null) return false;
+  final own = seasonGroupKeyOf(v);
+  if (own != null) return own == key;
+  return v.title == key || v.title.startsWith('$key ');
+}
+
+/// OVA / 特别篇（标题没有 `第N话`）借「**同列表里已识别出来的**季名」归位：
+/// 取能匹配上、且**最长**的那个季名（`XX` 与 `XX 第二季` 同时匹配时取更具体
+/// 的那个）。一个都匹配不上 → null（不猜）。
+String? _seasonKeyFromList(List<WhitelistVideo> list, WhitelistVideo current) {
+  String? best;
+  for (final v in list) {
+    final k = seasonGroupKeyOf(v);
+    if (k == null) continue;
+    if (current.title != k && !current.title.startsWith('$k ')) continue;
+    if (best == null || k.length > best.length) best = k;
+  }
+  return best;
+}
+
+/// 取 [current] **所属那一部番剧**的分集，**组内正序**返回。
+///
+/// 三种输入三类结果：
+/// - `epId == null`（普通视频 / 旧数据）→ **原样返回 [list]**：合集页照旧用
+///   整列表排序，行为与改动前逐字符一致；
+/// - `epId != null` 且认得出同部（标题有 `第N话`，或能借列表里的季名归位）
+///   → 返回**只含这一部**的集、组内正序。末集天然是组内最后一条，
+///   播放页 `_canPlayNext == false` → **永不跨番**；
+/// - `epId != null` 但认不出同部（标题没有 `第N话` 且列表里没有可借的季名）
+///   → 返回 **[current] 自己**：它是**番剧集**，把「下一集」指向合集里的
+///   下一条（可能是别的番）正是用户报的那个毛病；宁可这一条不给上下集，
+///   也不跨番。返回长度 1 时播放页整行不构建（不是两个死按钮）。
+///
+/// 为什么组内按**集号升序**而不是 added_at / order：
+/// - `order` 在整季导入里恒 0（没有任何一集被拖过），它表达不了集序；
+/// - `added_at` 是**导入时刻**（逐集递增），只在「一次导完整季」时恰好等于
+///   集序，用户后来补导入一集就会乱；
+/// - 标题里的集号是**内容自带的语义**，与导入顺序、拖拽顺序都无关 ——
+///   唯一与用户认知（第 3 话后面是第 4 话）一致的依据。
+///
+/// 回退顺序（集号解析不出的那些，如 OVA）：**有集号的排在前面**，
+/// 没集号的按 `pubdate` 升序 → 再按 `added_at` 升序（`pubdate` 缺失/0 时
+/// 视为最旧，与既有「0 = 未知」口径一致）。OVA / 特别篇通常挂在最后一集之后。
+///
+/// 返回**新列表**（入参列表的顺序一字不改）。
+List<WhitelistVideo> sortedSeasonEpisodes(
+  List<WhitelistVideo> list,
+  WhitelistVideo current,
+) {
+  if (current.epId == null) return list; // 普通视频：不动
+  final key = seasonGroupKeyOf(current) ?? _seasonKeyFromList(list, current);
+  if (key == null) return [current]; // 番剧集但认不出同部：不给上下集也不跨番
+  return list.where((v) => _belongsToSeason(v, key)).toList()
+    ..sort((a, b) {
+      final ia = seasonEpisodeIndexOf(a);
+      final ib = seasonEpisodeIndexOf(b);
+      if (ia != null && ib != null) {
+        final byEpisode = ia.compareTo(ib);
+        if (byEpisode != 0) return byEpisode;
+      } else if (ia != null) {
+        return -1; // 有集号的在前（OVA/特别篇排在后面）
+      } else if (ib != null) {
+        return 1;
+      }
+      final pa = a.pubdate ?? 0;
+      final pb = b.pubdate ?? 0;
+      if (pa != pb) return pa.compareTo(pb);
+      // added_at 升序（本项目既有比较器只有倒序版，取反即升序）
+      return -WhitelistData._compareAddedAtDesc(a.addedAt, b.addedAt);
+    });
 }
 
 /// 合集信息（whitelist.json v3 的 collections 数组项）。

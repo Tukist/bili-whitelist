@@ -338,6 +338,49 @@ void main() {
           fallbackBvid: 'BV1');
       expect(dirty.desc, '123');
     });
+
+    // 播放量（v2.37.0）：字段名 `stat.view` 是**实测确认**的
+    // （curl /x/web-interface/view?bvid=… 响应里
+    //  `"stat":{"aid":…,"view":105989388,…}`），不是猜的。
+    test('meta stat.view → WhitelistVideo.view（实测字段名）', () {
+      final meta = {
+        'bvid': 'BV1xx411c7mD',
+        'cid': 62131,
+        'title': '测试视频',
+        'stat': {'aid': 1, 'view': 105989388, 'danmaku': 149576},
+      };
+      final v = WhitelistWriter.videoFromMeta(meta, fallbackBvid: 'BV1xx411c7mD');
+      expect(v.view, 105989388);
+      // toJson 往返保留（导入 → Gist → 拉回 → 卡片显示链路不丢）
+      expect(WhitelistVideo.fromJson(v.toJson()).view, 105989388);
+    });
+
+    test('meta 无 stat / view = 0 / 脏类型 → 0 照收、缺失与脏值 null', () {
+      // 0 是合法值（真·零播放）
+      final zero = WhitelistWriter.videoFromMeta(
+          {'bvid': 'BV1', 'cid': 1, 'title': 't', 'stat': {'view': 0}},
+          fallbackBvid: 'BV1');
+      expect(zero.view, 0);
+      // 没有 stat（老接口/降级响应）
+      final noStat = WhitelistWriter.videoFromMeta(
+          {'bvid': 'BV1', 'cid': 1, 'title': 't'}, fallbackBvid: 'BV1');
+      expect(noStat.view, isNull);
+      expect(noStat.toJson().containsKey('view'), isFalse);
+      // stat 在但没有 view
+      final noView = WhitelistWriter.videoFromMeta(
+          {'bvid': 'BV1', 'cid': 1, 'title': 't', 'stat': {'like': 5}},
+          fallbackBvid: 'BV1');
+      expect(noView.view, isNull);
+      // 脏类型（字符串）/ 负数 → null（不写脏值）
+      final dirty = WhitelistWriter.videoFromMeta(
+          {'bvid': 'BV1', 'cid': 1, 'title': 't', 'stat': {'view': '999'}},
+          fallbackBvid: 'BV1');
+      expect(dirty.view, isNull);
+      final neg = WhitelistWriter.videoFromMeta(
+          {'bvid': 'BV1', 'cid': 1, 'title': 't', 'stat': {'view': -5}},
+          fallbackBvid: 'BV1');
+      expect(neg.view, isNull);
+    });
   });
 
   group('番剧（pgc）单集 → WhitelistVideo', () {

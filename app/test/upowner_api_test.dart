@@ -164,6 +164,7 @@ Map<String, dynamic> _oneVideo({
   String author = 'UP',
   String pic = '//i0.hdslb.com/bfs/archive/x.jpg',
   int created = 1700000000,
+  num? play = 999, // null = 响应里不带 play（测缺省）
 }) => {
   'bvid': bvid,
   'title': title,
@@ -172,7 +173,7 @@ Map<String, dynamic> _oneVideo({
   'pic': pic,
   'mid': 100,
   'created': created,
-  'play': 999,
+  if (play != null) 'play': play,
   'favorites': 11,
 };
 
@@ -442,6 +443,59 @@ void main() {
       });
       final page = await _api(adapter).fetchUpownerVideos(1);
       expect(page.videos.first.duration, 3723);
+    });
+
+    // 播放量（v2.37.0，用户需求「视频卡片加播放量」）：vlist 里本来就有
+    // `play`，但 _videoFromVlist 以前**拿到了却丢掉**，现在写进 view。
+    test('vlist 的 play → view（播放量）', () async {
+      final adapter = _RoutingAdapter({
+        '/x/frontend/finger/spi': _spiBody,
+        '/x/web-interface/nav': _navBody,
+        '/x/space/wbi/arc/search': () =>
+            _videoListBody(vlist: [_oneVideo(play: 123456)], count: 1),
+      });
+      final page = await _api(adapter).fetchUpownerVideos(1);
+      expect(page.videos.first.view, 123456);
+    });
+
+    test('vlist 的 play = 0 → view = 0（真·零播放，不是「未知」）', () async {
+      final adapter = _RoutingAdapter({
+        '/x/frontend/finger/spi': _spiBody,
+        '/x/web-interface/nav': _navBody,
+        '/x/space/wbi/arc/search': () =>
+            _videoListBody(vlist: [_oneVideo(play: 0)], count: 1),
+      });
+      final page = await _api(adapter).fetchUpownerVideos(1);
+      expect(page.videos.first.view, 0);
+    });
+
+    test('vlist 缺 play / 脏值 → view = null（卡片不显示播放量这一段）', () async {
+      final adapter = _RoutingAdapter({
+        '/x/frontend/finger/spi': _spiBody,
+        '/x/web-interface/nav': _navBody,
+        '/x/space/wbi/arc/search': () =>
+            _videoListBody(vlist: [_oneVideo(play: null)], count: 1),
+      });
+      final page = await _api(adapter).fetchUpownerVideos(1);
+      expect(page.videos.first.view, isNull);
+    });
+
+    test('元数据接口的 duration/title/view 一起落到同一条上（不串字段）', () async {
+      final adapter = _RoutingAdapter({
+        '/x/frontend/finger/spi': _spiBody,
+        '/x/web-interface/nav': _navBody,
+        '/x/space/wbi/arc/search': () => _videoListBody(
+          vlist: [
+            _oneVideo(bvid: 'BV1', title: '视频一', length: '3:20', play: 10),
+            _oneVideo(bvid: 'BV2', title: '视频二', length: '1:02:03', play: 20),
+          ],
+          count: 2,
+        ),
+      });
+      final page = await _api(adapter).fetchUpownerVideos(1);
+      expect(page.videos.map((v) => v.title).toList(), ['视频一', '视频二']);
+      expect(page.videos.map((v) => v.duration).toList(), [200, 3723]);
+      expect(page.videos.map((v) => v.view).toList(), [10, 20]);
     });
 
     test('length 非法（"abc"）→ duration=0，不崩', () async {

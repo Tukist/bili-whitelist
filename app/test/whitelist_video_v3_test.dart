@@ -152,6 +152,63 @@ void main() {
     });
   });
 
+  group('WhitelistVideo.view（v2.37.0 播放量）', () {
+    test('fromJson 解析 view + toJson 序列化（非空才输出）', () {
+      final v = WhitelistVideo.fromJson({..._v2Video('BVv'), 'view': 123456});
+      expect(v.view, 123456);
+      expect(v.toJson()['view'], 123456);
+    });
+
+    test('旧数据无 view → null，toJson 不回写多余字段（向后兼容）', () {
+      final v = WhitelistVideo.fromJson(_v2Video('BV1'));
+      expect(v.view, isNull);
+      expect(v.toJson().containsKey('view'), isFalse);
+    });
+
+    test('view = 0 是**合法值**（真·零播放）→ 解析为 0、toJson 照常输出', () {
+      final v = WhitelistVideo.fromJson({..._v2Video('BVz'), 'view': 0});
+      expect(v.view, 0);
+      expect(v.toJson()['view'], 0);
+      expect(v.toJson().containsKey('view'), isTrue);
+    });
+
+    test('view 脏类型（字符串）→ null 不崩', () {
+      expect(
+        WhitelistVideo.fromJson({..._v2Video('BVd1'), 'view': '999'}).view,
+        isNull,
+      );
+      expect(
+        WhitelistVideo.fromJson({..._v2Video('BVd2'), 'view': null}).view,
+        isNull,
+      );
+    });
+
+    test('view 负数（脏值）→ null（UI 不会画出「-5 播放」）', () {
+      expect(
+        WhitelistVideo.fromJson({..._v2Video('BVneg'), 'view': -5}).view,
+        isNull,
+      );
+    });
+
+    test('fromJson → toJson 往返保留 view', () {
+      final original = WhitelistVideo.fromJson(
+          {..._v2Video('BVv'), 'view': 987654321, 'epId': 98603});
+      final back = WhitelistVideo.fromJson(original.toJson());
+      expect(back.view, 987654321);
+      expect(back.epId, 98603);
+      expect(back.bvid, 'BVv');
+    });
+
+    test('copyWith 改合集不丢 view（合集移动后卡片仍显示播放量）', () {
+      final v = WhitelistVideo.fromJson({..._v2Video('BVv'), 'view': 4242});
+      expect(v.copyWith(collection: '动画').view, 4242);
+      expect(v.copyWith().view, 4242);
+      // 未传时沿用原值；显式传则覆盖
+      expect(v.copyWith(order: 3).view, 4242);
+      expect(v.copyWith(view: 1).view, 1);
+    });
+  });
+
   group('WhitelistVideo.epId（v2.16.4 番剧集标识）', () {
     test('fromJson 解析 epId + toJson 序列化（非空才输出）', () {
       final v = WhitelistVideo.fromJson({..._v2Video('BVpgc'), 'epId': 98603});

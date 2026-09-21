@@ -706,25 +706,42 @@ class _CollectionPageState extends State<CollectionPage> {
                       onTap: _selectMode
                           ? () => _toggleSelect(video.bvid)
                           : () {
+                              // 同合集上下集（v2.30.0+）：把**整个合集**按
+                              // 用户在本页看到的顺序交下去，「下一集」就是
+                              // 列表里的下一条（[_videos] = sortedVideos
+                              // 的 order 升序 + addedAt 倒序兜底，与列表
+                              // 渲染用的是同一个 getter，不会出现两套顺序）。
+                              // 只接这一条「点单条视频播放」的路径：多选/
+                              // 批量/子合集下钻都不是「从某个列表开始连播」
+                              // 的语义。
+                              //
+                              // v2.37.0 修「番剧上下集跨番」（用户需求）：
+                              // 整季导入的集全是 order=0 + added_at 递增 →
+                              // 在合集里排成「第43话 → 第1话」一块，走到块末
+                              // 的「下一集」就跳到**别的番剧**了。所以这里换成
+                              // 「**只取当前这部的分集**、组内按集号正序」：
+                              // 末集天然 `_canPlayNext == false`（播放页不
+                              // 循环），永远跨不出去。
+                              // 普通视频（epId == null）拿到的是**原列表本身**，
+                              // 行为与改动前逐字符一致（见 sortedSeasonEpisodes）。
+                              final playlistVideos =
+                                  sortedSeasonEpisodes(videos, video);
+                              // 组内下标：找不到时给 -1 也无妨，播放页会
+                              // 回退到 0（见 player_page 初始化下标那段）。
+                              final playlistIndex =
+                                  playlistVideos.indexOf(video);
                               Navigator.of(context).push(
                                 MaterialPageRoute<void>(
                                   settings: const RouteSettings(
                                       name: kPlayerRouteName),
-                                  // 同合集上下集（v2.30.0+）：把**整个合集**按
-                                  // 用户在本页看到的顺序交下去，「下一集」就是
-                                  // 列表里的下一条（[_videos] = sortedVideos
-                                  // 的 order 升序 + addedAt 倒序兜底，与列表
-                                  // 渲染用的是同一个 getter，不会出现两套顺序）。
-                                  // 只接这一条「点单条视频播放」的路径：多选/
-                                  // 批量/子合集下钻都不是「从某个列表开始连播」
-                                  // 的语义。
                                   builder: (_) => PlayerPage(
                                     video: video,
                                     playlist: PlaylistContext(
-                                      videos: videos,
+                                      videos: playlistVideos,
                                       label: _label,
                                     ),
-                                    playlistIndex: vi,
+                                    playlistIndex:
+                                        playlistIndex < 0 ? 0 : playlistIndex,
                                   ),
                                 ),
                               );

@@ -1,7 +1,8 @@
-// VideoTile 副信息行测试：时长 · UP主（· 发布时间）。
+// VideoTile 副信息行测试：时长 · UP主（· 发布时间）（· N 播放，v2.37.0）。
 // - 新数据（pubdate 非空）→ 副信息行含 `· yyyy-MM-dd`
 // - 旧数据（pubdate null / 0）→ 副信息行与旧版逐字符一致（不含日期段），
 //   不崩、不破坏布局（标题/时长照常渲染）
+// - 播放量（view 非空才显示；null → 与改动前逐字符一致）
 // - 块化（P0 批次 B）：外形给 ListTile 自己（圆角 + 强描边 + 纸底），
 //   **容器类型不变**（`find.byType(VideoTile)` 照旧命中）；封面外层包
 //   CoverHero（空 bvid → 零 Hero 节点），多选模式整块关掉 Hero。
@@ -29,6 +30,7 @@ WhitelistVideo _video({
   String bvid = 'BV1',
   String title = '测试视频标题',
   List<PageInfo>? pages,
+  int? view,
 }) =>
     WhitelistVideo(
       bvid: bvid,
@@ -40,6 +42,7 @@ WhitelistVideo _video({
       addedAt: '2026-01-01T00:00:00Z',
       pubdate: pubdate,
       pages: pages,
+      view: view,
     );
 
 /// 超长标题：测试字体下（每字符宽 = fontSize = 14）必然超过 2 行。
@@ -73,6 +76,71 @@ void main() {
     await tester.pumpWidget(_wrap(VideoTile(video: _video(pubdate: 0))));
     expect(find.text('1:30 · UP主'), findsOneWidget);
     expect(find.textContaining(RegExp(r'· \d{4}-\d{2}-\d{2}')), findsNothing);
+  });
+
+  // 播放量（v2.37.0，用户需求「视频卡片加播放量」）。方案是「只对能拿到的
+  // 几处显示」：白名单里**老视频多数没有 view**（导入时拿不到）→ 卡片与改动
+  // 前逐字符一致，这是已知表现、不是 bug。
+  group('播放量（v2.37.0）', () {
+    testWidgets('view 非空 → 副信息行末尾多一段「N 播放」', (tester) async {
+      await tester.pumpWidget(_wrap(VideoTile(video: _video(view: 12345))));
+      expect(find.text('1:30 · UP主 · 1.2万 播放'), findsOneWidget);
+    });
+
+    testWidgets('view null（旧数据 / 拿不到）→ 与改动前**逐字符一致**', (tester) async {
+      await tester.pumpWidget(_wrap(VideoTile(video: _video())));
+      expect(find.text('1:30 · UP主'), findsOneWidget);
+      expect(find.textContaining('播放'), findsNothing);
+    });
+
+    testWidgets('view = 0 → 显示「0 播放」（真·零播放，不是「未知」）',
+        (tester) async {
+      await tester.pumpWidget(_wrap(VideoTile(video: _video(view: 0))));
+      expect(find.text('1:30 · UP主 · 0 播放'), findsOneWidget);
+    });
+
+    testWidgets('view + pubdate 都在 → 顺序 = 时长 · UP主 · 日期 · N 播放（播放量最后）',
+        (tester) async {
+      final pubdate = 1682899200;
+      await tester.pumpWidget(
+          _wrap(VideoTile(video: _video(pubdate: pubdate, view: 999))));
+      expect(find.text('1:30 · UP主 · ${_dateText(pubdate)} · 999 播放'),
+          findsOneWidget);
+    });
+
+    testWidgets('万/亿口径与专栏页 fmtArticleCount 一致', (tester) async {
+      final cases = {
+        999: '999 播放',
+        10000: '1万 播放',
+        12345: '1.2万 播放',
+        123456789: '1.2亿 播放',
+      };
+      for (final e in cases.entries) {
+        await tester.pumpWidget(_wrap(VideoTile(video: _video(view: e.key))));
+        expect(find.text('1:30 · UP主 · ${e.value}'), findsOneWidget);
+      }
+    });
+
+    testWidgets('纯函数 fmtVideoSubtitle：四种组合逐一钉住', (tester) async {
+      expect(
+        fmtVideoSubtitle(duration: '1:30', upName: 'UP主'),
+        '1:30 · UP主',
+      );
+      expect(
+        fmtVideoSubtitle(duration: '1:30', upName: 'UP主', view: 42),
+        '1:30 · UP主 · 42 播放',
+      );
+      expect(
+        fmtVideoSubtitle(
+            duration: '1:30', upName: 'UP主', pubdateText: '2023-05-01'),
+        '1:30 · UP主 · 2023-05-01',
+      );
+      expect(
+        fmtVideoSubtitle(
+            duration: '1:30', upName: 'UP主', pubdateText: '2023-05-01', view: 42),
+        '1:30 · UP主 · 2023-05-01 · 42 播放',
+      );
+    });
   });
 
   testWidgets('块化：容器类型不变，外形落在 ListTile 自己身上', (tester) async {
