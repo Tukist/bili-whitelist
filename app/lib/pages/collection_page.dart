@@ -29,6 +29,7 @@ import '../services/whitelist_writer.dart';
 import '../theme/app_palette.dart';
 import '../theme/app_tokens.dart';
 import '../widgets/app_block.dart';
+import '../widgets/app_snack.dart';
 import '../widgets/app_state_view.dart';
 import '../widgets/collection_dialogs.dart';
 import '../widgets/swipe_action_box.dart';
@@ -114,11 +115,11 @@ class _CollectionPageState extends State<CollectionPage> {
     if (mounted) setState(() {});
   }
 
-  void _showSnack(String message) {
+  /// 本页提示条入口（统一走 [AppSnack]；默认 info 档 = 受设置里的「界面提示」
+  /// 开关控制，失败类显式传 [SnackKind.error]）。
+  void _showSnack(String message, {SnackKind kind = SnackKind.info}) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(message)));
+    AppSnack.show(context, message, kind: kind);
   }
 
   // ---------------------------------------------------------------------------
@@ -176,7 +177,7 @@ class _CollectionPageState extends State<CollectionPage> {
       final next = createSubCollection(_data, path, name);
       await _saveAndRefresh(next);
     } on CollectionException catch (e) {
-      _showSnack(e.message);
+      _showSnack(e.message, kind: SnackKind.error);
     }
   }
 
@@ -189,7 +190,7 @@ class _CollectionPageState extends State<CollectionPage> {
       final next = renameCollection(_data, path, newName);
       await _saveAndRefresh(next);
     } on CollectionException catch (e) {
-      _showSnack(e.message);
+      _showSnack(e.message, kind: SnackKind.error);
     }
   }
 
@@ -208,7 +209,7 @@ class _CollectionPageState extends State<CollectionPage> {
       final next = deleteCollection(_data, path);
       await _saveAndRefresh(next);
     } on CollectionException catch (e) {
-      _showSnack(e.message);
+      _showSnack(e.message, kind: SnackKind.error);
     }
   }
 
@@ -247,7 +248,7 @@ class _CollectionPageState extends State<CollectionPage> {
           : '已把「${collectionDisplay(path)}」移动到'
               '「${collectionDisplay(target)}」下面');
     } on CollectionException catch (e) {
-      _showSnack(e.message);
+      _showSnack(e.message, kind: SnackKind.error);
     }
   }
 

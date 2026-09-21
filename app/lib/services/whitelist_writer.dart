@@ -1,6 +1,15 @@
 /// 白名单写入服务：把「构造视频 + 查重 + 写 Gist + 写本地缓存」抽成共用逻辑，
 /// 导入（playlist_page._importVideo）与搜索页「加入」共用同一份实现，避免重复。
+///
+/// ## 并发（v2.36.0）
+/// [addVideo] 是 **read-modify-write**（GET 整份 → 查重 → PATCH 整份），两次并发
+/// 调用会各自基于同一份旧快照构造新快照 → 后一次把前一次整份覆盖（丢视频）。
+/// 引入 [addVideo] 的串行闸门（见该方法的注释）之前，只有「用户手快点两下」
+/// 这种窄窗口能碰上；v2.36.0 起信箱右滑**松手 140ms 后就能划下一张**，
+/// 连划两张右滑就是必然并发 → 闸门是解锁连续滑动的必要配套，不能省。
 library;
+
+import 'dart:async';
 
 import 'package:dio/dio.dart';
 
@@ -238,9 +247,47 @@ class WhitelistWriter {
     );
   }
 
+  /// 串行闸门：同一时刻只允许一次「读整份 → 查重 → 写整份」在飞（v2.36.0）。
+  ///
+  /// 为什么必须串行：[addVideo] 是 **read-modify-write** —— 先 GET 整份 Gist
+  /// 查重、再 PATCH 整份。两次并发调用会各自读到**同一份旧快照**，各写一份
+  /// "只包含自己那条"的新快照 → 后一次 PATCH 把前一次整份覆盖掉（丢更新：
+  /// 白名单和本地缓存都少一条，而且**全程没有任何报错**，用户不会发现）。
+  ///
+  /// 什么时候会并发：信箱右滑「加入」在 v2.36.0 起松手 140ms 后就能拖下一张
+  /// （连续跳过的解锁）→ 连划两张右滑就是两次并发加入；搜索页「加入」与信箱
+  /// 同时操作同理。
+  ///
+  /// 为什么**不**复用 `WhitelistWriteQueue`（那个串行乐观写队列）：它串行的是
+  /// "**调用方已经构造好的完整快照**"的 PATCH；而这里的快照**必须先 GET 才知道**
+  /// （要先查重），两次 GET 拿到同一份旧快照这件事它挡不住。串行点只能放在
+  /// 「GET 到 PATCH」整段外面 —— 也就是这里。
+  ///
+  /// 语义：后来者**排队**（不是丢弃）—— 前一次写完，后一次才开始自己的 GET，
+  /// 于是它读到的是前一次的 PATCH 结果，两次加入都保得住。
+  Future<void>? _chain;
+
   /// 把已构造好的视频加入白名单：拉当前 Gist → 按 bvid 查重 → 合并 →
   /// saveToGist → 写本地缓存。重复/失败不写盘，返回 [AddResult] 说明原因。
+  ///
+  /// ★ 本方法**天然可并发调用**（各入口都可能在用户连点/连划时并发进来），
+  /// 所以先过 [_chain] 这一道串行闸门，再走 [_addVideoNow]。
   Future<AddResult> addVideo(WhitelistVideo video) async {
+    final prev = _chain;
+    final done = Completer<void>();
+    // 先把闸门占住（同步完成，中间没有 await → 单线程下不会插进第二次调用）
+    _chain = done.future;
+    try {
+      // 上一个排队者一定会正常 complete（见下面的 finally），不会把异常传下去
+      if (prev != null) await prev;
+      return await _addVideoNow(video);
+    } finally {
+      done.complete();
+    }
+  }
+
+  /// [addVideo] 的实际工作（已经在串行闸门里面）。
+  Future<AddResult> _addVideoNow(WhitelistVideo video) async {
     final current = await github.fetchFromGist();
     final existing = current?.videos ?? const <WhitelistVideo>[];
     final displayTitle = video.title.isEmpty ? video.bvid : video.title;

@@ -1,0 +1,25 @@
+amoTV v2.36.0「垂直上下快速切换」真机取证（emulator-5554）
+动作：下滑(稍后) → 上滑(取回) 交替 4 轮，命令间 sleep 0.25s
+语义：稍后把卡推到队尾、取回把它拿回栈顶 —— 两个动作都不判定、不写白名单、不标记已读（无损往返）
+
+09-21 15:30:55.716 I/flutter (23842): [inbox] 判定 edge=down → 稍后 bvid=BV1T5hi6tEjU drag=Offset(0.0, 163.2)
+09-21 15:30:56.588 I/flutter (23842): [inbox] 判定 edge=up → 取回 bvid=BV1T5hi6tEjU drag=Offset(0.0, -163.2)
+09-21 15:30:57.471 I/flutter (23842): [inbox] 判定 edge=down → 稍后 bvid=BV1T5hi6tEjU drag=Offset(0.0, 155.7)
+09-21 15:30:58.321 I/flutter (23842): [inbox] 判定 edge=up → 取回 bvid=BV1T5hi6tEjU drag=Offset(0.0, -163.2)
+09-21 15:30:59.360 I/flutter (23842): [inbox] 判定 edge=down → 稍后 bvid=BV1T5hi6tEjU drag=Offset(0.0, 163.2)
+09-21 15:31:00.321 I/flutter (23842): [inbox] 判定 edge=up → 取回 bvid=BV1T5hi6tEjU drag=Offset(0.0, -161.8)
+09-21 15:31:01.259 I/flutter (23842): [inbox] 判定 edge=down → 稍后 bvid=BV1T5hi6tEjU drag=Offset(0.0, 163.2)
+09-21 15:31:02.257 I/flutter (23842): [inbox] 判定 edge=up → 取回 bvid=BV1T5hi6tEjU drag=Offset(0.0, -163.2)
+
+结论（如实说明边界）：
+1) 8 次手势全部被判定了 —— 每张卡都在松手那一刻就被接受，没有一张被「上一个动画还没跑完」挡住；
+   判定间隔 872/883/934/961ms 与 adb 注入节奏（swipe 250ms + sleep 250ms + adb 启动开销）吻合，
+   说明页面没有额外等待。
+2) 每次「稍后」之后紧跟的「取回」都把**同一个 bvid** 拿回了栈顶 = 无损往返（稍后/取回都不写任何数据）。
+3) ⚠️ 这份日志**不能**用来证明锁定期比旧实现短：adb 的注入节奏最快也在 300ms 以上、
+   这里实测成对间隔 ~870ms，探不到 160ms 与旧值 320/400ms 的差别。
+   精确的时延断言在 widget 测试里（test/inbox_swipe_test.dart 的「连续滑动」组）：
+   - 「松手 kDurAdvance 后立刻能拖下一张」只等到 40ms + kDurAdvance(160ms) = 200ms 就要求能拖
+     → 旧实现锁到飞出结束（320ms）时这条必然失败；
+   - 「上滑取回…锁输入 ≤ 250ms」只等到 140ms 就要求取回已生效
+     → 旧实现第一步就要 200ms、整段 400ms，这条也必然失败。

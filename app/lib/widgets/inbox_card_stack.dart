@@ -94,13 +94,16 @@ const int kInboxStackCards = 4;
 /// 后层是按底边往下铺的，不预留就会压到下面那排按钮上。
 const double kInboxStackMaxDrop = 36;
 
-/// 「向前推进」的时长。
+/// 「向前推进」的时长（= 出栈可以安全发生的时刻）。
 ///
 /// ★ 必须 **≤ 顶层飞出时长**（[kDurSlow]，320ms）：推进与飞出并行跑，出栈那一刻
 /// 推进必须已经到位 —— 否则出栈会把没走完的层硬拽到位（跳变）。
-/// 取 260ms（kDurBase 200 ~ kDurSlow 320 之间）比飞出**略早**收尾：
-/// 下一张先落位，顶层再飞出屏幕，收尾干净。
-const Duration kDurAdvance = Duration(milliseconds: 260);
+///
+/// ★★ v2.36.0 从 260ms 降到 160ms：这个值**同时就是"松手 → 能拖下一张"的等待
+/// 时间**（页面在 `u = 1` 那一刻把飞出的那张交接给幽灵层、顶卡换成下一张）。
+/// 160ms 比人"再划一张"的手速（≥150ms 起步）还短，所以体感上不再是"划了没
+/// 反应"；而下一张长上来这件事本身仍看得清（不是跳变）。
+const Duration kDurAdvance = Duration(milliseconds: 160);
 
 /// 连续深度 → 缩放（线性插值；深度 1 沿用既有常量 [kInboxStackScale]，
 /// 保证「下一张露多少」这一既有观感不变）。
@@ -181,6 +184,7 @@ class InboxCardStack extends StatefulWidget {
     required this.style,
     this.advancing = false,
     this.restoreTick = 0,
+    this.overlay,
   }) : assert(items.length > 0, '空队列不该进卡片栈（页面走空态）');
 
   /// 待处理队列（index 0 = 队首 = 顶层，由 [topCard] 渲染）。
@@ -188,6 +192,14 @@ class InboxCardStack extends StatefulWidget {
 
   /// 顶层卡片（含手势、跟手位移/旋转、飞出与弹回装饰）。
   final Widget topCard;
+
+  /// 画在**整叠牌之上**的一层（页面用它渲染"正在飞出的幽灵卡"，v2.36.0）。
+  ///
+  /// 必须是一个定位子项（页面传 `Positioned`）—— 非定位子项会参与 Stack 的
+  /// 尺寸计算，而"整叠牌的尺寸由顶层卡片决定"是本组件的既有约定。
+  /// 幽灵层不吃手势（页面自己套 IgnorePointer），所以压在它下面的新顶卡照样
+  /// 能接住新手势。
+  final Widget? overlay;
 
   /// 卡片宽度（高度 = 宽 × [kInboxCardAspect]，见 [inboxCardHeight]）。
   final double width;
@@ -360,8 +372,13 @@ class _InboxCardStackState extends State<InboxCardStack>
       alignment: Alignment.topCenter,
       // 后层会伸到 Stack 框外（页面已按 kInboxStackMaxDrop 预留高度）→ 别裁
       clipBehavior: Clip.none,
-      // 绘制顺序：深 → 浅，顶层最后画（盖住后层，只露出各层的边）
-      children: [...layers, widget.topCard],
+      // 绘制顺序：深 → 浅，顶层最后画（盖住后层，只露出各层的边）；
+      // 幽灵层（如果有）画在最上面 —— 它是"正在飞出去的那张"，理应在最前
+      children: [
+        ...layers,
+        widget.topCard,
+        if (widget.overlay != null) widget.overlay!,
+      ],
     );
   }
 

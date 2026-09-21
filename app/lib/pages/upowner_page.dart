@@ -78,6 +78,7 @@ import '../services/whitelist_writer.dart';
 import '../theme/app_motion.dart';
 import '../theme/app_palette.dart';
 import '../theme/app_tokens.dart';
+import '../widgets/app_snack.dart';
 import '../utils/relative_time.dart';
 import '../widgets/animated_copy_line.dart';
 import '../widgets/app_block.dart';
@@ -682,12 +683,10 @@ class _UpownerPageState extends State<UpownerPage> {
     }
   }
 
-  /// 轻提示（SnackBar）。
+  /// 轻提示（SnackBar）：统一走 [AppSnack]（info 档 → 受设置里的「界面提示」开关控制）。
   void _toast(String message) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(message)));
+    AppSnack.show(context, message);
   }
 
   /// 缓存命中但缺粉丝数时补拉一次 stat（单次、不重试，失败静默）。
@@ -1042,7 +1041,7 @@ class _UpownerPageState extends State<UpownerPage> {
         _dynLoadedOnce = false;
       }
     });
-    if (!isFirst) _showSnack('加载失败：$message');
+    if (!isFirst) _showSnack('加载失败：$message', kind: SnackKind.error);
   }
 
   /// 点动态配图 → 全屏查看（与评论图片共用同一个查看页）。
@@ -1153,7 +1152,7 @@ class _UpownerPageState extends State<UpownerPage> {
         _artLoadedOnce = false;
       }
     });
-    if (!isFirst) _showSnack('加载失败：$message');
+    if (!isFirst) _showSnack('加载失败：$message', kind: SnackKind.error);
   }
 
   /// 点专栏卡 → 专栏阅读页（[ArticlePage]；携带列表里的标题，首屏不闪）。
@@ -1258,11 +1257,11 @@ class _UpownerPageState extends State<UpownerPage> {
       } on BiliApiException catch (e) {
         if (!mounted) return;
         setState(() => _fetchingMeta = false);
-        _showSnack('获取视频信息失败：${e.message}');
+        _showSnack('获取视频信息失败：${e.message}', kind: SnackKind.error);
       } on DioException {
         if (!mounted) return;
         setState(() => _fetchingMeta = false);
-        _showSnack('网络请求失败，请重试');
+        _showSnack('网络请求失败，请重试', kind: SnackKind.error);
       }
     } else {
       Navigator.of(
@@ -1319,19 +1318,19 @@ class _UpownerPageState extends State<UpownerPage> {
       final result = await writer.addVideo(full);
       _showSnack(result.message);
     } on BiliApiException catch (e) {
-      _showSnack('获取视频信息失败：${e.message}');
+      _showSnack('获取视频信息失败：${e.message}', kind: SnackKind.error);
     } on DioException {
-      _showSnack('网络请求失败，请检查网络后重试');
+      _showSnack('网络请求失败，请检查网络后重试', kind: SnackKind.error);
     } on GithubApiException catch (e) {
-      _showSnack('加入失败：${e.message}');
+      _showSnack('加入失败：${e.message}', kind: SnackKind.error);
     }
   }
 
-  void _showSnack(String message) {
+  /// 提示条入口（统一走 [AppSnack]）：成功/门禁类默认 info 档（受「界面提示」
+  /// 开关控制），失败类显式 `kind: SnackKind.error`（关掉提示也不能静默）。
+  void _showSnack(String message, {SnackKind kind = SnackKind.info}) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(message)));
+    AppSnack.show(context, message, kind: kind);
   }
 
   @override
@@ -1990,7 +1989,7 @@ class _UpownerPageState extends State<UpownerPage> {
     } on GithubApiException catch (e) {
       if (!mounted) return;
       setState(() => _followBusy = false);
-      _showSnack('关注失败：${e.message}');
+      _showSnack('关注失败：${e.message}', kind: SnackKind.error);
     }
   }
 
@@ -2038,7 +2037,7 @@ class _UpownerPageState extends State<UpownerPage> {
     } on GithubApiException catch (e) {
       if (!mounted) return;
       setState(() => _followBusy = false);
-      _showSnack('取消失败：${e.message}');
+      _showSnack('取消失败：${e.message}', kind: SnackKind.error);
     }
   }
 }

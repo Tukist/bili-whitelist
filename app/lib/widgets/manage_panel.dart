@@ -11,9 +11,11 @@ import '../services/clipboard_link_store.dart';
 import '../services/inbox_card_style_store.dart';
 import '../services/theme_store.dart';
 import '../services/ui_copy_store.dart';
+import '../services/ui_prefs_store.dart';
 import '../theme/app_palette.dart';
 import '../theme/app_tokens.dart';
 import '../theme/ink_recipes.dart';
+import 'app_snack.dart';
 import 'inbox_card_styles.dart';
 
 /// 管理面板内容组件（v2.17.10+ 抽取自首页 _ManageSheet；v2.19.0 起由
@@ -83,6 +85,9 @@ enum _AccountState { loading, loggedIn, expired, none }
 
 /// 「启动时播放剪贴板里的视频」开关的 key（测试锚点；v2.35.0）。
 const Key kClipboardOpenSwitchKey = Key('clipboard-open-switch');
+
+/// 「显示底部提示条」开关的 key（测试锚点；v2.36.0）。
+const Key kTipsSwitchKey = Key('ui-tips-switch');
 
 class _ManagePanelState extends State<ManagePanel> {
   final _tokenCtrl = TextEditingController();
@@ -183,17 +188,20 @@ class _ManagePanelState extends State<ManagePanel> {
         _showSnack('GitHub 配置已保存（仅存本机）');
       }
     } catch (_) {
-      if (mounted) _showSnack('配置保存失败，请重试');
+      // 失败类：走 AppSnack 的 error 档 —— 关掉「界面提示」也不静默（用户
+      // 以为存上了、其实没存，是最坏的一种"提示被关掉"）
+      if (mounted) {
+        _showSnack('配置保存失败，请重试', kind: SnackKind.error);
+      }
     } finally {
       if (mounted) setState(() => _savingConfig = false);
     }
   }
 
-  void _showSnack(String message) {
+  /// 设置页内的提示条入口（统一走 AppSnack，见 [AppSnack] 的说明）。
+  void _showSnack(String message, {SnackKind kind = SnackKind.info}) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(message)));
+    AppSnack.show(context, message, kind: kind);
   }
 
   /// 弹层宿主：动作前先 pop 自己（登录/检查更新需干净上下文弹 UI）。
@@ -508,6 +516,39 @@ class _ManagePanelState extends State<ManagePanel> {
         const SizedBox(height: 16),
         const Divider(height: 1),
         const SizedBox(height: 16),
+        // ---- 界面提示（v2.36.0：底部提示条开关）----
+        Text('界面提示', style: theme.textTheme.titleMedium),
+        const SizedBox(height: 4),
+        Text(
+          '关掉后不再弹底部的提示条（「已保存」「已取回「…」」这类）。'
+          '错误提示（保存失败 / 网络请求失败 / 未同步到 Gist）'
+          '和带「撤销」按钮的提示一定会显示——'
+          '关了它们，失败会变成没声音，撤销入口也会一起消失。',
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+        const SizedBox(height: 8),
+        // 开关态要跟着 store 走 → 单独监听 UiPrefsStore
+        ListenableBuilder(
+          listenable: UiPrefsStore.instance,
+          builder: (context, _) {
+            final on = UiPrefsStore.instance.showTips;
+            return SwitchListTile(
+              key: kTipsSwitchKey,
+              value: on,
+              onChanged: (v) => UiPrefsStore.instance.setShowTips(v),
+              contentPadding: EdgeInsets.zero,
+              title: const Text('显示底部提示条'),
+              subtitle: Text(on
+                  ? '已开启：操作结果都会用底部提示条告知'
+                  : '已关闭：只剩错误提示与带「撤销」的提示'),
+            );
+          },
+        ),
+        const SizedBox(height: 16),
+        const Divider(height: 1),
+        const SizedBox(height: 16),
         // ---- 版本更新 ----
         Text('版本更新', style: theme.textTheme.titleMedium),
         const SizedBox(height: 4),
@@ -656,9 +697,9 @@ class _TranslateConfigDialogState extends State<_TranslateConfigDialog> {
       if (mounted) Navigator.of(context).pop(true);
     } catch (_) {
       if (mounted) {
-        ScaffoldMessenger.of(context)
-          ..hideCurrentSnackBar()
-          ..showSnackBar(const SnackBar(content: Text('翻译配置保存失败，请重试')));
+        // 失败类：error 档，关掉「界面提示」也不静默
+        AppSnack.show(context, '翻译配置保存失败，请重试',
+            kind: SnackKind.error);
       }
     } finally {
       if (mounted) setState(() => _saving = false);

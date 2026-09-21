@@ -26,6 +26,7 @@ import '../cache/download_manager.dart';
 import '../models/whitelist_video.dart';
 import '../theme/app_palette.dart';
 import '../theme/app_tokens.dart';
+import '../widgets/app_snack.dart';
 import '../widgets/app_state_view.dart';
 import '../widgets/cover_hero.dart';
 import '../widgets/cover_image.dart';
@@ -164,11 +165,11 @@ class _OfflinePageState extends State<OfflinePage> {
   /// 索引/占用读取的超时预算（本地 json + 目录扫描，正常远小于它）。
   static const Duration _kLoadTimeout = Duration(milliseconds: 500);
 
-  void _showSnack(String message) {
+  /// 本页提示条入口（统一走 [AppSnack]）。本页全部是「已删除 / 已清空」这类
+  /// 结果告知 → info 档（受设置里的「界面提示」开关控制）。
+  void _showSnack(String message, {SnackKind kind = SnackKind.info}) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(message)));
+    AppSnack.show(context, message, kind: kind);
   }
 
   // ---------------------------------------------------------------------------

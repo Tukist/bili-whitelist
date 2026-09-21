@@ -78,13 +78,38 @@
 ///   摘掉 → 首页红点立刻下降。
 ///
 /// ## 动效与测试
-/// - 飞出用 [kDurSlow]、弹回与「撤销飞回」用 [kDurBase]，曲线 [kCurveOut]；
-///   后层推进用 [kDurAdvance]（与飞出并行，见 `inbox_card_stack.dart`）；
+/// - **一次滑动分两段**（v2.36.0）：
+///   1. **推进段**（`0 → kDurAdvance`，140ms）：飞出的那张还是顶卡，后层同时
+///      往前顶（[InboxCardStack] 的推进）；这一段里新手势会被 `_busy` 挡住 ——
+///      此时顶卡正飞在半路、下一张还没长到位，"抓住下一张"在画面上不成立；
+///   2. **幽灵段**（`kDurAdvance → 出屏时长`）：到推进到位那一刻把飞出的那张
+///      **从队列里摘出去**（[_handOff]），交给画在整叠牌之上的**幽灵层**
+///      （[_buildGhost]，[IgnorePointer] 不吃手势）继续飞完。于是
+///      `_items.first` 立刻就是新的顶卡 → **松手 140ms 后就能拖下一张**，
+///      连续跳过快划不再"划了没反应"（旧实现整段飞出都锁输入：
+///      上滑取回两步动画加起来 ~400ms 全程锁）。
+/// - 飞出时长按**距离**给（[inboxExitMotion]）：水平 = 1.4 × 屏宽 / [kDurSlow]；
+///   竖直 = 1.0 × 屏高 / 等比例放大的时长 → 四个方向出屏速度一致
+///   （旧实现竖直距离 1.4 × 屏高、时长却与水平一样 → 竖直快一倍，"嗖一下没了"）；
+/// - 回弹 / 取回滑入 / 撤销飞回用 [kDurBase]，**回弹半路可以被新手势接管**
+///   （[_takeOverBackAnimation]：手指落下就从当前画面位置接着走）→ 锁输入的时间
+///   只有"手指还没落下"那一下；取回的第一步（让手上这张让位）用 [kDurQuick]，
+///   它就是取回这条路的锁输入时长（120ms）；
 /// - [MotionControl.of] 为 false（`flutter test` 默认 / 系统「减少动画」）时
-///   **连 AnimationController 都不建**（本页的飞出、卡片栈的推进都是），
-///   直接跳变 —— `pumpAndSettle` 必然收敛；
+///   **连 AnimationController 都不建**（本页的飞出/幽灵、卡片栈的推进都是），
+///   松手即交接、即出栈 —— `pumpAndSettle` 必然收敛；
 /// - 卡片子树挂在 `AnimatedBuilder` 的 `child:` 上，飞出/推进期间不逐帧重建；
 /// - 拖动期间不触发任何网络/存储请求，动作只在松手后执行。
+///
+/// ## 连续判定与并发写（v2.36.0）
+/// 输入解锁后"连划两张右滑"会**并发两次 Gist 写**（`WhitelistWriter.addVideo`
+/// 是"GET 整份查重 → PATCH 整份"的 read-modify-write，两次并行会互相覆盖、
+/// 静默丢一条视频）。处理方式：把串行闸门放在**写入服务内部**
+/// （`whitelist_writer.dart` 的 `_chain`）—— 它同时罩住搜索页「加入」、UP 主页
+/// 长按加入、链接导入等一切共用该服务的入口，比在本页加一把锁覆盖得全。
+/// 判定本身（出栈、记已处理）照旧**立刻**生效，只有"写白名单"这一步排队，
+/// 用户感觉不到等待。为什么没复用 `WhitelistWriteQueue`：见该字段的注释
+/// （它只能串行"已知快照"的 PATCH，挡不住两次 GET 读到同一份旧快照）。
 ///
 /// ## 既有锚点（别动）
 /// 空态 [AppStateView]`copyId: 'empty.inbox'`、首屏 [AppLoadingHero]`seed: 'inbox'`
@@ -108,6 +133,7 @@ import '../services/whitelist_writer.dart';
 import '../theme/app_palette.dart';
 import '../theme/app_tokens.dart';
 import '../theme/motion_control.dart';
+import '../widgets/app_snack.dart';
 import '../widgets/app_state_view.dart';
 import '../widgets/inbox_card_stack.dart';
 import '../widgets/inbox_card_styles.dart';
@@ -125,6 +151,82 @@ const double _kBottomBarH = 76;
 
 /// 未配置 GitHub 时的门禁提示（与搜索页 / 管理页文案一致）。
 const String _kConfigHint = '请先到底部导航「个人」页配置 GitHub token 与 Gist ID';
+
+/// 水平飞出的距离倍数（× 屏宽）。**既有值，别动**：它是"出屏"这件事的
+/// 观感基准，竖直方向的时长就是按它等比折算的（见 [inboxExitMotion]）。
+const double kInboxExitRatio = 1.4;
+
+/// 一出屏的**位移**与**时长**（纯函数，测试可直接断言"四向出屏速度一致"）。
+///
+/// - **水平**：距离 = 屏宽 × [kInboxExitRatio]，时长 = [kDurSlow]（既有值）；
+/// - **竖直**：距离 = **1.0 × 屏高** —— 卡片顶边恒在屏内（≥ 0）处，往下推满
+///   一屏高就必然整张出屏；旧值 1.4 × 屏高**多推了 40%**，白跑一截。
+///   时长按 `水平时长 × 竖直距离 / 水平距离` 等比给。
+///
+/// ★ 这是"垂直比水平快一倍"的根治：旧实现竖直距离是水平的 h/w 倍（411×914 上
+/// 约 2.2 倍）、时长却和水平一样长 → 上下滑时卡片"嗖一下没了"，而连续上下切换
+/// 时又因为下一张的锁定期同样长而显得迟钝。现在四个方向**出屏速度一致**
+/// （竖直只是"走得远、所以走得久"）。
+///
+/// [perp] = 另一根轴上保留的余量（斜着划时卡片跟着偏，与改动前的观感一致）。
+({Offset offset, Duration duration}) inboxExitMotion({
+  required Size screen,
+  required bool vertical,
+  required bool positive,
+  double perp = 0,
+}) {
+  final ref = screen.width * kInboxExitRatio;
+  final dist = vertical ? screen.height : ref;
+  final main = positive ? dist : -dist;
+  return (
+    offset: vertical ? Offset(perp, main) : Offset(main, perp),
+    duration: Duration(
+      microseconds: (kDurSlow.inMicroseconds * dist / ref).round(),
+    ),
+  );
+}
+
+/// 正在飞出的那张（**已经交接**：从 [_InboxPageState._items] 里摘出去了）。
+///
+/// 它就是"松手后立刻能拖下一张"的关键：飞行观感还在（画在整叠牌之上、由
+/// [_InboxPageState._ghostFly] 独立驱动），但**不吃手势**、也不占队列的队首 ——
+/// 新顶卡因此可以马上开始下一次拖动。
+class _GhostExit {
+  _GhostExit({
+    required this.item,
+    required this.edge,
+    required this.from,
+    required this.to,
+    required this.action,
+    required this.badge,
+    required this.badgeProgress,
+    required this.vertical,
+  });
+
+  final InboxItem item;
+
+  /// 朝哪一边飞出去的（只用于 debugPrint / 断言）。
+  final _SwipeEdge edge;
+
+  /// 飞出区间（松手那一刻的位移 → 屏外），与顶卡飞出的那一段**完全同一组端点**：
+  /// 交接时把 [_InboxPageState._fly] 的进度原样交给 [_InboxPageState._ghostFly]，
+  /// 位置逐帧连续（不会在交接那一帧"跳一下"）。
+  final Offset from;
+  final Offset to;
+
+  /// 这次判定是什么（稍后 / 加入 / 跳过）——落地时要按它决定"要不要把这张
+  /// 插回队尾"（稍后要，判定掉的不要）。
+  final InboxSwipeAction action;
+
+  /// 交接那一刻钉住的浮层（徽标 + 渐显进度 + 是否竖直）：飞行途中它一直亮着
+  /// （沿用"飞出时徽标钉在松手那一刻"的既有观感），下一张顶卡的浮层则归零。
+  final InboxSwipeAction? badge;
+  final double badgeProgress;
+  final bool vertical;
+
+  /// 幽灵卡在进度 `t ∈ [0,1]` 时的位移（与顶卡飞出用同一条曲线 [kCurveOut]）。
+  Offset offsetAt(double t) => Offset.lerp(from, to, kCurveOut.transform(t))!;
+}
 
 /// 检查进行中「回读本地未读」的间隔（见 [_InboxPageState._pollProgress]）。
 ///
@@ -220,7 +322,9 @@ class InboxPage extends StatefulWidget {
 }
 
 class _InboxPageState extends State<InboxPage>
-    with SingleTickerProviderStateMixin {
+    // 两个 controller：顶卡（[_fly]）与幽灵卡（[_ghostFly]）要同时跑 —— 后者是
+    // "飞出的那张继续飞"、前者要能立刻接住新手势 → 不能用 Single
+    with TickerProviderStateMixin {
   late final BiliApi _api = widget.api ?? BiliApi();
   late final WhitelistWriter _writer = widget.writer ?? WhitelistWriter();
 
@@ -263,7 +367,7 @@ class _InboxPageState extends State<InboxPage>
   ///   卡片"之后，它照样会随着队列转回来；这份记录只是为了记**取回的顺序**；
   /// - 它**不进** [_consumedBvids]、不调 `markHandled`、不写 Gist、不取元数据
   ///   （用户原话：「暂时不判断」）；
-  /// - 一张卡在这份记录里最多出现一次（再次下滑时挪到栈顶，见 [_commitDefer]）；
+  /// - 一张卡在这份记录里最多出现一次（再次下滑时挪到栈顶，见 [_settleExit]）；
   /// - 判定掉（加入 / 跳过）、撤销、全部标记已读时把它清出来（见各处调用点）——
   ///   否则上滑会把一张已经处理掉的卡再搬回栈顶。
   final List<InboxItem> _deferred = <InboxItem>[];
@@ -306,8 +410,22 @@ class _InboxPageState extends State<InboxPage>
   /// 当前动画类型；null = 静止（位移直接用 [_drag]）。
   _SwipeAnim? _anim;
 
-  /// 飞出/弹回动画控制器；关动效时**恒为 null**（不建 ticker）。
+  /// 飞出/弹回动画控制器（**只管顶卡**）；关动效时**恒为 null**（不建 ticker）。
   AnimationController? _fly;
+
+  /// 幽灵卡（[ _ghost]）的飞出控制器：与 [_fly] 分开 —— 交接之后"飞出的那张继续飞"
+  /// 与"新顶卡跟手/再飞出"必须能同时进行（见 [_handOff]）。
+  /// 关动效时**恒为 null**（没有幽灵层）。
+  AnimationController? _ghostFly;
+
+  /// 正在飞出的那张（已交接；null = 没有幽灵在飞）。同一时刻**最多一个**，
+  /// 见 [_handOff] 里"上一个幽灵还没落地就延后交接"的策略。
+  _GhostExit? _ghost;
+
+  /// 本次判定的头卡**是否已经交接给幽灵层**（见 [_handOff]）。
+  ///
+  /// 交接点 = 后层推进到位（[kDurAdvance]）；关动效时松手即交接。
+  bool _exitRetired = false;
 
   /// [MotionControl.of] 的当前值（didChangeDependencies 里刷新）。
   bool _motion = false;
@@ -336,7 +454,19 @@ class _InboxPageState extends State<InboxPage>
   int _restoreTick = 0;
 
   /// 上一张（撤销用）。
-  _SwipeRecord? _undo;
+  ///
+  /// ★ **栈**（v2.36.0 起可连撤）：输入解锁后用户会连着划好几张，只留一张的话
+  /// "撤销上一张"按一次就用完了（第二张永远撤不回来）。判定掉的卡按顺序压栈，
+  /// 每次撤销弹栈顶那张放回队首 —— 连撤 N 次就逐张退回去（LIFO，与直觉一致）。
+  /// 上限 [_kMaxUndo] 条：够连撤了，也不让会话内存无界增长（每张只是一个
+  /// 不可变的 [InboxItem] 引用，但没必要留着整场会话的所有历史）。
+  final List<_SwipeRecord> _undoStack = <_SwipeRecord>[];
+
+  /// 撤销栈上限（见 [_undoStack]）。
+  static const int _kMaxUndo = 20;
+
+  /// 现在是否有可撤销的（底部按钮的可用性就靠它）。
+  bool get _canUndo => _undoStack.isNotEmpty;
 
   @override
   void initState() {
@@ -353,13 +483,31 @@ class _InboxPageState extends State<InboxPage>
     _motion = on;
     if (on) {
       _fly ??= AnimationController(vsync: this, duration: kDurSlow)
-        ..addStatusListener(_onFlyStatus);
+        ..addStatusListener(_onFlyStatus)
+        // 逐帧检查"后层推进到位了没" → 到点就把飞出的那张交接出去
+        // （交接之后顶卡换人、新手势立刻可用，见 [_onFlyTick]）
+        ..addListener(_onFlyTick);
+      _ghostFly ??= AnimationController(vsync: this, duration: kDurSlow)
+        ..addStatusListener(_onGhostStatus);
       return;
     }
     // 关动效：连 controller 都不留（不是建了不 forward），并立刻收尾
+    //（此刻若还有幽灵在飞，先让它**落地**：「稍后」的那张必须回队尾，
+    // 否则它会凭空消失 —— 这里不能 setState，紧接着就会 build）
+    final flying = _ghost;
+    if (flying != null) {
+      _ghost = null;
+      if (flying.action == InboxSwipeAction.defer) _reinsertDeferred(flying.item);
+    }
+    _fly?.removeListener(_onFlyTick);
     _fly?.dispose();
     _fly = null;
+    _ghostFly?.removeStatusListener(_onGhostStatus);
+    _ghostFly?.dispose();
+    _ghostFly = null;
+    _ghost = null;
     _anim = null;
+    _exitRetired = false;
     _restorePending = false;
     _resetGestureState();
   }
@@ -368,8 +516,13 @@ class _InboxPageState extends State<InboxPage>
   void dispose() {
     _stopProgressPolling();
     _fly?.removeStatusListener(_onFlyStatus);
+    _fly?.removeListener(_onFlyTick);
     _fly?.dispose();
     _fly = null;
+    _ghostFly?.removeStatusListener(_onGhostStatus);
+    _ghostFly?.dispose();
+    _ghostFly = null;
+    _ghost = null;
     super.dispose();
   }
 
@@ -488,7 +641,8 @@ class _InboxPageState extends State<InboxPage>
         _items = _mergeChecked(result.items);
       });
       if (result.failed && _items.isNotEmpty) {
-        _showSnack(result.message);
+        // 整体检查失败：这是「没能刷新」这个结论，error 档（关掉提示也不静默）
+        _showSnack(result.message, kind: SnackKind.error);
       }
     } on DioException {
       if (!mounted) return;
@@ -550,10 +704,11 @@ class _InboxPageState extends State<InboxPage>
       if (!mounted) return;
       setState(() {
         _items = items;
-        _undo = null;
         // 全部标记已读 = 用户明说"这些都看过了" → 「待取回」的也一并作废
         // （否则上滑还会把一张已经标记已读的卡搬回栈顶）
         _deferred.clear();
+        // 全部标记已读 = 这一屏的卡都不作数了 → 撤销栈也一并作废
+        _undoStack.clear();
         _busyNote = null;
         // 用户显式清空 → 之后就是空态（不是"还没加载出来"）
         _loadedOnce = true;
@@ -563,7 +718,7 @@ class _InboxPageState extends State<InboxPage>
     } catch (e) {
       if (!mounted) return;
       setState(() => _busyNote = null);
-      _showSnack('标记已读失败：$e');
+      _showSnack('标记已读失败：$e', kind: SnackKind.error);
     }
   }
 
@@ -588,27 +743,43 @@ class _InboxPageState extends State<InboxPage>
       ));
     } on BiliApiException catch (e) {
       if (!mounted) return;
-      _showSnack('获取视频信息失败：${e.message}');
+      _showSnack('获取视频信息失败：${e.message}', kind: SnackKind.error);
     } on DioException {
       if (!mounted) return;
-      _showSnack('网络请求失败，请重试');
+      _showSnack('网络请求失败，请重试', kind: SnackKind.error);
     } finally {
       _opening = false;
     }
   }
 
-  void _showSnack(String message) {
+  /// 本页提示条入口（统一走 [AppSnack]，见该文件顶部：info 档受设置里的
+  /// 「界面提示」开关控制，失败类显式 `kind: SnackKind.error` 永不静默）。
+  ///
+  /// ★ 本页是"最吵"的一处（每取回一张就一句「已取回「…」」），也正是改连续滑动
+  /// 时最碍事的存在 —— 关掉提示之后连划三张只看见卡片飞，不再刷三条黑框。
+  void _showSnack(String message, {SnackKind kind = SnackKind.info}) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(SnackBar(content: Text(message)));
+    AppSnack.show(context, message, kind: kind);
   }
 
   // ---------------------------------------------------------------------------
   // 手势与动画
   // ---------------------------------------------------------------------------
 
+  /// 顶卡是否**正忙**（提交中 / 正在飞 / 正在回弹）→ 挡住新手势。
+  ///
+  /// 注意它**不含幽灵卡**：飞出去的那张交接给幽灵层之后就不再挡输入了
+  /// （见 [_handOff]），所以"连续跳过"能一张接一张地划。
   bool get _busy => _deciding || _anim != null;
+
+  /// 「队列里还有几张」——**把已经交接出去、还在飞的那张也算上**。
+  ///
+  /// 为什么要把幽灵算进来：交接到落地之间那张卡不在 [_items] 里，但它在用户眼里
+  /// 仍然是"这个队列里的一张"（马上要落到队尾）。若只数 [_items]，连划两张下滑
+  /// 时第二张会被判成"队列只剩 1 张 → 推到队尾就是原地打转"而**拒绝执行**
+  /// （卡弹回来，用户以为又卡住了）。判定"稍后是否等于原地打转"用它，
+  /// 才与用户的感受一致。
+  int get _deckLength => _items.length + (_ghost == null ? 0 : 1);
 
   /// 位移：静止时 = 手指位移；动画中 = 端点之间按 [kCurveOut] 插值。
   Offset _offsetAt(double t) {
@@ -623,6 +794,27 @@ class _InboxPageState extends State<InboxPage>
   /// touch slop），后续事件才送到这里来，所以不会一次收到两份。
   void _onDragStart(DragStartDetails details) {
     _pointer = details.globalPosition;
+    _takeOverBackAnimation();
+  }
+
+  /// 手指在「回弹 / 取回滑入」跑到一半时又按下并拖动 → 把动画**交给手指**
+  /// （从画面上当前那一帧的位置接着走）。
+  ///
+  /// 为什么可以半路夺回：这两种动画都只是"卡片回到原位"，**还没提交任何判定**
+  /// （没记已处理、没写白名单），用户想改主意就该让他改 —— 这也是"上下快速切换
+  /// 不卡手"的关键：回弹期间不需要等动画跑完才能开始下一次拖动。
+  ///
+  /// 为什么**不**接管 [_SwipeAnim.exit]：那一下已经 `markHandled`（右滑还写了
+  /// 白名单），半路把卡拽回来会让人以为"刚才那下不算"，而远端其实已经落了账。
+  void _takeOverBackAnimation() {
+    if (_anim != _SwipeAnim.back) return;
+    final c = _fly;
+    _drag = c == null ? Offset.zero : _offsetAt(c.value);
+    c?.stop();
+    _anim = null;
+    // 取回的第一步被夺回 = 这次取回取消（那张还在 [_deferred] 里，随时能再上滑）
+    _restorePending = false;
+    _deciding = false;
   }
 
   void _onDragUpdate(DragUpdateDetails details) {
@@ -722,22 +914,29 @@ class _InboxPageState extends State<InboxPage>
     _clearReaction();
   }
 
-  /// 朝 [edge] 那一侧**飞出屏幕**的终点位移。
+  /// 朝 [edge] 那一侧**飞出屏幕**的终点位移（见 [inboxExitMotion]）。
   ///
   /// [perp] 是另一根轴上保留的余量：向右划但手上带了下沉，卡片就斜着飞出去
   /// （与改动前 `Offset(±屏宽 × 1.4, _drag.dy)` 的观感一致）；竖直方向同理。
-  /// 主轴那一侧一律取 1.4 倍屏宽 / 屏高，保证卡片真的出屏。
-  Offset _offscreen(_SwipeEdge edge, {double perp = 0}) {
-    final media = MediaQuery.sizeOf(context);
-    return switch (edge) {
-      _SwipeEdge.right => Offset(media.width * 1.4, perp),
-      _SwipeEdge.left => Offset(-media.width * 1.4, perp),
-      _SwipeEdge.up => Offset(perp, -media.height * 1.4),
-      _SwipeEdge.down => Offset(perp, media.height * 1.4),
-    };
-  }
+  Offset _offscreen(_SwipeEdge edge, {double perp = 0}) => _exitMotion(edge, perp: perp).offset;
+
+  /// 出屏位移 + 时长（本页唯一的出口，纯计算在 [inboxExitMotion] 里）。
+  ({Offset offset, Duration duration}) _exitMotion(
+    _SwipeEdge edge, {
+    double perp = 0,
+  }) =>
+      inboxExitMotion(
+        screen: MediaQuery.sizeOf(context),
+        vertical: edge == _SwipeEdge.up || edge == _SwipeEdge.down,
+        positive: edge == _SwipeEdge.right || edge == _SwipeEdge.down,
+        perp: perp,
+      );
 
   /// 没过阈值 → 弹回原位（不调用任何动作）。
+  ///
+  /// 时长用 [kDurSlow]（= 飞出的时长）：回弹比飞出更急会显得"甩回来"很生硬
+  /// （旧实现 200ms vs 飞出 320ms）。回弹期间手指落下可以从当前位置接管
+  /// （[_takeOverBackAnimation]），所以给足时长不影响"连续操作"。
   void _springBack() {
     if (_deciding) return;
     final c = _motion ? _fly : null;
@@ -754,7 +953,7 @@ class _InboxPageState extends State<InboxPage>
       _animTo = Offset.zero;
       _anim = _SwipeAnim.back;
     });
-    c.duration = kDurBase;
+    c.duration = kDurSlow;
     c.forward(from: 0);
   }
 
@@ -763,7 +962,7 @@ class _InboxPageState extends State<InboxPage>
   /// - [InboxSwipeAction.like] / [InboxSwipeAction.skip]：飞出屏幕 → [_commitExit]
   ///   （记「已处理」，进撤销位）；
   /// - [InboxSwipeAction.defer]（下滑 = **稍后**）：也是朝下飞出屏幕，但飞出结束
-  ///   后走 [_commitDefer] —— **不记「已处理」**，只把这张推到队尾；
+  ///   后走 [_settleExit] 的 defer 分支 —— **不记「已处理」**，落地时推到队尾；
   /// - [InboxSwipeAction.restore]（上滑 = **取回**）：**当前这张不飞走**，见
   ///   [_restoreTop]。
   Future<void> _decide(_SwipeEdge edge) async {
@@ -792,8 +991,8 @@ class _InboxPageState extends State<InboxPage>
       return;
     }
 
-    // ---- 下滑 = 稍后：队列只有 1 张时"推到队尾"就是原地打转 → 什么都不做 ----
-    if (action == InboxSwipeAction.defer && _items.length < 2) {
+    // ---- 下滑 = 稍后：队列里只剩 1 张时"推到队尾"就是原地打转 → 什么都不做 ----
+    if (action == InboxSwipeAction.defer && _deckLength < 2) {
       debugPrint('[inbox] 判定 edge=${_edgeLabel(edge)} → 稍后（队列只有 1 张 → 不动）'
           ' bvid=${item.bvid} drag=$_drag');
       _deciding = false;
@@ -832,12 +1031,16 @@ class _InboxPageState extends State<InboxPage>
     }
     _exiting = edge;
     _exitingAction = action;
+    _exitRetired = false;
     if (action != InboxSwipeAction.defer) {
       // 记「已处理」+ 从本地未读缓存里摘掉 → 首页红点立刻下降（不触网）。
       // ★ 下滑「稍后」绝不走这里（它不是判定，那张必须还能再看到）
       unawaited(ServiceLocator.inboxService.markHandled(item.bvid));
     }
     if (like) {
+      // 加入白名单是真写 Gist（GET 整份 + PATCH 整份）：输入解锁后连划两张右滑
+      // 会并发两次，`WhitelistWriter.addVideo` 内部已把整段读改写串行化
+      // （见该服务里的 `_chain`），这里 fire-and-forget 即可。
       unawaited(_like(item));
     }
     final c = _motion ? _fly : null;
@@ -846,13 +1049,16 @@ class _InboxPageState extends State<InboxPage>
       return;
     }
     final vertical = edge == _SwipeEdge.up || edge == _SwipeEdge.down;
+    // 朝实际判定出来的那一侧飞出去（下滑往下、左滑往左、右滑往右）；
+    // 时长按出屏距离给 —— 竖直方向距离更长、时长等比放大，四个方向的出屏
+    // **速度**一致（见 [inboxExitMotion]）。
+    final motion = _exitMotion(edge, perp: vertical ? _drag.dx : _drag.dy);
     setState(() {
       _animFrom = _drag;
-      // 朝实际判定出来的那一侧飞出去（下滑往下、左滑往左、右滑往右）
-      _animTo = _offscreen(edge, perp: vertical ? _drag.dx : _drag.dy);
+      _animTo = motion.offset;
       _anim = _SwipeAnim.exit;
     });
-    c.duration = kDurSlow;
+    c.duration = motion.duration;
     c.forward(from: 0);
   }
 
@@ -866,13 +1072,13 @@ class _InboxPageState extends State<InboxPage>
       _showSnack(result.message);
     } on BiliApiException catch (e) {
       if (!mounted) return;
-      _showSnack('获取视频信息失败：${e.message}');
+      _showSnack('获取视频信息失败：${e.message}', kind: SnackKind.error);
     } on DioException {
       if (!mounted) return;
-      _showSnack('网络请求失败，请重试');
+      _showSnack('网络请求失败，请重试', kind: SnackKind.error);
     } on GithubApiException catch (e) {
       if (!mounted) return;
-      _showSnack('加入失败：${e.message}');
+      _showSnack('加入失败：${e.message}', kind: SnackKind.error);
     }
   }
 
@@ -882,6 +1088,8 @@ class _InboxPageState extends State<InboxPage>
     final mode = _anim;
     _anim = null;
     if (mode == _SwipeAnim.exit) {
+      // 兜底：正常路径早在"后层推进到位"那一刻就交接完了（[_onFlyTick]），
+      // 这里处理没赶上交接点的情形（例如交接被上一个幽灵延后了）
       _commitExit();
       return;
     }
@@ -891,55 +1099,199 @@ class _InboxPageState extends State<InboxPage>
     if (_restorePending) _applyRestore();
   }
 
-  /// 飞出动画结束（关动效时是松手即到）：按 [_exitingAction] 分流结算。
+  /// 顶卡飞出动画**逐帧**：到「后层推进到位」那一刻就把飞出的那张交接出去。
   ///
-  /// - 稍后 → [_commitDefer]（**不记「已处理」**，只把这张推到队尾）；
-  /// - 加入 / 跳过 → [_commitJudged]（记「已处理」+ 进撤销位）。
-  void _commitExit() {
-    if (_exitingAction == InboxSwipeAction.defer) {
-      _commitDefer();
-      return;
-    }
-    _commitJudged();
+  /// 为什么盯着自家的 controller 而不是等卡片栈回调：两边是同一帧启动的
+  /// ticker、时长分别是 [kDurAdvance] 与本次出屏时长 → `_fly.value` 到
+  /// `kDurAdvance / 出屏时长` 这一比例的时刻，恰好就是后层推进到位（u = 1）的
+  /// 那一帧。而 [InboxCardStack] 只在 u = 1 时出栈才不会跳变（那条硬约束见
+  /// `inbox_card_stack.dart` 文件头第 1 条）—— 所以交接点必须精确落在这里。
+  void _onFlyTick() {
+    final c = _fly;
+    if (c == null || _anim != _SwipeAnim.exit || _exitRetired) return;
+    final total = c.duration?.inMicroseconds ?? 0;
+    if (total <= 0) return;
+    if (c.value * total < kDurAdvance.inMicroseconds) return;
+    // 上一个幽灵还没落地 → **延后交接**（一次只放一个幽灵；它一落地 [_landGhost]
+    // 会再调一次这里补上）。为什么不直接顶掉旧幽灵：竖直方向出屏要 ~500ms，
+    // 交接点在它的 1/3 处，顶掉时那张卡还在屏幕里飞 → 会"凭空消失"，
+    // 更糟的是它那句"落地回队尾"的收尾也跟着没了（卡片直接从队列里丢掉）。
+    if (_ghost != null) return;
+    _handOff();
   }
 
-  /// 结算「下滑 = 稍后」：把这一张从**队首移到队尾**，不做任何判断。
+  /// 幽灵卡飞完 → 落地（见 [_landGhost]）。
+  void _onGhostStatus(AnimationStatus status) {
+    if (status != AnimationStatus.completed) return;
+    _landGhost();
+  }
+
+  /// 把「正在飞出的那张」**交接给幽灵层**（v2.36.0 连续滑动的核心）。
   ///
-  /// ★ 与 [_commitJudged] 的区别（别合并）：这里**不记「已处理」**
-  /// （[_consumedBvids] 与 `markHandled` 都不动）、不写 Gist、不取元数据 ——
-  /// 用户原话「暂时不判断，先看后面的卡片」，所以这张之后还会再出现（它一直在
-  /// [_items] 里，只是排到最后）。同时把它压进 [_deferred]（LIFO）→ 上滑可逐张
-  /// 取回。
+  /// 动作（同一个 `setState` 里一次做完，卡片栈才认得出"头部少了一张"）：
+  /// - 从 [_items] 摘掉队首 → `_items.first` 立刻是下一张，**新手势马上可用**；
+  /// - 把这一张连同飞出区间交给 [_ghost]（画在整叠牌之上、不吃手势的幽灵层），
+  ///   进度从 [_fly] 当前值原样接过去 → 位置逐帧连续，看不出交接；
+  /// - 判定记账（[_settleExit]）：记「已处理」/ 进撤销栈 / 「稍后」的等落地再回队尾。
   ///
-  /// 队列只有 1 张时在 [_decide] 就被拦下了（推到队尾 = 原地打转）。
-  void _commitDefer() {
+  /// ★ 一次只放**一个**幽灵：上一个还没落地时**延后交接**（[_onFlyTick] 会每帧
+  /// 再试），等它落地立刻补上。宁可多锁几十毫秒，也不把一张还剩大半路程的卡
+  /// 凭空抹掉（旧幽灵直接替换掉的话，竖直方向出屏要走 ~500ms，交接后幽灵还有
+  /// 一大半路要飞，抹掉就是"卡片在半屏处消失"）。
+  void _handOff() {
     final item = _items.isEmpty ? null : _items.first;
+    final edge = _exiting;
+    final action = _exitingAction;
+    if (item == null || edge == null || action == null) {
+      // 队列被清空了（例如全部标记已读）：直接收尾，别留下悬空的动画状态
+      //（force —— 这时候本来就没有可交接的那张）
+      _finishExitState(force: true);
+      return;
+    }
+    final from = _animFrom;
+    final to = _animTo;
+    final progress = _fly?.value ?? 1;
+    final duration = _fly?.duration ?? kDurSlow;
+    _fly?.stop();
+    _exitRetired = true;
+
+    final g = _ghostFly == null
+        ? null
+        : _GhostExit(
+            item: item,
+            edge: edge,
+            from: from,
+            to: to,
+            action: action,
+            badge: _reaction,
+            badgeProgress: _reactionProgress,
+            vertical: _vertical,
+          );
+    _anim = null;
+    _deciding = false;
+    _exiting = null;
+    _exitingAction = null;
+    if (!mounted) {
+      _ghost = null;
+      _finishExitState();
+      return;
+    }
+    setState(() {
+      _settleExit(item, action, edge);
+      // 屏上的卡片全处理完了 → 收起「上次检查失败」的提示（错误态不该盖住
+      // 「没有未读了」这个结论；要重试还可以下拉刷新）
+      if (_items.isEmpty) _error = null;
+      _resetGestureState();
+      _ghost = g;
+    });
+    if (g != null) {
+      // 同一个时长 + 从当前进度续跑 → 位置与速度都连续（不是重新起一段动画）
+      _ghostFly!
+        ..duration = duration
+        ..forward(from: progress);
+    } else {
+      // 关动效（没有幽灵层）：交接即落地（「稍后」的那张就地插回队尾）
+      _landGhost(deferred: item, deferredAction: action);
+      return;
+    }
+    // 顶卡换人了 → 重新看一眼新顶卡作者在不在播
+    unawaited(_loadTopLive());
+  }
+
+  /// 判定记账：把飞出的这一张从队首摘掉（并做对应的簿记）。
+  ///
+  /// ★ 行为分流（别合并）：
+  /// - **稍后**（[InboxSwipeAction.defer]）：**不记「已处理」**（[_consumedBvids]
+  ///   与 `markHandled` 都不动）、不写 Gist、不取元数据 —— 用户原话「暂时不判断，
+  ///   先看后面的卡片」。它只是**离开队首**，等幽灵落地再插回**队尾**（那句
+  ///   "推到队尾"的语义没变，只是分两步：先摘、落地再插，免得同一张卡同时出现在
+  ///   "飞出去"和"牌堆里"两处）。
+  /// - **加入 / 跳过**：进 [_consumedBvids]（本轮的 checkAll 结果不复活它）、
+  ///   从 [_deferred] 里摘掉（一张卡只能"在某个地方等着"）、压进撤销栈。
+  void _settleExit(InboxItem item, InboxSwipeAction action, _SwipeEdge edge) {
+    final bvid = item.bvid;
+    _items = [
+      for (final it in _items)
+        if (it.bvid != bvid) it,
+    ];
+    if (action == InboxSwipeAction.defer) return; // 稍后：不判定，落地时回队尾
+    _consumedBvids.add(bvid);
+    _deferred.removeWhere((it) => it.bvid == bvid);
+    _undoStack.add(_SwipeRecord(item, edge: edge));
+    if (_undoStack.length > _kMaxUndo) _undoStack.removeAt(0);
+  }
+
+  /// 幽灵卡落地：收掉它，并把「稍后」的那张插回队尾。
+  ///
+  /// [deferred] / [deferredAction] 是**关动效**那条路传进来的（没有幽灵对象，
+  /// 交接即落地）；有幽灵时一律从 [_ghost] 读。
+  ///
+  /// ★ 必须**在 setState 里**清 [_ghost]：否则树不重建，那张已经"落地"的幽灵卡
+  /// 会一直挂在 Stack 上（表现为"飞走的卡没消失、牌堆多一张"）。
+  void _landGhost({InboxItem? deferred, InboxSwipeAction? deferredAction}) {
+    final g = _ghost;
+    final item = g?.item ?? deferred;
+    final action = g?.action ?? deferredAction;
+    _ghost = null;
+    _ghostFly?.stop();
+    if (mounted && item != null) {
+      setState(() {
+        if (action == InboxSwipeAction.defer) _reinsertDeferred(item);
+      });
+    }
+    _finishExitState();
+    // 上一次飞出因为"幽灵没落地"被延后交接了 → 现在补上（它此刻已到推进点）
+    _onFlyTick();
+  }
+
+  /// 「稍后」的那张落地回**队尾**（[_settleExit] 在交接时把它从队首摘掉了）。
+  ///
+  /// 若这张已经被"取回"插回队首了（[_items] 里已有）就不重复插 ——
+  /// 取回是更晚的意图，以它为准。
+  void _reinsertDeferred(InboxItem item) {
+    if (!_items.any((it) => it.bvid == item.bvid)) {
+      _items = [..._items, item];
+    }
+    // 推后记录是**栈**：绕一圈又回到队首的挪到栈顶，不留两份
+    //（否则上滑会把同一张插回队列两次）
+    _deferred
+      ..removeWhere((it) => it.bvid == item.bvid)
+      ..add(item);
+    // 它已经"回到牌堆后面"了：让交错入场账本忘掉它，好让它在新的层位上
+    // 淡入一次（不退账的话，它会从"飞出屏幕"直接"啪"地出现在牌堆里）
+    _entranceLedger.clear();
+  }
+
+  /// 收尾这次飞出（交给"松手即出栈"那条路与 [_abortSwipe] 共用）。
+  ///
+  /// ★ 只在**这次飞出确实已经交接**时才清状态：幽灵落地时若已经有一次新的飞出
+  /// 在等交接（它的 [_exitRetired] 是 false），那份状态不能清 —— 清了它就会
+  /// 永远停在"正在飞"上（顶卡永远不换人）。见 [_onFlyTick] / [_landGhost]。
+  /// [force] = 那些"本来就没有可交接的东西"的收尾路径（队列被清空 / 关动效）。
+  void _finishExitState({bool force = false}) {
+    if (!force && !_exitRetired) return;
     _exiting = null;
     _exitingAction = null;
     _anim = null;
     _deciding = false;
-    if (!mounted) return;
-    setState(() {
-      if (item != null) {
-        _items = [
-          for (final it in _items)
-            if (it.bvid != item.bvid) it,
-          item, // 队首 → 队尾（其余各项相对顺序不变）
-        ];
-        // 推后记录是**栈**：绕一圈又回到队首的（先推后过、又划回来）挪到栈顶，
-        // 不留在里面两份（否则上滑会把同一张插回队列两次）
-        _deferred
-          ..removeWhere((it) => it.bvid == item.bvid)
-          ..add(item);
-        // 它已经"回到牌堆后面"了：让交错入场账本忘掉它，好让它在新的层位上
-        // 淡入一次（不退账的话，它会从"飞出屏幕"直接"啪"地出现在牌堆里）
-        _entranceLedger.clear();
-      }
-      _resetGestureState();
-    });
-    // 顶卡换人了 → 重新看一眼新顶卡作者在不在播
-    unawaited(_loadTopLive());
-    // 刻意**不提示**：用户要的是"先看后面的卡片"，弹一条 Toast 只会打断他
+    _exitRetired = false;
+    _ghost = null;
+    _ghostFly?.stop();
+  }
+
+  /// 飞出结束（关动效时是松手即到）：按 [_exitingAction] 分流结算。
+  ///
+  /// 交接过（有幽灵 / 已摘队首）→ 只需收尾；没交接（顶卡的飞出动画在别的路径上
+  /// 走完了，或刷新要强推）→ 先交接再收尾。
+  void _commitExit() {
+    if (!_exitRetired) {
+      // 强推交接之前先把**还在飞的旧幽灵**落地：它的「稍后」那张必须回队尾
+      //（刷新收尾也要保证这张不丢）。落地那一帧它会顺手把交接补上
+      //（[_landGhost] 末尾的 [_onFlyTick]）→ 所以下面再判一次是否还欠交接。
+      if (_ghost != null) _landGhost();
+      if (!_exitRetired) _handOff();
+    }
+    _landGhost();
   }
 
   /// 上滑 = **取回**：把最近一次被「稍后」推后的那张拿回**栈顶**。
@@ -947,6 +1299,13 @@ class _InboxPageState extends State<InboxPage>
   /// 两步（见 [_restorePending]）：① 手上这张先弹回原位；② 落位后由
   /// [_applyRestore] 把取回的那张从**下方**滑进来（它当初是往下飞出去的）。
   /// 全程不写任何东西 —— 那张既没被判过"已处理"，也没进过白名单。
+  ///
+  /// ★ 第一步用 [kDurQuick]（120ms）而不是 [kDurBase]：**这一步的时长就是
+  /// "取回"这条路锁输入的时间**（[_deciding] 在这一步里是 true）。上滑取回是
+  /// "上下快速来回切"的主路径，用户原话要的是"可以垂直上下快速切换" ——
+  /// 让手上这张**快点让位**比让它优雅地滑回去重要。第二步（被取回的那张滑入）
+  /// 不锁输入：手指落下就能接管（[_takeOverBackAnimation]），所以仍用
+  /// [kDurBase] 保证观感。
   void _restoreTop() {
     final c = _motion ? _fly : null;
     if (c == null || _drag == Offset.zero) {
@@ -960,7 +1319,7 @@ class _InboxPageState extends State<InboxPage>
       _anim = _SwipeAnim.back;
       _restorePending = true;
     });
-    c.duration = kDurBase;
+    c.duration = kDurQuick;
     c.forward(from: 0);
   }
 
@@ -1001,47 +1360,14 @@ class _InboxPageState extends State<InboxPage>
     _showSnack('已取回「${item.title}」');
   }
 
-  /// 结算「这一张已经处理掉了」（加入 / 跳过）：出栈 + 记入撤销位 + 复位手势状态。
-  void _commitJudged() {
-    final edge = _exiting;
-    final item = _items.isEmpty ? null : _items.first;
-    _exiting = null;
-    _exitingAction = null;
-    _anim = null;
-    _deciding = false;
-    if (!mounted) return;
-    setState(() {
-      if (item != null) {
-        final bvid = item.bvid;
-        // 记账：这一轮 checkAll 还在跑的话，它返回的列表里可能还有这张
-        // → [_mergeChecked] 靠这份记录把它挡在队列外（不复活）
-        _consumedBvids.add(bvid);
-        _items = [
-          for (final it in _items)
-            if (it.bvid != bvid) it,
-        ];
-        // 一张卡只能"在某个地方等着"：判定掉就不再是"待取回"的了，
-        // 否则上滑会把一张已经处理掉的卡又搬回栈顶
-        _deferred.removeWhere((it) => it.bvid == bvid);
-        // 撤销位记的是**飞出去的那一边**（不记行为）：行为由 [_actionForEdge]
-        // 从方向现算，撤销时还要靠它知道该从哪一侧飞回来
-        if (edge != null) _undo = _SwipeRecord(item, edge: edge);
-      }
-      // 屏上的卡片全处理完了 → 收起「上次检查失败」的提示（错误态不该盖住
-      // 「没有未读了」这个结论；要重试还可以下拉刷新）
-      if (_items.isEmpty) _error = null;
-      _resetGestureState();
-    });
-    // 顶卡换人了（v2.25.2+）：新顶卡作者是否在播，重新看一眼（走会话缓存 +
-    // 串行节流，不额外轰炸 live 接口）
-    unawaited(_loadTopLive());
-  }
-
   /// 刷新/离开前收尾：把正在飞出的那张按已完成结算（动作早已发出），
   /// 并清掉拖动与浮层状态（避免刷新回来后残留一个半飞的卡片）。
+  ///
+  /// 「幽灵卡」也要一起落地：它的"稍后"那张得插回队尾（见 [_landGhost]），
+  /// 否则刷新一次那张卡就凭空消失了。
   void _abortSwipe() {
     _fly?.stop();
-    if (_anim == _SwipeAnim.exit) {
+    if (_anim == _SwipeAnim.exit || _exitRetired) {
       _commitExit();
       return;
     }
@@ -1054,7 +1380,11 @@ class _InboxPageState extends State<InboxPage>
     _resetGestureState();
   }
 
-  /// 撤销上一张：放回队首 + 删掉「已处理」记录。
+  /// 撤销上一张：从撤销栈弹出一张放回队首 + 删掉它的「已处理」记录。
+  ///
+  /// **可连撤**（v2.36.0）：输入解锁后用户会连着划好几张，只留一张的话
+  /// "撤销上一张"按一次就用完了 —— 现在判定掉的卡按顺序进 [_undoStack]，
+  /// 每按一次退一张（LIFO）。
   ///
   /// **不会**自动把已经写进白名单的视频移除（那是一次不可逆的 Gist 写操作），
   /// 所以提示文案里明确说明——让用户自己决定要不要再去白名单删掉。
@@ -1064,7 +1394,7 @@ class _InboxPageState extends State<InboxPage>
   /// ## 动效（v2.22.0+）
   /// 撤销是**反着播**划走那一下：
   /// - 放回来的这张从原来飞出去的**那一侧**飞回来（复用 [_fly] 的 back 区间：
-  ///   起点 = 屏外同侧（[_offscreen]）、终点 = 原位，走的还是 [kCurveOut] +
+  ///   起点 = 屏外同侧（[_exitMotion]）、终点 = 原位，走的还是 [kCurveOut] +
   ///   [kDurBase]）→ 上滑划走的就从上方飞回来，所以它带着一点回正的角度感，
   ///   而不是"啪"地出现在原位；
   /// - 后层的「退回」由卡片栈自己反播推进（它检测到队首插回一张，
@@ -1072,12 +1402,12 @@ class _InboxPageState extends State<InboxPage>
   ///
   /// 关动效时两件事都是瞬时到位（[MotionControl.of] 为 false → 没有 controller）。
   void _undoLast() {
-    // 飞出/推进/弹回期间不动队列：此刻 _items 的头部正是"正在飞的那张"，
-    // 往队首插一张会让它中途换人
+    // 顶卡正在飞 / 正在回弹时不动队列：此刻 _items 的头部正要换人，
+    // 往队首插一张会让它中途换人。（幽灵卡不算"正在飞" —— 它已经从队列里
+    // 摘出去了，所以交接之后撤销随时可用。）
     if (_busy) return;
-    final rec = _undo;
-    if (rec == null) return;
-    _undo = null;
+    if (_undoStack.isEmpty) return;
+    final rec = _undoStack.removeLast();
     unawaited(ServiceLocator.inboxService.unmarkHandled(rec.item));
     final c = _motion ? _fly : null;
     setState(() {
@@ -1253,6 +1583,9 @@ class _InboxPageState extends State<InboxPage>
                             // 上滑取回一次 → 后层退回原位（见该字段的说明）
                             restoreTick: _restoreTick,
                             topCard: _buildTopCard(_items.first, cardW, style),
+                            // 幽灵卡：已经交接出去、还在飞的那张（画在最上面、
+                            // 不吃手势）—— 新手势因此落到下面新顶卡上
+                            overlay: _buildGhost(cardW, style),
                           ),
                         ),
                       ),
@@ -1336,12 +1669,51 @@ class _InboxPageState extends State<InboxPage>
     );
   }
 
+  /// 幽灵卡：**已经交接出去、还在飞**的那张（null = 没有）。
+  ///
+  /// 三个要点：
+  /// - 它画在**整叠牌之上**（所以"飞出期间 `find.byType(InboxSwipeCard).last`
+  ///   仍是飞出去的那张"这条既有观感/既有用例都成立），但整层套
+  ///   [IgnorePointer] → **不吃手势**，新手势落到下面的新顶卡上（这就是"松手
+  ///   140ms 后就能拖下一张"）；
+  /// - 位置由自己的控制器 [_ghostFly] 驱动，进度从顶卡飞出的那一帧**原样接过来**
+  ///   （[ _GhostExit.offsetAt ] + 同一个时长）→ 交接那一帧看不出任何变化；
+  /// - 卡片内容不重建（[AnimatedBuilder] 的 `child:`），400ms 内只是被平移。
+  Widget? _buildGhost(double cardW, InboxCardStyle style) {
+    final g = _ghost;
+    final c = _ghostFly;
+    if (g == null || c == null) return null;
+    return Positioned(
+      key: ValueKey<String>('inbox.ghost:${g.item.bvid}'),
+      left: 0,
+      right: 0,
+      top: 0,
+      child: IgnorePointer(
+        child: AnimatedBuilder(
+          animation: c,
+          child: InboxSwipeCard(
+            item: g.item,
+            width: cardW,
+            style: style,
+            // 飞出途中浮层一直亮着（沿用"钉在松手那一刻"的既有观感）
+            action: g.badge,
+            actionProgress: g.badgeProgress,
+            reactionVertical: g.vertical,
+          ),
+          builder: (_, child) => _decorateWith(child!, g.offsetAt(c.value)),
+        ),
+      ),
+    );
+  }
+
   /// 位移 + 旋转（旋转角与水平位移成正比，最多 ±[kInboxSwipeMaxTilt]）。
-  Widget _decorate(Widget child, double t) {
-    final off = _offsetAt(t);
+  Widget _decorate(Widget child, double t) => _decorateWith(child, _offsetAt(t));
+
+  /// 按一个**已经算好的位移**摆卡片（顶卡与幽灵卡共用；幽灵卡不走 [_offsetAt]，
+  /// 它的区间与进度都在 [_ghost] 里）。
+  Widget _decorateWith(Widget child, Offset off) {
     final screenW = MediaQuery.sizeOf(context).width;
-    final tilt =
-        (off.dx / screenW).clamp(-1.0, 1.0) * kInboxSwipeMaxTilt;
+    final tilt = (off.dx / screenW).clamp(-1.0, 1.0) * kInboxSwipeMaxTilt;
     return Transform.translate(
       offset: off,
       child: Transform.rotate(angle: tilt, child: child),
@@ -1367,7 +1739,7 @@ class _InboxPageState extends State<InboxPage>
         ),
         child: Center(
           child: OutlinedButton.icon(
-            onPressed: _undo == null ? null : _undoLast,
+            onPressed: _canUndo ? _undoLast : null,
             icon: const Icon(Icons.undo, size: 18),
             label: const Text('撤销上一张'),
             style: OutlinedButton.styleFrom(
@@ -1391,7 +1763,7 @@ class _InboxPageState extends State<InboxPage>
             width: 56,
             child: IconButton(
               tooltip: '撤销',
-              onPressed: _undo == null ? null : _undoLast,
+              onPressed: _canUndo ? _undoLast : null,
               icon: const Icon(Icons.undo),
             ),
           ),

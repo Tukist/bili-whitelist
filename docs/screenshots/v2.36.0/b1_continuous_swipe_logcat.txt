@@ -1,0 +1,13 @@
+amoTV v2.36.0 连续滑动真机取证（模拟器 emulator-5554，bili_whitelist_app 已登录 B 站 + 已配 GitHub）
+动作：连续 4 次「下滑 = 稍后」（非破坏性：不判定、不写 Gist、不标记已读，只把卡推到队尾）
+注入：adb shell input swipe 540 1000 540 1450 250（命令间 sleep 0.25s，含 adb 启动开销）
+过滤：[inbox] 判定（页面在 _decide 里打的判定留痕，带毫秒时间戳）
+
+09-21 15:30:38.920 I/flutter (23842): [inbox] 判定 edge=down → 稍后 bvid=BV1AshB6bEUr drag=Offset(0.0, 317.5)
+09-21 15:30:39.875 I/flutter (23842): [inbox] 判定 edge=down → 稍后 bvid=BV1pxhB6ZES9 drag=Offset(0.0, 158.4)
+09-21 15:30:40.747 I/flutter (23842): [inbox] 判定 edge=down → 稍后 bvid=BV1K7hB6PEqV drag=Offset(0.0, 148.1)
+09-21 15:30:41.658 I/flutter (23842): [inbox] 判定 edge=down → 稍后 bvid=BV1TEhB6YEea drag=Offset(0.0, 162.5)
+
+注：adb input 注入在连发时会丢手势（同一命令序列不同轮次只会产生 3~4 条判定），
+    所以这里只证明「连续划出的手势都被判定了、没有一张被吞在动画里」，
+    精确的解锁时延（kDurAdvance=160ms）由 widget 测试 test/inbox_swipe_test.dart 断言。

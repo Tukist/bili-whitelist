@@ -27,6 +27,7 @@ import '../utils/import_parser.dart';
 import '../utils/relative_time.dart';
 import '../widgets/add_success_button.dart';
 import '../widgets/app_block.dart';
+import '../widgets/app_snack.dart';
 import '../widgets/app_state_view.dart';
 import '../widgets/collection_dialogs.dart';
 import '../widgets/favorites_import_dialog.dart';
@@ -167,7 +168,9 @@ class _PlaylistPageState extends State<PlaylistPage> {
     onError: (message) {
       if (!mounted) return;
       // 失败**不回滚**：本地改动保留，只告诉用户「没同步上」
-      _showSnack('未同步到 Gist（本地已生效）：$message');
+      // （error 档：关掉「界面提示」也不能让写盘失败静默）
+      _showSnack('未同步到 Gist（本地已生效）：$message',
+          kind: SnackKind.error);
     },
   );
 
@@ -430,7 +433,8 @@ class _PlaylistPageState extends State<PlaylistPage> {
     }
     if (result.status == ClipboardOpenStatus.failed) {
       // 失败不静默：解析失败 / 取元数据失败都给一句明确提示（不跳空白页）
-      _showSnack(result.message);
+      // —— 这里显式走 error 档，关掉「界面提示」也照样弹
+      _showSnack(result.message, kind: SnackKind.error);
     }
     // none（没链接 / 番剧 / 落点非视频）/ duplicate / disabled：什么都不做
   }
@@ -609,22 +613,24 @@ class _PlaylistPageState extends State<PlaylistPage> {
 
   /// 管理面板「检查更新」按钮调用：force=true 跳过节流。
   Future<void> _manualCheckUpdate() async {
-    final messenger = ScaffoldMessenger.of(context);
     try {
       final svc = await _ensureUpdateService();
       final info = await svc.check(force: true);
       if (!mounted) return;
       if (info == null) {
-        // 已是最新：用 PackageInfo 读当前 version 显示
-        final current = _version;
-        messenger.showSnackBar(SnackBar(content: Text('已是最新 v$current')));
+        // 已是最新：用 PackageInfo 读当前 version 显示（info 档 → 受设置里的
+        // 「界面提示」开关控制：这条纯属告知，关掉提示时不必打扰）
+        AppSnack.show(context, '已是最新 v$_version');
         return;
       }
       _showUpdateDialog(info);
     } on UpdateException catch (e) {
-      messenger.showSnackBar(SnackBar(content: Text(e.message)));
+      // 检查更新失败 → error 档（关掉提示也不能让"检查更新没反应"变成静默）
+      if (!mounted) return;
+      _showSnack(e.message, kind: SnackKind.error);
     } catch (e) {
-      messenger.showSnackBar(SnackBar(content: Text('检查更新失败：$e')));
+      if (!mounted) return;
+      _showSnack('检查更新失败：$e', kind: SnackKind.error);
     }
   }
 
@@ -780,21 +786,26 @@ class _PlaylistPageState extends State<PlaylistPage> {
   // 防沉迷：新增视频入口只有「导入」（与电脑端等价）。
   // ---------------------------------------------------------------------------
 
-  /// 底部提示条。
+  /// 底部提示条入口（统一走 [AppSnack]）。
   ///
   /// [ok] = true（导入成功）时首行加一个小号勾（[AddSuccessSnackContent]，
   /// 与「加入」成功动效同一个勾的形状）。**文案字符串本身不变**。
-  void _showSnack(String message, {bool ok = false}) {
+  ///
+  /// ⚠️ **失败类必须显式传 `kind: SnackKind.error`**：本页最容易踩的是
+  /// 「未同步到 Gist（本地已生效）」—— 那是写盘失败，关掉提示也不能让它静默
+  /// （用户会以为改动已经同步好了）。
+  void _showSnack(
+    String message, {
+    bool ok = false,
+    SnackKind kind = SnackKind.info,
+  }) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context)
-      ..hideCurrentSnackBar()
-      ..showSnackBar(
-        SnackBar(
-          content: ok
-              ? AddSuccessSnackContent(message: message)
-              : Text(message),
-        ),
-      );
+    AppSnack.show(
+      context,
+      message,
+      kind: kind,
+      content: ok ? AddSuccessSnackContent(message: message) : null,
+    );
   }
 
   /// 统一落库（乐观更新）：
@@ -858,7 +869,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
       final next = createSubCollection(_data, parentPath, name);
       await _saveAndRefresh(next);
     } on CollectionException catch (e) {
-      _showSnack(e.message);
+      _showSnack(e.message, kind: SnackKind.error);
     }
   }
 
@@ -950,7 +961,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
     try {
       pgc = await parsePgcRef(input);
     } on ImportParseException catch (e) {
-      _showSnack(e.message);
+      _showSnack(e.message, kind: SnackKind.error);
       return;
     }
     if (pgc != null) {
@@ -982,7 +993,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
     try {
       bvid = await parseBvid(input);
     } on ImportParseException catch (e) {
-      _showSnack(e.message);
+      _showSnack(e.message, kind: SnackKind.error);
       return;
     }
     debugPrint('[import] parseBvid -> $bvid');
@@ -998,13 +1009,13 @@ class _PlaylistPageState extends State<PlaylistPage> {
     try {
       result = await _writer.addByBvid(bvid);
     } on BiliApiException catch (e) {
-      _showSnack('获取视频信息失败：${e.message}');
+      _showSnack('获取视频信息失败：${e.message}', kind: SnackKind.error);
       return;
     } on DioException {
-      _showSnack('网络请求失败，请检查网络后重试');
+      _showSnack('网络请求失败，请检查网络后重试', kind: SnackKind.error);
       return;
     } on GithubApiException catch (e) {
-      _showSnack('导入失败：${e.message}');
+      _showSnack('导入失败：${e.message}', kind: SnackKind.error);
       return;
     }
     if (!result.added) {
@@ -1121,7 +1132,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
       final next = renameCollection(_data, path, neu);
       await _saveAndRefresh(next);
     } on CollectionException catch (e) {
-      _showSnack(e.message);
+      _showSnack(e.message, kind: SnackKind.error);
     }
   }
 
@@ -1132,7 +1143,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
       final next = deleteCollection(_data, path);
       await _saveAndRefresh(next);
     } on CollectionException catch (e) {
-      _showSnack(e.message);
+      _showSnack(e.message, kind: SnackKind.error);
     }
   }
 
@@ -1151,7 +1162,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
           : '已把「${collectionDisplay(source)}」移动到'
               '「${collectionDisplay(target)}」下面');
     } on CollectionException catch (e) {
-      _showSnack(e.message);
+      _showSnack(e.message, kind: SnackKind.error);
     }
   }
 
@@ -2566,9 +2577,7 @@ class _CollectionManageSheetState extends State<_CollectionManageSheet> {
   Future<void> _move(String path) async {
     final targets = _moveTargetsFor(path);
     if (targets.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('没有其它合集可以作为目标，请先新建一个合集')),
-      );
+      AppSnack.show(context, '没有其它合集可以作为目标，请先新建一个合集');
       return;
     }
     final target = await showCollectionMoveTargetSheet(

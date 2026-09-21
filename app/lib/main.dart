@@ -7,6 +7,7 @@ import 'pages/playlist_page.dart';
 import 'services/clipboard_link_store.dart';
 import 'services/inbox_card_style_store.dart';
 import 'services/theme_store.dart';
+import 'services/ui_prefs_store.dart';
 import 'theme/app_theme.dart';
 
 /// 全局路由观察者（v2.17.1+）：播放页 [RouteAware] 订阅它，感知「自己上面
@@ -31,6 +32,9 @@ void main() {
   // 但用户可能关过——启动时先读进来，免得关掉之后第一次冷启动仍然去读剪贴板
   // （store 内部幂等 + 读失败静默回默认）。
   unawaited(ClipboardLinkStore.instance.ensureLoaded());
+  // 读「界面提示」开关（v2.36.0）：默认开，但用户可能关过——启动时先读进来，
+  // 免得关掉之后第一次冷启动仍然弹一堆提示（store 内部幂等 + 读失败静默回默认）。
+  unawaited(UiPrefsStore.instance.ensureLoaded());
   // 预热离线缓存索引（v2.29.0 修复「冷启动入口缺计数」）：索引是**懒加载**的（[DownloadManager.init]
   // 原先只由合集页 / 离线缓存页 / 播放页触发），而「个人」页设置区的
   // 「缓存管理」入口文案直接读 [DownloadManager.cached]

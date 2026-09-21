@@ -10,6 +10,7 @@ import '../services/schedule_store.dart';
 import '../services/xlsx_reader.dart';
 import '../theme/app_palette.dart';
 import '../theme/app_tokens.dart';
+import '../widgets/app_snack.dart';
 
 /// 单元格宽度（dp）。96 大致能横排下「抄实验报告」这种 5 字中文（14sp），
 /// 且在 411dp 宽的机器上「行头 44 + 3 列」正好铺满首屏（见 [ScheduleData.initial]）。
@@ -533,18 +534,19 @@ class SchedulePageState extends State<SchedulePage> {
     await _store.save(prev);
   }
 
+  /// 日程页提示条入口（统一走 [AppSnack]）。
+  ///
+  /// [undoable] 的「撤销」动作是**填充 / 增删的唯一挽回入口** —— 关掉提示不能
+  /// 把它一起关掉，所以带 action 的提示 `AppSnack` 一律放行（见该文件顶部第 3 条）。
   void _toast(String message, {bool undoable = false}) {
     if (!mounted) return;
-    final messenger = ScaffoldMessenger.of(context);
-    messenger.clearSnackBars();
-    messenger.showSnackBar(
-      SnackBar(
-        content: Text(message),
-        duration: const Duration(seconds: 2),
-        action: undoable
-            ? SnackBarAction(label: '撤销', onPressed: () => unawaited(_undo()))
-            : null,
-      ),
+    AppSnack.show(
+      context,
+      message,
+      duration: const Duration(seconds: 2),
+      action: undoable
+          ? SnackBarAction(label: '撤销', onPressed: () => unawaited(_undo()))
+          : null,
     );
   }
 

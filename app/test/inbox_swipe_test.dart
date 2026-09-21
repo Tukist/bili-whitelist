@@ -138,6 +138,46 @@ class _FakeGithubApi extends GithubApi {
   }
 }
 
+/// 会「慢」的 GitHub 替身：每次读写都耗 [delay]，并统计**同一时刻在飞的请求数**。
+///
+/// 用来验证「连续两张右滑 → Gist 写被串行化」：[WhitelistWriter.addVideo] 是
+/// "GET 整份 → 查重 → PATCH 整份"的 read-modify-write，两次并发会各自基于同一份
+/// 旧快照写，后一次覆盖前一次（丢一条视频，而且全程没有任何报错）。
+class _SerialGithubApi extends GithubApi {
+  _SerialGithubApi({this.delay = Duration.zero});
+
+  final Duration delay;
+  WhitelistData data = WhitelistData.empty();
+
+  int _inFlight = 0;
+
+  /// 观测到的**并发峰值**（串行化之后必须恒为 1）。
+  int maxInFlight = 0;
+
+  Future<T> _track<T>(Future<T> Function() body) async {
+    _inFlight++;
+    if (_inFlight > maxInFlight) maxInFlight = _inFlight;
+    try {
+      if (delay > Duration.zero) await Future<void>.delayed(delay);
+      return await body();
+    } finally {
+      _inFlight--;
+    }
+  }
+
+  @override
+  Future<bool> hasConfig() async => true;
+
+  @override
+  Future<WhitelistData?> fetchFromGist() => _track(() async => data);
+
+  @override
+  Future<bool> saveToGist(WhitelistData wl) => _track(() async {
+        data = wl;
+        return true;
+      });
+}
+
 /// 假同步服务（`WhitelistWriter.addVideo` 落缓存用）。
 class _FakeSyncService extends WhitelistSyncService {
   @override
@@ -1737,6 +1777,277 @@ void main() {
       expect(find.byType(InboxSwipeCard), findsNWidgets(2));
       expect(find.text('检查中…'), findsNothing);
       expect(h.service.checkCalls, 1);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // 连续滑动（v2.36.0）：松手后立刻能拖下一张 + 垂直上下快速切换
+  // -------------------------------------------------------------------------
+  group('连续滑动：解锁输入 + 幽灵层', () {
+    /// 划一张（到出屏）→ 返回这一张**从松手到幽灵落地**经过的虚拟时间。
+    ///
+    /// 靠幽灵层的 key 判定"还在飞"（卡片栈的后层是 `inbox.stack:<bvid>`，
+    /// 不会混）：幽灵落地那一刻它就消失了 —— 那就是这次飞出的总时长。
+    Future<Duration> flightTime(
+      WidgetTester tester,
+      String bvid,
+      Offset offset,
+    ) async {
+      await tester.drag(_cardByBvid(bvid), offset);
+      await tester.pump();
+      final ghost = find.byKey(ValueKey<String>('inbox.ghost:$bvid'));
+      var ms = 0;
+      // 先等幽灵出现（= 交接发生），再等它消失（= 落地）→ 两段之和就是这次飞出的总时长
+      while (ghost.evaluate().isEmpty && ms < 1000) {
+        await tester.pump(const Duration(milliseconds: 16));
+        ms += 16;
+      }
+      expect(ghost, findsOneWidget, reason: '交接之后必须有幽灵卡接着飞');
+      while (ghost.evaluate().isNotEmpty && ms < 3000) {
+        await tester.pump(const Duration(milliseconds: 16));
+        ms += 16;
+      }
+      expect(ghost, findsNothing, reason: '$bvid 的幽灵卡必须落地（不能挂着不放）');
+      await tester.pumpAndSettle();
+      return Duration(milliseconds: ms);
+    }
+
+    test('飞出位移与时长：竖直按距离等比放大（四向出屏速度一致）', () {
+      const screen = Size(411, 914);
+      final h = inboxExitMotion(screen: screen, vertical: false, positive: true);
+      final v = inboxExitMotion(screen: screen, vertical: true, positive: true);
+      final hl = inboxExitMotion(screen: screen, vertical: false, positive: false);
+      final vu = inboxExitMotion(screen: screen, vertical: true, positive: false);
+
+      // 水平：既有观感基准（1.4 × 屏宽 / kDurSlow），一个字没动
+      expect(h.offset.dx, closeTo(411 * kInboxExitRatio, 0.001));
+      expect(h.offset.dy, 0);
+      expect(h.duration, kDurSlow);
+
+      // 竖直：只推一屏高（旧值 1.4 屏高 = 多推 40%），时长等比放大
+      expect(v.offset.dy, closeTo(914, 0.001));
+      expect(v.offset.dx, 0);
+      expect(v.duration.inMilliseconds, greaterThan(h.duration.inMilliseconds),
+          reason: '走得更远 → 必须走得更久（旧实现两者同为 320ms → 竖直快一倍）');
+
+      // ★ 核心不变式：四个方向出屏的**速度**一致
+      final speedH = h.offset.dx / h.duration.inMicroseconds;
+      final speedV = v.offset.dy / v.duration.inMicroseconds;
+      expect(speedV, closeTo(speedH, speedH * 0.01),
+          reason: '竖直与水平的出屏速度必须同量级（旧实现是 2.2 倍）');
+
+      // 符号：四个方向各朝各的边；时长与方向无关（只与距离有关）
+      expect(hl.offset.dx, lessThan(0));
+      expect(vu.offset.dy, lessThan(0));
+      expect(hl.duration, h.duration);
+      expect(vu.duration, v.duration);
+    });
+
+    testWidgets('实测：竖直飞出时长 ≈ 水平 × (屏高 / 1.4 屏宽)', (tester) async {
+      await _pumpInboxAnimated(tester, [for (var i = 1; i <= 4; i++) _item(i)]);
+
+      // 水平：BV1 左滑（跳过 → 飞出去就不再回来）
+      final tH = await flightTime(tester, 'BV1', const Offset(-300, 0));
+      // 竖直：BV2 下滑（稍后 → 落地后回队尾，但幽灵本身同样"飞完就消失"）
+      final tV = await flightTime(tester, 'BV2', const Offset(0, 300));
+
+      const ref = 411 * kInboxExitRatio;
+      final expectedV = tH.inMilliseconds * (914 / ref);
+      expect(tV.inMilliseconds, closeTo(expectedV, expectedV * 0.15),
+          reason: '竖直时长必须按距离等比放大（实测 ${tV.inMilliseconds}ms vs '
+              '预期 ${expectedV.round()}ms；旧实现是 320 vs 320）');
+      // 换算成平均速度：两者同量级（±15%）
+      final speedH = ref / tH.inMilliseconds;
+      final speedV = 914 / tV.inMilliseconds;
+      expect(speedV, closeTo(speedH, speedH * 0.15),
+          reason: '竖直速度必须重回同一量级（旧实现快 2.2 倍）');
+    });
+
+    testWidgets('松手 kDurAdvance 后立刻能拖下一张（旧实现整段飞出都在吞手势）',
+        (tester) async {
+      await _pumpInboxAnimated(tester, [for (var i = 1; i <= 4; i++) _item(i)]);
+      final rest = tester.getCenter(_cardByBvid('BV2'));
+
+      await tester.drag(_cardByBvid('BV1'), const Offset(300, 0)); // 右滑 = 加入
+      await tester.pump();
+
+      // ① 推进段内（还没到 kDurAdvance）：顶卡仍是飞出去的 BV1，抓下一张抓不动
+      await tester.pump(const Duration(milliseconds: 40));
+      // warnIfMissed: false —— 此刻 BV2 还是**不吃手势**的后层（推进段内本来
+      // 就不该拖动它），命中警告是预期的
+      await tester.drag(_cardByBvid('BV2'), const Offset(60, 0),
+          warnIfMissed: false);
+      await tester.pump();
+      expect(tester.getCenter(_cardByBvid('BV2')).dx, closeTo(rest.dx, 0.5),
+          reason: '推进段（0~kDurAdvance）内下一张还没长到位，手势不该作用在它身上');
+
+      // ② 过了交接点：BV2 就是顶卡 → 立刻能拖（这就是"连续跳过"的前提）
+      await tester.pump(kDurAdvance);
+      await tester.drag(_cardByBvid('BV2'), const Offset(60, 0));
+      await tester.pump();
+      expect(tester.getCenter(_cardByBvid('BV2')).dx, greaterThan(rest.dx + 20),
+          reason: '松手 kDurAdvance（160ms）后就能拖下一张 —— '
+              '旧实现要等整段飞出（320ms）');
+      await tester.pumpAndSettle();
+    });
+
+    testWidgets('连续滑三张：每张只等 kDurAdvance 就能接着划（吞吐翻倍）',
+        (tester) async {
+      final h =
+          await _pumpInboxAnimated(tester, [for (var i = 1; i <= 5; i++) _item(i)]);
+
+      for (var i = 1; i <= 3; i++) {
+        await tester.drag(_cardByBvid('BV$i'), const Offset(-300, 0)); // 左滑 = 跳过
+        await tester.pump();
+        // 只等到"交接点"就划下一张（每张之间的等待 = kDurAdvance）
+        await tester.pump(kDurAdvance + const Duration(milliseconds: 20));
+      }
+
+      // 每张之间只等 kDurAdvance：如果交接没生效，第二、三次拖动会被 _busy 吞掉
+      // → handled 里就不会有三条
+      expect(h.service.handled, ['BV1', 'BV2', 'BV3'],
+          reason: '三张都被判定掉了（没有一张被"手势被吞"挡掉）');
+
+      // 第三张的幽灵还在飞（.last 此刻是它）→ 等它落地再看牌堆
+      await tester.pumpAndSettle();
+      expect(_topBvid(tester), 'BV4', reason: '第四张已经在顶上待命');
+      expect(_deckOrder(tester), ['BV4', 'BV5']);
+    });
+
+    testWidgets('连续下滑两张（开动效）：第二张不被"队列只剩 1 张"挡掉（在飞的也算队列里的）',
+        (tester) async {
+      final h = await _pumpInboxAnimated(tester, [_item(1), _item(2)]);
+
+      await tester.drag(_cardByBvid('BV1'), const Offset(0, 300)); // 稍后
+      await tester.pump();
+      await tester.pump(kDurAdvance + const Duration(milliseconds: 20)); // 交接
+      // 此刻 _items 里只剩 BV2（BV1 还在飞）：队列长度必须把幽灵算上，
+      // 否则这次下滑会被判成"推到队尾 = 原地打转"而拒绝执行
+      await tester.drag(_cardByBvid('BV2'), const Offset(0, 300)); // 稍后
+      await tester.pump();
+      await tester.pumpAndSettle();
+
+      expect(h.service.handled, isEmpty, reason: '稍后不是判定');
+      expect(_deckOrder(tester), ['BV1', 'BV2'],
+          reason: '两张都推到了队尾（队列转了一圈）—— 旧实现在这里会拒绝第二张');
+    });
+
+    testWidgets('上滑取回：锁输入 ≤ 250ms（第一步 kDurQuick），滑入途中可被手指接管',
+        (tester) async {
+      await _pumpInboxAnimated(tester, [for (var i = 1; i <= 3; i++) _item(i)]);
+
+      // 先把 BV1「稍后」推走 → 有可取的卡
+      await tester.drag(_topCard(), const Offset(0, 300));
+      await tester.pumpAndSettle();
+      expect(_topBvid(tester), 'BV2');
+
+      // 上滑 = 取回
+      await tester.drag(_topCard(), const Offset(0, -200));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 40));
+      expect(_deckOrder(tester).first, 'BV2',
+          reason: '第一步（手上这张让位）还没走完：队首仍是 BV2');
+
+      // 累计 140ms ≥ kDurQuick(120ms) → 取回已经生效（≤ 250ms 的硬要求）
+      await tester.pump(const Duration(milliseconds: 100));
+      expect(_deckOrder(tester).first, 'BV1',
+          reason: '取回必须在 250ms 内生效（旧实现要等第一步 200ms 走完）');
+
+      // 第二步（被取回的那张从下方滑入）不锁输入：手指落下就能接管
+      expect(find.byKey(const ValueKey<String>('inbox.ghost:BV1')), findsNothing,
+          reason: '取回的那张是顶卡（从下方滑入），不是幽灵');
+      // 再等 100ms：BV1 从下方滑入了一点，卡片中心进到屏内（否则手势点落在
+      // 屏幕外、根本送不到卡片上，测不出能不能接管）
+      await tester.pump(const Duration(milliseconds: 100));
+      final before = tester.getTopLeft(_cardByBvid('BV1')).dy;
+      final rect = tester.getRect(_cardByBvid('BV1'));
+      final gesture = await tester.startGesture(
+        Offset(rect.center.dx, rect.center.dy.clamp(60.0, 854.0)),
+      );
+      await gesture.moveBy(const Offset(0, -60)); // 第一次移动被 touch slop 吃掉
+      await tester.pump();
+      await gesture.moveBy(const Offset(0, -40));
+      await tester.pump();
+      expect(tester.getTopLeft(_cardByBvid('BV1')).dy, lessThan(before - 20),
+          reason: '滑入途中手指落下即可接管（[_takeOverBackAnimation]）');
+      await gesture.up();
+      await _flush(tester);
+      expect(_deckOrder(tester), ['BV1', 'BV2', 'BV3'], reason: '接管后队列不变');
+    });
+
+    testWidgets('撤销可连撤（栈）：连划两张后连按两次撤销，逐张退回队首',
+        (tester) async {
+      final h = await _pumpInbox(tester, [_item(1), _item(2), _item(3)]);
+
+      await tester.drag(_topCard(), const Offset(-300, 0)); // BV1 跳过
+      await _flush(tester);
+      await tester.drag(_topCard(), const Offset(-300, 0)); // BV2 跳过
+      await _flush(tester);
+      expect(_deckOrder(tester), ['BV3']);
+
+      await tester.tap(find.byTooltip('撤销'));
+      await _flush(tester);
+      expect(h.service.unhandled, ['BV2'], reason: 'LIFO：先退回最近判定掉的那张');
+      expect(_deckOrder(tester), ['BV2', 'BV3']);
+
+      // ★ 旧实现是单张撤销位 → 这里按钮已经禁用；现在可连撤
+      expect(
+        tester
+            .widget<IconButton>(find.widgetWithIcon(IconButton, Icons.undo))
+            .onPressed,
+        isNotNull,
+        reason: '撤销栈里还有 BV1 → 按钮必须仍可用',
+      );
+      await tester.tap(find.byTooltip('撤销'));
+      await _flush(tester);
+      expect(h.service.unhandled, ['BV2', 'BV1']);
+      expect(_deckOrder(tester), ['BV1', 'BV2', 'BV3'], reason: '两张都退回来了');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // 连续右滑的 Gist 写必须串行（解锁输入之后才出现的并发风险）
+  // -------------------------------------------------------------------------
+  group('连续右滑：Gist 写串行化', () {
+    testWidgets('连续两张右滑 → 同一时刻只有一次「读整份 → 写整份」在飞，两条都保住',
+        (tester) async {
+      MotionControl.enabled = true;
+      _usePortraitPhone(tester);
+      final service = _FakeInboxService([_item(1), _item(2), _item(3)]);
+      final api = _FakeBiliApi();
+      final github = _SerialGithubApi(delay: const Duration(milliseconds: 200));
+      ServiceLocator.overrideInboxService(service);
+      ServiceLocator.overrideSyncService(_FakeSyncService());
+      await tester.pumpWidget(MaterialApp(
+        home: InboxPage(
+          api: api,
+          writer: WhitelistWriter(github: github, api: api),
+        ),
+      ));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 500));
+
+      // 第一张右滑（加入）：Gist 读改写开始（一次要 200ms×2）
+      await tester.drag(_cardByBvid('BV1'), const Offset(300, 0));
+      await tester.pump();
+      // 只等到交接点（此刻第一张的 Gist 写还在飞）就划第二张
+      await tester.pump(kDurAdvance + const Duration(milliseconds: 20));
+      await tester.drag(_cardByBvid('BV2'), const Offset(300, 0));
+      await tester.pump();
+
+      // 让排队与在飞的写全部跑完
+      for (var i = 0; i < 40; i++) {
+        await tester.pump(const Duration(milliseconds: 50));
+      }
+      await tester.pumpAndSettle();
+
+      expect(github.maxInFlight, 1,
+          reason: '同一时刻只能有一次「GET 整份 → 查重 → PATCH 整份」在飞 —— '
+              '两次并行会各自基于同一份旧快照 PATCH，后一次把前一次覆盖掉');
+      expect(github.data.videos.map((v) => v.bvid).toList(), ['BV1', 'BV2'],
+          reason: '两次加入都要落进白名单（不丢更新）');
+      expect(service.handled, ['BV1', 'BV2']);
+      expect(_deckOrder(tester), ['BV3']);
     });
   });
 }
