@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -21,6 +22,7 @@ import '../models/upowner.dart';
 import '../models/video_shot.dart';
 import '../models/whitelist_video.dart';
 import '../services/secure_store.dart';
+import '../services/web_login_cookies.dart';
 import '../wbi/wbi_signer.dart';
 
 /// 评论正文的字数上限（B 站网页端的「0/1000」就是它）。
@@ -698,6 +700,142 @@ SessionStartAction planSessionStart(
   return SessionStartAction.silent;
 }
 
+/// 从一段 cookie 串里解析出的 B 站登录凭据（「粘贴 Cookie 登录」与登录页
+/// 读 WebView cookie 两条路共用，见 [parseBiliCookieCreds]）。
+class BiliCookieCreds {
+  /// `SESSDATA`（必需；登录态本体）。
+  final String? sessdata;
+
+  /// `bili_jct`（有则存：点赞/投币/收藏/评论的 csrf 令牌）。
+  final String? biliJct;
+
+  /// 刷新口令：`bili_refresh_token` / `refresh_token` / `ac_time_value`
+  /// 任一存在即取（自动续期用；没有也不阻塞登录）。
+  final String? refreshToken;
+
+  const BiliCookieCreds({this.sessdata, this.biliJct, this.refreshToken});
+
+  /// 是否拿到了可用的 SESSDATA。
+  bool get hasSessdata => sessdata != null && sessdata!.isNotEmpty;
+}
+
+/// 容错解析一段 cookie 串（`SESSDATA=xxx; bili_jct=yyy; DedeUserID=123;
+/// bili_refresh_token=zzz` 这种形状）。
+///
+/// 要容错的地方都是真实粘贴/读取场景会遇到的：
+/// - **分隔符**：`;`，但从浏览器或开发者工具复制出来的常带**换行** →
+///   `\r` / `\n` 也当分隔符；
+/// - **顺序任意、键可缺**：只给 SESSDATA 也能登（jct/refresh_token 后续可从
+///   登录页 localStorage 补）；
+/// - **值里含 `=`**：只在**第一个** `=` 处切分（否则 `a=b=c` 会被丢掉整条）；
+/// - **键名大小写**：`SESSDATA` / `sessdata` 都认；
+/// - **尾部多余 `;`、空段、前后空白**；
+/// - **值被引号包着**（部分工具复制出来带 `"` / `'`）→ 剥掉外层引号；
+/// - **只拷贝了 Set-Cookie 风格的整行**（`SESSDATA=…; Path=/; HttpOnly`）→
+///   没有 `=` 的段（Path/HttpOnly/Secure）自动跳过。
+///
+/// **值不做 url 解码**：`SESSDATA` 里的 `%2C` 保持原样——它要原封不动地回填
+/// 进 `Cookie` 请求头，解码后再发反而会让服务端认不出来。
+BiliCookieCreds parseBiliCookieCreds(String raw) {
+  String? sessdata;
+  String? biliJct;
+  String? refreshToken;
+  // 换行与 `;` 等价（先归一化，后面只处理 `;`）
+  final normalized = raw.replaceAll('\r', ';').replaceAll('\n', ';');
+  for (final segment in normalized.split(';')) {
+    final entry = segment.trim();
+    if (entry.isEmpty) continue;
+    final eq = entry.indexOf('=');
+    if (eq <= 0) continue; // 无 `=`（Path/HttpOnly/Secure）或空键名 → 跳过
+    final key = entry.substring(0, eq).trim().toLowerCase();
+    var value = entry.substring(eq + 1).trim();
+    if (value.length >= 2) {
+      final first = value[0];
+      final last = value[value.length - 1];
+      if ((first == '"' && last == '"') || (first == "'" && last == "'")) {
+        value = value.substring(1, value.length - 1).trim();
+      }
+    }
+    if (value.isEmpty) continue;
+    switch (key) {
+      case 'sessdata':
+        sessdata ??= value;
+      case 'bili_jct':
+        biliJct ??= value;
+      case 'bili_refresh_token':
+      case 'refresh_token':
+      case 'ac_time_value':
+        refreshToken ??= value;
+    }
+  }
+  return BiliCookieCreds(
+    sessdata: sessdata,
+    biliJct: biliJct,
+    refreshToken: refreshToken,
+  );
+}
+
+/// 登录态**服务端**校验的结论分类（[BiliApi.verifySession] 返回值）。
+enum SessionVerifyStatus {
+  /// 服务端点头：`nav` 返回 `code == 0` 且 `data.isLogin == true`。**唯一**
+  /// 允许落盘 + 报"登录成功"的状态。
+  ok,
+
+  /// 服务端明确说未登录：`code == -101`，或 `code == 0` 但服务端当匿名处理
+  /// （`isLogin` 不为 true）。这份凭据已作废。
+  invalid,
+
+  /// 服务端给了别的业务码（风控 `-412` / 限流 / 未知）——**不是"已失效"，
+  /// 但也不是"已登录"**：结论未知，一律按不通过处理（不给假成功）。
+  rejected,
+
+  /// 网络/超时/解析失败：压根没拿到结论。
+  network,
+}
+
+/// [BiliApi.verifySession] 的结果：结论 + 业务码 + 可直接展示给用户的说明。
+class SessionVerifyResult {
+  final SessionVerifyStatus status;
+
+  /// 服务端业务码（`code`）；网络失败时为 null。
+  final int? code;
+
+  /// 面向用户的短说明（不含任何凭据）。
+  final String message;
+
+  /// 通过时服务端给的我的 mid（>0 才有意义；仅用于日志/排查，不落盘）。
+  final int mid;
+
+  const SessionVerifyResult({
+    required this.status,
+    required this.code,
+    required this.message,
+    this.mid = 0,
+  });
+
+  /// 服务端是否确认"已登录"——**只有它为 true 才允许保存登录态**。
+  bool get passed => status == SessionVerifyStatus.ok;
+
+  const SessionVerifyResult.ok(this.mid)
+      : status = SessionVerifyStatus.ok,
+        code = 0,
+        message = '服务端已确认登录';
+
+  const SessionVerifyResult.invalid([this.message = '登录状态已失效'])
+      : status = SessionVerifyStatus.invalid,
+        code = -101,
+        mid = 0;
+
+  const SessionVerifyResult.network(this.message)
+      : status = SessionVerifyStatus.network,
+        code = null,
+        mid = 0;
+
+  const SessionVerifyResult.rejected(this.code, this.message)
+      : status = SessionVerifyStatus.rejected,
+        mid = 0;
+}
+
 /// B 站 API 客户端（dio 封装）。
 ///
 /// - 全局默认头 = 完整浏览器头（防 -412 风控），登录后追加 Cookie: SESSDATA
@@ -802,6 +940,133 @@ class BiliApi {
     await _storage.delete(key: _sessdataKey);
     await _storage.delete(key: _biliJctKey);
     await _storage.delete(key: _refreshTokenKey);
+  }
+
+  /// **服务端**校验一份登录凭据（`SESSDATA` [+ `bili_jct`]）是否真的有效。
+  ///
+  /// 为什么需要它（v2.49.1+ 的核心修复）：客户端能看到的只有"cookie 里有没有
+  /// SESSDATA"，而**死会话的 cookie 长得和有效的一模一样**——服务端早就把它
+  /// 作废了，本地却什么也看不出来（真机取证：本地解析出的过期时间是 2027-02，
+  /// 服务端对同一份会话一律回 -101）。凡是"拿到凭据就宣布登录成功"的地方
+  /// （WebView 登录页、粘贴 Cookie 登录）都必须先过这一关，否则用户会掉进
+  /// 「提示登录成功 → 一用就 -101 → 再登 → 又提示成功」的死循环。
+  ///
+  /// 实现上用 `x/web-interface/nav`（项目里已有 nav 逻辑，见 [_ensureMyMid]）：
+  /// **只按 `code == 0 && data.isLogin == true` 判成功**——这是服务端的权威结论。
+  /// 这里刻意不复用 [_ensureMyMid]：那个方法读的是 secure storage 里**已保存**
+  /// 的会话（还带 `_myMid` 缓存、失败会清本地凭据），而本方法校验的是"手上
+  /// 这一份"（可能还没保存），并且**不碰本地存储**——校验不通过时落不落盘
+  /// 由调用方决定（默认就是不落盘）。
+  ///
+  /// 网络/超时/解析失败 → [SessionVerifyStatus.network]；其它业务码
+  /// （风控 -412 等）→ [SessionVerifyStatus.rejected]。两者都**不是"有效"**，
+  /// 调用方按"不通过"处理（宁可让用户重试，也不给一个假的登录成功）。
+  Future<SessionVerifyResult> verifySession({
+    required String sessdata,
+    String? biliJct,
+  }) async {
+    final sess = sessdata.trim();
+    if (sess.isEmpty) {
+      return const SessionVerifyResult.invalid('没有 SESSDATA');
+    }
+    final cookie = <String>[
+      'SESSDATA=$sess',
+      if (biliJct != null && biliJct.trim().isNotEmpty)
+        'bili_jct=${biliJct.trim()}',
+    ].join('; ');
+    try {
+      // 显式带这次要校验的 cookie：不读 storage、不动全局默认头
+      // （dio 会把它并进 BaseOptions 的默认头，同名键以本次为准）
+      final resp = await _dio.get<Map<String, dynamic>>(
+        '/x/web-interface/nav',
+        options: Options(headers: {'Cookie': cookie}),
+      );
+      final data = resp.data;
+      final code = data?['code'] as int?;
+      final d = data?['data'] as Map<String, dynamic>?;
+      final isLogin = d?['isLogin'] == true;
+      if (code == 0 && isLogin) {
+        final midRaw = d?['mid'];
+        final mid = midRaw is num
+            ? midRaw.toInt()
+            : (midRaw is String ? int.tryParse(midRaw) ?? 0 : 0);
+        // 脱敏：只报长度量级，不打印任何凭据内容
+        debugPrint('[bili_api] verifySession 服务端确认已登录'
+            '（SESSDATA 长度 ${sess.length}，mid 有效=${mid > 0}）');
+        return SessionVerifyResult.ok(mid);
+      }
+      if (code == -101 || (code == 0 && !isLogin)) {
+        debugPrint('[bili_api] verifySession 服务端判定未登录'
+            '（code=$code，isLogin=$isLogin）');
+        return const SessionVerifyResult.invalid('服务端返回 -101（未登录 / 已失效）');
+      }
+      final message = data?['message'] as String? ?? '';
+      debugPrint('[bili_api] verifySession 拿到非预期业务码 code=$code');
+      return SessionVerifyResult.rejected(
+        code ?? -1,
+        message.isEmpty ? '服务端返回 $code' : message,
+      );
+    } on DioException catch (e) {
+      debugPrint('[bili_api] verifySession 网络失败 type=${e.type}');
+      return SessionVerifyResult.network('网络请求失败（${e.type.name}）');
+    } catch (e) {
+      debugPrint('[bili_api] verifySession 异常: ${e.runtimeType}');
+      return SessionVerifyResult.network('校验请求异常（${e.runtimeType}）');
+    }
+  }
+
+  /// 服务端 -101 的自愈：本地会话已被服务端作废 → 清掉凭据，让下次启动
+  /// 能重新引导登录。
+  ///
+  /// **为什么必须做**（2026-09-22 真机取证）：本地「是否过期」只看 SESSDATA
+  /// 内嵌的时间戳（[sessdataExpireAt]），而 B 站可以在那个时间戳到期**之前**
+  /// 就把会话作废（改密码 / 退出全部设备 / 风控 / 续期轮换后旧会话立即失效）。
+  /// 此时本地仍判「有效 ≥ 阈值」→ 启动检查说「会话有效，静默恢复」→
+  /// **永不主动引导重登**，用户看到的是「每个需要登录的功能都失败，但 App
+  /// 张口就说自己已登录」（收藏夹/点赞/收藏/评论全部 -101，首页还当已登录，
+  /// 登录页也永远不会自动弹出来）。真机实测就是这一种：本地读到的会话
+  /// 过期时间是 2027-02，服务端对同一会话一律回 -101。
+  ///
+  /// 服务端的 -101 是权威结论，收到就清：下次启动 [planSessionStart] 拿到
+  /// null → 自动进登录页。
+  ///
+  /// **只清「服务端明确说未登录」这一种**：本地「压根没有 SESSDATA」的前置
+  /// 检查（没东西可清）与 [_postAuth] 里「缺 csrf」的本机拦下都不调它——
+  /// 那些不是服务端结论，误清会把可能还好的会话毁掉。
+  ///
+  /// **同时清 WebView 那份（v2.49.1+）**：WebView 的 cookie jar 是同一份会话的
+  /// 第二处拷贝，而且它在登录页里是"登录是否成功"的判定依据。只清 secure
+  /// storage 不清它 → 登录页仍然读到这份死 cookie → 判"登录成功" → 落盘 → pop
+  /// → 收藏夹又 -101 → 又提示重登 → 又读到同一份死 cookie……**死循环**。
+  Future<void> _discardDeadSession(String path) async {
+    debugPrint('[bili_api] 服务端 -101（path=$path）'
+        '→ 本地会话已被服务端作废，清除凭据（下次启动将重新引导登录）');
+    try {
+      await clearSession();
+    } catch (_) {
+      // 存储异常静默：凭据没清掉不影响把 -101 抛给页面（页面仍提示去登录）
+    }
+    // ★ 清 WebView cookie **不等它**（fire-and-forget）：这是"顺手打扫"，而
+    // 上面那个 -101 才是要立刻报给用户/页面的结论。等它会带来两个坏处：
+    // 1) 原生通道异常/慢时，-101 的提示被无谓地拖住（页面停在"加载中"）；
+    // 2) 测试环境里通道未注册，多一个 await 就会让页面的加载态多等一轮——
+    //    真机无此问题，但"错误上报不该依赖次要清理"这条原则是通用的。
+    unawaited(clearWebLoginCookies(path));
+  }
+
+  /// 清掉 WebView（登录页）里的 cookie，见 [_discardDeadSession] 的最后一段。
+  ///
+  /// 单独成方法是为了让「还有别的地方也要清」时复用同一套日志与失败处理：
+  /// 原生通道不可用（测试环境 / 非 Android 平台）时**只记日志、不上抛**——
+  /// 调用点都在错误处理路径上，那里再抛一次异常只会把真正要报的 -101 盖掉。
+  Future<void> clearWebLoginCookies(String reason) async {
+    try {
+      await WebLoginCookies.clear();
+      debugPrint('[bili_api] 已同步清空 WebView cookie（原因：$reason）');
+    } catch (e) {
+      debugPrint('[bili_api] 清 WebView cookie 失败（通道不可用？原因：$reason）：'
+          '${e.runtimeType}');
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -1229,6 +1494,7 @@ class BiliApi {
   ///
   /// 错误分类：
   /// - nav code=-101（cookie 失效）→ [BiliApiException](-101,「登录已失效」)
+  ///   **并清掉本地已死的会话**（[_discardDeadSession]，v2.49.1+）
   /// - nav code=0 但 data.mid 缺失/为 0（匿名态）→ 同上 -101（视为未登录）
   /// - 其他业务码 → [BiliApiException]（带接口 message）
   /// - 网络失败（[DioException]）→ 原样上抛
@@ -1239,6 +1505,7 @@ class BiliApi {
     final data = resp.data;
     final code = data?['code'] as int?;
     if (code == -101) {
+      await _discardDeadSession('/x/web-interface/nav');
       throw const BiliApiException(
         code: -101,
         message: '登录已失效，请重新登录',
@@ -1258,6 +1525,9 @@ class BiliApi {
         ? midRaw.toInt()
         : (midRaw is String ? int.tryParse(midRaw) ?? 0 : 0);
     if (mid <= 0) {
+      // 带上了 SESSDATA 却被当匿名处理（code=0 且没有 mid）：服务端不认这个
+      // 会话，与 -101 同义——一并清掉，避免继续拿死 cookie 反复白跑
+      await _discardDeadSession('/x/web-interface/nav(匿名态)');
       throw const BiliApiException(
         code: -101,
         message: '登录已失效，请重新登录',
@@ -1303,6 +1573,7 @@ class BiliApi {
     final data = resp.data;
     final code = data?['code'] as int?;
     if (code == -101) {
+      await _discardDeadSession('/x/v3/fav/folder/created/list-all');
       throw const BiliApiException(
         code: -101,
         message: '登录已失效，请重新登录',
@@ -1366,6 +1637,7 @@ class BiliApi {
     final data = resp.data;
     final code = data?['code'] as int?;
     if (code == -101) {
+      await _discardDeadSession('/x/v3/fav/resource/list');
       throw const BiliApiException(
         code: -101,
         message: '登录已失效，请重新登录',
@@ -1988,6 +2260,7 @@ class BiliApi {
         continue;
       }
       if (code == -101) {
+        await _discardDeadSession('/x/player/wbi/v2');
         throw const BiliApiException(
           code: -101,
           message: '未登录或登录已失效，请重新登录后查看字幕',
@@ -2587,6 +2860,7 @@ class BiliApi {
     final data = resp.data;
     final code = data?['code'] as int?;
     if (code == -101) {
+      await _discardDeadSession('/x/relation/followings');
       throw const BiliApiException(
         code: -101,
         message: '登录已失效，请重新登录',
@@ -3604,6 +3878,11 @@ class BiliApi {
       debugPrint('[bili_api] POST $path code=$code 是"已经是该状态"，按成功处理');
       final d0 = data?['data'];
       return d0 is Map<String, dynamic> ? d0 : null;
+    }
+    if (code == -101) {
+      // 写接口的 -101 = 服务端不认这个会话（与读接口同义）：清掉死会话，
+      // 免得"点赞/收藏一直失败但 App 说自己已登录"（v2.49.1+）
+      await _discardDeadSession(path);
     }
     _throwWriteError(data, path);
     final d = data?['data'];

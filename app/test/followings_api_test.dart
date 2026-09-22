@@ -315,6 +315,9 @@ void main() {
         (-352, '限流', '限流'),
         (-400, '参数错误', '参数错误'),
       ]) {
+        // 每轮重置登录态：-101 那轮会把本地凭据清掉（v2.49.1+ 自愈），不重置的
+        // 话后面的码会先被「无 SESSDATA → 请先登录」的本机门禁拦下
+        _store['bili_sessdata'] = 'sess_test';
         final adapter = _RoutingAdapter({
           '/x/frontend/finger/spi': () => _spiBody(),
           '/x/web-interface/nav': () => _navBody(mid: 777),

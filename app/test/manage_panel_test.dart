@@ -217,6 +217,34 @@ void main() {
       expect(spy.loginCalls, 0);
     });
 
+    testWidgets('secure storage 读取异常 → 显示「读取登录态失败」，不伪装成「未登录」',
+        (tester) async {
+      // Keystore 故障 / 原生插件异常：read 抛异常（不是"返回 null"）。
+      // v2.49.1+ 前这种状态被显示成「未登录」→ 用户以为"再登一次就好"，
+      // 实际登了也存不住，白折腾。
+      TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+          .setMockMethodCallHandler(_channel, (call) async {
+        if (call.method == 'read') {
+          throw PlatformException(
+            code: 'KeyStoreException',
+            message: 'keystore unavailable',
+          );
+        }
+        return null;
+      });
+      final spy = _Spy();
+      await _pumpPanel(tester, _panel(spy, heading: '设置'));
+
+      expect(find.textContaining('读取登录态失败'), findsOneWidget);
+      expect(
+        find.textContaining('登录后可解锁 1080P'),
+        findsNothing,
+        reason: '存储异常 ≠ 未登录：不能给「再登一次就好」的错提示',
+      );
+      // 仍保留登录入口，用户可手动重试
+      expect(find.text('登录'), findsOneWidget);
+    });
+
     testWidgets('保存 GitHub 配置 → 写入 secure storage + 成功提示',
         (tester) async {
       final spy = _Spy();

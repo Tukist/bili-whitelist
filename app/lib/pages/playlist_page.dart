@@ -1160,6 +1160,12 @@ class _PlaylistPageState extends State<PlaylistPage> {
       onLogin: () {
         if (mounted) _openLogin(context);
       },
+      // 「粘贴 Cookie 登录」成功（v2.49.1+）：面板内那条路不走登录页，
+      // 宿主得自己重查登录态——否则用户回到首页仍看到「未登录仅 720P」提示条。
+      // 与 [_openLogin] 返回后的处理同一口径（刷新提示条 + 触发关注自动同步）。
+      onSessionChanged: () {
+        if (mounted) unawaited(_refreshLoginHint());
+      },
     );
   }
 

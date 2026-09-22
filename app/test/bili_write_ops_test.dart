@@ -407,6 +407,27 @@ void main() {
         reason: '顺带清掉失效会话，避免后续请求继续带死 cookie');
   });
 
+  test('写接口收到服务端 -101 → 清掉本地死会话（v2.49.1+ 自愈）', () async {
+    // 本地时间戳看着还有效（9999999999 = 2286 年），但服务端不认这个会话：
+    // 这正是 2026-09-22 真机的状态——B 站会在时间戳到期前把会话作废
+    // （改密码 / 退出全部设备 / 风控 / 续期轮换），本地过期判定看不出来。
+    _store['bili_sessdata'] = _kValidSess;
+    _store['bili_jct'] = _kJct;
+    final adapter = _WriteAdapter({
+      _kLikePath: () => {'code': -101, 'message': '账号未登录'},
+    });
+    await expectLater(
+      _api(adapter).likeVideo(aid: 7, like: true),
+      throwsA(isA<BiliApiException>()
+          .having((e) => e.code, 'code', -101)
+          .having((e) => e.message, 'message', '登录已失效，请重新登录 B 站账号')),
+    );
+    expect(adapter.posts, isNotEmpty, reason: '这次是真发出去了才被服务端拒的');
+    expect(_store.containsKey('bili_sessdata'), isFalse,
+        reason: '服务端的 -101 是权威结论：清掉凭据，下次启动才会重新引导登录');
+    expect(_store.containsKey('bili_jct'), isFalse);
+  });
+
   // -------------------------------------------------------------------------
   // 错误码分类
   // -------------------------------------------------------------------------
@@ -422,6 +443,11 @@ void main() {
       -352: '操作被限流，请稍后再试',
     };
     for (final e in cases.entries) {
+      // 每个码前都重置登录态：-101 那一轮会把本地凭据清掉（v2.49.1+ 自愈），
+      // 不重置的话后面的码会先被「缺 csrf → 请先登录」的本机门禁拦下，
+      // 测的就不是这段分类逻辑了
+      _store['bili_sessdata'] = _kValidSess;
+      _store['bili_jct'] = _kJct;
       final adapter = _WriteAdapter({
         _kLikePath: () => {'code': e.key, 'message': '服务端原文'},
       });

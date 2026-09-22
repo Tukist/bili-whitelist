@@ -12,6 +12,7 @@ import '../services/inbox_card_style_store.dart';
 import '../services/theme_store.dart';
 import '../services/ui_copy_store.dart';
 import '../services/ui_prefs_store.dart';
+import '../services/web_login_cookies.dart';
 import '../theme/app_palette.dart';
 import '../theme/app_tokens.dart';
 import '../theme/ink_recipes.dart';
@@ -43,6 +44,10 @@ import 'inbox_card_styles.dart';
 class ManagePanel extends StatefulWidget {
   final GithubApi github;
 
+  /// 「粘贴 Cookie 登录」用的接口客户端（测试注入 fake adapter 用；
+  /// 默认自建一个——校验必须走真实的 B 站 `nav` 接口才算数）。
+  final BiliApi? bili;
+
   /// 打开合集管理面板（重命名 / 删除；宿主维护合集数据）。
   final VoidCallback onManageCollections;
 
@@ -51,6 +56,14 @@ class ManagePanel extends StatefulWidget {
 
   /// B 站账号：宿主推登录页（登录 / 重新登录共用）。
   final VoidCallback onLogin;
+
+  /// 登录态发生变化（面板里的「粘贴 Cookie 登录」成功）时通知宿主。
+  ///
+  /// 为什么要通知：宿主要重查一次登录态刷新它自己的「未登录仅 720P」提示条、
+  /// 并触发一次关注自动同步（与「登录页返回后」的处理保持一致）；
+  /// 不通知的话，用户粘贴登录成功后回到首页**仍会看到「未登录」提示条**，
+  /// 直到下次冷启动。
+  final VoidCallback? onSessionChanged;
 
   /// 宿主是否为弹层：true = 点「登录 / 检查更新」先 pop 自己再执行回调
   /// （弹层需要让 SnackBar/Dialog 显示在干净上下文）；false = 内联嵌入
@@ -66,9 +79,11 @@ class ManagePanel extends StatefulWidget {
   const ManagePanel({
     super.key,
     required this.github,
+    this.bili,
     required this.onManageCollections,
     required this.onCheckUpdate,
     required this.onLogin,
+    this.onSessionChanged,
     this.closeBeforeNavigate = false,
     this.headingTitle = '管理',
     this.headingSubtitle =
@@ -82,7 +97,11 @@ class ManagePanel extends StatefulWidget {
 }
 
 /// B 站账号登录态（管理面板顶部状态展示）。
-enum _AccountState { loading, loggedIn, expired, none }
+///
+/// [storageError] 单列一项（v2.49.1+）：secure storage 读取抛异常（Keystore
+/// 故障 / 原生插件缺失）与「压根没登录」是两回事，旧代码都显示成「未登录」
+/// ——那会让用户以为"登一次就好"，而实际是登了也存不住，白折腾。
+enum _AccountState { loading, loggedIn, expired, none, storageError }
 
 /// 「启动时播放剪贴板里的视频」开关的 key（测试锚点；v2.35.0）。
 const Key kClipboardOpenSwitchKey = Key('clipboard-open-switch');
@@ -92,6 +111,12 @@ const Key kTipsSwitchKey = Key('ui-tips-switch');
 
 /// 「允许点赞 / 投币 / 收藏」总开关的 key（测试锚点；v2.40.0）。
 const Key kWriteActionsSwitchKey = Key('ui-write-actions-switch');
+
+/// 「粘贴 Cookie 登录」入口按钮的 key（测试锚点；v2.49.1+）。
+const Key kPasteCookieButtonKey = Key('paste-cookie-login');
+
+/// 「退出登录」入口按钮的 key（测试锚点；v2.49.1+）。
+const Key kLogoutButtonKey = Key('bili-logout');
 
 class _ManagePanelState extends State<ManagePanel> {
   final _tokenCtrl = TextEditingController();
@@ -105,6 +130,19 @@ class _ManagePanelState extends State<ManagePanel> {
 
   /// SESSDATA 剩余有效期（-1 秒 = 刚过期；仅展示用，不涉及具体凭据内容）。
   Duration? _accountRemain;
+
+  /// 「退出登录」正在清理中（清凭据 + 清 WebView cookie，可能跨原生通道，
+  /// 期间禁用按钮防重复点）。
+  bool _loggingOut = false;
+
+  /// 本机是否有会话（含已过期那种）：决定「退出登录」入口是否出现。
+  ///
+  /// 只认 [loggedIn] / [expired] 两种：它们代表"有一份东西可以退"。
+  /// [loading] 状态未知先不显示（避免按钮闪一下又消失）、[none]
+  /// 与 [storageError] 都没有可退的会话（后者是**读不到**存储，
+  /// 此时清也清不动，给按钮等于给一个按了没反应的入口）。
+  bool get _hasSession =>
+      _account == _AccountState.loggedIn || _account == _AccountState.expired;
 
   @override
   void initState() {
@@ -139,7 +177,9 @@ class _ManagePanelState extends State<ManagePanel> {
         next = _AccountState.loggedIn;
       }
     } catch (_) {
-      next = _AccountState.none; // 存储异常按未登录展示（可手动进登录页）
+      // 存储读取异常（Keystore 故障 / 插件缺失）：**不要显示成「未登录」**——
+      // 那是"你登一次就好"的误导（v2.49.1+）。仍保留「登录」按钮可手动重试。
+      next = _AccountState.storageError;
     }
     if (!mounted) return;
     setState(() {
@@ -161,6 +201,11 @@ class _ManagePanelState extends State<ManagePanel> {
         return '登录已过期：重新登录后恢复 1080P';
       case _AccountState.none:
         return '未登录：登录后可解锁 1080P（登录一次，之后每次进入自动恢复）';
+      case _AccountState.storageError:
+        // 与「未登录」区分：这里是**读不到本机存的登录态**（系统密钥库异常），
+        // 不是"没有登录态"。措辞要挡住"再登一次就好了"的误解。
+        return '读取登录态失败：本机安全存储异常（系统密钥库问题）。'
+            '可点「登录」重试；若一直如此，重启手机通常可恢复。';
     }
   }
 
@@ -256,6 +301,43 @@ class _ManagePanelState extends State<ManagePanel> {
             label: Text(_accountActionLabel),
           ),
         ),
+        const SizedBox(height: 8),
+        // ---- 粘贴 Cookie 登录（v2.49.1+）：不依赖 WebView 的兜底登录路径 ----
+        //
+        // 为什么要有它：真机上登录页的 WebView 渲染进程每次必崩（系统日志
+        // `Renderer process crash detected`），WebView 这条路直接不可用。
+        // 必须留一条"不管 WebView 好坏都能登进去"的路，否则用户只能干等我们修
+        // 环境问题——而那是他的手机/网络里的代理导致的。
+        SizedBox(
+          width: double.infinity,
+          child: OutlinedButton.icon(
+            key: kPasteCookieButtonKey,
+            onPressed: _showPasteCookieDialog,
+            icon: const Icon(Icons.content_paste_go, size: 18),
+            label: const Text('粘贴 Cookie 登录（WebView 打不开时用）'),
+          ),
+        ),
+        // ---- 退出登录（v2.49.1+）：只在**本机有会话**时出现 ----
+        //
+        // 为什么要有它：在此之前"退不出登录"——用户想换个账号 / 把凭据从
+        // 这台机器上抹掉，只能去系统设置里清 App 数据（等于顺手丢掉 GitHub
+        // 配置与全部本地数据）。而登录态存在两处（secure storage + WebView
+        // cookie jar），**只清一处都会留下另一半**，必须由 App 一次清干净。
+        //
+        // 未登录 / 读不到登录态时**不显示**（而不是置灰）：那种状态下点了
+        // 也没东西可退，留一个永远点不动的按钮只会让人怀疑"是不是还有残留"。
+        if (_hasSession) ...[
+          const SizedBox(height: 8),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              key: kLogoutButtonKey,
+              onPressed: _loggingOut ? null : _confirmLogout,
+              icon: const Icon(Icons.logout, size: 18),
+              label: Text(_loggingOut ? '正在退出…' : '退出登录'),
+            ),
+          ),
+        ],
         const SizedBox(height: 16),
         const Divider(height: 1),
         const SizedBox(height: 16),
@@ -667,6 +749,115 @@ class _ManagePanelState extends State<ManagePanel> {
     }
   }
 
+  /// 打开「粘贴 Cookie 登录」弹层（v2.49.1+）。
+  ///
+  /// 成功后：重读本面板的账号状态 + 通知宿主重查登录态（同 [_showTranslateConfig]
+  /// 的"对话框 pop 后再提示"模式，让 SnackBar 显示在干净上下文里）。
+  Future<void> _showPasteCookieDialog() async {
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (_) => _PasteCookieDialog(api: widget.bili ?? BiliApi()),
+    );
+    if (saved != true || !mounted) return;
+    _loadAccount();
+    widget.onSessionChanged?.call();
+    _showSnack('登录成功，已解锁 1080P 清晰度（仅存本机）');
+  }
+
+  /// 「退出登录」（v2.49.1+）：确认后把**两处**凭据一起清干净。
+  ///
+  /// 为什么两处都要清（这是这个功能最容易做错的地方）：
+  /// - secure storage 那三个 key（`bili_sessdata` / `bili_jct` /
+  ///   `bili_refresh_token`）是 App 自己用会话的地方；
+  /// - WebView 的 cookie jar 是**同一份会话的第二处拷贝**，而且登录页是拿它
+  ///   判"登录是否成功"的。只清 storage 不清它 → 用户下次打开登录页，登录页
+  ///   读到这份残留 cookie → 拿去服务端校验（v2.49.1+ 的校验就是这样）→
+  ///   若那份 cookie 还有效就"自动登录回去"了，退出等于没退。
+  ///
+  /// 顺序：先清 storage（权威那份），再清 WebView cookie。反之亦然其实都行，
+  /// 但先清 storage 更安全——万一第二步的原生通道炸了，至少 App 自己的登录态
+  /// 已经没了，不会出现"App 还在用旧会话、用户以为退了"。
+  ///
+  /// 退完**不推登录页**（那是用户的下一步选择），只把状态刷新成未登录：
+  /// 重读本面板账号区 + 通知宿主（宿主重查登录态刷新首页「未登录仅 720P」
+  /// 提示条，与「粘贴 Cookie 登录」成功时同一口径）。
+  Future<void> _confirmLogout() async {
+    // 确认框沿用项目既有样式（AlertDialog + 取消 / 危险动作红色文字）
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogCtx) => AlertDialog(
+        title: const Text('退出 B 站登录？'),
+        content: const Text(
+          '会清除本机保存的登录凭据（SESSDATA / bili_jct / 刷新口令）'
+          '以及登录页 WebView 里的 B 站 cookie。'
+          '退出后收藏夹、点赞、收藏、评论都不能用，需要重新登录；'
+          'GitHub 配置、白名单与离线缓存不受影响。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(dialogCtx, false),
+            child: const Text('取消'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.pop(dialogCtx, true),
+            child: const Text('退出', style: TextStyle(color: kError)),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    setState(() => _loggingOut = true);
+    final api = widget.bili ?? BiliApi();
+
+    // 1) 本机凭据（三个 key）
+    var storageOk = true;
+    try {
+      await api.clearSession();
+    } catch (e) {
+      // 存储异常（Keystore 故障）→ 如实告知"没退成功"，别让用户以为退了
+      storageOk = false;
+      debugPrint('[session] 退出登录：清本机凭据失败（${e.runtimeType}）');
+    }
+
+    // 2) WebView cookie jar 里那份
+    //    这里直接调 [WebLoginCookies.clear] 而不用 [BiliApi.clearWebLoginCookies]：
+    //    后者是给**错误处理路径**用的（内部吞掉异常只记日志——清理失败不该盖掉
+    //    真正要报的错误码）；而退出登录是用户主动发起的动作，清没清干净必须
+    //    能回报给用户，所以自己 try/catch。
+    var cookieOk = true;
+    try {
+      await WebLoginCookies.clear();
+    } catch (e) {
+      cookieOk = false;
+      debugPrint('[session] 退出登录：清 WebView cookie 失败（通道不可用？'
+          '${e.runtimeType}）');
+    }
+
+    if (!mounted) return;
+    setState(() => _loggingOut = false);
+    debugPrint('[session] 退出登录完成：本机凭据已清=$storageOk，'
+        'WebView cookie 已清=$cookieOk');
+    // 账号区回到未登录 + 宿主刷新首页提示条（两者都不涉及具体凭据内容）
+    await _loadAccount();
+    if (!mounted) return;
+    widget.onSessionChanged?.call();
+
+    if (!storageOk) {
+      // 失败类：走 error 档，关掉「界面提示」也不静默
+      _showSnack('退出失败：本机凭据没能清除（安全存储异常），请重试',
+          kind: SnackKind.error);
+    } else if (!cookieOk) {
+      // 本机那份已清（App 侧确实退出了），但 WebView 里可能还剩一份——
+      // 登录页可能因此显示成"已登录"，必须让用户知道而不是含糊说"已退出"
+      _showSnack('已退出登录，但网页数据没清干净：登录页可能仍显示旧登录状态，'
+          '可在登录页用「清除网页数据后重试」',
+          kind: SnackKind.error);
+    } else {
+      _showSnack('已退出登录（本机凭据与网页登录状态都已清除）');
+    }
+  }
+
   /// 打开翻译服务配置弹窗（base_url / api_key / model）。
   Future<void> _showTranslateConfig(BuildContext context) async {
     final saved = await showDialog<bool>(
@@ -674,6 +865,156 @@ class _ManagePanelState extends State<ManagePanel> {
       builder: (_) => _TranslateConfigDialog(api: TranslateApi()),
     );
     if (saved == true && context.mounted) _showSnack('翻译服务配置已保存（仅存本机）');
+  }
+}
+
+/// 「粘贴 Cookie 登录」弹窗（v2.49.1+）：不依赖 WebView 的兜底登录路径。
+///
+/// 为什么需要：真机登录页的 WebView 渲染进程每次必崩（见 CHANGELOG v2.49.1），
+/// 只要 WebView 不可用，用户就完全没有别的入口——而 WebView 崩不崩取决于
+/// 他的手机/网络环境（代理中间人证书等），App 侧修不了。于是留一条"人工搬
+/// 凭据"的路：在电脑浏览器里登录 B 站后把整段 cookie 复制过来粘贴。
+///
+/// **必须先经服务端校验**（[BiliApi.verifySession]，与登录页同一套）：校验不
+/// 通过**绝不落盘**——保存一份服务端不认的凭据，正是"每项功能都 -101 但 App
+/// 说自己已登录"那种坏状态的来源。
+///
+/// 对话框内所有文案与错误提示都**不含任何凭据内容**（连长度都不显示）。
+class _PasteCookieDialog extends StatefulWidget {
+  final BiliApi api;
+
+  const _PasteCookieDialog({required this.api});
+
+  @override
+  State<_PasteCookieDialog> createState() => _PasteCookieDialogState();
+}
+
+class _PasteCookieDialogState extends State<_PasteCookieDialog> {
+  final _ctrl = TextEditingController();
+  bool _busy = false;
+
+  /// 需要用户看见的失败原因（null = 无；校验失败/保存失败都在这里显示，
+  /// 弹窗**不关**，用户可以改一改再试）。
+  String? _error;
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _submit() async {
+    // 容错解析（顺序任意、大小写、换行、多余键都认，见 parseBiliCookieCreds）
+    final creds = parseBiliCookieCreds(_ctrl.text);
+    if (!creds.hasSessdata) {
+      setState(() => _error =
+          '没找到 SESSDATA。请确认粘贴的是完整的 cookie 串（形如 '
+          'SESSDATA=…; bili_jct=…），而不是只复制了其中一段。');
+      return;
+    }
+    final sessdata = creds.sessdata!;
+    setState(() {
+      _busy = true;
+      _error = null;
+    });
+    final result = await widget.api.verifySession(
+      sessdata: sessdata,
+      biliJct: creds.biliJct,
+    );
+    if (!mounted) return;
+    if (!result.passed) {
+      // 不通过 → 不落盘。文案按"能不能指望用户自己修"分档：
+      // -101 = 凭据本身废了，只能重新弄一份；网络/风控 = 检查网络后重试。
+      final String why;
+      if (result.status == SessionVerifyStatus.invalid) {
+        why = '这份 Cookie 服务端不认（-101：已失效 / 已在别处退出登录），'
+            '没有保存。请重新获取一份再试。';
+      } else if (result.status == SessionVerifyStatus.network) {
+        why = '无法连接 B 站校验这份 Cookie（${result.message}），没有保存。'
+            '请检查网络后重试。';
+      } else {
+        why = 'B 站返回 ${result.code}（${result.message}），没有保存。'
+            '通常是被风控拦了，稍后再试一次。';
+      }
+      setState(() {
+        _busy = false;
+        _error = why;
+      });
+      return;
+    }
+    try {
+      await widget.api.saveSession(
+        sessdata: sessdata,
+        biliJct: creds.biliJct ?? '',
+        refreshToken: creds.refreshToken ?? '',
+      );
+    } catch (_) {
+      setState(() {
+        _busy = false;
+        _error = '校验已通过，但保存到本机失败（安全存储异常），没有生效。请重试。';
+      });
+      return;
+    }
+    if (mounted) Navigator.of(context).pop(true);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return AlertDialog(
+      title: const Text('粘贴 Cookie 登录'),
+      content: SingleChildScrollView(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              '在电脑浏览器里登录 B 站后，从开发者工具的 Cookie 列表里'
+              '（域名 bilibili.com）把整段复制过来，粘贴到下面。\n'
+              '这份字符串等同于你的登录凭据，只保存在本机、不会上传到任何地方，'
+              '不要发给别人。粘贴后 App 会先向 B 站校验一次，'
+              '只有确认有效的才会保存。',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: _ctrl,
+              enabled: !_busy,
+              minLines: 3,
+              maxLines: 8,
+              autocorrect: false,
+              enableSuggestions: false,
+              decoration: const InputDecoration(
+                labelText: 'Cookie',
+                hintText: 'SESSDATA=…; bili_jct=…; DedeUserID=…',
+                border: OutlineInputBorder(),
+                isDense: true,
+              ),
+            ),
+            if (_error != null) ...[
+              const SizedBox(height: 8),
+              Text(
+                _error!,
+                style: theme.textTheme.bodySmall
+                    ?.copyWith(color: theme.colorScheme.error),
+              ),
+            ],
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: _busy ? null : () => Navigator.of(context).pop(false),
+          child: const Text('取消'),
+        ),
+        FilledButton(
+          onPressed: _busy ? null : _submit,
+          child: Text(_busy ? '校验中…' : '校验并登录'),
+        ),
+      ],
+    );
   }
 }
 

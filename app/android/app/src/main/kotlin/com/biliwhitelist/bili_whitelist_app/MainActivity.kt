@@ -1,7 +1,9 @@
 package com.biliwhitelist.bili_whitelist_app
 
 import android.content.Intent
+import android.util.Log
 import android.webkit.CookieManager
+import android.webkit.WebStorage
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
@@ -9,6 +11,7 @@ import io.flutter.plugin.common.MethodChannel
 class MainActivity : FlutterActivity() {
     companion object {
         private const val COOKIE_CHANNEL = "bili_whitelist/cookie"
+        private const val TAG = "bili_whitelist"
     }
 
     // 评论图片保存相册（v2.16.19+）：授权结果（API 26~28 的
@@ -86,7 +89,14 @@ class MainActivity : FlutterActivity() {
      * 方法：
      *  - getCookies(url: String) -> String  返回该 url 匹配的全部 cookie 串
      *    （形如 "SESSDATA=xxx; bili_jct=yyy; ..."），找不到返回空串
-     *  - clearAll() -> void                 清空所有 WebView cookie（退出登录用）
+     *  - clearAll() -> void                 清空所有 WebView cookie（退出登录 /
+     *    服务端判定会话已死时同步清掉 WebView 里那份残留，v2.49.1+）
+     *  - clearAllData() -> void             清空 cookie + Web Storage
+     *    （localStorage 等；「清除网页数据后重试」用，v2.49.1+）
+     *
+     * 两个 clear 都补了 `flush()`：`removeAllCookies` 的回调是异步的、且写入
+     * 是延迟落盘的，不清求立即刷盘的话，进程被系统杀掉后 cookie 可能"复活"
+     * （重启后又读到那份该死会话）。
      */
     private fun setupCookieChannel(flutterEngine: FlutterEngine) {
         MethodChannel(
@@ -100,6 +110,24 @@ class MainActivity : FlutterActivity() {
                 }
                 "clearAll" -> {
                     CookieManager.getInstance().removeAllCookies(null)
+                    CookieManager.getInstance().flush()
+                    result.success(null)
+                }
+                "clearAllData" -> {
+                    try {
+                        CookieManager.getInstance().removeAllCookies(null)
+                        CookieManager.getInstance().flush()
+                    } catch (e: Exception) {
+                        // cookie 清不掉不该拦住"清网页数据"整体流程
+                        Log.w(TAG, "clearAllData: 清 cookie 失败 ${e.javaClass.simpleName}")
+                    }
+                    try {
+                        // WebStorage 覆盖 localStorage / sessionStorage / WebSQL；
+                        // API 19+ 可用（本项目 minSdk 26）
+                        WebStorage.getInstance().deleteAllData()
+                    } catch (e: Exception) {
+                        Log.w(TAG, "clearAllData: 清 WebStorage 失败 ${e.javaClass.simpleName}")
+                    }
                     result.success(null)
                 }
                 else -> result.notImplemented()

@@ -282,6 +282,7 @@ void main() {
     test('nav code=-101（cookie 失效）→ BiliApiException(-101) 登录已失效',
         () async {
       _store['bili_sessdata'] = 'sess_test';
+      _store['bili_jct'] = 'jct_test';
       final adapter = _RoutingAdapter({
         '/x/frontend/finger/spi': _spiBody,
         '/x/web-interface/nav': () => _navBody(code: -101),
@@ -292,6 +293,11 @@ void main() {
             .having((e) => e.code, 'code', -101)
             .having((e) => e.message, 'message', contains('登录已失效'))),
       );
+      // v2.49.1+ 自愈：服务端的 -101 是权威结论 → 本地凭据必须清掉。否则下次
+      // 启动仍判「会话有效」→ 永不引导重登（2026-09-22 真机症状：所有需要登录
+      // 的功能全废，但 App 处处自称已登录）
+      expect(_store.containsKey('bili_sessdata'), isFalse);
+      expect(_store.containsKey('bili_jct'), isFalse);
     });
 
     test('nav 返回 data.mid=0（匿名态）→ 视为 -101 未登录', () async {
@@ -306,6 +312,8 @@ void main() {
             .having((e) => e.code, 'code', -101)
             .having((e) => e.message, 'message', contains('登录已失效'))),
       );
+      // 带着 SESSDATA 却被服务端当匿名处理 → 同义「服务端不认这个会话」，一并清
+      expect(_store.containsKey('bili_sessdata'), isFalse);
     });
 
     test('list-all code=-101 / -412 → 分类提示', () async {
@@ -321,7 +329,12 @@ void main() {
             .having((e) => e.code, 'code', -101)
             .having((e) => e.message, 'message', contains('登录已失效'))),
       );
+      // 响应体里的 -101 同样清会话（v2.49.1+）
+      expect(_store.containsKey('bili_sessdata'), isFalse);
 
+      // -412 子例：上一步把会话清掉了，这里必须重新登录（否则会先被
+      // 「无 SESSDATA → 请先登录」的本机门禁拦下，测不到 -412 分类）
+      _store['bili_sessdata'] = 'sess_test';
       final adapter412 = _RoutingAdapter({
         '/x/frontend/finger/spi': _spiBody,
         '/x/web-interface/nav': _navBody,
