@@ -1,7 +1,11 @@
 // 全屏双指缩放 / 旋转 / 缩放态单指平移（v2.39.0）测试。
+// v2.46.0 追加：画面变换的**显式入口**（右下角「旋转」按钮 + 复位按钮文案）。
 //
 // 背景（用户原话）：「全屏模式下可以手势放大，旋转视频窗口。注意不要和之前的
-// 手势冲突」。
+// 手势冲突」；v2.46.0 追加（用户原话）：「没有手势旋转」——旋转代码其实在，
+// 但只在「双指连线转过 45°」才换档，**没有任何可发现的入口**，用户根本不知道
+// 要这么做；且「横屏置顶」态（非全屏）下画面看着也是满宽的，在那里转完全没
+// 反应（那个态原本不启用变换）。
 //
 // 覆盖：
 // A. 纯函数：缩放换算与钳制（1.0–4.0）、旋转吸附 90° 步进、角度差归一化、
@@ -13,10 +17,14 @@
 //    3. 双指旋转 → 吸附到 90° 步进（矩阵里读出来的角度是 π/2 的整数倍）；
 //    4. 缩放态下单指拖动 → 平移画面（**不发 seek**）；
 //    5. 复位：底栏「复位」按钮 / 退出全屏 / 换 bvid（下一集）三条路径；
-//    6. 非全屏时双指手势**不生效**（画面不变换）。
+//    6. 非全屏时双指手势**不生效**（画面不变换）；
+//    7. v2.46.0：「旋转」按钮常驻（变换可用时）→ 点一下转 90°、连点 4 次回原
+//       位；复位按钮文案同时报倍率与角度，一次清掉缩放+旋转；
+//    8. v2.46.0：**横屏置顶**态（非全屏 + 视口横放）也能变换（按钮同样在），
+//       竖屏置顶仍然不给入口（视频区只有 231dp，且 v2.43.0 用例钉着它）。
 //
 // ⚠️ 多指手势只能由 widget 测试覆盖：`adb shell input` 不支持多点触控，真机
-// 取证只能验「单指三向语义未回归 + 双击/长按不冲突」，见报告「没做到的」。
+// 取证只能验「单指三向语义未回归 + 双击/长按不冲突 + 按钮能点」，见报告。
 //
 // 环境：mock 播放器通道（记录 setDataSource/seekTo，setDataSource 立即回
 // onPrepared 1280×720）+ 假 HTTP（playurl 给 DASH 双流）+ 内存 DownloadManager。
@@ -40,6 +48,7 @@ const String _kBvB = 'BV1ZOOM00002';
 
 const Key _kViewTransform = ValueKey('player-view-transform');
 const Key _kViewReset = ValueKey('player-view-reset');
+const Key _kViewRotate = ValueKey('player-view-rotate');
 const Key _kNextVideo = ValueKey('player-next-video');
 
 WhitelistVideo _video(String bvid, String title) => WhitelistVideo(
@@ -761,5 +770,173 @@ void main() {
     await tester.pump();
     expect(_viewMatrix(tester), isNull);
     await _flushGestureTimers(tester);
+  });
+
+  // -------------------------------------------------------------------------
+  // v2.46.0：画面变换的**显式入口**（用户报「没有手势旋转」的真实答案：
+  // 旋转实现一直在，但入口只有「双指连线转过 45°」这一种，没人发现得了）。
+  // -------------------------------------------------------------------------
+  group('画面旋转按钮 / 复位文案（v2.46.0）', () {
+    /// 挂载 + 进全屏（按钮在画面右下角，全屏横屏视口下位置稳定）。
+    Future<_PlayerRec> pumpFullscreen(WidgetTester tester) async {
+      SharedPreferences.setMockInitialValues({});
+      HttpOverrides.global = _FakeHttpOverrides();
+      addTearDown(() => HttpOverrides.global = null);
+      DownloadManager.debugOverride(_FakeManager());
+      final rec = _PlayerRec();
+      _installPlayerMock(tester, rec);
+      await _pumpPlayer(tester, _video(_kBvA, '缩放测试A'));
+      await _enterFullscreen(tester);
+      return rec;
+    }
+
+    testWidgets('点「旋转」按钮 → 画面转 90°；连点 4 次回到原位', (tester) async {
+      await pumpFullscreen(tester);
+
+      // 未变换时旋转键**也**在（这是本版的关键：入口要能被发现）
+      expect(find.byKey(_kViewRotate), findsOneWidget,
+          reason: '全屏下「旋转」按钮常驻，不依赖「已经变换过」');
+      expect(_viewRotation(tester), closeTo(0, 1e-6));
+
+      await tester.tap(find.byKey(_kViewRotate));
+      await tester.pump();
+      expect(_viewRotation(tester), closeTo(math.pi / 2, 1e-6),
+          reason: '点一下 = 顺时针 90°（与手势同一套档位）');
+
+      await tester.tap(find.byKey(_kViewRotate));
+      await tester.pump();
+      expect(_viewRotation(tester), closeTo(math.pi, 1e-6));
+
+      await tester.tap(find.byKey(_kViewRotate));
+      await tester.pump();
+      // ⚠️ 读角度用 atan2（值域 (-π, π]）：270° 读出来是 -90°，同一个角
+      expect(_viewRotation(tester), closeTo(-math.pi / 2, 1e-6),
+          reason: '第 3 次 → 270°（atan2 读作 -90°）');
+
+      // 第 4 次 → 360° → 归一化回 0°，画面变换整体清空（回到贴合尺寸）
+      await tester.tap(find.byKey(_kViewRotate));
+      await tester.pump();
+      expect(_viewRotation(tester), closeTo(0, 1e-6));
+      expect(_viewScale(tester), closeTo(1.0, 1e-6));
+      expect(find.byKey(_kViewReset), findsNothing,
+          reason: '无变换后复位入口消失（旋转也不再占用一个按钮）');
+
+      await _flushGestureTimers(tester);
+    });
+
+    testWidgets('复位按钮文案同时报倍率与旋转档位，且一次清掉缩放与旋转', (tester) async {
+      await pumpFullscreen(tester);
+
+      // 先双指放大 2x（避开中央播放簇的起手点，见本文件既有用例说明）
+      final g1 = await tester.startGesture(const Offset(300, 90));
+      final g2 = await tester.startGesture(const Offset(400, 90));
+      await tester.pump();
+      await g1.moveTo(const Offset(250, 90));
+      await g2.moveTo(const Offset(450, 90));
+      await tester.pump();
+      await g1.up();
+      await g2.up();
+      await tester.pump();
+      expect(_viewScale(tester), closeTo(2.0, 1e-3), reason: '前置：已放大 2x');
+
+      // 再点旋转 90°
+      await tester.tap(find.byKey(_kViewRotate));
+      await tester.pump();
+      expect(_viewRotation(tester), closeTo(math.pi / 2, 1e-6));
+
+      // 文案：旧版只有「复位 2.0x」——只旋转不缩放时会显示「复位 1.0x」，
+      // 用户看不出画面被转过，也看不出还差几下才回正
+      expect(find.byKey(_kViewReset), findsOneWidget);
+      expect(find.text('复位 2.0x · 90°'), findsOneWidget,
+          reason: '文案要同时体现倍率与旋转档位');
+
+      await tester.tap(find.byKey(_kViewReset));
+      await tester.pump();
+      expect(_viewScale(tester), closeTo(1.0, 1e-6), reason: '复位清缩放');
+      expect(_viewRotation(tester), closeTo(0, 1e-6), reason: '复位清旋转');
+      expect(_viewTranslation(tester), Offset.zero);
+      expect(find.byKey(_kViewReset), findsNothing);
+
+      await _flushGestureTimers(tester);
+    });
+
+    testWidgets('只旋转不缩放：复位文案也能看出转过（旧版这里显示 1.0x）', (tester) async {
+      await pumpFullscreen(tester);
+
+      await tester.tap(find.byKey(_kViewRotate));
+      await tester.pump();
+
+      expect(find.text('复位 1.0x · 90°'), findsOneWidget,
+          reason: '倍率没变但画面被转过 → 文案必须把角度说清楚');
+
+      await tester.tap(find.byKey(_kViewReset));
+      await tester.pump();
+      expect(_viewRotation(tester), closeTo(0, 1e-6));
+      await _flushGestureTimers(tester);
+    });
+
+    testWidgets('横屏置顶（非全屏）：变换同样可用，按钮也在', (tester) async {
+      SharedPreferences.setMockInitialValues({});
+      HttpOverrides.global = _FakeHttpOverrides();
+      addTearDown(() => HttpOverrides.global = null);
+      DownloadManager.debugOverride(_FakeManager());
+      final rec = _PlayerRec();
+      _installPlayerMock(tester, rec);
+
+      // 914×411 且不进全屏 = v2.17.17 的「横屏置顶」态
+      await _pumpPlayer(tester, _video(_kBvA, '缩放测试A'),
+          size: const Size(914, 411));
+      expect(find.byIcon(Icons.fullscreen_exit), findsNothing,
+          reason: '前置：确实是非全屏');
+
+      // 此前这个态只做「让位」不变换（用户在这里转 → 没反应）
+      final g1 = await tester.startGesture(const Offset(300, 90));
+      final g2 = await tester.startGesture(const Offset(400, 90));
+      await tester.pump();
+      await g1.moveTo(const Offset(250, 90));
+      await g2.moveTo(const Offset(450, 90));
+      await tester.pump();
+      expect(_viewScale(tester), closeTo(2.0, 1e-3),
+          reason: '横屏置顶现在也能双指缩放（v2.46.0 放开）');
+      await g1.up();
+      await g2.up();
+      await tester.pump();
+
+      // 显式入口同样在，且点一下真的转（此处是用户报「没有手势旋转」的场景）
+      expect(find.byKey(_kViewRotate), findsOneWidget);
+      await tester.tap(find.byKey(_kViewRotate));
+      await tester.pump();
+      expect(_viewRotation(tester), closeTo(math.pi / 2, 1e-6),
+          reason: '横屏置顶点旋转要真的有反应');
+      expect(_viewScale(tester), closeTo(2.0, 1e-3), reason: '旋转不清缩放');
+
+      // 复位入口也要在（不然这个态下用户没有退路）
+      expect(find.byKey(_kViewReset), findsOneWidget);
+      await tester.tap(find.byKey(_kViewReset));
+      await tester.pump();
+      expect(_viewMatrix(tester), isNull,
+          reason: '复位后非全屏不再构建变换节点（画面回到裸 Center）');
+      expect(find.byKey(_kViewReset), findsNothing);
+
+      await _flushGestureTimers(tester);
+    });
+
+    testWidgets('竖屏置顶（非全屏竖放）：不给变换入口（视频区只有 231dp）',
+        (tester) async {
+      SharedPreferences.setMockInitialValues({});
+      HttpOverrides.global = _FakeHttpOverrides();
+      addTearDown(() => HttpOverrides.global = null);
+      DownloadManager.debugOverride(_FakeManager());
+      final rec = _PlayerRec();
+      _installPlayerMock(tester, rec);
+
+      await _pumpPlayer(tester, _video(_kBvA, '缩放测试A'),
+          size: const Size(411, 914));
+
+      expect(find.byKey(_kViewRotate), findsNothing,
+          reason: '竖屏置顶不给入口（放大只多露黑边，且横滑 seek 优先）');
+      expect(find.byKey(_kViewReset), findsNothing);
+      expect(_viewMatrix(tester), isNull);
+    });
   });
 }

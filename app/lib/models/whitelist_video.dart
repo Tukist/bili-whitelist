@@ -140,9 +140,13 @@ class WhitelistVideo {
   ///
   /// epId/pubdate/desc/view 不被本方法修改：未传时沿用原值（合集移动/重排不丢
   /// 番剧集标识、发布时间、简介与播放量）。
+  ///
+  /// [pages]（v2.46.0+）：只在**传了**才替换（`pages ?? this.pages` 语义），
+  /// 调用方（播放页运行时补齐分 P 列表）用它把 view 接口的 data.pages 挂到
+  /// 条目上；不传时原样保留（既有调用零影响，也没法用它把 pages 清成 null）。
   WhitelistVideo copyWith(
           {String? collection, int? order, int? epId, int? pubdate, String? desc,
-          int? view}) =>
+          int? view, List<PageInfo>? pages}) =>
       WhitelistVideo(
         bvid: bvid,
         cid: cid,
@@ -151,7 +155,7 @@ class WhitelistVideo {
         duration: duration,
         upName: upName,
         addedAt: addedAt,
-        pages: pages,
+        pages: pages ?? this.pages,
         collection: collection ?? this.collection,
         order: order ?? this.order,
         epId: epId ?? this.epId,

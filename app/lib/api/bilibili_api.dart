@@ -4252,6 +4252,44 @@ int? resolveAidForVideo(WhitelistVideo v, {Map<String, dynamic>? meta}) {
   return null;
 }
 
+/// 从 view 接口的 `data` 解析**分 P 列表**（纯函数，可单测；v2.46.0+）。
+///
+/// 为什么需要一个新函数而不是复用 [WhitelistWriter.videoFromMeta]：那个函数的
+/// 职责是「用 view 的数据**造一条完整视频**」（title/cover/up_name/added_at/
+/// collection 全部重建）。播放页要补的只有分 P 列表——合集归属、白名单里的
+/// added_at/order/epId 等必须原样保留，拿 view 重建会把它们覆盖掉。
+///
+/// 容错（不抛、不崩）：
+/// - `pages` 键缺失 / 不是 List / 空 → 空列表（调用方按「没有分 P 信息」处理，
+///   与改动前的行为逐字一致）；
+/// - 数组元素不是 Map、或者条目里有脏类型（`PageInfo.fromJson` 的 `as String?`
+///   / `as num?` 会抛）、或者**任何一条 cid <= 0** → **整份空列表**。
+///   为什么不是「跳过坏的那条」：分 P 序号就是数组下标，跳过一条会让用户点的
+///   第 3 集映射到别的分 P 上（比整份不要危险得多）。返回空列表时调用方保持
+///   原行为（按顶层 cid 播）。
+List<PageInfo> parseViewPages(Map<String, dynamic>? meta) {
+  final raw = meta?['pages'];
+  if (raw is! List || raw.isEmpty) return const [];
+  final pages = <PageInfo>[];
+  for (final e in raw) {
+    if (e is! Map) {
+      debugPrint('[bili_api] parseViewPages 分 P 列表含非 Map 条目 → 整份丢弃');
+      return const [];
+    }
+    try {
+      pages.add(PageInfo.fromJson(Map<String, dynamic>.from(e)));
+    } catch (err) {
+      debugPrint('[bili_api] parseViewPages 分 P 条目脏数据（$err）→ 整份丢弃');
+      return const [];
+    }
+  }
+  if (pages.any((p) => p.cid <= 0)) {
+    debugPrint('[bili_api] parseViewPages 分 P 列表含 cid<=0 的脏条目 → 整份丢弃');
+    return const [];
+  }
+  return pages;
+}
+
 // ---------------------------------------------------------------------------
 // 写操作（v2.40.0+）：view 接口里的「我的互动态」与展示计数
 // ---------------------------------------------------------------------------
