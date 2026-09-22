@@ -645,7 +645,7 @@ final Map<String, ({int like, int coin, int favorite})> _viewStatCache = {};
 /// 会话内 aid 缓存（bvid → aid）：写接口只认 aid，拿到就记着。
 final Map<String, int> _viewAidCache = {};
 
-/// 会话内分 P 列表缓存（bvid → pages，v2.46.0+）。
+/// 会话内分 P 列表缓存（bvid → pages，v2.49.0+）。
 ///
 /// 与上面几个缓存写在**同一次 view 响应**里（零额外请求），寿命也一样：
 /// 同一条多 P 视频被反复进播放页时，第二次进来能**同步**补上分 P 列表（缓存
@@ -1087,7 +1087,7 @@ class _PlayerPageState extends State<PlayerPage>
   /// 当前视频是否**多 P**（分 P 数 > 1）。
   ///
   /// 与 [WhitelistVideo.isMultiPage] 的区别：这里看的是播放页**当前**的
-  /// `_video.pages`——运行时补齐（v2.46.0+，见 [_applyViewPages]）之后可能
+  /// `_video.pages`——运行时补齐（v2.49.0+，见 [_applyViewPages]）之后可能
   /// 才为真，所以不能在 initState 里一次性算死。
   bool get _isMultiPageVideo => (_pages?.length ?? 0) > 1;
 
@@ -1100,7 +1100,7 @@ class _PlayerPageState extends State<PlayerPage>
 
   /// 上一集是否可用。
   ///
-  /// **维度判定**（v2.46.0+）：多 P 视频走**分 P**维度（P1 的「上一集」禁用，
+  /// **维度判定**（v2.49.0+）：多 P 视频走**分 P**维度（P1 的「上一集」禁用，
   /// **不跨到播放列表里的其它视频**），非多 P 才走播放列表维度。这条边界是
   /// 有意的：多 P 与播放列表并存时跨界会让用户想看第 2 P 却跳到另一条视频
   /// （v2.37.0 修过的「切到别的番」是同一类问题）。
@@ -1315,11 +1315,11 @@ class _PlayerPageState extends State<PlayerPage>
   /// 写请求在飞（防连点：一次只放行一个写动作，三个按钮一起置灰）。
   bool _writeBusy = false;
 
-  /// 全屏画面变换（缩放 / 旋转 / 平移，v2.39.0+；v2.46.0 起扩到横屏置顶）
+  /// 全屏画面变换（缩放 / 旋转 / 平移，v2.39.0+；v2.49.0 起扩到横屏置顶）
   // ---------------------------------------------------------------------
   // 需求（用户原话）：「全屏模式下可以手势放大，旋转视频窗口。注意不要和之前
   // 的手势冲突」。变换的生效范围见 [_viewTransformEnabled] —— v2.39.0 只在
-  // 全屏，v2.46.0 起加上「横屏置顶」态（用户报「没有手势旋转」最常发生的
+  // 全屏，v2.49.0 起加上「横屏置顶」态（用户报「没有手势旋转」最常发生的
   // 就是这个态）。**竖屏置顶仍然禁用**：
   // - 竖屏视频区只有 ~231dp 高，放大/旋转后能看到的有效内容反而更少；
   // - 且竖屏的横滑是 seek（用户验收过的三向语义），让画面变换插进来会把
@@ -1393,7 +1393,7 @@ class _PlayerPageState extends State<PlayerPage>
   }
 
   /// 显式「旋转」按钮：画面顺指针转一档（+90°），连点 4 次回到 0° 档
-  /// （v2.46.0+）。
+  /// （v2.49.0+）。
   ///
   /// 为什么需要它（用户原话「没有手势旋转」其实是"用不出来"）：双指旋转是
   /// **两指连线方向**的连续角度，只有转过 45° 才吸附换档——没有任何可见入口，
@@ -1419,7 +1419,7 @@ class _PlayerPageState extends State<PlayerPage>
     });
   }
 
-  /// 复位按钮文案：**同时**报倍率与旋转档位（v2.46.0+）。
+  /// 复位按钮文案：**同时**报倍率与旋转档位（v2.49.0+）。
   ///
   /// 旧文案只有倍数（「复位 N.Nx」）——只旋转不缩放时显示「复位 1.0x」，用户
   /// 看不出画面被转过，也看不出还得点几下才回正。角度直接按档位取整（画面角度
@@ -1450,7 +1450,7 @@ class _PlayerPageState extends State<PlayerPage>
 
   /// 双指**变换**（缩放/旋转/平移）是否启用。
   ///
-  /// v2.39.0 ~ v2.45.x：**只在全屏**。v2.46.0 起扩到「横屏置顶」态，理由：
+  /// v2.39.0 ~ v2.48.x：**只在全屏**。v2.49.0 起扩到「横屏置顶」态，理由：
   /// - 用户报的「没有手势旋转」实测最容易发生在这个态：横屏置顶时视频看着也
   ///   是满宽的（屏高 55% 的横屏黑盒），顺手双指一转**没有任何反应**，看起来
   ///   就是「App 不支持旋转」；
@@ -1485,7 +1485,7 @@ class _PlayerPageState extends State<PlayerPage>
   /// v2.43.0 起**非全屏也记录**（旧实现在非全屏直接 return）：记录 + 配对是
   /// 「双指让位」的判据来源，而让位是全屏/非全屏都要的。代价只是两个 int/double
   /// 的字典操作；是否真的变换画面另由 [_viewTransformEnabled] 决定
-  /// （v2.46.0 起 = 全屏 + 横屏置顶，竖屏置顶仍在 [_applyViewGesture] 早退）。
+  /// （v2.49.0 起 = 全屏 + 横屏置顶，竖屏置顶仍在 [_applyViewGesture] 早退）。
   final Map<int, Offset> _viewPointers = <int, Offset>{};
 
   /// 本轮双指手势的起始双指间距 / 起始连线角度 / 起始焦点。
@@ -1557,7 +1557,7 @@ class _PlayerPageState extends State<PlayerPage>
 
   /// 双指移动 → 换算缩放 / 旋转（90° 吸附）/ 平移，并同步渲染。
   ///
-  /// **竖屏置顶在这里早退**（v2.46.0 前是"非全屏早退"，v2.46.0 起横屏置顶也
+  /// **竖屏置顶在这里早退**（v2.49.0 前是"非全屏早退"，v2.49.0 起横屏置顶也
   /// 参与变换，见 [_viewTransformEnabled]）：不参与变换的那一态的「双指」只做
   /// 让位（见 [_onViewPointerDown]），不改画面——画面变换在过矮的视频区里没有
   /// 意义（放大只多露黑边）。早退放在**换算之前**是为了不改动 [_viewScaleStart]
@@ -1769,7 +1769,7 @@ class _PlayerPageState extends State<PlayerPage>
   // 多 P 选集：_currentPageIndex 指向 pages 中的当前集
   // ---------------------------------------------------------------------
   // 分 P 信息来自 [WhitelistVideo.pages]（白名单 JSON v2；导入时就写好）。
-  // **运行时补齐**（v2.46.0+）：条目没带 pages 时（旧数据 / 离线缓存页 / 老
+  // **运行时补齐**（v2.49.0+）：条目没带 pages 时（旧数据 / 离线缓存页 / 老
   // 历史记录）由播放页进页时那次 view 请求顺路补上——见 [_applyViewPages] 与
   // [_ensurePagesForInitialPage]。
   // （无 pages 数据 → 单 P，不展示选集 UI）
@@ -1831,7 +1831,7 @@ class _PlayerPageState extends State<PlayerPage>
     return _video.title;
   }
 
-  /// 把一份分 P 列表**就地补进当前条目**（v2.46.0+）：补上了返回 true。
+  /// 把一份分 P 列表**就地补进当前条目**（v2.49.0+）：补上了返回 true。
   ///
   /// 三条硬约束：
   /// 1. **只补不覆盖**——条目已经带 pages（白名单/油猴/PC 端写入的）时一个字节
@@ -1858,7 +1858,7 @@ class _PlayerPageState extends State<PlayerPage>
     return true;
   }
 
-  /// 首次进页补齐分 P 列表：**在取流之前**把 pages 拿到手（v2.46.0+）。
+  /// 首次进页补齐分 P 列表：**在取流之前**把 pages 拿到手（v2.49.0+）。
   ///
   /// 为什么必须早于取流：`?p=2` / 历史记录第 3 集这类入口带 `initialPageIndex`
   /// 进来，而取流用的是 [_currentCid] —— 没有 pages 时它恒为 `_video.cid`
@@ -2026,7 +2026,7 @@ class _PlayerPageState extends State<PlayerPage>
     // ModalRoute.of(context) 在本阶段必然非空（页面在路由栈中）。
     final route = ModalRoute.of(context);
     if (route != null) routeObserver.subscribe(this, route as ModalRoute<void>);
-    // 视口方向（「横屏置顶」态判定用，v2.46.0+）：MediaQuery 变化（旋屏）时本
+    // 视口方向（「横屏置顶」态判定用，v2.49.0+）：MediaQuery 变化（旋屏）时本
     // 阶段会被重新调用，所以这里是唯一的更新点。**必须缓存在字段里**——手势
     // 回调不是 build 阶段，那里做依赖查询是不允许的（[_landscapePinned]）。
     final size = MediaQuery.sizeOf(context);
@@ -2416,7 +2416,7 @@ class _PlayerPageState extends State<PlayerPage>
       _player = player;
       if (!mounted) return;
       setState(() => _textureId = player.textureId);
-      // 分 P 列表补齐必须**早于取流**（v2.46.0+）：取流 cid 来自 [_currentCid]，
+      // 分 P 列表补齐必须**早于取流**（v2.49.0+）：取流 cid 来自 [_currentCid]，
       // 没有 pages 时它恒为顶层 cid（P1）→ 用户点第 3 集却播了第 1 集。
       // 本地缓存命中这一集时跳过：缓存按 (bvid, pageIndex) 命中，cid 不参与
       // 取源（离线播放不必为一次网络请求白等一轮超时），分 P 列表交给顺路的
@@ -5981,7 +5981,7 @@ class _PlayerPageState extends State<PlayerPage>
   /// 之所以不再私有：通知链路与测试都要用它，而两处若各写一份「取邻居 + 换源」
   /// 迟早会漂移（越界/防连点/缺 cid 补齐三件套都得同步）。
   ///
-  /// **两个维度**（v2.46.0+，这是本版的核心修复）：
+  /// **两个维度**（v2.49.0+，这是本版的核心修复）：
   /// - 当前视频**多 P** → 切**分 P**（复用 [_switchToPage]，不新写切换逻辑）。
   ///   这条路对上的是用户报的「单个视频有多集却切不了上下集」：`?p=2` 进来
   ///   只能播一集，《CHANGELOG》里两次写到的「上下集」其实都是「播放列表里
@@ -6220,7 +6220,7 @@ class _PlayerPageState extends State<PlayerPage>
     // 退出全屏 → 画面缩放/旋转复位（v2.39.0，见 [_resetViewTransform]）：
     // 退出后视频区变成黑盒（屏幕中部一块），全屏那套缩放/平移量落在这个更小的
     // 窗口里会变成「画面被裁掉一块」——复位是「换坐标系」的收尾，不是"非全屏
-    // 不能用变换"（v2.46.0 起横屏置顶本身也能变换，见 [_viewTransformEnabled]，
+    // 不能用变换"（v2.49.0 起横屏置顶本身也能变换，见 [_viewTransformEnabled]，
     // 用户从干净状态重新捏/重新点旋转即可）。
     if (!full) _resetViewTransform();
   }
@@ -6586,7 +6586,7 @@ class _PlayerPageState extends State<PlayerPage>
               ),
             ),
           // 3. 登录过期横幅
-          //    v2.17.18：不再与返回键共享同一条带——横幅整条下压不合适（会落进
+          //    v2.18.0：不再与返回键共享同一条带——横幅整条下压不合适（会落进
           //    中央播放簇的命中带、抢走「点按去登录」），改为让横幅**从返回键
           //    触摸区右缘起**（left = 48，与 [_buildTopBar] 里 IconButton 钉死的
           //    minWidth 48 对齐）：箭头独占左上角 48×48 触摸区，不再压在横幅
@@ -6643,7 +6643,7 @@ class _PlayerPageState extends State<PlayerPage>
           //    三条 seek 用例零回归。
           //    v2.43.0：回调**不再只在全屏挂**（旧实现非全屏时传 null）——非全屏
           //    也要让双指期间的让位生效，否则一次捏合会被当成单指长横滑 →
-          //    无故 seek。变换本身的生效范围见 [_viewTransformEnabled]（v2.46.0
+          //    无故 seek。变换本身的生效范围见 [_viewTransformEnabled]（v2.49.0
           //    起 = 全屏 + 横屏置顶）。
           if (!_listenMode)
             Positioned.fill(
@@ -6677,7 +6677,7 @@ class _PlayerPageState extends State<PlayerPage>
           //     手感），但不把整套控制层弹出来、也不改用户的显隐偏好。
           else if (_gestureSeeking)
             _buildSeekRowOnly(),
-          // 5.2 画面变换区（v2.39.0 的复位 / v2.46.0 新增的「旋转」）：
+          // 5.2 画面变换区（v2.39.0 的复位 / v2.49.0 新增的「旋转」）：
           //     变换可用（全屏或横屏置顶）时出现——旋转键常驻、复位键只在
           //     真的缩放/旋转过时出现（见 [_buildViewControls]）。悬浮在底栏
           //     之上（**不进底栏那一行**——8 等分已经每格 51.4dp，再挤第 9 个
@@ -7086,7 +7086,7 @@ class _PlayerPageState extends State<PlayerPage>
   /// [_relationCache]/[_viewStatCache]/[_viewAidCache]/[_viewPagesCache]，
   /// 多播放页/切集不重复请求。
   ///
-  /// **顺路补分 P 列表**（v2.46.0+）：[WhitelistVideo.pages] 缺失时用同一个响应
+  /// **顺路补分 P 列表**（v2.49.0+）：[WhitelistVideo.pages] 缺失时用同一个响应
   /// 的 `data.pages` 补进 `_video`（见 [_applyViewPages]）——这条 view 请求本来
   /// 就发，不额外要 RTT。只补多 P、只补不覆盖。
   ///
@@ -7139,7 +7139,7 @@ class _PlayerPageState extends State<PlayerPage>
     _relationCache[bvid] = relation;
     _viewStatCache[bvid] = stat;
     if (aid != null) _viewAidCache[bvid] = aid;
-    // 分 P 列表（v2.46.0+）：同一个响应顺路取，**只补多 P、只补不覆盖**
+    // 分 P 列表（v2.49.0+）：同一个响应顺路取，**只补多 P、只补不覆盖**
     // （见 [_applyViewPages]）。缓存按 bvid 存，同会话回来时走上面的命中路径。
     final viewPages = parseViewPages(data);
     if (viewPages.length > 1) _viewPagesCache[bvid] = viewPages;
@@ -7600,7 +7600,7 @@ class _PlayerPageState extends State<PlayerPage>
   }
 
   /// 画面变换区（v2.39.0+）：右下角、底栏之上的一组小圆角按钮
-  /// ——**旋转**（v2.46.0 起常驻）+ **复位**（有变换时才出现）。
+  /// ——**旋转**（v2.49.0 起常驻）+ **复位**（有变换时才出现）。
   ///
   /// 位置：`bottom: 底栏高度 + 上下集行（若有）+ 12`——**不进底栏那一行**
   /// （8 等分每格 51.4dp，再挤第 9 个按钮会压垮「选集 1/2」这类文案，见 ② 的
@@ -7612,7 +7612,7 @@ class _PlayerPageState extends State<PlayerPage>
   /// 「已经变换过」时出现，而用户抱怨的恰恰是**找不到变换入口**。
   ///
   /// 底栏偏移里那个上下集行不能漏：多 P 视频（或带播放列表）时底栏是 120dp
-  /// 而不是 80dp，按 80 摆就会压在这一行上（v2.46.0 修的既有隐患）。
+  /// 而不是 80dp，按 80 摆就会压在这一行上（v2.49.0 修的既有隐患）。
   Widget _buildViewControls() {
     return Positioned(
       right: 12,
@@ -7923,7 +7923,7 @@ class _PlayerPageState extends State<PlayerPage>
     );
   }
 
-  /// 底部按钮行的单个按钮内容：**图标在上、标签在下**的竖排单元（v2.17.18）。
+  /// 底部按钮行的单个按钮内容：**图标在上、标签在下**的竖排单元（v2.18.0）。
   ///
   /// 为什么改成竖排：8 等分格在 411dp 宽屏（Pixel 7 档）上每格仅 51.4dp，
   /// 横排时「图标 20 + 间距 4」先吃掉 24dp，标签只剩 27.4dp——而 [kTypeLabel]
@@ -8147,7 +8147,7 @@ class _PlayerPageState extends State<PlayerPage>
   /// 初版 InkWell 只包了内容（18dp 高），点偏一点就落空。
   Widget _buildPlaylistRow() {
     final label = _playlistLabel;
-    // 中间标签的**维度**（v2.46.0+）：多 P 视频报分 P（`3/5 P`），否则报播放
+    // 中间标签的**维度**（v2.49.0+）：多 P 视频报分 P（`3/5 P`），否则报播放
     // 列表里的位置（「合集名 · 3/5」）。混用会让用户把「第几集」读成「第几条
     // 视频」——多 P 时这一行的两个按钮切的确实是分 P，不是别的视频。
     final String posText;
@@ -8271,7 +8271,7 @@ class _PlayerPageState extends State<PlayerPage>
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            // 上下集行（v2.30.0+ 播放列表 / v2.46.0+ 分 P）：**只在有去处时
+            // 上下集行（v2.30.0+ 播放列表 / v2.49.0+ 分 P）：**只在有去处时
             // 构建**——没有播放列表且单 P 的入口（历史/搜索/信箱/评论跳转/
             // 收藏夹…）这里一个像素都不多，底栏与改动前逐像素一致。
             if (_hasEpisodeNav) _buildPlaylistRow(),
@@ -8608,7 +8608,7 @@ class _SeekPreviewPainter extends CustomPainter {
 /// （白 54%）→ 已播 [kPlayerPaper]（纸白）；柄为 4×14 纸白竖条（「书签」
 /// 而非圆点），仅控制层可见时显示（[showHandle]）。
 ///
-/// 亮/暗双向可见（v2.17.18）：三态墨里只有已播/已缓冲/柄是「白系」，它们在
+/// 亮/暗双向可见（v2.18.0）：三态墨里只有已播/已缓冲/柄是「白系」，它们在
 /// 浅色画面上靠底部黑色渐变（`_buildBottomBar` 的 black54 遮罩）压暗背景才
 /// 显出来；未播档的 kPlayerRule 只有白 24%，压在**浅米色画面**上与背景同色
 /// → 实测拖动后「柄右侧的未播轨道几乎消失」（看不出轨道走向）。修法：在整条
@@ -8795,7 +8795,7 @@ class _SeekBarPainter extends CustomPainter {
     final track = Rect.fromLTWH(
         left, trackTop, span, _PlayerSeekBar.trackThickness);
 
-    // 暗垫（v2.17.18）：整条轨道先铺一层 kInkBlack 70% 的**同厚度**底——
+    // 暗垫（v2.18.0）：整条轨道先铺一层 kInkBlack 70% 的**同厚度**底——
     // 只垫底不加粗（保持 2px 细轨印刷感），让未播档在浅色画面上也有对比。
     canvas.drawRect(track, ink..color = kInkBlack.withValues(alpha: 0.7));
 

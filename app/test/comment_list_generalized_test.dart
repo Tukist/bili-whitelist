@@ -1,4 +1,4 @@
-// CommentListView 泛化（v2.25.2+）· **视频侧零回归**测试。
+// CommentListView 泛化（v2.26.0+）· **视频侧零回归**测试。
 //
 // 背景：为了给专栏阅读页复用评论列表，[CommentListView] 新增了一批可选参数
 // （oid / commentType / identityKey / header / footerSeed / initialTotal /

@@ -15,18 +15,21 @@
 ///   的时候需要把每集都收藏」。**折叠只是视图**：数据模型 / Gist / PC 端一个字
 ///   都没改（见 [buildCollectionListRows] 的取舍说明）。未分类页用的就是本页
 ///   （[collectionName] 为空串），所以那批「是，大臣 第一季」同样折
-/// - 子合集管理：卡片左滑露出「移动 / 重命名 / 删除」（沿用首页那套左滑语言）；
-///   本层新建成子合集的入口在 AppBar（「新建子合集」）
-/// - AppBar：标题是本合集的**局部名**（路径最后一段），下面一行是**可点的
-///   上级路径**（顶层/未分类没有上级，不显示）
+/// - 子合集管理：卡片左滑露出「封面 / 移动 / 重命名 / 删除」（沿用首页那套左滑
+///   语言）；本层新建成子合集的入口在 AppBar（「新建子合集」）
+/// - AppBar（v2.50.0 起）：标题是本合集的**局部名**（路径最后一段），下面一行是
+///   **可点的上级路径**（顶层/未分类没有上级，不显示）；右侧有「编辑封面与简介」
+///   （改**当前这个合集**，任何层级都能就地改 —— 一级合集的"父页面"是首页，
+///   那边没有可左滑的子合集卡）与「新建子合集」两个入口（未分类页两条都不给）
 /// - [collectionName] 空串表示「未分类」（它不是容器，没有上级也没有子合集）
-/// - **陈旧快照提示（v2.43.1）**：列表顶部常驻一条 [StaleSyncBanner]（由上一层
+/// - **陈旧快照提示（v2.44.0）**：列表顶部常驻一条 [StaleSyncBanner]（由上一层
 ///   传下来的 [stale] 驱动），因为本页的写操作同样被门禁拦——用户必须**动手
 ///   之前**就知道"这份数据可能是旧的、改了不会保存"，而不是点完才收到一句
 ///   「这次修改没有保存」。本页没有"数据时间/来源"的出口，那些信息仍在首页。
 library;
 
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/foundation.dart' show listEquals;
 import 'package:flutter/material.dart';
@@ -35,6 +38,7 @@ import '../cache/download_manager.dart';
 import '../config.dart';
 import '../models/playlist_context.dart';
 import '../models/whitelist_video.dart';
+import '../services/collection_cover_store.dart';
 import '../services/collection_stats.dart';
 import '../services/history_store.dart';
 import '../services/service_locator.dart';
@@ -259,6 +263,10 @@ class _CollectionPageState extends State<CollectionPage> {
   /// 离线缓存管理器（列表页显示已缓存标记；缓存状态变化时刷新）。
   final DownloadManager _downloads = DownloadManager.instance;
 
+  /// 本机合集封面存储（v2.50.0；单例，只读它算「卡片该用哪张图」 +
+  /// 在封面对话框里读写本机图）。
+  final CollectionCoverStore _covers = CollectionCoverStore.instance;
+
   /// **已展开**的季名集合（v2.41.0+）。
   ///
   /// ⚠️ 只在内存里、**绝不落库**（Gist / 本地缓存都不写）：折叠是"此刻怎么看"，
@@ -309,6 +317,10 @@ class _CollectionPageState extends State<CollectionPage> {
     unawaited(_downloads.init());
     // 播放历史（整季卡的「已看 X/N」）同样异步、不阻塞首帧
     unawaited(_loadHistory());
+    // 本机封面映射（v2.50.0）：读完刷新一次，让子合集卡换成本机图
+    unawaited(_covers.ensureLoaded().then((_) {
+      if (mounted) setState(() {});
+    }));
   }
 
   /// 读一次本机播放历史（整季卡上的「已看 X/N」用）。
@@ -404,19 +416,29 @@ class _CollectionPageState extends State<CollectionPage> {
   }
 
   /// 子合集改名（只改路径最后一段，子孙与视频引用级联跟着改）。
+  ///
+  /// 落库成功后同步搬迁本机封面的映射 key（合集的身份就是路径）。
   Future<void> _renameSubCollection(String path) async {
     final newName = await showRenameCollectionDialog(context, path);
     if (newName == null || !mounted) return;
     if (newName.trim() == collectionLocalName(path)) return; // 没改
     try {
       final next = renameCollection(_data, path, newName);
-      await _saveAndRefresh(next);
+      if (await _saveAndRefresh(next)) {
+        _covers.rebaseLocalCovers(
+          path,
+          collectionPathAfterRename(path, newName),
+        );
+      }
     } on CollectionException catch (e) {
       _showSnack(e.message, kind: SnackKind.error);
     }
   }
 
   /// 删除子合集：它自己消失，直属视频回未分类，它的子合集上提一级（都不删）。
+  ///
+  /// 本机封面跟着收拾：被删的那个删掉（映射 + 文件），子孙上提一级 → 映射
+  /// key 跟着前缀走（纯本地，不发任何请求）。
   Future<void> _deleteSubCollection(String path) async {
     final count = _data.videos.where((v) => v.collection == path).length;
     final childCount = collectionChildrenOf(_data, path).length;
@@ -429,7 +451,15 @@ class _CollectionPageState extends State<CollectionPage> {
     if (confirmed != true || !mounted) return;
     try {
       final next = deleteCollection(_data, path);
-      await _saveAndRefresh(next);
+      if (await _saveAndRefresh(next)) {
+        _covers.removeLocalCover(path);
+        _covers.rebaseLocalCovers(
+          path,
+          collectionParentOf(path),
+          includeSelf: false,
+        );
+        if (mounted) setState(() {});
+      }
     } on CollectionException catch (e) {
       _showSnack(e.message, kind: SnackKind.error);
     }
@@ -439,6 +469,7 @@ class _CollectionPageState extends State<CollectionPage> {
   ///
   /// 目标列表排除**自己 / 自己的子孙 / 当前父级**（防环 + 不列无效项），
   /// 非顶层时首项是「移到顶层」（见 [collectionMoveTargetsFor]）。
+  /// 路径变了 → 本机封面的映射 key 一起搬（自己 + 子孙）。
   Future<void> _moveSubCollection(String path) async {
     final targets = collectionMoveTargetsFor(
       path,
@@ -464,7 +495,12 @@ class _CollectionPageState extends State<CollectionPage> {
     if (confirmed != true || !mounted) return;
     try {
       final next = moveCollectionUnder(_data, path, target);
-      await _saveAndRefresh(next);
+      if (await _saveAndRefresh(next)) {
+        _covers.rebaseLocalCovers(
+          path,
+          collectionPathAfterMove(path, target),
+        );
+      }
       _showSnack(target.isEmpty
           ? '已把「${collectionDisplay(path)}」移到顶层'
           : '已把「${collectionDisplay(path)}」移动到'
@@ -474,12 +510,19 @@ class _CollectionPageState extends State<CollectionPage> {
     }
   }
 
-  /// 编辑子合集的封面与简介（v2.38.0）：与首页管理面板同一个对话框，
-  /// 落库走本页的 [_saveAndRefresh]（会往上一层逐级同步，返回父页面看到新值）。
+  /// 编辑**某个合集**的封面与简介（v2.38.0；v2.50.0 加本机封面 + 扩到本页
+  /// 自己这一层）。
   ///
-  /// 封面只收 **URL**（不做「从相册选图」的理由见 [CollectionInfo.cover]）；
-  /// 两个输入框留空 = 不设置（清空即恢复默认）。
-  Future<void> _editSubCollectionMeta(String path) async {
+  /// 两条入口共用这一个实现：
+  /// - 子合集卡左滑「封面」→ 改的是那张卡代表的子合集；
+  /// - AppBar「编辑封面与简介」→ 改的是**当前所在这个合集**（`widget.
+  ///   collectionName`）—— 一级合集的"父页面"是首页，首页没有可左滑的子合集
+  ///   卡，所以在 v2.50.0 之前**顶层合集在合集页里根本没有能改封面简介的地方**
+  ///   （只能在首页管理面板里绕）。
+  ///
+  /// 落库与首页那条完全同一套：本机封面（文件 + 本机映射，**不碰 Gist**）
+  /// 先落，URL/简介有变化才走 [_saveAndRefresh]（发 PATCH）。
+  Future<void> _editCollectionMeta(String path) async {
     final matches = _data.collections.where((c) => c.name == path);
     if (matches.isEmpty) return; // 竞态：卡片还在但合集已被删
     final current = matches.first;
@@ -488,11 +531,31 @@ class _CollectionPageState extends State<CollectionPage> {
       path,
       cover: current.cover,
       desc: current.desc,
+      localCoverPath: _covers.localCoverPath(path) ?? '',
     );
     if (input == null || !mounted) return;
-    if (input.cover.trim() == current.cover &&
+
+    // ① 本机封面（纯本地，不发网络请求）
+    var localChanged = false;
+    if (input.removeLocalCover &&
+        (_covers.localCoverPath(path) ?? '').isNotEmpty) {
+      _covers.removeLocalCover(path);
+      localChanged = true;
+    }
+    final bytes = input.coverBytes;
+    if (bytes != null &&
+        await _covers.saveLocalCover(path, bytes,
+                fileName: input.coverFileName) !=
+            null) {
+      localChanged = true;
+    }
+    if (!mounted) return;
+    if (localChanged) setState(() {});
+
+    // ② URL / 简介（有变化才发 PATCH）
+    if (input.cover.trim() == current.cover.trim() &&
         input.desc.trim() == current.desc) {
-      return; // 没改任何东西 → 不产生一次无意义的 Gist 写入
+      return; // 没改任何要同步的东西 → 不产生一次无意义的 Gist 写入
     }
     try {
       final next = setCollectionMeta(
@@ -506,6 +569,11 @@ class _CollectionPageState extends State<CollectionPage> {
       _showSnack(e.message, kind: SnackKind.error);
     }
   }
+
+  /// AppBar「编辑封面与简介」：改**当前这个合集**（未分类没有 CollectionInfo，
+  /// 不给入口）。
+  Future<void> _editCurrentCollectionMeta() =>
+      _editCollectionMeta(widget.collectionName);
 
   // ---------------------------------------------------------------------------
   // 管理写操作：内存副本 → saveAndRefresh（上一层写 Gist + 缓存）成功 → 同步
@@ -659,13 +727,18 @@ class _CollectionPageState extends State<CollectionPage> {
   ///
   /// 返回值仍是上层回调的 Future（调用方 `await` 它只是为了知道"写已经交给
   /// 上层了"，而不是"远端写完了"）。
-  Future<void> _saveAndRefresh(WhitelistData next) {
+  /// 返回值：**true = 这次修改已经生效**（本页副本 + 界面已更新，远端写由上一层
+  /// 负责）；false = 被陈旧快照门禁拦下（什么都没改）。v2.50.0 起改成有返回值，
+  /// 是为了让「本机封面映射搬迁」（[_renameSubCollection] 等）能对齐落库结果 ——
+  /// 写被拦下时若照搬 key，封面就会挂到一条并不存在的路径上。
+  /// 既有调用方 `await _saveAndRefresh(next);` 不受影响。
+  Future<bool> _saveAndRefresh(WhitelistData next) {
     // 陈旧快照门禁（v2.43.0）：本页有自己的内存副本，**必须在 setState 之前**
     // 拦——否则用户在本页看到"改好了"（乐观更新已生效），实际一条都没落库，
     // 而他会据此继续做后面的操作。父页（首页）另有一道同样的检查（本页的写
     // 最终回传到那里），两道缺一不可：父页那道挡的是"远端被写旧"，本页这道
     // 挡的是"本页界面先出现假成功"。
-    if (_blockWriteOnStaleSnapshot()) return Future.value();
+    if (_blockWriteOnStaleSnapshot()) return Future.value(false);
     if (mounted) {
       setState(() {
         _data = next;
@@ -675,7 +748,10 @@ class _CollectionPageState extends State<CollectionPage> {
         _selectedBvids.removeWhere((b) => !alive.contains(b));
       });
     }
-    return widget.saveAndRefresh(next);
+    // 交给上一层（首页）去后台写。返回 true = 本页已经生效：上一层那道
+    // 门禁查的是同一个全局新鲜度标记（两次检查之间没有 await，结论必然一致），
+    // 所以这里不需要再把它的返回值捞回来（回调类型是 `Future<void>`）。
+    return widget.saveAndRefresh(next).then((_) => true);
   }
 
   /// 陈旧快照门禁（v2.43.0）：返回 true = 写被拦下（调用方必须直接 return）。
@@ -705,7 +781,7 @@ class _CollectionPageState extends State<CollectionPage> {
   /// 直接调 [ServiceLocator] 即可。成功后本页数据一起换成最新（否则用户看到
   /// 的还是那份让他卡住的旧数据），门禁随之解除。
   ///
-  /// 也是顶部陈旧横幅上「立即同步」的动作（v2.43.1）：同步成功 → [_stale] 归
+  /// 也是顶部陈旧横幅上「立即同步」的动作（v2.44.0）：同步成功 → [_stale] 归
   /// false → 横幅自己消失。
   ///
   /// 不自动重放刚才那次修改：理由与首页一致（见 `PlaylistPage._resyncAfterStaleBlock`）。
@@ -1046,16 +1122,17 @@ class _CollectionPageState extends State<CollectionPage> {
   /// 子合集卡片：点进下一层；左滑「封面 / 移动 / 重命名 / 删除」
   /// （多选模式下全部禁用）。
   ///
-  /// 封面 / 简介（v2.38.0）：封面**只认用户自己设的 URL**，没设就保持原来的
-  /// 文件夹图标（与首页合集卡不同——那边没设封面时回落「合集内第一个视频的
-  /// 封面」，这里回落到图标，因为子合集卡只有 40×40 的一小块，塞视频截图
-  /// 反而认不出层级）。
+  /// 封面 / 简介（v2.38.0）：封面**只认用户自己设的**（v2.50.0 起本机相册图
+  /// 优先，其次 URL），都没设就保持原来的文件夹图标（与首页合集卡不同——那边
+  /// 没设封面时回落「合集内第一个视频的封面」，这里回落到图标，因为子合集卡
+  /// 只有 40×40 的一小块，塞视频截图反而认不出层级）。
   Widget _subCard(CollectionInfo c) {
     final path = c.name;
     return _SubCollectionCard(
       key: ValueKey('sub-$path'),
       name: c.localName,
       cover: c.cover,
+      localCover: _covers.localCoverPath(path) ?? '',
       desc: c.desc,
       videoCount: _data.videos.where((v) => v.collection == path).length,
       childCount: collectionChildrenOf(_data, path).length,
@@ -1063,7 +1140,7 @@ class _CollectionPageState extends State<CollectionPage> {
       onMove: _selectMode ? null : () => _moveSubCollection(path),
       onRename: _selectMode ? null : () => _renameSubCollection(path),
       onDelete: _selectMode ? null : () => _deleteSubCollection(path),
-      onEditMeta: _selectMode ? null : () => _editSubCollectionMeta(path),
+      onEditMeta: _selectMode ? null : () => _editCollectionMeta(path),
     );
   }
 
@@ -1145,10 +1222,18 @@ class _CollectionPageState extends State<CollectionPage> {
                   child: Text(selectAllVisible ? '取消全选' : '全选'),
                 ),
               ]
-            // 「新建子合集」：只在真实合集页显示（未分类不是容器，不能装子合集）
+            // 非多选态：合集页（未分类不是容器、也没有封面可设 → 一条都不给）
             : _isUncategorized
                 ? null
                 : [
+                    // 编辑**当前这个合集**的封面与简介（v2.50.0）：
+                    // 一级合集的"父页面"是首页（那边没有可左滑的子合集卡），
+                    // 没有这个入口就只能在首页管理面板里绕。
+                    IconButton(
+                      tooltip: '编辑封面与简介',
+                      icon: const Icon(Icons.image_outlined),
+                      onPressed: _editCurrentCollectionMeta,
+                    ),
                     IconButton(
                       tooltip: '新建子合集',
                       icon: const Icon(Icons.create_new_folder_outlined),
@@ -1158,7 +1243,7 @@ class _CollectionPageState extends State<CollectionPage> {
       ),
       body: Column(
         children: [
-          // 陈旧快照常驻提示（v2.43.1）：本页的写操作同样被门禁拦（见
+          // 陈旧快照常驻提示（v2.44.0）：本页的写操作同样被门禁拦（见
           // [_blockWriteOnStaleSnapshot]），所以「你看的可能是旧数据、改不了」
           // 必须在**动手之前**就看得见。点「立即同步」成功后横幅自己消失。
           StaleSyncBanner(
@@ -1333,6 +1418,10 @@ class _SubCollectionCard extends StatelessWidget {
   /// 用户自设封面 URL；空串 → 文件夹图标。
   final String cover;
 
+  /// 本机封面图片绝对路径（v2.50.0，相册选的图）；空串 = 没有。
+  /// **优先级高于 [cover]**（本机图 > Gist URL）。
+  final String localCover;
+
   /// 用户自设简介；空串 → 不渲染不占位。
   final String desc;
 
@@ -1348,6 +1437,7 @@ class _SubCollectionCard extends StatelessWidget {
     required this.videoCount,
     required this.childCount,
     this.cover = '',
+    this.localCover = '',
     this.desc = '',
     this.onTap,
     this.onMove,
@@ -1368,30 +1458,13 @@ class _SubCollectionCard extends StatelessWidget {
           onTap: onTap,
           child: Row(
             children: [
-              // 代表视觉：有自设封面就显图，没有就是原来的文件夹图标
+              // 代表视觉：本机封面图 > 自设 cover URL > 原来的文件夹图标
               ClipRRect(
                 borderRadius: BorderRadius.circular(kRadiusSm),
                 child: SizedBox(
                   width: 40,
                   height: 40,
-                  child: cover.isNotEmpty
-                      ? Image.network(
-                          cover,
-                          fit: BoxFit.cover,
-                          // 与首页合集卡 / CoverImage 一致：B 站图床必须带
-                          // 防盗链头，否则 403；加载失败回落文件夹图标
-                          headers: {
-                            'User-Agent': kBrowserUA,
-                            'Referer': kBiliReferer,
-                          },
-                          errorBuilder: (_, __, ___) =>
-                              _folderIcon(theme),
-                          loadingBuilder: (context, child, progress) {
-                            if (progress == null) return child;
-                            return _folderIcon(theme);
-                          },
-                        )
-                      : _folderIcon(theme),
+                  child: _coverVisual(theme),
                 ),
               ),
               const SizedBox(width: kSpace12),
@@ -1488,6 +1561,35 @@ class _SubCollectionCard extends StatelessWidget {
           ),
       ],
       child: card,
+    );
+  }
+
+  /// 卡片代表视觉：**本机封面图（相册选的）> 自设 cover URL > 文件夹图标**。
+  Widget _coverVisual(ThemeData theme) {
+    if (localCover.isNotEmpty) {
+      return Image.file(
+        File(localCover),
+        fit: BoxFit.cover,
+        // 文件在但读不出来（被清 / 权限异常）→ 回落文件夹图标（不留空白）
+        errorBuilder: (_, __, ___) => _folderIcon(theme),
+      );
+    }
+    if (cover.isEmpty) return _folderIcon(theme);
+    return Image.network(
+      // 最小规范化：`//host/x.jpg` 补 https:，否则直接加载失败
+      normalizeCoverUrl(cover),
+      fit: BoxFit.cover,
+      // 与首页合集卡 / CoverImage 一致：B 站图床必须带防盗链头，否则 403；
+      // 加载失败回落文件夹图标
+      headers: const {
+        'User-Agent': kBrowserUA,
+        'Referer': kBiliReferer,
+      },
+      errorBuilder: (_, __, ___) => _folderIcon(theme),
+      loadingBuilder: (context, child, progress) {
+        if (progress == null) return child;
+        return _folderIcon(theme);
+      },
     );
   }
 

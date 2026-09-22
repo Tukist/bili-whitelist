@@ -46,7 +46,7 @@ const List<(String, int)> _candidatePgc = [
 /// `lib/widgets/comment_list.dart`：主评论页 aid=… / 展开楼中楼 root=… 都在
 /// 这里），`[comment_page]` 只是**评论页外壳**（标题/链接跳转）的日志——旧版
 /// 白名单漏了 `[comment_list]`，于是「主评论页 aid=」「展开楼中楼 root=」两条
-/// 断言永远取不到证据（评论其实已加载成功，见运行日志），v2.17.18 已补上。
+/// 断言永远取不到证据（评论其实已加载成功，见运行日志），v2.18.0 已补上。
 List<String> _logs = [];
 void _captureDebugPrint() {
   _logs = [];

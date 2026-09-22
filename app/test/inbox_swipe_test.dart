@@ -15,9 +15,16 @@
 // - 底部按钮「跳过」/「加入」与滑动等价；「撤销」把上一张放回来；
 //   空态下底部仍留着「撤销上一张」（#2）
 // - 后台 checkAll 进行中不阻塞交互：仍能点卡开播放页 / 划卡 / 撤销，
-//   检查回来只追加新条目 → 卡片栈不跳回第一张、已消费的不复活（#1）
+//   检查回来只增不改（新条目按发布时间落位）→ 卡片栈不跳回第一张、
+//   已消费的不复活（#1）
 // - 检查**进行中**的新条目也会进卡片栈：页面每隔几秒只读盘回读一次本地未读
 //   （见 inbox_page.dart 的 _pollProgress），不必退出重进（#2）
+// - ★ 上下交替**不循环**（v2.49.1）：一张卡每次「稍后」只欠**一次**取回（票），
+//   交替多少轮都是"下滑→上滑→回到原样"，票用完即空；「稍后」的那张在**落地前**
+//   没有票 → 飞行窗口里取不到它、也不会取错卡；票空了再上滑只给一条可见反馈
+//   （不再静默）。断言落在状态上（队列 / 票栈 / 取回次数），见 `_inboxState`
+// - ★ 回读合并**按发布时间落位**（v2.49.1）：新抓到的条目插到该在的位置（绝不
+//   插到当前这张之前 → 正在看的那张不换人），且**不把正在飞的那张并回来**
 // - 队列被用户划空（后台检查还在跑）→ 显示空态而不是整页加载态（#6）
 // - 点按卡片仍是「打开播放页」（本文件用"是否去 fetch view 元数据"当证据：
 //   真去 push PlayerPage 要 mock 播放器通道，这里只验点按链路被触发）
@@ -40,6 +47,7 @@ import 'package:bili_whitelist_app/models/whitelist_video.dart';
 import 'package:bili_whitelist_app/pages/inbox_page.dart';
 import 'package:bili_whitelist_app/services/inbox_service.dart';
 import 'package:bili_whitelist_app/services/service_locator.dart';
+import 'package:bili_whitelist_app/services/ui_prefs_store.dart';
 import 'package:bili_whitelist_app/services/whitelist_writer.dart';
 import 'package:bili_whitelist_app/sync/whitelist_source.dart';
 import 'package:bili_whitelist_app/theme/app_palette.dart';
@@ -225,14 +233,20 @@ double _layerAlpha(WidgetTester tester, String bvid) {
 }
 
 /// 起一个**开着动效**的信箱页：飞出/推进/弹回都是真在跑（用于验证动画过程）。
+///
+/// [checkGate] 非空 → `checkAll` 挂在闸门上（"检查还在跑"），这时 [InboxPage] 的
+/// 3s 回读定时器（`_kProgressPoll`）才会真的回读一次 —— 要验"回读与飞行窗口重叠"
+/// 的用例必须传它。
 Future<_Harness> _pumpInboxAnimated(
   WidgetTester tester,
   List<InboxItem> items, {
   bool githubConfigured = true,
+  Completer<void>? checkGate,
 }) async {
   MotionControl.enabled = true;
   _usePortraitPhone(tester);
   final service = _FakeInboxService(items);
+  if (checkGate != null) service.checkGate = checkGate;
   final api = _FakeBiliApi();
   final github = _FakeGithubApi(configured: githubConfigured);
   ServiceLocator.overrideInboxService(service);
@@ -297,6 +311,18 @@ InboxItem _item(int i, {int duration = 245, int? pubDate}) => InboxItem(
       pubDate: pubDate ??
           DateTime.now().millisecondsSinceEpoch ~/ 1000 - 3 * 3600,
     );
+
+/// [hours] 小时前的 Unix 秒（构造"发布时间有序"的队列用）。
+int _agoHours(int hours) =>
+    DateTime.now().millisecondsSinceEpoch ~/ 1000 - hours * 3600;
+
+/// 页面 State —— 观察口见 `inbox_page.dart` 末尾的「测试观察口」一节
+/// （队列内容 / 待取回票栈 / 幽灵层里飞的那张 / 取回次数）。
+///
+/// 为什么必须直接读它：这批修的是"同一张卡被反复取回"这种**状态机不变式**，
+/// 只靠动画位置与文案间接推断，正是这个缺陷当初逃过全套测试的原因。
+InboxPageState _inboxState(WidgetTester tester) =>
+    tester.state<InboxPageState>(find.byType(InboxPage));
 
 class _Harness {
   _Harness({required this.service, required this.api, required this.github});
@@ -963,7 +989,7 @@ void main() {
       expect(h.github.savedBvids, isEmpty);
     });
 
-    testWidgets('没有可取的卡时上滑无动作：列表不变、不报错、不弹提示',
+    testWidgets('没有可取的卡时上滑：队列不动、弹回原位，并给一条可见提示（不再静默）',
         (tester) async {
       final h = await _pumpInbox(tester, [_item(1), _item(2)]);
       final before = tester.getCenter(_topCard());
@@ -979,7 +1005,28 @@ void main() {
       expect(h.service.unhandled, isEmpty);
       expect(h.github.savedBvids, isEmpty, reason: '绝不能误判成"加入"');
       expect(h.api.metaCalls, isEmpty);
-      expect(find.byType(SnackBar), findsNothing, reason: '不弹提示（它不是错误）');
+      // ★ v2.49.1 契约变更（旧断言：`find.byType(SnackBar), findsNothing`
+      //   "不弹提示（它不是错误）"）：**静默本身就是缺陷** —— 用户上滑什么都没
+      //   看到，读成"卡了 / 上下滑逻辑乱"。现在一律给一条克制的 info 提示
+      //   （受设置里的「界面提示」开关控制，关了照样安静）。
+      expect(find.text('暂无可取回的卡片'), findsOneWidget,
+          reason: '空手取回时必须有可见反馈（旧实现只有 debugPrint）');
+    });
+
+    testWidgets('设置里关掉「界面提示」→ 空手取回照旧不弹（提示条本就不该绕过总开关）',
+        (tester) async {
+      UiPrefsStore.instance.resetForTest(showTips: false);
+      addTearDown(() => UiPrefsStore.instance.resetForTest(showTips: true));
+      final h = await _pumpInbox(tester, [_item(1), _item(2)]);
+
+      await tester.drag(_topCard(), const Offset(0, -300)); // 从没下滑过
+      await _flush(tester);
+
+      expect(find.byType(SnackBar), findsNothing,
+          reason: 'info 档走 AppSnack，受「界面提示」总开关控制（关了就安静）');
+      expect(_deckOrder(tester), ['BV1', 'BV2'], reason: '队列照样一个字节都不动');
+      expect(h.service.handled, isEmpty);
+      expect(h.github.savedBvids, isEmpty);
     });
 
     testWidgets('只有 1 张卡时下滑无动作（"推到队尾"就是原地打转）', (tester) async {
@@ -1100,11 +1147,14 @@ void main() {
     testWidgets('快速轻扫｜上：有可取的卡 → 取回；没有 → 无动作', (tester) async {
       final h = await _pumpInbox(tester, [_item(1), _item(2)]);
 
-      // ① 还没下滑过 → 没卡可取：轻扫上滑什么都不做
+      // ① 还没下滑过 → 没卡可取：轻扫上滑什么队列都不动，只给一条提示
       await tester.fling(_topCard(), const Offset(0, -60), 2000);
       await _flush(tester);
       expect(_deckOrder(tester), ['BV1', 'BV2']);
-      expect(find.byType(SnackBar), findsNothing, reason: '没卡可取时不提示');
+      // ★ v2.49.1 契约变更（旧断言：`find.byType(SnackBar), findsNothing`）：
+      //   空手取回不再静默，见上面「没有可取的卡时上滑」那条用例的说明
+      expect(find.text('暂无可取回的卡片'), findsOneWidget,
+          reason: '没卡可取时给可见反馈');
       expect(h.github.savedBvids, isEmpty, reason: '上滑绝不是"加入"');
 
       // ② 先轻扫下滑把 BV1 推到后面 → 再轻扫上滑把它取回来
@@ -1328,6 +1378,338 @@ void main() {
       expect(_deckOrder(tester), ['BV2', 'BV1'], reason: '这一下算「下滑 = 稍后」');
       expect(h.service.handled, isEmpty, reason: '稍后不记「已处理」');
       expect(h.github.savedBvids, isEmpty);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // 上下交替的不变式（v2.49.1）
+  // 用户报障：「上下跳过逻辑很乱，不停上滑居然会出现之前跳过的卡片变成循环」
+  // 断言一律落在**状态**上（队列内容 / 待取回票栈 / 取回次数），不只看动画位置：
+  // - 一卡一票、票用完即空 → 同一张卡不可能靠一张票被取回两次；
+  // - 「稍后」的那张在**落地前**没有票 → 飞行窗口里取不到它，也不会取错卡；
+  // - 空手取回有可见反馈 → "划了没反应"不再被读成"逻辑乱"。
+  // -------------------------------------------------------------------------
+
+  group('上下交替不循环（一张卡最多被取回一次）', () {
+    testWidgets('下滑→上滑交替 5 轮：每轮回到原样，票用完即空（同一张卡不会被反复取回）',
+        (tester) async {
+      await _pumpInbox(tester, [for (var i = 1; i <= 3; i++) _item(i)]);
+      final s = _inboxState(tester);
+      expect(s.debugItemBvids, ['BV1', 'BV2', 'BV3'], reason: '初始队列');
+
+      for (var round = 1; round <= 5; round++) {
+        await tester.drag(_topCard(), const Offset(0, 300)); // 下滑 = 稍后
+        await _flush(tester);
+        expect(s.debugItemBvids, ['BV2', 'BV3', 'BV1'],
+            reason: '第 $round 轮：队首挪到队尾（队列转一位）');
+        expect(s.debugDeferredBvids, ['BV1'],
+            reason: '第 $round 轮：只有一张票（落地时才挂）');
+
+        await tester.drag(_topCard(), const Offset(0, -300)); // 上滑 = 取回
+        await _flush(tester);
+        expect(s.debugItemBvids, ['BV1', 'BV2', 'BV3'],
+            reason: '第 $round 轮：取回后回到原样');
+        expect(s.debugDeferredBvids, isEmpty,
+            reason: '第 $round 轮：票**被消费掉**了 —— 一张票不可能取回两次');
+        expect(s.debugRestoreCount, round,
+            reason: '第 $round 轮：全程只该发生 $round 次取回');
+        expect(s.debugItemBvids.toSet().length, 3, reason: '队列里没有重复 bvid');
+        expect(find.text('已取回「新视频 1」'), findsOneWidget,
+            reason: '第 $round 轮：取回的确实是刚「稍后」掉的那张');
+      }
+
+      // ★ 票已空：再上滑只给可见反馈，**不会**又冒出一张"之前处理掉的卡"
+      //   （旧实现走到这里往往还能再"取回"一次 —— 就是用户看到的循环）
+      await tester.drag(_topCard(), const Offset(0, -300));
+      await _flush(tester);
+      expect(s.debugDeferredBvids, isEmpty);
+      expect(s.debugRestoreCount, 5, reason: '没有第 6 次取回');
+      expect(s.debugItemBvids, ['BV1', 'BV2', 'BV3'], reason: '队列一个字节都不动');
+      expect(find.text('暂无可取回的卡片'), findsOneWidget);
+      expect(find.text('已取回「新视频 1」'), findsNothing,
+          reason: '同一张卡不会被再次"取回"（循环被消灭的直接证据）');
+    });
+
+    testWidgets('用户报障的原样动作：不停上滑 5 次 → 只有第一次真的取回，之后 4 次只给反馈',
+        (tester) async {
+      await _pumpInbox(tester, [for (var i = 1; i <= 3; i++) _item(i)]);
+      final s = _inboxState(tester);
+
+      // 上滑能取回的**唯一**来源是一次「稍后」：先下滑一张，攒下一张票
+      await tester.drag(_topCard(), const Offset(0, 300));
+      await _flush(tester);
+      expect(s.debugItemBvids, ['BV2', 'BV3', 'BV1']);
+      expect(s.debugDeferredBvids, ['BV1']);
+
+      // 用户报障的动作就是「不停上滑」（中间不夹下滑）。旧实现在这里能让同一
+      // 张卡反复回栈顶 —— 看起来就是"之前处理掉的卡变成循环"。
+      for (var i = 1; i <= 5; i++) {
+        await tester.drag(_topCard(), const Offset(0, -300));
+        await _flush(tester);
+        expect(s.debugRestoreCount, 1,
+            reason: '第 $i 次上滑：全程只该有第一次那一次取回（票用完即空）');
+        expect(s.debugDeferredBvids, isEmpty,
+            reason: '第 $i 次上滑：票栈必须为空 —— 不存在"同一张卡无限回到栈顶"');
+        expect(s.debugItemBvids, ['BV1', 'BV2', 'BV3'],
+            reason: '第 $i 次上滑：队列停在"取回一次"之后的样子，没有卡被反复搬回来');
+        expect(s.debugItemBvids.toSet().length, 3, reason: '队列里没有重复 bvid');
+      }
+      // 屏幕上最后一条提示是"没有可取的"，不是"又取回了一张"
+      expect(find.text('暂无可取回的卡片'), findsOneWidget);
+      expect(find.text('已取回「新视频 1」'), findsNothing,
+          reason: '★ 反复上滑不会让已经取回过的卡再冒出来（用户报障的直接反例）');
+    });
+
+    testWidgets('连续下滑三张后连续上滑：LIFO 逐张取回，第 4 次只给反馈（不再回到栈顶）',
+        (tester) async {
+      await _pumpInbox(tester, [for (var i = 1; i <= 3; i++) _item(i)]);
+      final s = _inboxState(tester);
+
+      for (var i = 1; i <= 3; i++) {
+        await tester.drag(_topCard(), const Offset(0, 300)); // 三张都「稍后」
+        await _flush(tester);
+      }
+      expect(s.debugItemBvids, ['BV1', 'BV2', 'BV3'], reason: '转一圈又回到原序');
+      expect(s.debugDeferredBvids, ['BV1', 'BV2', 'BV3'],
+          reason: '三张各有一张票（栈顶 = 最后推后的那张）');
+
+      const expects = [('BV3', '新视频 3'), ('BV2', '新视频 2'), ('BV1', '新视频 1')];
+      for (final (bvid, title) in expects) {
+        await tester.drag(_topCard(), const Offset(0, -300)); // 上滑 = 取回
+        await _flush(tester);
+        expect(s.debugItemBvids.first, bvid, reason: 'LIFO：$bvid 回到队首');
+        expect(find.text('已取回「$title」'), findsOneWidget,
+            reason: '取回的正是 $bvid（没有取错卡）');
+      }
+      expect(s.debugDeferredBvids, isEmpty, reason: '三张票各被取回一次 → 排空');
+      expect(s.debugRestoreCount, 3);
+
+      // 第 4 次上滑：旧实现这里还能"再取回"一张（反复上滑 → 卡片循环）
+      await tester.drag(_topCard(), const Offset(0, -300));
+      await _flush(tester);
+      expect(find.text('暂无可取回的卡片'), findsOneWidget);
+      expect(s.debugRestoreCount, 3, reason: '没有第 4 次取回');
+      expect(s.debugItemBvids, ['BV1', 'BV2', 'BV3']);
+    });
+
+    testWidgets('下滑之后幽灵还在飞就上滑：取不到正在飞的那张，取的是已落地的票（开动效）',
+        (tester) async {
+      await _pumpInboxAnimated(tester, [for (var i = 1; i <= 3; i++) _item(i)]);
+      final s = _inboxState(tester);
+
+      // ① 先把 BV1「稍后」并等它**落地** → 有了一张已落地的票
+      await tester.drag(_topCard(), const Offset(0, 300));
+      await tester.pumpAndSettle();
+      expect(s.debugItemBvids, ['BV2', 'BV3', 'BV1']);
+      expect(s.debugDeferredBvids, ['BV1']);
+      expect(s.debugGhostBvid, isNull, reason: '已经落地了');
+
+      // ② 再下滑 BV2：过了交接点（kDurAdvance）它还在幽灵层里飞
+      await tester.drag(_topCard(), const Offset(0, 300));
+      await tester.pump();
+      await tester.pump(kDurAdvance + const Duration(milliseconds: 20));
+      expect(s.debugGhostBvid, 'BV2', reason: 'BV2 正在飞');
+      expect(s.debugItemBvids, ['BV3', 'BV1'], reason: '交接之后它已离开牌堆');
+      expect(s.debugDeferredBvids, ['BV1'],
+          reason: '★ 飞行中的 BV2 **没有票**（旧实现这里会把它、或更早那张算成"可取"）');
+
+      // ③ 飞行途中上滑：只可能取到已落地的 BV1，取不到正在飞的 BV2
+      await tester.drag(_cardByBvid('BV3'), const Offset(0, -300));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 200)); // > kDurQuick：第一步走完
+      expect(s.debugItemBvids.first, 'BV1', reason: '取回的是票栈顶那张（已落地的）');
+      expect(s.debugRestoreCount, 1);
+      expect(s.debugDeferredBvids, isEmpty, reason: '那张票被消费掉了');
+      expect(find.text('已取回「新视频 1」'), findsOneWidget);
+
+      await tester.pumpAndSettle();
+      expect(s.debugItemBvids, ['BV1', 'BV3', 'BV2'],
+          reason: 'BV2 落地后回队尾（没有插到队首、也没有凭空多一张）');
+      expect(s.debugDeferredBvids, ['BV2'],
+          reason: '落地**之后**才给它挂票（飞行窗口里没有）');
+      expect(s.debugItemBvids.toSet().length, 3, reason: '队列里没有重复 bvid');
+      expect(s.debugGhostBvid, isNull);
+    });
+
+    testWidgets('下滑之后还没有已落地的票就上滑：给可见反馈，不再静默（开动效）',
+        (tester) async {
+      await _pumpInboxAnimated(tester, [for (var i = 1; i <= 3; i++) _item(i)]);
+      final s = _inboxState(tester);
+
+      await tester.drag(_topCard(), const Offset(0, 300)); // 稍后 BV1
+      await tester.pump();
+      await tester.pump(kDurAdvance + const Duration(milliseconds: 20));
+      expect(s.debugGhostBvid, 'BV1', reason: 'BV1 正在飞');
+      expect(s.debugItemBvids, ['BV2', 'BV3']);
+      expect(s.debugDeferredBvids, isEmpty, reason: '飞行中不挂票 → 此刻没有可取的');
+
+      // 上滑：弹回原位 + 一条提示（旧实现只有一行 debugPrint，用户看到的是
+      // "划了没反应"）
+      await tester.drag(_cardByBvid('BV2'), const Offset(0, -300));
+      await tester.pump();
+      expect(find.text('暂无可取回的卡片'), findsOneWidget);
+      expect(s.debugRestoreCount, 0, reason: '一次取回都没发生');
+      expect(s.debugItemBvids, ['BV2', 'BV3'], reason: '队列没有被改动');
+
+      // 落地之后就能取回了 —— 说明"刚才取不到"不是丢卡，只是还没轮到
+      await tester.pumpAndSettle();
+      expect(s.debugItemBvids, ['BV2', 'BV3', 'BV1']);
+      expect(s.debugDeferredBvids, ['BV1'], reason: '落地才挂票');
+      await tester.drag(_topCard(), const Offset(0, -300));
+      await tester.pumpAndSettle();
+      expect(s.debugItemBvids, ['BV1', 'BV2', 'BV3'], reason: '取回后回原样');
+      expect(s.debugRestoreCount, 1);
+      expect(s.debugDeferredBvids, isEmpty);
+    });
+
+    testWidgets('同一张卡第二次「稍后」的飞行窗口里上滑：取到的是已落地的票，绝不是正在飞的那张（开动效）',
+        (tester) async {
+      await _pumpInboxAnimated(tester, [for (var i = 1; i <= 3; i++) _item(i)]);
+      final s = _inboxState(tester);
+
+      // 三张各「稍后」一次并等落地 → 票 [BV1,BV2,BV3]，队列转回原序
+      for (var i = 0; i < 3; i++) {
+        await tester.drag(_topCard(), const Offset(0, 300));
+        await tester.pumpAndSettle();
+      }
+      expect(s.debugItemBvids, ['BV1', 'BV2', 'BV3']);
+      expect(s.debugDeferredBvids, ['BV1', 'BV2', 'BV3']);
+      expect(s.debugRestoreCount, 0, reason: '还一次都没取回过');
+
+      // 再把队首 BV1「稍后」一次：它在飞行窗口里**必须没有票**。旧实现这里
+      // 留着上一次那张票（defer 分支提前 return，不作废）→ 上滑取到的是**正在
+      // 飞的 BV1**，把它搬到队首 = 用户报的"取错卡 / 之前的卡又回来了"。
+      await tester.drag(_topCard(), const Offset(0, 300));
+      await tester.pump();
+      await tester.pump(kDurAdvance + const Duration(milliseconds: 20));
+      expect(s.debugGhostBvid, 'BV1', reason: 'BV1 正在飞');
+      expect(s.debugItemBvids, ['BV2', 'BV3'], reason: '交接后它离开了牌堆');
+      expect(s.debugDeferredBvids, ['BV2', 'BV3'],
+          reason: '★ 飞行的 BV1 不占票（旧实现这里还是 [BV1,BV2,BV3]）');
+
+      // 飞行途中上滑 → 只能取到那一摞里最近落地的 BV3
+      await tester.drag(_cardByBvid('BV2'), const Offset(0, -300));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 200)); // > kDurQuick
+      expect(s.debugItemBvids.first, 'BV3', reason: '取到的是已落地的 BV3，不是正在飞的 BV1');
+      expect(find.text('已取回「新视频 3」'), findsOneWidget);
+      expect(s.debugRestoreCount, 1);
+
+      await tester.pumpAndSettle();
+      expect(s.debugItemBvids, ['BV3', 'BV2', 'BV1'], reason: 'BV1 落地回队尾');
+      expect(s.debugDeferredBvids, ['BV2', 'BV1'], reason: 'BV1 落地后才挂票');
+      expect(s.debugItemBvids.toSet().length, 3, reason: '队列里没有重复 bvid');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // 回读合并的顺序（v2.49.1）：新条目按发布时间插到该在的位置
+  // -------------------------------------------------------------------------
+
+  group('回读合并：新条目按发布时间插入', () {
+    testWidgets('检查进行中新抓到的视频按发布时间插入，不顶掉当前这张、也不落到队尾',
+        (tester) async {
+      final gate = Completer<void>();
+      // 队列：BV1（1 小时前）、BV2（5 小时前）—— 中间还留着一个"两小时前"的位
+      final items = <InboxItem>[
+        _item(1, pubDate: _agoHours(1)),
+        _item(2, pubDate: _agoHours(5)),
+      ];
+      await _pumpInbox(tester, items, checkGate: gate);
+      final s = _inboxState(tester);
+      expect(s.debugItemBvids, ['BV1', 'BV2']);
+
+      // 检查还在跑：服务层又落盘了一条（2 小时前发的 → 比 BV2 新、比 BV1 旧）
+      items.add(_item(3, pubDate: _agoHours(2)));
+      await tester.pump(const Duration(seconds: 3)); // _kProgressPoll
+      await _flush(tester);
+
+      expect(s.debugItemBvids, ['BV1', 'BV3', 'BV2'],
+          reason: '按发布时间倒序插到 BV2 之前（旧实现一律追加到队尾 → '
+              '顺序与发布时间脱钩，用户读成"顺序很乱"）');
+      expect(_topBvid(tester), 'BV1', reason: '既有契约：不顶掉当前正在看的那张');
+
+      // 更晚抓到的"最新那条"同样不顶掉当前这张（插入位置下限 = 索引 1）
+      items.add(_item(4, pubDate: _agoHours(0)));
+      await tester.pump(const Duration(seconds: 3));
+      await _flush(tester);
+      expect(s.debugItemBvids, ['BV1', 'BV4', 'BV3', 'BV2']);
+      expect(_topBvid(tester), 'BV1', reason: '回读每 3s 一次，可能正跑在拖动中间');
+
+      // 当前这张被划走之后，队列就完全是发布时间序了
+      await tester.drag(_topCard(), const Offset(-300, 0)); // 跳过 BV1
+      await _flush(tester);
+      expect(s.debugItemBvids, ['BV4', 'BV3', 'BV2'], reason: '此后严格按发布时间倒序');
+
+      // 中途插入不影响「取回」的顺序：票是按"推后的先后"入栈的，与卡在队列里
+      // 的位置无关 → 取回后队列必须回到推后之前的样子
+      await tester.drag(_topCard(), const Offset(0, 300)); // 稍后 BV4
+      await _flush(tester);
+      expect(s.debugItemBvids, ['BV3', 'BV2', 'BV4']);
+      expect(s.debugDeferredBvids, ['BV4']);
+      await tester.drag(_topCard(), const Offset(0, -300)); // 取回 BV4
+      await _flush(tester);
+      expect(s.debugItemBvids, ['BV4', 'BV3', 'BV2'], reason: '取回后回到推后之前');
+
+      gate.complete(); // 收掉挂着的 checkAll（否则用例结束时留下未完成的 Future）
+      await _flush(tester);
+      expect(find.byType(InboxSwipeCard), findsNWidgets(3));
+    });
+
+    testWidgets('回读正好撞上「稍后」那张还在飞：不把它并回来、牌堆不出两张，落地后照样能取回（开动效）',
+        (tester) async {
+      final gate = Completer<void>();
+      // 服务层此刻仍把 BV1 当"未读"（「稍后」不写盘）→ 回读的列表里一定有它
+      final items = <InboxItem>[_item(1), _item(2), _item(3)];
+      await _pumpInboxAnimated(tester, items, checkGate: gate);
+      final s = _inboxState(tester);
+      expect(s.debugItemBvids, ['BV1', 'BV2', 'BV3']);
+
+      // ★ 时间安排（三个时刻必须落在一条线上，改这里的数字前先看这段算术）：
+      //   回读定时器（_kProgressPoll = 3s）从 initState 起算、_pumpInboxAnimated
+      //   已经走了 500ms → 第一次回读在**时钟 3.0s**；竖直出屏 ≈ 508ms
+      //   （= 320ms × 屏高 / 1.4 屏宽，见 inboxExitMotion），交接点在它的
+      //   kDurAdvance(160ms) 处 → 于是"松手"留在 **2.70s**：幽灵层存活区间
+      //   2.86s → 3.208s，回读那一刻（3.0s）正落在里面。
+      await tester.pump(const Duration(milliseconds: 2200)); // 时钟 → 2.70s
+      await tester.drag(_topCard(), const Offset(0, 300)); // 稍后 BV1（松手）
+      await tester.pump(); // 起飞
+      // 哨兵：只在"回读真的跑过一次"之后才会进队列（它跟守卫无关，
+      // 所以它出现 = 回读那一刻确实到了，下面关于 BV1 的断言不是在空转）
+      items.add(_item(9, pubDate: _agoHours(0)));
+      await tester.pump(kDurAdvance + const Duration(milliseconds: 10)); // 2.87s：已交接
+      expect(s.debugGhostBvid, 'BV1', reason: '交接之后 BV1 在幽灵层里飞');
+      expect(s.debugItemBvids, ['BV2', 'BV3']);
+      // 按 50ms 步进，**一旦哨兵出现就停下**：这样下面那条"BV1 还在飞"的断言
+      // 恰好落在回读那一帧上（多 pump 一步它就落地了，见下一段）
+      var steps = 0;
+      while (!s.debugItemBvids.contains('BV9') && steps < 40) {
+        await tester.pump(const Duration(milliseconds: 50));
+        steps++;
+      }
+      expect(s.debugItemBvids.contains('BV9'), isTrue,
+          reason: '回读必须真的跑过一次（哨兵 BV9 进了队列），否则本用例是空转');
+      expect(s.debugGhostBvid, 'BV1',
+          reason: '★ 回读与飞行窗口真的重叠了：此刻 BV1 还在幽灵层里飞');
+      expect(s.debugItemBvids, ['BV2', 'BV9', 'BV3'],
+          reason: '★ 回读不把正在飞的那张并回来（并回来会同时画两张一样的卡，'
+              '而且落地时"已经在队里"→ 不再挂票 → 这张再也取不回来）；'
+              'BV9 插在比它旧的 BV3 之前 = 按发布时间落位');
+
+      // 落地 → 回队尾 + 挂票 → 照样能取回（说明它没被回读吞掉）
+      await tester.pumpAndSettle();
+      expect(s.debugItemBvids, ['BV2', 'BV9', 'BV3', 'BV1'],
+          reason: '落地回队尾（只一张，没有插到队首）');
+      expect(s.debugDeferredBvids, ['BV1'], reason: '落地才挂票');
+      await tester.drag(_topCard(), const Offset(0, -300)); // 取回 BV1
+      await tester.pumpAndSettle();
+      expect(s.debugItemBvids, ['BV1', 'BV2', 'BV9', 'BV3'], reason: '取回后回队首');
+      expect(s.debugDeferredBvids, isEmpty);
+      expect(s.debugItemBvids.toSet().length, 4, reason: '全程没有重复 bvid');
+      expect(find.text('已取回「新视频 1」'), findsOneWidget);
+
+      gate.complete();
+      await _flush(tester);
     });
   });
 
@@ -1728,8 +2110,8 @@ void main() {
       await _flush(tester);
       expect(tester.widget<InboxSwipeCard>(_topCard()).item.bvid, 'BV3');
 
-      // ⑤ 检查回来（闸门放开）：只把新条目追加到队尾，
-      //    当前这张不动、已消费的不复活
+      // ⑤ 检查回来（闸门放开）：只把新条目并进来（这批 pubDate 相同 → 等价于
+      //    追加到队尾），当前这张不动、已消费的不复活
       gate.complete();
       await _flush(tester);
 
@@ -1763,13 +2145,14 @@ void main() {
       expect(_cardByBvid('BV2'), findsNothing, reason: '回读间隔还没到');
 
       // 页面在检查期间周期性回读本地未读（只读盘、不触网；间隔同
-      // inbox_page.dart 的 _kProgressPoll = 3s）→ 新卡自动追加进来
+      // inbox_page.dart 的 _kProgressPoll = 3s）→ 新卡自动并进来
+      //（这里两张的 pubDate 相同 → 等价于追加到队尾，见 _mergeChecked）
       await tester.pump(const Duration(seconds: 3));
       await _flush(tester);
       expect(_cardByBvid('BV2'), findsOneWidget,
           reason: '检查进行中的新条目必须能进卡片栈 —— 老实现要等整轮跑完');
       expect(tester.widget<InboxSwipeCard>(_topCard()).item.bvid, 'BV1',
-          reason: '只追加不重排：当前正在看的那张不能换人');
+          reason: '回读只增不改：当前正在看的那张不能换人');
 
       // 检查回来：不重复追加（还是那 2 张），提示收掉
       gate.complete();

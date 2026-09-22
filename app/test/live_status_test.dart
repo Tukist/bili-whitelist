@@ -1,4 +1,4 @@
-// 直播「正在直播」标记（v2.25.2+，最小形态）测试。
+// 直播「正在直播」标记（v2.26.0+，最小形态）测试。
 //
 // 覆盖：
 // - **接口解析**：`https://api.live.bilibili.com/room/v1/Room/getRoomInfoOld`

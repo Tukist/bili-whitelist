@@ -22,6 +22,10 @@ class MainActivity : FlutterActivity() {
     // onActivityResult）在此转发给 ScheduleImportPlugin。
     private lateinit var scheduleImport: ScheduleImportPlugin
 
+    // 从相册选图当合集封面（v2.50.0）：同样走 SAF，结果在这里转发给
+    // ImagePickPlugin（requestCode 与上面那条通道错开）。
+    private lateinit var imagePick: ImagePickPlugin
+
     // 应用内嵌插件不走 GeneratedPluginRegistrant（那是给独立插件包用的），
     // 在 configureFlutterEngine 里手动注册 B 站 DASH 播放插件。
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
@@ -38,6 +42,9 @@ class MainActivity : FlutterActivity() {
         // 日程表导入 Excel（v2.34.0）：系统文件选择器 MethodChannel
         scheduleImport = ScheduleImportPlugin(this)
         scheduleImport.register(flutterEngine)
+        // 从相册选图（v2.50.0）：系统图片选择器 MethodChannel
+        imagePick = ImagePickPlugin(this)
+        imagePick.register(flutterEngine)
     }
 
     /**
@@ -58,12 +65,18 @@ class MainActivity : FlutterActivity() {
         if (::scheduleImport.isInitialized) {
             scheduleImport.onActivityResult(requestCode, resultCode, data)
         }
+        if (::imagePick.isInitialized) {
+            imagePick.onActivityResult(requestCode, resultCode, data)
+        }
     }
 
     // 选文件期间 Activity 被销毁 → 收尾挂起的 Dart 调用（否则那条 await 永远不返回）
     override fun onDestroy() {
         if (::scheduleImport.isInitialized) {
             scheduleImport.onActivityDestroyed()
+        }
+        if (::imagePick.isInitialized) {
+            imagePick.onActivityDestroyed()
         }
         super.onDestroy()
     }

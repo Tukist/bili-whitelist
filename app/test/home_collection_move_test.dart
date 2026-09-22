@@ -1,13 +1,20 @@
 // 首页合集卡「移动到…」（v2.38.0）widget 测试：
-// - 左滑三块（移动 / 重命名 / 删除），**顺序与宽度**实测/断言（3 × 76 = 228dp
-//   ≤ 卡片可用宽 336dp，卡住「别把 360dp 屏挤坏」这条）；
+// - 左滑四块（封面 / 移动 / 重命名 / 删除），**顺序与宽度**实测/断言
+//   （4 × 60 = 240dp ≤ 卡片可用宽 336dp，卡住「别把 360dp 屏挤坏」这条）；
 // - 点「移动」→ 目标选择 sheet（排除自己/子孙/当前父级）→ 确认框 → 落库
 //   （断言 PATCH 出去的 collections 变成嵌套路径 + 视频 collection 跟着走）；
 // - 取消确认框 → 一个 PATCH 都不发；
 // - 防环：目标列表里没有自己，也没有自己的子孙；非顶层首项是「移到顶层」；
-// - 「未分类」卡不是合集 → 没有「移动」这一块；
+// - 「未分类」卡不是合集 → 四块一个都没有；
 // - 首页同级拖拽重排**没被动**（4 条既有拖拽用例在 collection_page_test.dart，
 //   本文件只补一条「左滑露出「移动」之后，长按拖拽仍然可用」的手势共存检查）。
+//
+// v2.50.0 的**契约变更**（本文件唯一被授权改动的部分）：首页一级卡左滑从
+// 「三块 × 76dp」改成「四块 × 60dp」，与合集页子合集卡对齐（那边 v2.38.0 就是
+// 四块 × 60）—— 新增的第四块是「封面」，用来补上「一级合集在合集页里没有可左滑
+// 的父卡片、改不了封面简介」这个缺口。为什么必须同时改宽度：4 × 76 = 304dp 会把
+// 卡片本体推到只剩 32dp（封面 64dp 都放不下），60dp 是「放得下四块」与「仍 ≥ 48dp
+// 最小触摸目标」的唯一交集。
 //
 // 基建复刻 collection_page_test.dart：mock secure storage 通道 + fake
 // HttpClientAdapter 记录 PATCH 请求体 → 断言真正要写进 Gist 的内容。
@@ -199,8 +206,8 @@ void main() {
 
   setUp(() => SharedPreferences.setMockInitialValues({}));
 
-  group('首页合集卡左滑三块：顺序与宽度', () {
-    testWidgets('左滑露出「移动 / 重命名 / 删除」三块，每块 76dp、总宽不撑破卡片',
+  group('首页合集卡左滑四块：顺序与宽度', () {
+    testWidgets('左滑露出「封面 / 移动 / 重命名 / 删除」四块，每块 60dp、总宽不撑破卡片',
         (tester) async {
       await _pumpHomeWithGithub(
         tester,
@@ -213,26 +220,27 @@ void main() {
       expect(find.text('移动'), findsNothing, reason: '合上时不在树上');
       await _swipeCardLeft(tester, find.text('动画'));
 
-      for (final label in ['移动', '重命名', '删除']) {
+      for (final label in ['封面', '移动', '重命名', '删除']) {
         final block = find.byKey(SwipeActionBox.actionKey(label));
         expect(block, findsOneWidget, reason: '「$label」这一块要露出来');
         final size = tester.getSize(block);
-        expect(size.width, 76, reason: '默认 actionWidth（≥48dp 触摸目标）');
+        expect(size.width, 60,
+            reason: '四块必须收到 60dp（与合集页子合集卡同宽，见文件头的契约变更说明）');
         expect(size.height, greaterThanOrEqualTo(48));
       }
 
-      // 「别把 360dp 屏挤坏」：3 块总宽 ≤ 卡片可用宽（360 - 左右各 12 内边距）
+      // 「别把 360dp 屏挤坏」：4 块总宽 ≤ 卡片可用宽（360 - 左右各 12 内边距）
       const cardWidth = 360.0 - 12 * 2;
-      expect(76.0 * 3, lessThanOrEqualTo(cardWidth));
+      expect(60.0 * 4, lessThanOrEqualTo(cardWidth));
       // 全露出后卡片本体仍留一块可见区域（不是被整张推出屏外）
       final area = tester.getSize(find.byKey(SwipeActionBox.actionAreaKey));
       expect(area.width, lessThanOrEqualTo(cardWidth));
-      expect(cardWidth - 76.0 * 3, greaterThanOrEqualTo(100),
-          reason: '至少留 100dp 卡片可见（封面 64 + 一截名字）');
+      expect(cardWidth - 60.0 * 4, greaterThanOrEqualTo(90),
+          reason: '至少留 90dp 卡片可见（封面 64 + 一截名字；实际 96dp）');
       expect(tester.takeException(), isNull);
     });
 
-    testWidgets('三块顺序：移动在最左、删除在最右（与合集页子合集卡一致）',
+    testWidgets('四块顺序：封面在最左、删除在最右（与合集页子合集卡一致）',
         (tester) async {
       await _pumpHomeWithGithub(
         tester,
@@ -243,17 +251,20 @@ void main() {
       );
       await _swipeCardLeft(tester, find.text('动画'));
 
+      final xCover =
+          tester.getCenter(find.byKey(SwipeActionBox.actionKey('封面'))).dx;
       final xMove =
           tester.getCenter(find.byKey(SwipeActionBox.actionKey('移动'))).dx;
       final xRename =
           tester.getCenter(find.byKey(SwipeActionBox.actionKey('重命名'))).dx;
       final xDelete =
           tester.getCenter(find.byKey(SwipeActionBox.actionKey('删除'))).dx;
+      expect(xCover, lessThan(xMove));
       expect(xMove, lessThan(xRename));
       expect(xRename, lessThan(xDelete));
     });
 
-    testWidgets('「未分类」卡不是合集 → 没有「移动」这一块', (tester) async {
+    testWidgets('「未分类」卡不是合集 → 四块一个都没有', (tester) async {
       await _pumpHomeWithGithub(
         tester,
         _dataWith(
@@ -262,9 +273,9 @@ void main() {
         ),
       );
       await _swipeCardLeft(tester, find.text('未分类'));
-      expect(find.text('移动'), findsNothing);
-      expect(find.text('重命名'), findsNothing);
-      expect(find.text('删除'), findsNothing);
+      for (final label in ['封面', '移动', '重命名', '删除']) {
+        expect(find.text(label), findsNothing);
+      }
     });
 
     testWidgets('左滑露出后，长按拖拽仍可用（同级重排没被手势层挡住）',

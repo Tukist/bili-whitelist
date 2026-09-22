@@ -83,7 +83,7 @@ Map<String, dynamic> _spiBody() => {
       'data': {'b_3': 'buvid3test', 'b_4': 'buvid4test'},
     };
 
-/// 评论区路径（v2.25.2+ 专栏页底部有评论区）。
+/// 评论区路径（v2.26.0+ 专栏页底部有评论区）。
 const String _kReplyPath = '/x/v2/reply/main';
 
 /// 空评论页：只关心正文的用例用它把评论区垫成「暂无评论」——

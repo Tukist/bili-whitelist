@@ -4,7 +4,7 @@ import '../sync/whitelist_freshness.dart';
 import '../theme/app_palette.dart';
 import '../theme/app_tokens.dart';
 
-/// 「你正在看的是**陈旧的离线快照**」常驻提示横幅（v2.43.1）。
+/// 「你正在看的是**陈旧的离线快照**」常驻提示横幅（v2.44.0）。
 ///
 /// ## 解决的是什么
 /// v2.43.0 把门禁做在了**写**侧：用户动手改的那一刻弹一句「这次修改没有保存」。

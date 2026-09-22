@@ -3,7 +3,7 @@
 /// - **独立评论页** [CommentPage]（comment_page.dart 现为薄壳）：整页只读评论；
 /// - **播放页竖屏内嵌评论区**（player_page.dart）：视频区下方直接内嵌本列表，
 ///   视频切换（换源/选集）时由宿主按 bvid+分P 换 [key] 触发重新加载；
-/// - **专栏阅读页**（article_page.dart，v2.25.2+）：正文整块作为 [header]
+/// - **专栏阅读页**（article_page.dart，v2.26.0+）：正文整块作为 [header]
 ///   挂在列表第 0 项，正文之下就是评论区（同一个滚动体，不再 shrinkWrap）——
 ///   此时走 [oid]（cvid）+ [commentType] = 12，[video] 传 null。
 ///
@@ -203,7 +203,7 @@ class _ChildrenState {
 class CommentListView extends StatefulWidget {
   /// 评论所属视频（aid 在本组件内异步解析；番剧 epId 等由 BiliApi 处理）。
   ///
-  /// v2.25.2+ 起**可为 null**：只按 [oid] 取评论的场景（专栏阅读页）不需要
+  /// v2.26.0+ 起**可为 null**：只按 [oid] 取评论的场景（专栏阅读页）不需要
   /// 视频对象；为 null 时不会再走 view 接口反查。
   final WhitelistVideo? video;
 

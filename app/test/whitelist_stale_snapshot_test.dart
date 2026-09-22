@@ -404,7 +404,7 @@ void main() {
 
       await _createCollection(tester, '被拦的');
       expect(adapter.requests, isEmpty);
-      // v2.43.1 起首页顶部多了一条常驻陈旧横幅（`StaleSyncBanner`），它也有
+      // v2.44.0 起首页顶部多了一条常驻陈旧横幅（`StaleSyncBanner`），它也有
       // 一个「立即同步」按钮 → 这里必须指名 SnackBar 里那个动作，否则会与横幅
       // 撞名。断言强度不变：仍然是"恰好一个"带该文案的动作，并且点的就是它。
       final snackSyncAction =

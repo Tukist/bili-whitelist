@@ -1,7 +1,7 @@
 // v2.17.17「横屏置顶模式」真机/模拟器集成验收（真实网络 + 真实播放器）：
 //   flutter test integration_test/landscape_pin_flow_test.dart -d emulator-5554
 //
-// 方向前置（v2.17.18 起自足，不再依赖宿主机手工介入）：
+// 方向前置（v2.18.0 起自足，不再依赖宿主机手工介入）：
 //   - 测试在需要横屏/竖屏处**自己发方向请求**（SystemChrome → Activity
 //     requestedOrientation，等价于用户横放/竖放设备；应用进程无
 //     WRITE_SETTINGS，写不了 `settings put system user_rotation`）；
@@ -162,7 +162,7 @@ void main() {
     }
 
     // 方向前置（② 之前）：设备必须横放（= 横屏窗口）。
-    //    v2.17.18：不再要求宿主机必须手工 adb 旋转——宿主 20s 内没转就由本
+    //    v2.18.0：不再要求宿主机必须手工 adb 旋转——宿主 20s 内没转就由本
     //    测试自行请求横屏（见 [_ensureLandscape]）；两者都不成 → 明确 skip
     //    （复位竖屏后跳过，不留红）。
     final (rotatedLandscape, selfRotated) = await _ensureLandscape(tester);

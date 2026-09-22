@@ -303,7 +303,7 @@ class _UpownerPageState extends State<UpownerPage> {
   @visibleForTesting
   static void debugClearUpownerInfoCache() => _upInfoCache.clear();
 
-  /// 开播状态（v2.25.2+，「正在直播」标记用；null = 没在播 / 还没查到 /
+  /// 开播状态（v2.26.0+，「正在直播」标记用；null = 没在播 / 还没查到 /
   /// 查失败——三种都不显示标记，与「没在播」同一个观感）。
   ///
   /// 只**会话内**缓存（在 [LiveStatusHub.instance] 里，不落盘、不写 Gist）；
@@ -681,7 +681,7 @@ class _UpownerPageState extends State<UpownerPage> {
     );
   }
 
-  /// 查「这位 UP 主是否正在直播」（白名单 UP 主的**最小形态**标记，v2.25.2+）。
+  /// 查「这位 UP 主是否正在直播」（白名单 UP 主的**最小形态**标记，v2.26.0+）。
   ///
   /// - 取数走 [LiveStatusHub.instance]：**会话内缓存 + 串行 + 相邻请求间隔
   ///   ≥1.5s**（B 站对 live 接口风控很严，不可并发轰炸），**失败静默**——
@@ -2341,7 +2341,7 @@ class _ArticleCard extends StatelessWidget {
 }
 
 // ---------------------------------------------------------------------------
-// 「正在直播」标记（v2.25.2+）
+// 「正在直播」标记（v2.26.0+）
 // ---------------------------------------------------------------------------
 
 /// 「正在直播」标记（UP 主页顶部信息区 + 信箱顶卡共用）。

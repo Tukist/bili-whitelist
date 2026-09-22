@@ -141,7 +141,7 @@ class WhitelistVideo {
   /// epId/pubdate/desc/view 不被本方法修改：未传时沿用原值（合集移动/重排不丢
   /// 番剧集标识、发布时间、简介与播放量）。
   ///
-  /// [pages]（v2.46.0+）：只在**传了**才替换（`pages ?? this.pages` 语义），
+  /// [pages]（v2.49.0+）：只在**传了**才替换（`pages ?? this.pages` 语义），
   /// 调用方（播放页运行时补齐分 P 列表）用它把 view 接口的 data.pages 挂到
   /// 条目上；不传时原样保留（既有调用零影响，也没法用它把 pages 清成 null）。
   WhitelistVideo copyWith(
@@ -355,13 +355,18 @@ class CollectionInfo {
 
   /// 封面图 **URL**（空串 = 没设，UI 回落到「合集内第一个视频的封面」）。
   ///
-  /// **为什么 v1 只支持 URL、不做「从相册选图」**（别改成 base64）：白名单整份
-  /// 存在一个 GitHub Gist 的文本 JSON 里，而**每一次写操作都要 PATCH 整份**
-  /// （改个合集名、加一个视频都会重传全部内容）。把图片塞成 base64 会让每次
-  /// 写入膨胀到十几 MB，既过不了 Gist 单文件体积上限，也会让「改个名字」这种
-  /// 小操作变成几十秒的网络请求。存本地路径同样不行：换设备 / 重装后路径失效，
-  /// 而白名单是跟着 Gist 走的跨设备数据。URL 是这里唯一「零成本、可跨设备」的
-  /// 方案。
+  /// **这个字段永远只存 URL，别改成 base64 / 本机路径**：白名单整份存在一个
+  /// GitHub Gist 的文本 JSON 里，而**每一次写操作都要 PATCH 整份**（改个合集名、
+  /// 加一个视频都会重传全部内容）。把图片塞成 base64 会让每次写入膨胀到十几 MB，
+  /// 既过不了 Gist 单文件体积上限，也会让「改个名字」这种小操作变成几十秒的网络
+  /// 请求。存本地路径同样不行：换设备 / 重装后路径失效，而白名单是跟着 Gist 走的
+  /// 跨设备数据。URL 是这里唯一「零成本、可跨设备」的方案。
+  ///
+  /// v2.50.0 起支持**从相册选一张本机封面**（用户需求），走的正是上面这条约束下
+  /// 唯一可行的做法：图片文件存 App 私有目录、映射存本机
+  /// SharedPreferences，**完全不进这个字段**（见 `CollectionCoverStore`）。
+  /// 所以这里是「可同步的封面地址」，本机封面是另一份数据、优先级更高
+  /// （本机图 > [cover] > 首个视频封面 > 占位）。
   final String cover;
 
   /// 简介（纯文本，可含换行；空串 = 没设，UI 不占位）。
@@ -478,6 +483,29 @@ String collectionLocalName(String path) {
   return i < 0 ? p : p.substring(i + 1);
 }
 
+/// 路径拼装：**单段名字**挂到 [parentPath] 下面（[parentPath] 空 = 顶层）。
+///
+/// 单独提出来（而不是各处自己写 `'$p/$n'`）有两个理由：分隔符与"顶层不额外
+/// 加斜杠"这条规则只有一处真相；以及**页面层改合集路径时要算出与模型层逐字符
+/// 一致的新路径** —— 本机封面映射（`CollectionCoverStore`）的 key 就是这个
+/// 路径，拼错一个字符，封面就会挂在一条没人认领的路径上（表现为"改个名封面
+/// 就没了"）。
+String joinCollectionPath(String parentPath, String localName) {
+  final p = normalizeCollectionPath(parentPath);
+  final n = localName.trim();
+  return p.isEmpty ? n : '$p$kCollectionSep$n';
+}
+
+/// 重命名后的新路径：[newLocalName] 是**单段**新名，层级不变
+/// （`甲/乙` + `丙` → `甲/丙`，顶层 `甲` + `乙` → `乙`）。
+String collectionPathAfterRename(String path, String newLocalName) =>
+    joinCollectionPath(collectionParentOf(path), newLocalName);
+
+/// 移动到 [target] 之后的新路径（[target] 空串 = 移到顶层）：前缀换成
+/// [target]，最后一段（局部名）不变（`甲` → `乙/甲`）。
+String collectionPathAfterMove(String source, String target) =>
+    joinCollectionPath(target, collectionLocalName(source));
+
 /// 层级深度：顶层 = 0，每深一层 +1（`甲/乙/丙` → 2）。
 int collectionDepth(String path) {
   final p = normalizeCollectionPath(path);
@@ -592,8 +620,7 @@ WhitelistData createSubCollection(
       '父合集「$parent」不存在（现有合集: ${_existingHint(names)}）',
     );
   }
-  final full =
-      parent.isEmpty ? name.trim() : '$parent$kCollectionSep${name.trim()}';
+  final full = joinCollectionPath(parent, name);
   if (names.contains(full)) {
     throw CollectionException('合集「$full」已存在');
   }
@@ -635,8 +662,7 @@ WhitelistData renameCollection(
       '合集「$old」不存在（现有合集: ${_existingHint(names)}）',
     );
   }
-  final parent = collectionParentOf(old);
-  final newPath = parent.isEmpty ? neu : '$parent$kCollectionSep$neu';
+  final newPath = collectionPathAfterRename(old, neu);
   if (newPath == old) return data; // 同名（含只差空白）→ 未改动
   if (names.contains(newPath)) {
     throw CollectionException(
@@ -784,8 +810,7 @@ WhitelistData moveCollectionUnder(
       '目标合集「$dst」不存在（现有合集: ${_existingHint(names)}）',
     );
   }
-  final local = collectionLocalName(src);
-  final newPath = dst.isEmpty ? local : '$dst$kCollectionSep$local';
+  final newPath = collectionPathAfterMove(src, dst);
   if (newPath == src) return data; // 已经在该层级 → 未改动
   if (names.contains(newPath)) {
     throw CollectionException(

@@ -17,7 +17,10 @@
 ///     卡片，可以上滑回来**」）—— 把这张从队首**推到队尾**、不做任何判断，
 ///     于是后面那张顶上来；这张之后还会再出现（它一直在队列里）；
 ///   - **上滑 = 取回** —— 把最近一次被「稍后」推后的那张拿回**栈顶**
-///     （LIFO，可连续取回），同样不写任何东西；
+///     （LIFO，可连续取回），同样不写任何东西；取不到（从没下滑过 / 那张还在
+///     飞）时弹回原位 + 一条「暂无可取回的卡片」提示，**不静默**（v2.49.1）；
+///     同一张卡每次「稍后」只欠**一次**取回（一张票一张卡，见 [_deferredBvids] 的
+///     不变式；旧实现会让同一张卡在飞行窗口里被反复搬回栈顶 = 用户看到的循环）；
 ///   - 没过阈值 → 弹回原位；
 /// - 「快速轻扫」四个方向都算数（v2.32.0+）：位移没过距离阈值但**甩得够快**
 ///   （同一对阈值横竖共用，见 [_onDragEnd]）→ 照样判定。斜着划按**主导轴**
@@ -53,12 +56,14 @@
 /// 这期间：
 /// - 顶部 AppBar 显示一行「检查中…」（[_busyNote]），**仅提示、不禁用任何操作**；
 /// - 用户照样能**划卡、点卡开播放页、撤销**（[_openItem] 只由 [_opening] 防连点）；
-/// - 检查完成时用 [_mergeChecked] 合并结果：**只把新出现的条目追加到队尾**，
-///   已经在队列里的、以及本次会话里被消费掉的（[_consumedBvids]）一律跳过 →
-///   卡片栈**不会跳回第一张**，用户划过的不复活；
+/// - 检查完成时用 [_mergeChecked] 合并结果：**只把新出现的条目并进来**，
+///   已经在队列里的、正在幽灵层里飞的、以及本次会话里被消费掉的
+///   （[_consumedBvids]）一律跳过 → 卡片栈**不会跳回第一张**，用户划过的不复活；
+///   新条目按**发布时间倒序**插到它该在的位置（v2.49.1；见 [_mergeChecked] 的
+///   说明：既不再压到队尾，也绝不顶掉用户当前正在看的那张）；
 /// - ★ **检查进行中也会把新条目送进来**（[_pollProgress]）：服务层是"边查边
 ///   落盘"的（每查完一个 UP 主就写一次本地未读），本页每隔几秒**只读盘、不触网**
-///   回读一次并追加进卡片栈 —— 老实现要等整轮 checkAll 求值回来才合并，一轮
+///   回读一次并并进卡片栈 —— 老实现要等整轮 checkAll 求值回来才合并，一轮
 ///   几分钟期间用户只能看到缓存快照（表现为"一次只见一张，退出重进才见下一张"）；
 /// - 服务层配合：写盘前按最新「已处理」记录再过滤一次（见 `inbox_service.dart`
 ///   的「并发」小节），红点数与页面上这条队列保持一致。
@@ -162,6 +167,17 @@ const double _kBottomBarH = 76;
 /// 未配置 GitHub 时的门禁提示（与搜索页 / 管理页文案一致）。
 const String _kConfigHint = '请先到底部导航「个人」页配置 GitHub token 与 Gist ID';
 
+/// 上滑「取回」但**没有可取的卡**时的提示（v2.49.1）。
+///
+/// 三种情况都会走到它：从没下滑过、下滑的那张还在幽灵层里飞（约 500ms 的窗口，
+/// 见 [_deferredBvids] 不变式 3）、票已经被上一次取回消费掉。
+///
+/// 为什么要提示而不是静默：旧实现这里只有一行 `debugPrint`，用户看到的是"卡片
+/// 弹回原位、什么都没发生"，直接读成"卡了 / 上下滑逻辑乱"（这正是本批要修的
+/// 观感）。文案克制到只说明"现在没有可取的"，不解释原因（那要分三句，反而吵）；
+/// 走 [AppSnack] 的 info 档 → 用户在设置里关掉「界面提示」时它同样安静。
+const String _kNoRestoreHint = '暂无可取回的卡片';
+
 /// 水平飞出的距离倍数（× 屏宽）。**既有值，别动**：它是"出屏"这件事的
 /// 观感基准，竖直方向的时长就是按它等比折算的（见 [inboxExitMotion]）。
 const double kInboxExitRatio = 1.4;
@@ -196,10 +212,10 @@ const double kInboxExitRatio = 1.4;
   );
 }
 
-/// 正在飞出的那张（**已经交接**：从 [_InboxPageState._items] 里摘出去了）。
+/// 正在飞出的那张（**已经交接**：从 [InboxPageState._items] 里摘出去了）。
 ///
 /// 它就是"松手后立刻能拖下一张"的关键：飞行观感还在（画在整叠牌之上、由
-/// [_InboxPageState._ghostFly] 独立驱动），但**不吃手势**、也不占队列的队首 ——
+/// [InboxPageState._ghostFly] 独立驱动），但**不吃手势**、也不占队列的队首 ——
 /// 新顶卡因此可以马上开始下一次拖动。
 class _GhostExit {
   _GhostExit({
@@ -219,7 +235,7 @@ class _GhostExit {
   final _SwipeEdge edge;
 
   /// 飞出区间（松手那一刻的位移 → 屏外），与顶卡飞出的那一段**完全同一组端点**：
-  /// 交接时把 [_InboxPageState._fly] 的进度原样交给 [_InboxPageState._ghostFly]，
+  /// 交接时把 [InboxPageState._fly] 的进度原样交给 [InboxPageState._ghostFly]，
   /// 位置逐帧连续（不会在交接那一帧"跳一下"）。
   final Offset from;
   final Offset to;
@@ -238,7 +254,7 @@ class _GhostExit {
   Offset offsetAt(double t) => Offset.lerp(from, to, kCurveOut.transform(t))!;
 }
 
-/// 检查进行中「回读本地未读」的间隔（见 [_InboxPageState._pollProgress]）。
+/// 检查进行中「回读本地未读」的间隔（见 [InboxPageState._pollProgress]）。
 ///
 /// 服务层是"边查边落盘"的（每个 UP 主查完就写一次未读），而一轮遍历里每个
 /// UP 主间隔 ≥1.5s（风控时 3s）——3s 回读一次足够跟上进度，又不至于频繁重建
@@ -314,7 +330,7 @@ class _SwipeRecord {
   /// true = 加入（右滑，可能已写白名单），false = 跳过（左滑）。
   /// 不单独存：行为一律由方向经 [_actionForEdge] 折算，免得两处说法打架。
   /// 注意：只有「加入 / 跳过」会进撤销位 —— 下滑「稍后」不进（它是靠上滑
-  /// 「取回」回来的，见 [_deferred]）。
+  /// 「取回」回来的，见 [_deferredBvids]）。
   bool get liked => _actionForEdge(edge) == InboxSwipeAction.like;
 }
 
@@ -328,10 +344,18 @@ class InboxPage extends StatefulWidget {
   final WhitelistWriter? writer;
 
   @override
-  State<InboxPage> createState() => _InboxPageState();
+  State<InboxPage> createState() => InboxPageState();
 }
 
-class _InboxPageState extends State<InboxPage>
+/// 状态类**故意是公开的**（与 `schedule_page.dart` 的 `SchedulePageState` 同一套
+/// 约定）：队列 `_items` 与「待取回」票据栈 `_deferredBvids` 都是私有字段，widget
+/// 测试读不到，而"上下交替多少轮之后每张卡最多被取回一次"这类**不变式**只有直接
+/// 核对这两个容器的内容才断言得动（只靠动画位置/文案间接推断，正是这个循环缺陷
+/// 一直没被测试逮住的原因）。
+///
+/// 观察口一律集中在文件末尾的「测试观察口」一节、一律 `@visibleForTesting`，
+/// 不参与任何业务逻辑（与 [ImageViewerPage] / `SchedulePage` 的同一约定）。
+class InboxPageState extends State<InboxPage>
     // 两个 controller：顶卡（[_fly]）与幽灵卡（[_ghostFly]）要同时跑 —— 后者是
     // "飞出的那张继续飞"、前者要能立刻接住新手势 → 不能用 Single
     with TickerProviderStateMixin {
@@ -383,17 +407,34 @@ class _InboxPageState extends State<InboxPage>
   /// （它不是判定，那张必须还能再看到）。
   final Set<String> _consumedBvids = <String>{};
 
-  /// 「稍后」推后的卡片（**栈**，LIFO）：上滑「取回」时从栈顶拿回最近的一张。
+  /// 「稍后」推后的卡片：**只存 bvid 的票据栈**（LIFO）—— 上滑「取回」时从栈顶
+  /// 拿回最近推后的一张。
   ///
-  /// 关键约定（改这里之前先读这条）：
-  /// - 被推后的卡**一直留在 [_items] 里**（只是排到了队尾）→ 用户"先看后面的
-  ///   卡片"之后，它照样会随着队列转回来；这份记录只是为了记**取回的顺序**；
+  /// ★ 表示方式（v2.49.1 定下的，动它之前先读这一段）
+  /// 卡**只有一份，就是 [_items] 里那一份**；这里存的不是第二份卡，而是"这张卡
+  /// 还欠着一次取回"的**票**。为什么不做成存放 [InboxItem] 的第二份列表：那样同一
+  /// 张卡会同时"活在"两处（旧实现就是这样），谁改了一处忘了另一处，两边就打架 ——
+  /// 用户报的「不停上滑，之前处理掉的卡片变成循环」正是这么来的（飞行窗口里上滑把
+  /// 正在飞的那张搬回队首、落地时又给它挂一次票，于是它永远可取）。票只认 bvid，
+  /// 卡的内容永远回查 [_items] 那一份 → 结构上不存在"两边不一致"。
+  ///
+  /// 三条不变式（[debugItemBvids] / [debugDeferredBvids] 就是给测试核对它们的）：
+  /// 1. **票必有卡**：这里每个 bvid 在 [_items] 里恰好找得到一次（[_topRestorable]
+  ///    顺手丢掉"票在、卡不在"的脏票，[_applyRestore] 也是靠它回查那一份）；
+  /// 2. **一卡一票**：同一个 bvid 在这里最多一条（[_reinsertDeferred] 先删后加）；
+  /// 3. **飞行中无票**：一张「稍后」的卡被交接进幽灵层那一刻票就作废
+  ///    （[_settleExit]）→ 约 500ms 的飞行窗口里它既不在 [_items] 也不在这里，
+  ///    上滑**取不到它**（要么取到更早落地的票，要么给可见反馈）；落地
+  ///    （[_reinsertDeferred]）回到队尾时才重新挂票。
+  ///
+  /// 其余既有约定不变（同样重要）：
+  /// - 被推后的卡**留在 [_items] 里**（只是排到了队尾）→ 用户"先看后面的卡片"
+  ///   之后它照样随队列转回来；这份记录只决定**取回的顺序**；
   /// - 它**不进** [_consumedBvids]、不调 `markHandled`、不写 Gist、不取元数据
   ///   （用户原话：「暂时不判断」）；
-  /// - 一张卡在这份记录里最多出现一次（再次下滑时挪到栈顶，见 [_settleExit]）；
   /// - 判定掉（加入 / 跳过）、撤销、全部标记已读时把它清出来（见各处调用点）——
   ///   否则上滑会把一张已经处理掉的卡再搬回栈顶。
-  final List<InboxItem> _deferred = <InboxItem>[];
+  final List<String> _deferredBvids = <String>[];
 
   /// 正在 fetch view 元数据（防连点重复 push 播放页）。
   bool _opening = false;
@@ -617,17 +658,56 @@ class _InboxPageState extends State<InboxPage>
   /// 把一份「服务端 / 缓存的队列」并进当前队列。
   ///
   /// ★ 只增不改（并发要求）：已经在队列里的、以及本次会话里被用户消费掉的
-  /// （[_consumedBvids]）一律跳过；新出现的条目**追加到队尾**。刻意不重排、
-  /// 不覆盖：一轮 [InboxService.checkAll] 可能跑几分钟，期间用户已经划走了
-  /// 几张，重排会让卡片栈跳回第一张、覆盖会让划过的不复活。
+  /// （[_consumedBvids]）一律跳过；新出现的条目**按发布时间倒序插到它该在的
+  /// 位置**。刻意不覆盖：一轮 [InboxService.checkAll] 可能跑几分钟，期间用户
+  /// 已经划走了几张，覆盖会让划过的不复活。
+  ///
+  /// 为什么不再是"一律追加到队尾"（v2.49.1 改）：服务返回的列表是按发布时间
+  /// **倒序**的（[InboxService.getItems] / checkAll 的返回值都走同一口径），
+  /// 追加会把**更新的视频压到队尾** → 卡片顺序与发布时间序脱钩，用户报的
+  /// 「顺序很乱」有一半来自这里。现在插到第一张比它旧的卡之前；pubDate 相同的
+  /// 排在后面（服务返回的顺序即"先到先得"）→ 既有的"同批条目顺序不变"照样成立。
+  ///
+  /// ★ 但**绝不插到当前这张之前**（插入位置下限 = 索引 1）：用户手上正在看的
+  /// 那张不许因为一次后台回读换人 —— 这是既有硬契约，被
+  /// `test/inbox_swipe_test.dart` 的「检查进行中…当前正在看的那张不能换人」
+  /// 锁着（回读每 3s 一次、正跑在拖动中间，换人会把这一次手势判到另一张视频
+  /// 头上）。当前那张被划走之后，队列就完全按发布时间序了。
+  ///
+  /// [_deferredBvids] 的取回顺序不受影响：它是按"推后的先后"入栈的，与卡在队列
+  /// 里的位置无关（「稍后」永远是把卡送到队尾，见 [_reinsertDeferred]）。
   List<InboxItem> _mergeChecked(List<InboxItem> incoming) {
     final known = {for (final it in _items) it.bvid};
-    final merged = List<InboxItem>.of(_items);
+    // 正在幽灵层里飞的那张（「稍后」的）不算"新条目"：它本来就在回来的路上，
+    // 落地时由 [_reinsertDeferred] 插回队尾。并进来会出两个问题：① 飞行窗口里
+    // 同一张卡同时画在牌堆与幽灵层上（看起来有两张）；② 落地时它"已经在队里"，
+    // 按 [_reinsertDeferred] 的约定就不再挂票 → 这张再也取不回来了。
+    //（判定掉的那张本来就在 [_consumedBvids] 里，已经挡住了。）
+    // ★ 这一条只在"回读刚好落在飞行窗口里"时才起作用（竖直方向出屏约 508ms，
+    //   交接点在它的 160ms 处 → 空窗期约 348ms，每 3s 一次的回读撞得上）。
+    //   去掉它，上面那两个问题会同时发生：`test/inbox_swipe_test.dart` 的
+    //   「回读正好撞上「稍后」那张还在飞」就是拿这条的消失当红。
+    final String? flyingBvid = _ghost?.item.bvid;
+    final fresh = <InboxItem>[];
     for (final it in incoming) {
       if (it.bvid.isEmpty) continue;
       if (_consumedBvids.contains(it.bvid)) continue;
+      if (it.bvid == flyingBvid) continue;
       if (!known.add(it.bvid)) continue; // 已在队列里（add 返回 false）
-      merged.add(it);
+      fresh.add(it);
+    }
+    if (fresh.isEmpty) return _items;
+    final merged = List<InboxItem>.of(_items);
+    for (final it in fresh) {
+      // 从索引 1 起找第一张比它旧的 → 插在它前面（没有比它旧的 → 追加到队尾）
+      var at = merged.length;
+      for (var i = 1; i < merged.length; i++) {
+        if (merged[i].pubDate < it.pubDate) {
+          at = i;
+          break;
+        }
+      }
+      merged.insert(at, it);
     }
     return merged;
   }
@@ -635,8 +715,8 @@ class _InboxPageState extends State<InboxPage>
   /// 触发 checkAll(force=true) 并刷新本地列表。
   ///
   /// ★ 不阻塞交互：检查期间用户可以继续划卡 / 点开播放页 / 撤销，只在 AppBar
-  /// 上给一行「检查中…」。结果走 [_mergeChecked]（只追加新条目），当前正在
-  /// 看的那张不会跳回第一张。
+  /// 上给一行「检查中…」。结果走 [_mergeChecked]（只增不改；新条目按发布时间
+  /// 落位，但绝不插到当前这张之前），当前正在看的那张不会跳回第一张。
   ///
   /// ★ 检查**进行中**也会把新条目送进卡片栈：见 [_pollProgress]（服务层是
   /// "边查边落盘"的）。一轮遍历可能几分钟，如果只靠这里 await 回来的那一次
@@ -733,13 +813,13 @@ class _InboxPageState extends State<InboxPage>
   }
 
   /// 检查进行中：每隔 [_kProgressPoll] **只读盘**（不触网）回读一次本地未读，
-  /// 把新出现的条目追加进卡片栈 —— 用户不必退出重进就能往下滑。
+  /// 把新出现的条目并进卡片栈（按发布时间落位）—— 用户不必退出重进就能往下滑。
   ///
   /// 服务层每查完一个 UP 主就落盘一次，所以这里读到的新条目就是"刚抓到的"。
-  /// 合并仍走 [_mergeChecked]：**只追加、不重排**，已在队列里的与本次会话里
-  /// 消费过的一律跳过；队列长度没变（没有新条目）时直接返回，连 setState 都
-  /// 不发 —— 既不会扰动正在进行的滑动/飞出动画，也让测试里的 `pumpAndSettle`
-  /// 能正常收敛。
+  /// 合并仍走 [_mergeChecked]：**只增不改**（已在队列里的与本次会话里消费过的
+  /// 一律跳过），且**绝不插到当前这张之前** → 既不会扰动正在进行的滑动/飞出
+  /// 动画；队列长度没变（没有新条目）时直接返回，连 setState 都不发，测试里的
+  /// `pumpAndSettle` 也就能正常收敛。
   Future<void> _pollProgress() async {
     if (!mounted || !_checking) return;
     final items = await ServiceLocator.inboxService.getItems();
@@ -764,7 +844,7 @@ class _InboxPageState extends State<InboxPage>
         _items = items;
         // 全部标记已读 = 用户明说"这些都看过了" → 「待取回」的也一并作废
         // （否则上滑还会把一张已经标记已读的卡搬回栈顶）
-        _deferred.clear();
+        _deferredBvids.clear();
         // 全部标记已读 = 这一屏的卡都不作数了 → 撤销栈也一并作废
         _undoStack.clear();
         _busyNote = null;
@@ -870,7 +950,7 @@ class _InboxPageState extends State<InboxPage>
     _drag = c == null ? Offset.zero : _offsetAt(c.value);
     c?.stop();
     _anim = null;
-    // 取回的第一步被夺回 = 这次取回取消（那张还在 [_deferred] 里，随时能再上滑）
+    // 取回的第一步被夺回 = 这次取回取消（那张的票还在，随时能再上滑）
     _restorePending = false;
     _deciding = false;
   }
@@ -949,8 +1029,8 @@ class _InboxPageState extends State<InboxPage>
         : (v > 0 ? _SwipeEdge.right : _SwipeEdge.left);
     final action = _actionForEdge(edge);
     // 没有"待取回"的卡时**不亮**「取回」：亮着却什么都回不来，会让人以为卡丢了
-    //（松手时的行为见 [_decide] 的 restore 分支：什么都不做、弹回原位）
-    _reaction = (action == InboxSwipeAction.restore && _deferred.isEmpty)
+    //（松手时的行为见 [_decide] 的 restore 分支：弹回原位 + 一条可见提示）
+    _reaction = (action == InboxSwipeAction.restore && _deferredBvids.isEmpty)
         ? null
         : action;
     _reactionProgress = (v.abs() / unit).clamp(0.0, 1.0);
@@ -1032,17 +1112,25 @@ class _InboxPageState extends State<InboxPage>
 
     // ---- 上滑 = 取回：手上这张不判定、不飞走，把最近推后的那张拿回栈顶 ----
     if (action == InboxSwipeAction.restore) {
-      final back = _deferred.isEmpty ? null : _deferred.last;
+      // ★ 只有"票栈顶、且那张确实还在队列里"才算有得取（[_topRestorable]）。
+      //   一张刚「稍后」出去、还在幽灵层里飞的卡**没有票**（不变式 3）→ 这里
+      //   取不到它，于是既不会把正在飞的那张搬到队首，也不会"取回"一张根本没
+      //   动过的卡（旧实现两种都会发生，这正是"上下滑逻辑乱"的来源）。
+      final back = _topRestorable();
       // 判定留痕：`adb logcat | grep inbox` 一眼看出"划了没反应"是为什么
       debugPrint(back == null
-          ? '[inbox] 判定 edge=${_edgeLabel(edge)} → 取回（没有可取的卡 → 不动）'
+          ? '[inbox] 判定 edge=${_edgeLabel(edge)} → 取回（没有可取的卡 → 弹回 + 提示）'
               ' bvid=${item.bvid} drag=$_drag'
           : '[inbox] 判定 edge=${_edgeLabel(edge)} → 取回 bvid=${back.bvid}'
               ' drag=$_drag');
       if (back == null) {
-        // 从没下滑过 → 什么都不做（不判定、不提示、不当成别的动作）
+        // 没有可取的卡（从没下滑过 / 那张还在飞 / 票已被上次取回消费）：
+        // 不判定、不动队列、不当成别的动作 —— 但**不能静默**：旧实现只打了
+        // 一行 debugPrint，用户看到的就是"卡片弹回原位、什么都没发生"，
+        // 直接读成"卡了 / 逻辑乱"（v2.49.1 补上可见反馈）。
         _deciding = false;
         _springBack();
+        _showSnack(_kNoRestoreHint);
         return;
       }
       _restoreTop();
@@ -1263,18 +1351,26 @@ class _InboxPageState extends State<InboxPage>
   ///   与 `markHandled` 都不动）、不写 Gist、不取元数据 —— 用户原话「暂时不判断，
   ///   先看后面的卡片」。它只是**离开队首**，等幽灵落地再插回**队尾**（那句
   ///   "推到队尾"的语义没变，只是分两步：先摘、落地再插，免得同一张卡同时出现在
-  ///   "飞出去"和"牌堆里"两处）。
+  ///   "飞出去"和"牌堆里"两处）。**同时把它的取回票作废**（见下）。
   /// - **加入 / 跳过**：进 [_consumedBvids]（本轮的 checkAll 结果不复活它）、
-  ///   从 [_deferred] 里摘掉（一张卡只能"在某个地方等着"）、压进撤销栈。
+  ///   从 [_deferredBvids] 里摘掉（一张卡只能"在某个地方等着"）、压进撤销栈。
   void _settleExit(InboxItem item, InboxSwipeAction action, _SwipeEdge edge) {
     final bvid = item.bvid;
     _items = [
       for (final it in _items)
         if (it.bvid != bvid) it,
     ];
-    if (action == InboxSwipeAction.defer) return; // 稍后：不判定，落地时回队尾
+    if (action == InboxSwipeAction.defer) {
+      // ★ 票当场作废（[_deferredBvids] 不变式 3）：这张已经离开牌堆、落在幽灵层
+      //   里接着飞（竖直方向约 500ms 才落地）。旧实现在这里直接 return，票留在
+      //   栈上 → ① 飞行窗口里上滑会把**正在飞的这一张**当成"待取回"搬到队首
+      //   （屏幕上同一张卡出现两处）；② 它落地时又挂一次票 → 反复上滑就是同一张
+      //   卡无限回栈顶。用户报的「不停上滑，之前的卡片变循环」正是这两条。
+      _deferredBvids.removeWhere((b) => b == bvid);
+      return; // 稍后：不判定，落地时回队尾（那时才重新挂票）
+    }
     _consumedBvids.add(bvid);
-    _deferred.removeWhere((it) => it.bvid == bvid);
+    _deferredBvids.removeWhere((b) => b == bvid);
     _undoStack.add(_SwipeRecord(item, edge: edge));
     if (_undoStack.length > _kMaxUndo) _undoStack.removeAt(0);
   }
@@ -1302,19 +1398,25 @@ class _InboxPageState extends State<InboxPage>
     _onFlyTick();
   }
 
-  /// 「稍后」的那张落地回**队尾**（[_settleExit] 在交接时把它从队首摘掉了）。
+  /// 「稍后」的那张落地回**队尾**（[_settleExit] 在交接时把它从队首摘掉了；
+  /// 飞行窗口里它没有票，现在才挂上 —— [_deferredBvids] 不变式 3）。
   ///
-  /// 若这张已经被"取回"插回队首了（[_items] 里已有）就不重复插 ——
-  /// 取回是更晚的意图，以它为准。
+  /// 若这张已经在 [_items] 里了（"全部标记已读"那一帧把新队列整体铺上来、
+  /// 或别处把它放了回去）就**什么都不做**：取回是更晚的意图，以它为准，而且
+  /// 一条指向"已经在队首那张"的票只会产生"取了但什么都没动"的假消息。
+  /// 旧实现在这里"插回时去重、挂票时不去重"—— 于是同一张卡可以同时"在队首"
+  /// 和"在待取回栈里"，上滑反复搬它（循环的直接成因）；现在两边同一个判断，
+  /// 票只跟着"这张真的回了牌堆"这件事走。
+  ///
+  /// ⚠️ 正常路径下这个 early return 是**兜底**：卡在飞行期间既不会被 [_items]
+  /// 重新收进来（[_mergeChecked] 会跳过正在飞的那张），也不可能有票。
   void _reinsertDeferred(InboxItem item) {
-    if (!_items.any((it) => it.bvid == item.bvid)) {
-      _items = [..._items, item];
-    }
-    // 推后记录是**栈**：绕一圈又回到队首的挪到栈顶，不留两份
-    //（否则上滑会把同一张插回队列两次）
-    _deferred
-      ..removeWhere((it) => it.bvid == item.bvid)
-      ..add(item);
+    if (_items.any((it) => it.bvid == item.bvid)) return;
+    _items = [..._items, item];
+    // 票是**栈**：绕一圈又回到队尾的挪到栈顶，一卡只留一票（不变式 2）
+    _deferredBvids
+      ..removeWhere((b) => b == item.bvid)
+      ..add(item.bvid);
     // 它已经"回到牌堆后面"了：让交错入场账本忘掉它，好让它在新的层位上
     // 淡入一次（不退账的话，它会从"飞出屏幕"直接"啪"地出现在牌堆里）
     _entranceLedger.clear();
@@ -1352,6 +1454,35 @@ class _InboxPageState extends State<InboxPage>
     _landGhost();
   }
 
+  /// 按 bvid 在队列里查那张**唯一**的卡（票只存 bvid，取回时回查它）。
+  ///
+  /// 正常路径不会查不到：票只在 [_reinsertDeferred]（卡确实落回队尾）时挂上、
+  /// 在卡离开牌堆时（[_settleExit]）作废 —— 见 [_deferredBvids] 不变式 1。
+  InboxItem? _itemOf(String bvid) {
+    for (final it in _items) {
+      if (it.bvid == bvid) return it;
+    }
+    return null;
+  }
+
+  /// 丢掉「票在、卡不在」的脏票（不变式 1 的兜底；正常路径产生不了）。
+  ///
+  /// 留着它的后果很具体：栈顶是一张取不回来的脏票时，上滑会"看起来有可取的卡"
+  /// 却什么都取不回来 —— 又回到"划了没反应"的老问题。
+  void _dropStaleTickets() {
+    if (_deferredBvids.isEmpty) return;
+    _deferredBvids.removeWhere((b) => _itemOf(b) == null);
+  }
+
+  /// 现在能取回的那张（= 票栈顶、且那张确实还在队列里；null = 没有可取的）。
+  ///
+  /// ⚠️ "有没有得取"与"取哪一张"必须是同一个答案，所以 [_decide]、
+  /// [_applyRestore] 都只经这里判断，不各自去看 [_deferredBvids]。
+  InboxItem? _topRestorable() {
+    _dropStaleTickets();
+    return _deferredBvids.isEmpty ? null : _itemOf(_deferredBvids.last);
+  }
+
   /// 上滑 = **取回**：把最近一次被「稍后」推后的那张拿回**栈顶**。
   ///
   /// 两步（见 [_restorePending]）：① 手上这张先弹回原位；② 落位后由
@@ -1381,17 +1512,21 @@ class _InboxPageState extends State<InboxPage>
     c.forward(from: 0);
   }
 
-  /// 取回的第二步：把 [_deferred] 栈顶那张放回**队首**，并从下方滑入到栈顶。
+  /// 取回的第二步：把票栈顶那张放回**队首**，并从下方滑入到栈顶。
   ///
-  /// 它一直在 [_items] 里（只是先前被推到了队尾）→ 先摘掉旧位置再插到队首，
-  /// 免得队列里出现两张一样的。后层由卡片栈反播推进退回原位（[restoreTick]
-  /// 打点，见 `inbox_card_stack.dart`），所以是退回去、不是跳回去。
+  /// 取回的是 [_items] 里那一份（票只记 bvid）→ 先摘掉旧位置再插到队首，
+  /// 免得队列里出现两张一样的；**票在这里消费掉**（一票只能取回一次，
+  /// 见 [_deferredBvids] 不变式 1/2）。后层由卡片栈反播推进退回原位
+  /// （[restoreTick] 打点，见 `inbox_card_stack.dart`），所以是退回去、不是跳回去。
   void _applyRestore() {
     _restorePending = false;
     _deciding = false;
     _anim = null;
-    if (!mounted || _deferred.isEmpty) return;
-    final item = _deferred.removeLast();
+    if (!mounted) return;
+    // 取到哪张、就消费哪张的票：两者是同一个判断（[_topRestorable]）
+    final item = _topRestorable();
+    if (item == null) return; // 没有可取的（票被别的路径清掉 / 队列里已无那张）
+    _deferredBvids.removeLast();
     final c = _motion ? _fly : null;
     setState(() {
       _items = [
@@ -1429,8 +1564,8 @@ class _InboxPageState extends State<InboxPage>
       _commitExit();
       return;
     }
-    // 「取回」的两步动画走到一半：直接放弃这次取回（什么都没写，那张还在
-    // [_deferred] 里，随时能再上滑一次）。★ 必须把 [_deciding] 一起放掉——
+    // 「取回」的两步动画走到一半：直接放弃这次取回（什么都没写，那张的票还在，
+    // 随时能再上滑一次）。★ 必须把 [_deciding] 一起放掉——
     // 它在这一段里是 true，留着的话刷新之后所有手势都会被 [_busy] 挡死。
     _restorePending = false;
     _deciding = false;
@@ -1471,11 +1606,17 @@ class _InboxPageState extends State<InboxPage>
     setState(() {
       // 撤销 → 这条不再算「已消费」：检查回来的合并结果里可以重新出现它
       _consumedBvids.remove(rec.item.bvid);
-      _items = [rec.item, ..._items];
+      // 去重后再插（队列里同一个 bvid 只能有一份 —— 与 [_deferredBvids] 的不变式
+      // 同一口径：一张卡只能在一个位置上）
+      _items = [
+        rec.item,
+        for (final it in _items)
+          if (it.bvid != rec.item.bvid) it,
+      ];
       _loadedOnce = true;
       _clearReaction();
       // 放回来的这张回到了队首 → 不再算「待取回」的（免得它被上滑又插一次）
-      _deferred.removeWhere((it) => it.bvid == rec.item.bvid);
+      _deferredBvids.removeWhere((b) => b == rec.item.bvid);
       if (c == null) {
         _anim = null;
         _drag = Offset.zero;
@@ -1865,4 +2006,34 @@ class _InboxPageState extends State<InboxPage>
       ),
     );
   }
+
+  // ==================== 测试观察口 ====================
+
+  /// 队列（`_items`）的 bvid 顺序，index 0 = 队首。
+  ///
+  /// 测试用它核对两件事：上下滑之后队首是谁、以及**队列里没有重复 bvid**
+  /// （同一张卡不能同时以两份存在）。
+  @visibleForTesting
+  List<String> get debugItemBvids => [for (final it in _items) it.bvid];
+
+  /// 「待取回」票栈的 bvid 顺序（**栈顶 = `.last`**）。
+  ///
+  /// "一张卡最多被取回一次"就是靠它断言的：取回一次它就少一条，取不回来的
+  /// 时候它必须为空（空 + 队首没变 = 没有"同一张卡又回来了"）。
+  @visibleForTesting
+  List<String> get debugDeferredBvids => List<String>.of(_deferredBvids);
+
+  /// 正在幽灵层里飞的那张的 bvid（null = 没有幽灵）。
+  ///
+  /// 飞行窗口里它既不在队列、也不在票栈（[_deferredBvids] 不变式 3）—— 这条
+  /// 就是"下滑之后立刻上滑取不到它"的可观测证据。
+  @visibleForTesting
+  String? get debugGhostBvid => _ghost?.item.bvid;
+
+  /// 「取回」生效的次数（每次成功取回 +1；与卡片栈的 [restoreTick] 同步）。
+  ///
+  /// 给测试数"总共取回了几次"用：交替 N 轮 = 取回 N 次，多一次就说明有卡被
+  /// 重复取回（循环）。
+  @visibleForTesting
+  int get debugRestoreCount => _restoreTick;
 }

@@ -8,7 +8,8 @@
 // - `favFolderId`：>0 才存，0/负数等同"没有上次"；
 // - 存储抛异常时静默降级（读失败回默认、写失败不抛）；
 // - 设置页「写操作」分区：默认关、说明文案写清了为什么默认关 + 投币不可撤回 +
-//   评论/投稿不做；点一下开关 → 开关态与 store 同步。
+//   评论会立刻公开（v2.50.0 把副标题压到两行后只留这几条要点，"投稿/发视频不在
+//   这里"那条免责说明移出）；点一下开关 → 开关态与 store 同步。
 import 'package:dio/dio.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -150,11 +151,15 @@ void main() {
     expect(find.text('已关闭：一个写操作入口都不显示'), findsOneWidget);
     // 默认关的**理由**必须在页面上，不能只写在代码注释里
     expect(find.textContaining('默认关闭'), findsOneWidget);
-    expect(find.textContaining('不支持撤回'), findsOneWidget);
+    // v2.50.0：副标题压到两行 → 原文的「B 站不支持撤回」缩成「投币不可撤回」，
+    // 断言跟着改用新措辞（守的还是同一件事：不可撤回这条安全信息必须在页面上）
+    expect(find.textContaining('投币不可撤回'), findsOneWidget);
     // v2.42.0：评论区也归这道总闸 → 文案必须把"发评论会怎样"说清（它是四件
-    // 写操作里唯一一件"立刻公开给第三方"的）
-    expect(find.textContaining('评论会立刻出现在对方评论区'), findsOneWidget);
-    expect(find.textContaining('投稿/发视频不在这里'), findsOneWidget);
+    // 写操作里唯一一件"立刻公开给第三方"的）。v2.50.0 压到两行后从"评论会立刻
+    // 出现在对方评论区"缩成「（会立刻公开）」，断言随之收窄但意图不变。
+    // 另：「投稿/发视频不在这里」那条免责说明随文案删减一并移出（它只是把
+    // CHANGELOG 里的边界说明重复一遍，不是安全信息）。
+    expect(find.textContaining('会立刻公开'), findsOneWidget);
   });
 
   testWidgets('设置页：点一下开关 → store 变 true 且副标题跟着改', (tester) async {

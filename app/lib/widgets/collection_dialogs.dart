@@ -6,15 +6,24 @@
 /// 首页已经改对、合集页还写着旧文案的情况。
 /// v2.38.0 加的「编辑封面与简介」同理：首页管理面板与子合集卡左滑用的是同一个
 /// 对话框。
+/// v2.50.0 起这个对话框还能**从相册选本机封面**（预览 + 选图 + 移除，见
+/// [showEditCollectionMetaDialog]）：入口也随之补齐到「首页一级合集卡左滑」与
+/// 「合集页 AppBar」，任何层级的合集都能就地改自己的封面简介（此前顶层合集在
+/// 合集页里无处可改，只能在首页管理面板里绕）。
 ///
 /// 合集名的展示统一走 [collectionDisplay]（`甲/乙` → `甲 / 乙`）：顶层合集没有
 /// `/`，展示出来与原样完全一致（既有测试锚点不受影响）；子合集带全路径，
 /// 才看得出自己到底在哪一层。
 library;
 
+import 'dart:io';
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
 
+import '../config.dart';
 import '../models/whitelist_video.dart';
+import '../services/image_pick_service.dart';
 import '../theme/app_tokens.dart';
 
 /// 新建合集 / 新建子合集输入框：返回用户输入的名字（null = 取消）。
@@ -194,17 +203,64 @@ class CollectionPathTile extends StatelessWidget {
   }
 }
 
-/// 编辑合集封面与简介：返回用户填的两个值（null = 取消）。
+/// 封面 URL 的**最小规范化**：只补协议，不做任何其它改写。
 ///
-/// 只负责**收集输入**，落库交给调用方（模型层的 [setCollectionMeta]）。
-/// - 封面只收 **URL**（为什么不做「从相册选图」见 [CollectionInfo.cover] 的
-///   注释：白名单整份存在 Gist，每次写操作都要 PATCH 整份，图片 base64 进去
-///   会让每次写入膨胀到十几 MB；本地路径换设备就丢）；
-/// - **留空 = 不设置**：封面留空 → 卡片回落到「合集内第一个视频的封面」
-///   （与改动前完全一致）；简介留空 → 卡片不占位。所以对话框不提供「恢复
-///   默认」按钮，清空输入框本身就是要表达的意思；
-/// - 简介 `maxLines: 4`：卡片上只展示 1–2 行，「够写一句话」比「能写一篇」
-///   更贴合这个字段的用途。
+/// 真实踩过的坑：从网页 / 图床复制来的封面地址经常是**协议相对**的
+/// `//i0.hdslb.com/xx.jpg`（浏览器里显示得好好的），但 `Image.network` 拿到
+/// 一个没有协议的串会直接加载失败 —— 卡片只剩占位图标，用户看着"地址明明是
+/// 对的"完全不知道为什么。这里把 `//` 开头的补成 `https:`（B 站图床与绝大
+/// 多数图床都是 https）。
+///
+/// **只做这一件事**：不校验后缀、不补 www、不动大小写、不加/去查询参数 ——
+/// 任何额外改写都可能把一条本来能用的地址改坏，而在 `Image.network` 的
+/// errorBuilder 面前"判错"比"照原样试一次"更糟。
+String normalizeCoverUrl(String url) {
+  final u = url.trim();
+  return u.startsWith('//') ? 'https:$u' : u;
+}
+
+/// 编辑合集封面与简介的返回值。
+///
+/// - [cover]：**规范化后**的封面 URL（空串 = 没设，卡片回落首个视频封面）；
+/// - [desc]：简介；
+/// - [coverBytes]：这次从相册**新选**的图片字节（null = 这次没选，保持原样）；
+///   [coverFileName] 是相册给的文件名（只用来取扩展名）；
+/// - [removeLocalCover]：用户点了「移除本机封面」（true 时调用方删掉本机映射
+///   + 文件，卡片回落 [cover]）。
+///
+/// 「本机封面」与 Gist 的 `cover` URL 是**两件并存的事**（本机图优先），所以
+/// 它们分成两组字段返回：调用方据此决定「要不要发 PATCH」—— 只动本机图时
+/// **一个字节都不该发往 Gist**。
+typedef CollectionMetaInput = ({
+  String cover,
+  String desc,
+  Uint8List? coverBytes,
+  String coverFileName,
+  bool removeLocalCover,
+});
+
+/// 编辑合集封面与简介：返回用户填的值（null = 取消）。
+///
+/// 只负责**收集输入**，落库交给调用方（模型层的 [setCollectionMeta]；本机
+/// 封面的文件与映射交给 `CollectionCoverStore`）。
+///
+/// 封面**两种来源并存**（v2.50.0 起）：
+/// - **URL**（可同步）：写进 Gist 的 `cover` 字段，换设备也在；
+/// - **本机图片**（相册选图）：图片拷进 App 私有目录
+///   （`<ApplicationSupport>/collection_covers/`），映射存本机
+///   SharedPreferences，**绝不进 Gist**（base64 进 Gist 会让每次写操作膨胀到
+///   十几 MB；本地路径换设备必失效）—— 为什么只能这样，见
+///   `CollectionCoverStore` 的文件头；
+/// - **优先级：本机图片 > URL**（对话框里那句小字就是告诉用户这件事）。
+///
+/// 几个交互约定：
+/// - **留空 = 不设置**：URL 留空 → 没本机图时卡片回落「合集内第一个视频的
+///   封面」；简介留空 → 卡片不占位；
+/// - **用户取消选图 → 什么都不改**（点开选择器又退出来是正常操作，
+///   不该弹"失败"、也不该清掉已有的本机封面）；
+/// - **预览**（v2.50.0 新增，顺带解决 v2.38.0 "对话框没有预览"的已知限制）：
+///   本机图 / URL / 都空 三种状态当场可见，URL 边打字边变；URL 打错时预览
+///   位置直接显示"这张图加载不出来"，而不是等保存完回到列表才发现。
 ///
 /// 对话框本体的输入框状态放在一个**私有 StatefulWidget** 里（[_CollectionMetaDialog]），
 /// 而不是在这个函数里 `TextEditingController()` + 用完 `dispose()`：
@@ -212,31 +268,38 @@ class CollectionPathTile extends StatelessWidget {
 /// 还没被卸载 —— 那时候 dispose 控制器会踩到 Flutter 框架的
 /// `_dependents.isEmpty` 断言（重建树时直接抛异常）。让 State 自己管自己，
 /// 生命周期就天然对齐了。
-Future<({String cover, String desc})?> showEditCollectionMetaDialog(
+Future<CollectionMetaInput?> showEditCollectionMetaDialog(
   BuildContext context,
   String path, {
   String cover = '',
   String desc = '',
+  String localCoverPath = '',
 }) =>
-    showDialog<({String cover, String desc})>(
+    showDialog<CollectionMetaInput>(
       context: context,
       builder: (_) => _CollectionMetaDialog(
         path: path,
         initialCover: cover,
         initialDesc: desc,
+        initialLocalCoverPath: localCoverPath,
       ),
     );
 
-/// 「封面与简介」对话框本体：自己持有两个输入控制器，随 State 一起释放。
+/// 「封面与简介」对话框本体：自己持有输入控制器，随 State 一起释放。
 class _CollectionMetaDialog extends StatefulWidget {
   final String path;
   final String initialCover;
   final String initialDesc;
 
+  /// 该合集**当前**的本机封面绝对路径（空串 = 没有），只用于预览；
+  /// 换新图 / 移除都由调用方在保存后传给 `CollectionCoverStore`。
+  final String initialLocalCoverPath;
+
   const _CollectionMetaDialog({
     required this.path,
     required this.initialCover,
     required this.initialDesc,
+    this.initialLocalCoverPath = '',
   });
 
   @override
@@ -249,28 +312,142 @@ class _CollectionMetaDialogState extends State<_CollectionMetaDialog> {
   late final TextEditingController _descCtrl =
       TextEditingController(text: widget.initialDesc);
 
+  /// 这次从相册选到的图（null = 没选）。
+  Uint8List? _pickedBytes;
+
+  /// 选到那张图的文件名（相册给的显示名 → 只用来定扩展名）。
+  String _pickedName = '';
+
+  /// 用户在本次对话框里点了「移除本机封面」。
+  bool _removedLocal = false;
+
+  /// 选图失败时的一句中文（成功 / 取消后清空）。
+  String? _pickError;
+
+  /// 是否正在拉起选择器（防连点；按钮上显示转圈）。
+  bool _picking = false;
+
+  /// 当前是否还有本机封面（原图还在 或 这次刚选了新图）。
+  bool get _hasLocalCover =>
+      _pickedBytes != null ||
+      (!_removedLocal && widget.initialLocalCoverPath.isNotEmpty);
+
+  @override
+  void initState() {
+    super.initState();
+    // URL 边打字边更新预览（不然"预览"要等保存完才准）
+    _coverCtrl.addListener(_onCoverChanged);
+  }
+
+  void _onCoverChanged() {
+    if (mounted) setState(() {});
+  }
+
   @override
   void dispose() {
+    _coverCtrl.removeListener(_onCoverChanged);
     _coverCtrl.dispose();
     _descCtrl.dispose();
     super.dispose();
   }
 
+  /// 拉起系统图片选择器。
+  ///
+  /// 三种结果分开处理（与 `ScheduleImportService` 同一套约定）：
+  /// 取消 → **什么都不做**；失败 → 一行中文提示（就在按钮下面，不弹 SnackBar
+  /// —— 对话框开着的时候气泡容易被盖住）；成功 → 记住字节，预览立刻变。
+  Future<void> _pickFromGallery() async {
+    if (_picking) return;
+    setState(() {
+      _picking = true;
+      _pickError = null;
+    });
+    final result = await const ImagePickService().pickImage();
+    if (!mounted) return;
+    setState(() {
+      _picking = false;
+      if (result.isCancelled) return; // 取消：本机封面与 URL 都不动
+      if (!result.isOk) {
+        _pickError = result.error;
+        return;
+      }
+      _pickedBytes = result.bytes;
+      _pickedName = result.fileName;
+      // 刚选了新图 → 之前点过的「移除」作废（用户显然又要了本机封面）
+      _removedLocal = false;
+    });
+  }
+
+  void _removeLocalCover() {
+    setState(() {
+      _pickedBytes = null;
+      _removedLocal = true;
+      _pickError = null;
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
+    final theme = Theme.of(context);
     return AlertDialog(
       title: Text('封面与简介「${collectionDisplay(widget.path)}」'),
       content: SingleChildScrollView(
         child: Column(
           mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            _preview(theme),
+            const SizedBox(height: kSpace8),
+            Row(
+              children: [
+                OutlinedButton.icon(
+                  onPressed: _picking ? null : _pickFromGallery,
+                  icon: _picking
+                      ? const SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Icon(Icons.photo_library_outlined, size: 18),
+                  label: const Text('从相册选图'),
+                ),
+                const SizedBox(width: kSpace8),
+                if (_hasLocalCover)
+                  TextButton.icon(
+                    onPressed: _removeLocalCover,
+                    icon: const Icon(Icons.hide_image_outlined, size: 18),
+                    label: const Text('移除本机封面'),
+                  ),
+              ],
+            ),
+            // 「本机」这件事必须写在明面上：用户会理所当然以为"我设的封面
+            // 换手机也在"，而它其实只在本机（可同步的是下面那个 URL）
+            Padding(
+              padding: const EdgeInsets.only(top: kSpace4),
+              child: Text(
+                '相册选的图只存在这台设备上，不会同步到其它设备；'
+                '下面的 URL 才是可同步的封面地址（两者都有时优先显示本机图片）。',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ),
+            if (_pickError != null) ...[
+              const SizedBox(height: kSpace8),
+              Text(
+                _pickError!,
+                style: theme.textTheme.bodySmall
+                    ?.copyWith(color: theme.colorScheme.error),
+              ),
+            ],
+            const SizedBox(height: 12),
             TextField(
               controller: _coverCtrl,
               autofocus: true,
               keyboardType: TextInputType.url,
               decoration: const InputDecoration(
                 labelText: '封面图片 URL',
-                helperText: '留空 = 自动用合集内第一个视频的封面',
+                helperText: '留空 = 用合集内第一个视频的封面（本机图片优先于这个地址）',
                 helperMaxLines: 2,
                 border: OutlineInputBorder(),
                 isDense: true,
@@ -299,13 +476,83 @@ class _CollectionMetaDialogState extends State<_CollectionMetaDialog> {
         FilledButton(
           onPressed: () => Navigator.pop(
             context,
-            (cover: _coverCtrl.text, desc: _descCtrl.text),
+            (
+              // 最小规范化只在这里做一次（保存值 = 展示值，卡片那边同样兜一层）
+              cover: normalizeCoverUrl(_coverCtrl.text),
+              desc: _descCtrl.text,
+              coverBytes: _pickedBytes,
+              coverFileName: _pickedName,
+              removeLocalCover: _removedLocal,
+            ),
           ),
           child: const Text('保存'),
         ),
       ],
     );
   }
+
+  /// 封面预览（96×96）：本机图片 > URL > 「未设置」。
+  ///
+  /// 加载失败**不静默**：URL 打错 / 图床挂了都在这一小块里直说，用户当场就
+  /// 知道这条地址有问题（而不是保存后回列表看见一个占位图标）。
+  Widget _preview(ThemeData theme) {
+    final picked = _pickedBytes;
+    final url = normalizeCoverUrl(_coverCtrl.text);
+    Widget child;
+    if (picked != null) {
+      child = Image.memory(picked, fit: BoxFit.cover);
+    } else if (!_removedLocal && widget.initialLocalCoverPath.isNotEmpty) {
+      child = Image.file(
+        File(widget.initialLocalCoverPath),
+        fit: BoxFit.cover,
+        errorBuilder: (_, __, ___) => _previewHint(theme, '本机图片读不出来'),
+      );
+    } else if (url.isNotEmpty) {
+      child = Image.network(
+        url,
+        fit: BoxFit.cover,
+        // 与卡片一致：B 站图床必须带防盗链头，否则 403
+        headers: const {
+          'User-Agent': kBrowserUA,
+          'Referer': kBiliReferer,
+        },
+        errorBuilder: (_, __, ___) =>
+            _previewHint(theme, '这个地址的图加载不出来'),
+        loadingBuilder: (context, c, progress) =>
+            progress == null ? c : _previewHint(theme, '加载中…'),
+      );
+    } else {
+      child = _previewHint(theme, '未设置封面');
+    }
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        ClipRRect(
+          borderRadius: BorderRadius.circular(kRadiusSm),
+          child: Container(
+            width: 96,
+            height: 96,
+            color: theme.colorScheme.secondaryContainer,
+            child: child,
+          ),
+        ),
+      ],
+    );
+  }
+
+  /// 预览区的一句提示（也当加载失败的兜底）。
+  Widget _previewHint(ThemeData theme, String text) => Center(
+        child: Padding(
+          padding: const EdgeInsets.all(kSpace8),
+          child: Text(
+            text,
+            textAlign: TextAlign.center,
+            style: theme.textTheme.labelSmall?.copyWith(
+              color: theme.colorScheme.onSecondaryContainer,
+            ),
+          ),
+        ),
+      );
 }
 
 /// 「移动到…」目标选择器：返回目标路径（空串 = 移到顶层；null = 取消）。

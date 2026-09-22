@@ -570,13 +570,13 @@ class _ManagePanelState extends State<ManagePanel> {
         const SizedBox(height: 16),
         const Divider(height: 1),
         const SizedBox(height: 16),
-        // ---- 启动行为（v2.35.0：剪贴板里的 B 站链接直接开播）----
+        // ---- 启动行为（v2.35.0：剪贴板里的 B 站链接直接开播；v2.50.0 副标题压到两行）----
         Text('启动行为', style: theme.textTheme.titleMedium),
         const SizedBox(height: 4),
+        // 两行上限：只说清「在读剪贴板」（隐私）与「仅存本机」（范围），
+        // b23.tv / 分享文本那类解析细节与"只读一次"的机制留在代码与 CHANGELOG 里。
         Text(
-          '冷启动时读一次剪贴板：里面如果有 B 站视频链接（含 b23.tv 短链、'
-          '「【标题】 链接」这种分享文本），就直接打开播放页。'
-          '只在前台读一次、不需要任何权限；同一条链接只会播一次。仅存本机。',
+          '冷启动时读一次剪贴板，有 B 站视频链接就直接打开播放。仅存本机。',
           style: theme.textTheme.bodySmall?.copyWith(
             color: theme.colorScheme.onSurfaceVariant,
           ),
@@ -602,14 +602,13 @@ class _ManagePanelState extends State<ManagePanel> {
         const SizedBox(height: 16),
         const Divider(height: 1),
         const SizedBox(height: 16),
-        // ---- 界面提示（v2.36.0：底部提示条开关）----
+        // ---- 界面提示（v2.36.0：底部提示条开关；v2.50.0 副标题压到两行）----
         Text('界面提示', style: theme.textTheme.titleMedium),
         const SizedBox(height: 4),
+        // 两行上限：开头这句是既有用例钉着的锚点（test/ui_prefs_snack_test.dart），
+        // 后半只留"错误提示 / 撤销提示一定会显示"这条不可关的例外，枚举的例子删掉。
         Text(
-          '关掉后不再弹底部的提示条（「已保存」「已取回「…」」这类）。'
-          '错误提示（保存失败 / 网络请求失败 / 未同步到 Gist）'
-          '和带「撤销」按钮的提示一定会显示——'
-          '关了它们，失败会变成没声音，撤销入口也会一起消失。',
+          '关掉后不再弹底部的提示条；错误提示与带「撤销」的提示一定会显示。',
           style: theme.textTheme.bodySmall?.copyWith(
             color: theme.colorScheme.onSurfaceVariant,
           ),
@@ -635,19 +634,18 @@ class _ManagePanelState extends State<ManagePanel> {
         const SizedBox(height: 16),
         const Divider(height: 1),
         const SizedBox(height: 16),
-        // ---- 写操作（v2.40.0+：点赞 / 投币 / 收藏；v2.42.0+ 含评论）----
+        // ---- 写操作（v2.40.0+：点赞 / 投币 / 收藏；v2.42.0+ 含评论；
+        //       v2.50.0 副标题压到两行）----
         Text('写操作', style: theme.textTheme.titleMedium),
         const SizedBox(height: 4),
+        // 两行上限：只留三条安全信息——① 作用在你的 B 站账号上；② 默认关闭；
+        // ③ 投币不可撤回。评论"会立刻公开"附在括号里（这条原本也有用例钉着，
+        // 见 test/write_actions_prefs_test.dart）。改账号状态的具体后果枚举、
+        // "投币会再问一次 / 评论先写好再发送"的操作细节与"投稿不在这里"的
+        // 免责说明都删掉了（它们在 CHANGELOG 里）。
         Text(
-          '打开后，播放页的视频信息块里会出现「点赞 / 投币 / 收藏」三个按钮，'
-          '视频下方的评论区会出现「说点什么…」与每条评论的「回复」——'
-          '都直接作用在你真实的 B 站账号上。\n'
-          '默认关闭：这个 App 至今为止都是只读的（不碰你的账号），'
-          '而这几件事会改账号状态——点赞会进你的动态、收藏会进收藏夹、'
-          '投币会扣真实硬币且 B 站不支持撤回、评论会立刻出现在对方评论区'
-          '并进对方的消息通知。想用再自己开。\n'
-          '投币会再问一次才发出去；发评论也会先在弹层里写好、点「发送」'
-          '才真的提交。投稿/发视频不在这里（那是另一件事，本版不做）。',
+          '会在你的 B 站账号上点赞 / 投币 / 收藏 / 评论（会立刻公开）。'
+          '默认关闭，投币不可撤回。',
           style: theme.textTheme.bodySmall?.copyWith(
             color: theme.colorScheme.onSurfaceVariant,
           ),
