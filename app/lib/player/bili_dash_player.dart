@@ -3,11 +3,14 @@ import 'dart:async';
 import 'package:flutter/services.dart';
 import 'package:flutter/widgets.dart';
 
+import '../config.dart';
 import '../models/media_search_result.dart';
 
 /// B 站 DASH 双流播放器（Dart 侧封装，对应 android 原生插件 `BiliDashPlayerPlugin`）。
 ///
-/// 原生侧负责：双流合并（MergingMediaSource）、防盗链请求头（Referer + UA）、
+/// 原生侧负责：双流合并（MergingMediaSource）、防盗链请求头（Referer + UA，
+/// 其中 UA 由 Dart 侧在 [create] 时传入——v2.51.0+ 起「免流兼容（实验）」开关
+/// 会改这一个值，Referer 恒定不变）、
 /// 可自动恢复的数据源错误识别（流 URL 过期 / 瞬时网络错误 → onUrlExpired 事件）、
 /// 媒体通知 + 媒体会话（耳机媒体键控制播放，v2.25.x）；**直播**（v2.27.0+）走
 /// 另一条源：[setDataSource] 的 `isLive: true` → 原生 `HlsMediaSource`。
@@ -63,9 +66,21 @@ class BiliDashPlayer {
   /// 构建后改不了），于是 `COMMAND_SEEK_BACK/FORWARD` 从根源上不进可用命令集
   /// —— 通知栏 / 锁屏 / 系统媒体卡片都不会出现 seek。VOD 传默认 false，
   /// 行为与从前一字不差。
-  static Future<BiliDashPlayer> create({bool isLive = false}) async {
-    final id = await _channel
-        .invokeMethod<int>('create', {'isLive': isLive});
+  ///
+  /// [userAgent]（v2.51.0+）= 播放器取流请求要用的 User-Agent，**显式传给原生**：
+  /// 原生侧原来写死浏览器 UA，现在改成以 Dart 传进去的值为准（缺省仍回退浏览器
+  /// UA，旧调用与原生单测不受影响）。不传时按
+  /// `config.streamUserAgent()` 取——即设置页「免流兼容（实验）」开关关着时是
+  /// [kBrowserUA]（默认行为与改动前一致），开着时是官方 App 特征 UA。
+  /// **只影响这个播放器**（视频/音频流 + 直播 HLS），API/图片/弹幕另走各处的头。
+  static Future<BiliDashPlayer> create({
+    bool isLive = false,
+    String? userAgent,
+  }) async {
+    final id = await _channel.invokeMethod<int>('create', {
+      'isLive': isLive,
+      'userAgent': userAgent ?? streamUserAgent(),
+    });
     if (id == null) {
       throw StateError('原生播放器创建失败（create 返回 null）');
     }

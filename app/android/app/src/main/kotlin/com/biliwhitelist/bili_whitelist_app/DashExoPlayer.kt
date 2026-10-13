@@ -29,6 +29,9 @@ import java.net.UnknownHostException
  * 设计保持"哑"：只响应 Dart 侧方法调用，前后台切换等生命周期由 Dart 播放页处理。
  * 防盗链（M0 实测）：流请求必须带 Referer + 浏览器 UA（双必需），流请求不带 cookie；
  * 流 URL 带 deadline/upsig 数分钟过期 → 播放时必须实时取，不可持久化缓存。
+ * ⚠️ v2.51.0 起 **UA 是构造参数**（Dart 侧经 `create(userAgent:)` 传入，设置页
+ * 「免流兼容（实验）」开关会把它换成官方 App 特征 UA）；**Referer 恒定不变**，
+ * 依然写死在 [dataSourceFactory] 里——开关只动 UA 一个面。
  *
  * 本地缓存播放：Dart 侧传 `file://`（或本地绝对路径）时走 [DefaultDataSource]
  * （file scheme → FileDataSource，无需防盗链头），其余逻辑（MergingMediaSource/
@@ -52,6 +55,12 @@ private const val kSeekIncrementMs = 15_000L
 class DashExoPlayer(
     context: Context,
     private val surfaceTextureEntry: TextureRegistry.SurfaceTextureEntry,
+    /**
+     * 取流请求的 User-Agent（v2.51.0 起由 Dart 侧传入，见 `BiliDashPlayerPlugin`）。
+     *
+     * 视频流与音频流、直播 HLS 分片**共用**这一份头（同一个 [dataSourceFactory]）。
+     * 默认是浏览器 UA；设置页「免流兼容（实验）」开关打开时是官方 App 特征 UA。
+     */
     userAgent: String,
     private val listener: Listener,
     /**
@@ -134,6 +143,8 @@ class DashExoPlayer(
         .setReadTimeoutMs(20_000)
         .setDefaultRequestProperties(
             mapOf(
+                // Referer 恒定（防盗链必需）；UA 由 Dart 侧经 create(userAgent:) 传来
+                // ——「免流兼容（实验）」开关只换这一个值，别顺手把 Referer 也改了
                 "Referer" to "https://www.bilibili.com/",
                 "User-Agent" to userAgent,
             )

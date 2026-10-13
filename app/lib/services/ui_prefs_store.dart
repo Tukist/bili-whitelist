@@ -1,6 +1,7 @@
 /// 「界面偏好」本地存储（v2.36.0 起）：底部提示条开关 [showTips]
 /// （用户原话：「可以在设置里关掉底部的黑框提示」）+ v2.40.0 的**写操作总开关**
-/// [writeActionsEnabled] 与**上次选的收藏夹** [favFolderId]。
+/// [writeActionsEnabled] 与**上次选的收藏夹** [favFolderId]
+/// + v2.51.0 的「**免流兼容（实验）**」总开关 [streamCompatEnabled]。
 ///
 /// 为什么单独开一个 store，而不是塞进 [UiCopyStore] 或 [DanmakuSettingsStore]：
 /// - [UiCopyStore] 存的是「一句话被改成了什么」的**文案覆盖表**（key = 文案 id，
@@ -32,6 +33,9 @@ class UiPrefsStore extends ChangeNotifier {
   /// 写操作总开关的存储 key（bool；缺省/读失败 = false，**默认关**）。
   static const String writeActionsKey = 'ui:write_actions';
 
+  /// 「免流兼容（实验）」开关的存储 key（bool；缺省/读失败 = false，**默认关**）。
+  static const String streamCompatKey = 'ui:stream_compat';
+
   /// 上次选的收藏夹 id 的存储 key（int；缺省/读失败 = null，没有"上次"）。
   static const String favFolderKey = 'ui:fav_folder_id';
 
@@ -42,6 +46,7 @@ class UiPrefsStore extends ChangeNotifier {
 
   bool _showTips = true;
   bool _writeActionsEnabled = false;
+  bool _streamCompatEnabled = false;
   int? _favFolderId;
   bool _loaded = false;
 
@@ -67,6 +72,23 @@ class UiPrefsStore extends ChangeNotifier {
   ///   自不可逆在哪（见 manage_panel 的「写操作」分区）。
   bool get writeActionsEnabled => _writeActionsEnabled;
 
+  /// **「免流兼容（实验）」开关**（v2.51.0+，默认 **false**）：视频/音频**流类**
+  /// 请求的 User-Agent 是否换成 `kBiliAppUA`（对齐 B 站官方 Android App 特征，
+  /// 期望落进运营商定向免流范围）。
+  ///
+  /// 为什么默认关、且标「实验」：
+  /// - **可能让播放变糟**：仓库实测过反向的事实——非浏览器 UA 请求
+  ///   `.bilivideo.com` 流会 403（见 `config.dart` 的 `kBrowserUA` 注释）。
+  ///   也就是说这个开关在"本来能播"的设备上有把播放搞挂的真实风险；
+  /// - **收益不确定**：流本来就发往 B 站官方 CDN，运营商若按域名放行则现在
+  ///   已经在免流；只有"按 App 特征判定"时才可能因此改变，本机无从验证；
+  /// - 所以：默认关 + 文案写明「实验 / 播放 403 就关掉」，把决定权与止损办法
+  ///   一起交给用户（同 [writeActionsEnabled] 的"默认关 + 知情确认"思路）。
+  ///
+  /// 三条豁免仍然成立：**API 头表、图片请求、弹幕 WS 握手、登录页 WebView
+  /// 一律不受本开关影响**（判定集中在 `config.dart` 的 `streamUserAgent()`）。
+  bool get streamCompatEnabled => _streamCompatEnabled;
+
   /// 上次收藏到的收藏夹 id（null = 还没有"上次"）。
   ///
   /// 存在本地 prefs 而**不写进 Gist 配置**：Gist 里放的是白名单/合集这类
@@ -76,33 +98,38 @@ class UiPrefsStore extends ChangeNotifier {
 
   /// 启动时读一次；幂等（重复调用只在首次真正读盘，之后直接返回）。
   ///
-  /// 读失败 → 回默认（提示开 / 写操作关 / 无上次收藏夹），不抛。三个值里
-  /// 只要有一个与当前不同就发通知。
+  /// 读失败 → 回默认（提示开 / 写操作关 / 免流兼容关 / 无上次收藏夹），不抛。
+  /// 四个值里只要有一个与当前不同就发通知。
   Future<void> ensureLoaded() async {
     if (_loaded) return;
     var showTips = true;
     var writeActions = false;
+    var streamCompat = false;
     int? favFolder;
     try {
       final prefs = await SharedPreferences.getInstance();
       showTips = prefs.getBool(showTipsKey) ?? true;
       writeActions = prefs.getBool(writeActionsKey) ?? false;
+      streamCompat = prefs.getBool(streamCompatKey) ?? false;
       final fav = prefs.getInt(favFolderKey);
       favFolder = (fav != null && fav > 0) ? fav : null;
     } catch (_) {
-      // 存储异常：按默认值启动（提示开 / 写操作关 / 无上次收藏夹）
+      // 存储异常：按默认值启动（提示开 / 写操作关 / 免流兼容关 / 无上次收藏夹）
       showTips = true;
       writeActions = false;
+      streamCompat = false;
       favFolder = null;
     }
     _loaded = true;
     if (showTips == _showTips &&
         writeActions == _writeActionsEnabled &&
+        streamCompat == _streamCompatEnabled &&
         favFolder == _favFolderId) {
       return;
     }
     _showTips = showTips;
     _writeActionsEnabled = writeActions;
+    _streamCompatEnabled = streamCompat;
     _favFolderId = favFolder;
     notifyListeners();
   }
@@ -136,6 +163,21 @@ class UiPrefsStore extends ChangeNotifier {
     }
   }
 
+  /// 「免流兼容（实验）」开关：语义与 [setShowTips] 完全一致
+  /// （立即生效 + 静默持久化）。
+  Future<void> setStreamCompatEnabled(bool value) async {
+    if (_streamCompatEnabled != value) {
+      _streamCompatEnabled = value;
+      notifyListeners();
+    }
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(streamCompatKey, value);
+    } catch (_) {
+      // 写入失败静默
+    }
+  }
+
   /// 记住"上次收进了哪个夹"（写失败静默，下次仍按没有"上次"处理）。
   Future<void> setFavFolderId(int? value) async {
     final next = (value != null && value > 0) ? value : null;
@@ -160,11 +202,13 @@ class UiPrefsStore extends ChangeNotifier {
   void resetForTest({
     bool? showTips,
     bool writeActionsEnabled = false,
+    bool streamCompatEnabled = false,
     int? favFolderId,
     bool loaded = false,
   }) {
     _showTips = showTips ?? true;
     _writeActionsEnabled = writeActionsEnabled;
+    _streamCompatEnabled = streamCompatEnabled;
     _favFolderId = favFolderId;
     _loaded = loaded;
   }

@@ -32,6 +32,8 @@ import 'inbox_card_styles.dart';
 /// 内容分区：B 站账号（登录/重新登录）→ 配色主题（P1.5 双墨配方切换）→
 /// 信箱卡片样式（v2.21.0+ 多版式切换）→
 /// GitHub 配置（token/gist）→ 合集管理（重命名/删除）→ 离线缓存管理 →
+/// **网络与播放（v2.51.0+：「免流兼容（实验）」开关，只改视频/音频流请求的
+/// User-Agent，默认关）** →
 /// 翻译服务 → 界面文案（空态/加载/错误/页脚，可改可恢复，v2.19.0 补）→
 /// 启动行为 → 界面提示 → **写操作（v2.40.0+，点赞/投币/收藏总开关，
 /// v2.42.0+ 加入评论，默认关）** → 版本更新（检查更新）。面板只含内容本身（无自己的滚动/
@@ -111,6 +113,17 @@ const Key kTipsSwitchKey = Key('ui-tips-switch');
 
 /// 「允许点赞 / 投币 / 收藏」总开关的 key（测试锚点；v2.40.0）。
 const Key kWriteActionsSwitchKey = Key('ui-write-actions-switch');
+
+/// 「免流兼容（实验）」开关的 key（测试锚点；v2.51.0+）。
+const Key kStreamCompatSwitchKey = Key('ui-stream-compat-switch');
+
+/// 「网络与播放」分区的小字说明（v2.51.0+）。
+///
+/// 抽成常量是**为了被测试钉住**：用户要求设置页小字 ≤ 2 行，本串按"非空白字符
+/// ≤ 42"（`test/stream_compat_test.dart`）；且必须说清两件事——这是**实验**、
+/// 以及**播放 403 时应当关掉**。改文案时留意这两条与长度。
+const String kStreamCompatHint =
+    '实验：视频流请求伪装成官方 App，可能走运营商免流；播放 403 请关掉。';
 
 /// 「粘贴 Cookie 登录」入口按钮的 key（测试锚点；v2.49.1+）。
 const Key kPasteCookieButtonKey = Key('paste-cookie-login');
@@ -514,6 +527,44 @@ class _ManagePanelState extends State<ManagePanel> {
               },
             ),
           ),
+        ),
+        const SizedBox(height: 16),
+        const Divider(height: 1),
+        const SizedBox(height: 16),
+        // ---- 网络与播放（v2.51.0+：「免流兼容（实验）」开关）----
+        //
+        // 放这一带（离线缓存之后、翻译服务之前）的理由：它管的是**视频/音频流
+        // 类请求的 User-Agent**，与紧邻的离线缓存（同样在下流）语义最近；不进
+        // 「写操作」区——那里是"会改你账号状态"的动作，与流量口径无关。
+        Text('网络与播放', style: theme.textTheme.titleMedium),
+        const SizedBox(height: 4),
+        // 小字上限（用户要求两行；测试按"非空白字符 ≤ 42"钉住 kStreamCompatHint）：
+        // 只说两件事——① 这是实验；② 播放 403 就关掉。机制（只换流请求 UA、
+        // 不动 API/图片/弹幕）留在常量注释与 CHANGELOG 里。
+        Text(
+          kStreamCompatHint,
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+        const SizedBox(height: 8),
+        // 开关态要跟着 store 走 → 单独监听 UiPrefsStore
+        ListenableBuilder(
+          listenable: UiPrefsStore.instance,
+          builder: (context, _) {
+            final on = UiPrefsStore.instance.streamCompatEnabled;
+            return SwitchListTile(
+              key: kStreamCompatSwitchKey,
+              value: on,
+              onChanged: (v) =>
+                  UiPrefsStore.instance.setStreamCompatEnabled(v),
+              contentPadding: EdgeInsets.zero,
+              title: const Text('免流兼容（实验）'),
+              subtitle: Text(on
+                  ? '已开启：视频/音频流用官方 App 特征 UA；播放 403 就关掉'
+                  : '已关闭：流请求仍用浏览器 UA（最稳，默认）'),
+            );
+          },
         ),
         const SizedBox(height: 16),
         const Divider(height: 1),

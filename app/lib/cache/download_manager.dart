@@ -763,16 +763,17 @@ class DownloadManager {
   }
 
   /// 默认下载：独立 dio，仅 Referer + 浏览器 UA（不带 cookie，M0 实测）。
+  ///
+  /// 头走 `biliStreamHeaders()`（v2.51.0+）：设置页「免流兼容（实验）」开关打开时
+  /// UA 换成官方 App 特征值——下载的就是视频/音频流本身，正是免流该覆盖的流量；
+  /// Referer 恒定不变。
   Future<void> _defaultDownloadFile(
       String url, String savePath, DownloadProgressCallback? onProgress) async {
     final dio = Dio(
       BaseOptions(
         connectTimeout: const Duration(seconds: 15),
         receiveTimeout: const Duration(seconds: 60),
-        headers: {
-          'User-Agent': kBrowserUA,
-          'Referer': kBiliReferer,
-        },
+        headers: biliStreamHeaders(),
       ),
     );
     await dio.download(

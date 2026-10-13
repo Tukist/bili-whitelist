@@ -206,6 +206,9 @@ class SherpaAudioSource {
   }
 
   /// 默认下载：独立 dio，仅 Referer + 浏览器 UA（与离线缓存下载同策略）。
+  ///
+  /// 头走 `biliStreamHeaders()`（v2.51.0+）：这是**语音转写用的临时音频流**下载，
+  /// 属于流类请求 → 跟着「免流兼容（实验）」开关走；Referer 恒定不变。
   Future<void> _defaultDownloadFile(
     String url,
     String savePath,
@@ -215,10 +218,7 @@ class SherpaAudioSource {
       BaseOptions(
         connectTimeout: const Duration(seconds: 15),
         receiveTimeout: const Duration(minutes: 3),
-        headers: {
-          'User-Agent': kBrowserUA,
-          'Referer': kBiliReferer,
-        },
+        headers: biliStreamHeaders(),
       ),
     );
     await dio.download(

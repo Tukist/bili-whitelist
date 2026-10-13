@@ -1,6 +1,8 @@
 /// 全局配置 —— 浏览器请求头、数据源 URL（集中管理，页面不散落硬编码）。
 library;
 
+import 'services/ui_prefs_store.dart';
+
 /// App 版本显示兜底值（与 pubspec.yaml 的 version 主版本号保持一致）。
 ///
 /// 正常运行时优先用 package_info_plus 读取 Android versionName（来源是
@@ -14,6 +16,50 @@ const String kAppVersion = '2.0.0';
 /// i*.hdslb.com 封面会 403；必须是浏览器 UA 才能过防盗链。
 const String kBrowserUA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
     'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+
+/// 「官方 App 特征」User-Agent（**只给视频/音频流类请求用**，v2.51.0+）。
+///
+/// 用途：设置页「免流兼容（实验）」开关打开时，DASH/mp4 流、直播 HLS、离线下载、
+/// 语音转写的临时音频下载改用这个 UA —— 运营商若按「App 特征」判定免流范围，
+/// 浏览器 UA 会被算成「网页流量」（不计入定向免流），换成 BiliDroid 那串格式才是
+/// 官方 App 的样子。
+///
+/// ⚠️ **这是一次性实验值，不是保证能免流的凭据**：
+/// - 版本号（7.65.0 / build 7650300 / osVer 15）是**取的一个合理值**，不对应某一
+///   次抓包；B 站升版本后可能需要跟着调整，格式本身才是关键（`BiliDroid` +
+///   os/model/mobi_app/build/channel/innerVer 这几段）；
+/// - B 站若变更 CDN 防盗链策略（例如改判 Referer/签名），这个值可能失效；
+/// - 仓库里的实测记录是**反方向**的：非浏览器 UA 请求 `.bilivideo.com` 流或
+///   `i*.hdslb.com` 封面可能 403（见 [kBrowserUA] 的注释）。因此本值只挂在
+///   开关后面、只作用于流请求，默认**不使用**；真出 403 就把它关掉。
+const String kBiliAppUA = 'Mozilla/5.0 BiliDroid/7.65.0 (bbcallen@gmail.com) '
+    'os/android model/Pixel 7 mobi_app/android build/7650300 channel/bili '
+    'innerVer/7650300 osVer/15 network/2';
+
+/// 视频/音频**流类**请求应当使用的 User-Agent（v2.51.0+）。
+///
+/// 开关（[UiPrefsStore.streamCompatEnabled]，设置页「免流兼容（实验）」）关着时
+/// 返回 [kBrowserUA]（改动前的行为）；打开时返回 [kBiliAppUA]。
+///
+/// **只用于流**：DASH / mp4 降级流（原生 ExoPlayer）、直播 HLS、离线缓存下载、
+/// 语音转写的临时音频下载。**API 请求（[biliHeaders]）、图片请求、直播弹幕 WS、
+/// 登录页 WebView 一律继续用 [kBrowserUA]** —— API 改 UA 有风控风险（实测精简头
+/// 会被 -412），图片改了对免流毫无帮助（且实测非浏览器 UA 取封面会 403）。
+String streamUserAgent() => UiPrefsStore.instance.streamCompatEnabled
+    ? kBiliAppUA
+    : kBrowserUA;
+
+/// 视频/音频**流类**请求的完整请求头（v2.51.0+）：只有 Referer + UA，不带 cookie
+/// （离线缓存下载与语音转写临时音频下载同策略，M0 实测）。
+///
+/// 抽出来是为了**两处下载共用一份**、并且被测试直接钉住：Referer 恒定
+/// [kBiliReferer]，UA 随「免流兼容（实验）」开关在 [kBrowserUA] / [kBiliAppUA]
+/// 之间切（[streamUserAgent]）。原生 ExoPlayer 那边不走这里（它由 Kotlin 侧
+/// 组装同一份头，UA 经 `BiliDashPlayer.create(userAgent:)` 传入）。
+Map<String, String> biliStreamHeaders() => {
+      'User-Agent': streamUserAgent(),
+      'Referer': kBiliReferer,
+    };
 
 /// B 站 API 域名。
 const String kBiliApi = 'https://api.bilibili.com';

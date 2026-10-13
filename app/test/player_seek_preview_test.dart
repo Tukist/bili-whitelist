@@ -528,11 +528,31 @@ Future<void> _pumpPlayer(
 /// 在 `testWidgets` 的假时钟里这些 Future **不会自己完成**（flutter_test 的
 /// 已知约束），只有 runAsync 能让真实事件循环转起来。这是测试环境问题，
 /// 不是实现问题——服务层单测（纯 `test`）无需 runAsync。
-Future<void> _settleFrames(WidgetTester tester) async {
-  await tester.runAsync(
-      () => Future<void>.delayed(const Duration(milliseconds: 30)));
-  await tester.pump();
-  await tester.pump();
+///
+/// **等待策略是「轮询到条件成立」而不是「固定睡 30ms」**（v2.51.0 修）：
+/// 解码是真 I/O + 引擎解码，多久完成取决于机器负载——并行跑全量测试时明显变慢，
+/// 固定的 30ms 预算就不够了：帧还没落地就断言 → `Found 0 widgets with key
+/// 'seek-preview-thumb'` 的**假红**（同一文件单跑必过，正是这个原因）。
+/// 现在：最多 [maxRounds] 轮，每轮让真实事件循环跑 [roundMs] 并推进两帧，
+/// [until] 一旦命中就**立即返回**（正常负载下通常 1~3 轮）。总预算给足
+/// （默认 100×30ms = 3s），超时后照常进入断言 —— **断言强度一点没放宽**：
+/// 等不到就还是红，只是不再因为机器忙而红。
+///
+/// [until] 为 null（用例不盯某个 widget）= 跑一轮即返回，与旧的固定 30ms 等价。
+Future<void> _settleFrames(
+  WidgetTester tester, {
+  Finder? until,
+  int maxRounds = 100,
+  int roundMs = 30,
+}) async {
+  final rounds = until == null ? 1 : maxRounds;
+  for (var i = 0; i < rounds; i++) {
+    await tester.runAsync(
+        () => Future<void>.delayed(Duration(milliseconds: roundMs)));
+    await tester.pump();
+    await tester.pump();
+    if (until != null && until.evaluate().isNotEmpty) return;
+  }
 }
 
 class _SeekDrag {
@@ -616,14 +636,16 @@ class _VideoSwipe {
   final TestGesture _g;
 
   /// 分步移动 [delta]。[settle] = true 时顺带放行真实异步（缩略图解码走
-  /// `dart:ui`，假时钟里不会自己完成，见 [_settleFrames]）。
+  /// `dart:ui`，假时钟里不会自己完成，见 [_settleFrames]）——并**轮询等缩略图
+  /// 真的出现**再返回（本助手的两处调用方都紧跟 `findsOneWidget` 断言；
+  /// 固定等一段时间在负载高时会不够，见 [_settleFrames] 的说明）。
   Future<void> by(Offset delta, {int steps = 3, bool settle = false}) async {
     final step = delta / steps.toDouble();
     for (var i = 0; i < steps; i++) {
       await _g.moveBy(step);
       await _tester.pump();
     }
-    if (settle) await _settleFrames(_tester);
+    if (settle) await _settleFrames(_tester, until: find.byKey(_kThumb));
   }
 
   /// 抬手（松手瞬间的断言在该方法返回后做：气泡应已立即消失）。

@@ -2994,8 +2994,19 @@ class _PlayerPageState extends State<PlayerPage>
       unawaited(_onAutoRecover());
       return;
     }
-    // 403 = 防盗链异常（流请求 Referer/UA 缺失或被拦）
-    final msg = message.contains('403') ? '防盗链异常（403），请稍后重试' : message;
+    // 403 = 防盗链异常（流请求 Referer/UA 缺失或被拦）。
+    //
+    // 开关联动（v2.51.0+）：「免流兼容（实验）」把流请求的 UA 换成了官方 App
+    // 特征值，而仓库实测过非浏览器 UA 取流会 403 —— 所以开着它报 403 时，必须
+    // 在第一现场告诉用户「是那个开关干的、去哪关」，否则他只能看到一句"稍后重试"
+    // 然后反复重试同一个必然失败的配置（关掉开关时文案与改动前逐字一致）。
+    final on = UiPrefsStore.instance.streamCompatEnabled;
+    final msg = !message.contains('403')
+        ? message
+        : on
+            ? '防盗链异常（403），可能是「免流兼容（实验）」开关导致的，'
+                '请到设置里关掉后再试'
+            : '防盗链异常（403），请稍后重试';
     setState(() {
       _error = '播放失败（$code）：$msg';
       _playing = false;

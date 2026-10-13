@@ -17,7 +17,13 @@ import io.flutter.plugin.common.MethodChannel.MethodCallHandler
 import io.flutter.plugin.common.MethodChannel.Result
 import io.flutter.view.TextureRegistry
 
-/// 浏览器 UA：必须与 lib/config.dart 的 kBrowserUA 完全一致（防盗链双必需之一）。
+/// 浏览器 UA 兜底值：与 lib/config.dart 的 kBrowserUA 完全一致（防盗链双必需之一）。
+///
+/// ⚠️ v2.51.0 起播放器用的 UA **以 Dart 侧 `create(userAgent:)` 传进来的为准**
+/// （设置页「免流兼容（实验）」开关决定传浏览器 UA 还是官方 App 特征 UA）——
+/// 本常量只剩两个用途：① Dart 没传 / 传空时的兜底；② **通知封面**下载
+/// （[DashMediaNotification]，那是图片请求，实测非浏览器 UA 取 i*.hdslb.com 会
+/// 403，所以刻意不跟着开关走）。
 private const val kBrowserUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
@@ -29,10 +35,12 @@ private const val kReqNotification = 9048
 /**
  * B 站 DASH 双流播放原生插件（MethodChannel: `bili_dash_player`）。
  *
- * - `create(isLive)`：创建播放器 + TextureRegistry 纹理，返回 textureId（Dart 侧
- *   Texture 渲染）。`isLive`（v2.27.0+）必须在**创建期**告知：直播不设
+ * - `create(isLive, userAgent)`：创建播放器 + TextureRegistry 纹理，返回 textureId
+ *   （Dart 侧 Texture 渲染）。`isLive`（v2.27.0+）必须在**创建期**告知：直播不设
  *   seekBack/ForwardIncrementMs（那两个只能在 ExoPlayer.Builder 上设，见
- *   [DashExoPlayer]），旧调用不带该参数 → 默认 false（VOD，行为不变）
+ *   [DashExoPlayer]），旧调用不带该参数 → 默认 false（VOD，行为不变）。
+ *   `userAgent`（v2.51.0+）为取流请求的 UA，**由 Dart 侧传**（设置页「免流兼容
+ *   （实验）」开关决定值）；缺省 / 空串 → 回退 [kBrowserUA]（旧调用行为不变）
  * - `setDataSource(videoUrl, audioUrl, positionMs, title, artist, coverUrl, isLive)`：
  *   VOD 走 MergingMediaSource 组源后播放；`isLive` = true 走 HlsMediaSource
  *   （B 站直播是 HLS）。后三个字段只写进 MediaItem 元信息，供会话侧消费者 /
@@ -118,7 +126,13 @@ class BiliDashPlayerPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
         try {
             when (call.method) {
                 "create" -> result.success(
-                    createPlayer(isLive = call.argument<Boolean>("isLive") ?: false)
+                    createPlayer(
+                        isLive = call.argument<Boolean>("isLive") ?: false,
+                        // 取流 UA（v2.51.0+）：Dart 侧传（「免流兼容（实验）」开关
+                        // 决定值）；缺省 / 空串回退浏览器 UA，旧调用行为不变
+                        userAgent = call.argument<String>("userAgent")
+                            ?.takeIf { it.isNotBlank() } ?: kBrowserUA,
+                    )
                 )
                 "setDataSource" -> {
                     val id = call.argument<Number>("textureId")!!.toLong()
@@ -209,7 +223,11 @@ class BiliDashPlayerPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
         )
     }
 
-    /** 懒建媒体通知控制器（一个插件实例只持有一套会话 + 通知）。 */
+    /** 懒建媒体通知控制器（一个插件实例只持有一套会话 + 通知）。
+     *
+     * ⚠️ 封面 UA 固定 [kBrowserUA]：那是**图片**请求（通知 largeIcon），
+     * 与「免流兼容（实验）」开关无关，也不该跟着走 —— 实测非浏览器 UA 取
+     * `i*.hdslb.com` 封面会 403（见 `lib/config.dart` 的 kBrowserUA 注释）。 */
     private fun notifier(): DashMediaNotification =
         notification ?: DashMediaNotification(
             context!!,
@@ -257,7 +275,14 @@ class BiliDashPlayerPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
     private fun player(id: Long): DashExoPlayer =
         players[id] ?: throw IllegalStateException("播放器不存在（textureId=$id）")
 
-    private fun createPlayer(isLive: Boolean = false): Long {
+    /**
+     * [userAgent]（v2.51.0+）：播放器取流请求（DASH/mp4/HLS）使用的 UA，由 Dart
+     * 侧传入；缺省值是浏览器 UA（旧调用 / Dart 没传时的兜底）。
+     */
+    private fun createPlayer(
+        isLive: Boolean = false,
+        userAgent: String = kBrowserUA,
+    ): Long {
         val registry = textureRegistry
             ?: throw IllegalStateException("插件尚未绑定 TextureRegistry")
         val entry = registry.createSurfaceTexture()
@@ -265,12 +290,16 @@ class BiliDashPlayerPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
         // 而非自增序号——否则 Texture 找不到对应纹理 → 有声音无画面（黑屏）。
         // 与 video_player_android 同源（surfaceTextureEntry.id()）。
         val id = entry.id()
-        Log.i(TAG, "createPlayer: Dart textureId=$id (engine surfaceTexture) isLive=$isLive")
+        Log.i(
+            TAG,
+            "createPlayer: Dart textureId=$id (engine surfaceTexture) " +
+                "isLive=$isLive ua=${if (userAgent == kBrowserUA) "browser" else "app"}"
+        )
 
         players[id] = DashExoPlayer(
             context!!,
             entry,
-            kBrowserUA,
+            userAgent,
             object : DashExoPlayer.Listener {
                 override fun onPrepared(
                     width: Int,
