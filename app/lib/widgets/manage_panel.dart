@@ -117,13 +117,14 @@ const Key kWriteActionsSwitchKey = Key('ui-write-actions-switch');
 /// 「免流兼容（实验）」开关的 key（测试锚点；v2.51.0+）。
 const Key kStreamCompatSwitchKey = Key('ui-stream-compat-switch');
 
-/// 「网络与播放」分区的小字说明（v2.51.0+）。
+/// 「网络与播放」分区的小字说明（v2.51.0+；v2.51.1 改成如实描述）。
 ///
 /// 抽成常量是**为了被测试钉住**：用户要求设置页小字 ≤ 2 行，本串按"非空白字符
 /// ≤ 42"（`test/stream_compat_test.dart`）；且必须说清两件事——这是**实验**、
-/// 以及**播放 403 时应当关掉**。改文案时留意这两条与长度。
+/// 以及**取不到流时会自动切回普通模式**（不必用户自己去关）。改文案时留意
+/// 这两条与长度。
 const String kStreamCompatHint =
-    '实验：视频流请求伪装成官方 App，可能走运营商免流；播放 403 请关掉。';
+    '实验：只改视频流请求的 UA 试探运营商免流；取不到流会自动切回普通模式。';
 
 /// 「粘贴 Cookie 登录」入口按钮的 key（测试锚点；v2.49.1+）。
 const Key kPasteCookieButtonKey = Key('paste-cookie-login');
@@ -539,8 +540,8 @@ class _ManagePanelState extends State<ManagePanel> {
         Text('网络与播放', style: theme.textTheme.titleMedium),
         const SizedBox(height: 4),
         // 小字上限（用户要求两行；测试按"非空白字符 ≤ 42"钉住 kStreamCompatHint）：
-        // 只说两件事——① 这是实验；② 播放 403 就关掉。机制（只换流请求 UA、
-        // 不动 API/图片/弹幕）留在常量注释与 CHANGELOG 里。
+        // 只说两件事——① 这是实验；② 取不到流会自动切回普通模式（v2.51.1 起）。
+        // 机制（只换流请求 UA、不动 API/图片/弹幕）留在常量注释与 CHANGELOG 里。
         Text(
           kStreamCompatHint,
           style: theme.textTheme.bodySmall?.copyWith(

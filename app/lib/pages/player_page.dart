@@ -11,6 +11,7 @@ import '../api/sherpa_model.dart';
 import '../api/translate_api.dart';
 import '../cache/download_manager.dart';
 import '../cache/playback_progress.dart';
+import '../config.dart';
 import '../models/danmaku.dart';
 import '../models/danmaku_settings.dart';
 import '../models/playlist_context.dart';
@@ -147,6 +148,47 @@ int? autoRecoverDelayMs(int attempt) =>
 /// 自动续播耗尽（连续失败超过上限）后的错误文案（保留「重试」按钮兜底）。
 const String kAutoRecoverGiveUpMessage = '播放中断（网络或视频流异常），请重试';
 
+/// 「免流兼容（实验）」开关开着时，流失败文案后面补的归因句（v2.51.1+）。
+///
+/// 单独抽成常量：错误视图上的归因、一键自救按钮、测试断言共用同一句话，
+/// 别在多处各写一份（改文案时漏一处就会出现"按钮说是开关、文案不认"）。
+const String kStreamCompatAttribution = '可能是「免流兼容（实验）」开关导致的';
+
+/// 错误视图上「一键自救」按钮的文案（v2.51.1+）：点它 = 关掉「免流兼容（实验）」
+/// 开关 + 重建播放器 + 重取流续播当前视频（见 [_PlayerPageState._disableStreamCompatAndRetry]）。
+const String kStreamCompatFixLabel = '关掉免流兼容并重试';
+
+/// 「免流兼容（实验）」被**自动回退**后的提示条文案（v2.51.1+）。
+///
+/// 回退本身是静默的（只换 UA、不动用户设置），必须明说一句：否则用户以为免流
+/// 还在生效，白等一整个视频 —— 所以这条提示走 [SnackKind.error]（不被设置里的
+/// 「界面提示」开关挡掉）。
+const String kStreamCompatFallbackNotice = '这个网络下「免流兼容」取不到流，已自动切回普通模式，视频继续播放';
+
+/// 开关开着时给失败文案补一句归因；关着时**原样返回**。
+///
+/// 关着时逐字不变是硬要求：既有文案是用户看惯的、也被既有用例逐字钉住
+/// （见 `test/stream_compat_test.dart` 与 `player_auto_recover_wiring_test.dart`）。
+String withStreamCompatAttribution(String msg) =>
+    UiPrefsStore.instance.streamCompatEnabled
+        ? '$msg（$kStreamCompatAttribution）'
+        : msg;
+
+/// 这条**原生致命错误**是否属于「流取不到」这一类（而非解码/格式/本地文件）。
+///
+/// 用来决定要不要把失败归因到「免流兼容（实验）」开关：只归因流类失败 ——
+/// 解码器初始化失败（3001）与 UA 无关，硬扯上开关是误导。
+/// 判据两条（任一命中即算）：
+/// - 文案里带 `403`：media3 的 `InvalidResponseCodeException` 文案是
+///   `Invalid response code: 403`，这正是仓库实测「非浏览器 UA 取流」的形态；
+/// - 错误码是 media3 的网络 IO / HTTP 状态兜底码：2001（IO 兜底桶）、
+///   2002（读/建连超时）、2004（BAD_HTTP_STATUS，HTTP 非 2xx 的兜底）。
+bool isStreamLevelNativeError({required int code, required String message}) =>
+    message.contains('403') ||
+    code == kExoErrorIoNetworkConnectionFailed ||
+    code == kExoErrorIoNetworkConnectionTimeout ||
+    code == kExoErrorIoBadHttpStatus;
+
 /// **可恢复类**的 ExoPlayer 错误码（media3 `PlaybackException` 常量值，v2.45.0+）。
 ///
 /// 用途：原生报「致命错误」时（[BiliDashErrorEvent]）再给一次自动续播机会——
@@ -177,6 +219,10 @@ const int kExoErrorIoNetworkConnectionFailed = 2001;
 /// media3 `PlaybackException.ERROR_CODE_IO_NETWORK_CONNECTION_TIMEOUT`（读/建连超时，
 /// `SocketTimeoutException` 映射而来）。
 const int kExoErrorIoNetworkConnectionTimeout = 2002;
+
+/// media3 `PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS`（HTTP 非 2xx 的兜底码，
+/// 用于 [isStreamLevelNativeError] 的流类判定）。
+const int kExoErrorIoBadHttpStatus = 2004;
 
 // -------------------------------------------------------------------------
 // 流 URL deadline 解析 + 主动预取换源决策（v2.17.15+，纯函数，便于单测）
@@ -1917,6 +1963,14 @@ class _PlayerPageState extends State<PlayerPage>
   bool _loginPrompt = false;
   bool _canRetry = true;
 
+  /// 本次错误是不是「开关开着 + 流取不到」这一类（v2.51.1+）：
+  /// 决定错误视图上要不要出现 [kStreamCompatFixLabel] 一键自救按钮。
+  ///
+  /// 只在**流类失败出口**置位（自动续播耗尽 / 原生流级错误），取流接口自身
+  /// 失败（[_handleLoadFailure]，API 头表不受开关影响）不置位——别把风控/
+  /// 解析失败也算到 UA 头上。[_init] 每次重建时清零。
+  bool _streamCompatTrouble = false;
+
   // 自动续播（流 URL 过期 / 瞬时网络错误，v2.17.14+）
   // ---------------------------------------------------------------------
   // 原生把「可自动恢复的数据源错误」统一发 onUrlExpired 事件，Dart 重取
@@ -2361,6 +2415,8 @@ class _PlayerPageState extends State<PlayerPage>
       _buffering = true;
       _loaded = false;
       _completed = false;
+      // 重建即重来：上一轮的「开关嫌疑」归零（新错误出口自己会重新置位）
+      _streamCompatTrouble = false;
       // 重新初始化（重试/重进/换源）→ 自动续播预算与进行中标记重置
       // （新播放器从零开始，续播成功 READY 后还会在 onPrepared 再次清零）
       _autoRecoverFails = 0;
@@ -2650,6 +2706,10 @@ class _PlayerPageState extends State<PlayerPage>
 
   /// 取流失败分类处理。
   Future<void> _handleLoadFailure(Object e) async {
+    // 取流**接口**本身失败（风控/限流/解析…）：与流请求的 UA 无关（开关只动流
+    // 请求，API 头表恒定），所以先清掉「开关嫌疑」，别在错误视图上给一键自救
+    // 按钮（那会引导用户去关一个跟本次失败无关的开关）。
+    _streamCompatTrouble = false;
     // -412 风控：指数退避 1s→2s→4s 后重试（fetchPlayUrl 内部已刷新 WBI key 重试过一次）
     if (e is BiliApiException && e.code == -412) {
       for (final delay in const [
@@ -3000,15 +3060,32 @@ class _PlayerPageState extends State<PlayerPage>
     // 特征值，而仓库实测过非浏览器 UA 取流会 403 —— 所以开着它报 403 时，必须
     // 在第一现场告诉用户「是那个开关干的、去哪关」，否则他只能看到一句"稍后重试"
     // 然后反复重试同一个必然失败的配置（关掉开关时文案与改动前逐字一致）。
+    //
+    // v2.51.1+ 补一件事：光说"去设置里关掉"还得让用户自己找路，所以这里同时
+    // 置 [_streamCompatTrouble]，让错误视图多一个「关掉免流兼容并重试」按钮
+    // （一键关开关 + 重建播放器 + 续播当前视频）。判定用**用户设置的原值**
+    // （[UiPrefsStore.streamCompatEnabled]，与上面那句文案同一判据）：会话内自动
+    // 回退不改设置，开关本身还是开着的，用户看到的仍是"我开着那个开关"。
     final on = UiPrefsStore.instance.streamCompatEnabled;
-    final msg = !message.contains('403')
-        ? message
-        : on
-            ? '防盗链异常（403），可能是「免流兼容（实验）」开关导致的，'
-                '请到设置里关掉后再试'
-            : '防盗链异常（403），请稍后重试';
+    final is403 = message.contains('403');
+    final String msg;
+    if (!is403) {
+      msg = message;
+    } else if (on) {
+      msg = '防盗链异常（403），$kStreamCompatAttribution，请到设置里关掉后再试';
+    } else {
+      msg = '防盗链异常（403），请稍后重试';
+    }
+    // 流类失败（403 / 网络 IO 兜底码）才归因到开关；解码类（3001…）与 UA 无关，
+    // 不置位也不补归因（[isStreamLevelNativeError]）
+    _streamCompatTrouble =
+        on && isStreamLevelNativeError(code: code, message: message);
+    // 403 分支的文案已自带归因（别重复补），其余流类失败补一句
+    final shown = _streamCompatTrouble && !msg.contains('免流兼容')
+        ? withStreamCompatAttribution(msg)
+        : msg;
     setState(() {
-      _error = '播放失败（$code）：$msg';
+      _error = '播放失败（$code）：$shown';
       _playing = false;
     });
     // 原生报错：画面不会来了，封面占位层让位给错误视图
@@ -3072,6 +3149,11 @@ class _PlayerPageState extends State<PlayerPage>
   /// 失败按 [kAutoRecoverBackoffMs] 退避重试**有限次**（预算 [_autoRecoverFails]，
   /// 新流成功 READY 后清零），仍失败才显示 [kAutoRecoverGiveUpMessage]——
   /// 保留「重试」按钮手动兜底，网络抖动弹错打断观看成为极少情况。
+  ///
+  /// 【v2.51.1】预算耗尽时多一步判断：如果「免流兼容（实验）」的 UA 正被使用
+  /// （[streamCompatInUse]），说明本地图 + 重取都救不回来 —— 那个 UA 是本次取流
+  /// 唯一与默认配置不同的东西，于是先**自动回退**（见 [_autoFallbackStreamCompat]）
+  /// 而不是直接放弃；回退后再失败才落到放弃文案。
   Future<void> _onAutoRecover() async {
     if (!mounted || _error != null) return;
     if (_autoRecovering) {
@@ -3091,9 +3173,24 @@ class _PlayerPageState extends State<PlayerPage>
         final attempt = _autoRecoverFails; // 本次为第 attempt+1 次尝试
         final delay = autoRecoverDelayMs(attempt);
         if (delay == null) {
-          // 连续失败超过上限：显示错误（手动重试兜底），不再自动折腾
+          // 连续失败超过上限：本地图/重取都救不回来 → 该怀疑「免流兼容（实验）」
+          // 了（它的 UA 是本次取流唯一与"默认配置"不同的东西）。
+          //
+          // 开关确实在用（[streamCompatInUse]）→ **自动回退**：本会话换回浏览器
+          // UA 再续播一次，而不是让用户对着黑屏看一句没用的"请重试"
+          // （这就是"开了这开关也不会把应用用坏"的兜底）。
+          if (streamCompatInUse()) {
+            if (mounted) setState(() => _buffering = true); // 回退期间继续转缓冲
+            debugPrint('[player] 自动续播 $attempt 次均失败 → 自动回退免流兼容 UA');
+            await _autoFallbackStreamCompat();
+            return;
+          }
+          // 开关没在用（关着，或本会话已回退过）：维持原行为，但**开关原值仍是
+          // 开的话**要点名它并给出错误视图上的「关掉免流兼容并重试」一键自救
+          // （会话回退不改设置，下次启动还会再撞一次，得让用户能一次关掉）
           debugPrint('[player] 自动续播 $attempt 次均失败，放弃自动恢复');
-          _showFatal(kAutoRecoverGiveUpMessage);
+          _streamCompatTrouble = UiPrefsStore.instance.streamCompatEnabled;
+          _showFatal(withStreamCompatAttribution(kAutoRecoverGiveUpMessage));
           return;
         }
         _autoRecoverFails = attempt + 1; // 预扣一次（成功 READY 后在 onPrepared 清零）
@@ -3119,6 +3216,82 @@ class _PlayerPageState extends State<PlayerPage>
     } finally {
       _autoRecovering = false;
     }
+  }
+
+  /// **自动回退**「免流兼容（实验）」（v2.51.1+）：开关的官方 App UA 正被使用、
+  /// 且我们已观察到流确实起不来（自动续播预算耗尽）时，把**本次运行会话**的流 UA
+  /// 换回浏览器 UA，重建播放器并接着放，而不是让用户卡在黑屏或看一句没用的
+  /// 「请重试」。
+  ///
+  /// 四条边界（都是刻意选的）：
+  /// - **只回退自己这个 UA**：只置会话标记
+  ///   （[UiPrefsStore.markStreamCompatSessionFallback]）⇒ 只有
+  ///   [streamUserAgent] 的取值变了；Referer、API 头表、图片、弹幕 WS、
+  ///   用户的其它设置一律不碰（见 `config.dart` 的单一判据 [streamCompatInUse]）；
+  /// - **不永久改用户的设置**：[UiPrefsStore.streamCompatEnabled] 与盘上的记录
+  ///   原样保留。理由：这个开关的收益只在**运营商网络**上才成立（比如蜂窝数据
+  ///   免流、家里 Wi-Fi 不免），一次失败就永久关掉它，"换个网络本来能用"的用户
+  ///   自己都找不回来；而设置页那个开关随时可手动关。真想让用户一次关掉，
+  ///   错误视图上有 [kStreamCompatFixLabel]（那是用户明确点的动作，才写设置）；
+  /// - **本会话只做一次、不来回抖动**：标记是纯内存的，一次播放里只会回退一次
+  ///   （回退后再失败就是真失败，走放弃文案 + 一键自救按钮）；重启 App 或用户在
+  ///   设置里重新打开开关（[UiPrefsStore.setStreamCompatEnabled]）即清标记 → 再试；
+  /// - **明说一句**（[kStreamCompatFallbackNotice]，走 [SnackKind.error] 不被
+  ///   「界面提示」开关挡掉）：回退是静默换 UA，不说的话用户以为免流还生效，
+  ///   白等一整个视频。
+  Future<void> _autoFallbackStreamCompat() async {
+    UiPrefsStore.instance.markStreamCompatSessionFallback();
+    debugPrint('[player] 免流兼容已回退为浏览器 UA（本次会话），'
+        '取流 UA=${streamUserAgent() == kBrowserUA ? 'browser' : 'app'}');
+    if (mounted) {
+      AppSnack.show(context, kStreamCompatFallbackNotice, kind: SnackKind.error);
+    }
+    await _rebuildPlayerAndResume();
+  }
+
+  /// 错误视图上的「一键自救」：关掉「免流兼容（实验）」**并**重取流续播
+  /// （v2.51.1+，错误视图上的 [kStreamCompatFixLabel] 按钮走这里）。
+  ///
+  /// 与 [_autoFallbackStreamCompat] 的唯一区别是**要不要写用户的设置**：
+  /// 用户明确点了「关掉免流兼容并重试」，就该真的关掉 —— 否则设置页显示"开"、
+  /// 实际却在用浏览器 UA，界面在说谎。会话内自动回退则相反（见那里的取舍）。
+  Future<void> _disableStreamCompatAndRetry() async {
+    debugPrint('[player] 一键自救：关闭「免流兼容（实验）」并重取流续播');
+    await UiPrefsStore.instance.setStreamCompatEnabled(false);
+    await _rebuildPlayerAndResume();
+  }
+
+  /// 重建播放器并从**当前位置**续播（换 UA 后的落地点）。
+  ///
+  /// 为什么必须重建播放器：取流 UA 是**原生创建期**的参数
+  /// （`BiliDashPlayer.create(userAgent:)` → `DashExoPlayer` 的
+  /// `dataSourceFactory`），只换 Dart 侧的取值不动已经建好的那个实例。
+  ///
+  /// 位置交给 [_pendingSeekMs]（onPrepared 时定位、**覆盖**记忆进度、不弹
+  /// 「已从上次…继续」）：续播失败的那次播放要接着刚才看的地方，而不是回到
+  /// 界面上次保存的进度。位置取不到（0）时不恢复记忆、从头播 —— 语义是"接着播
+  /// 这次失败的播放"，不是"重新进入这个视频"。
+  Future<void> _rebuildPlayerAndResume() async {
+    if (!mounted) return;
+    var pos = 0;
+    try {
+      pos = await _player?.getPosition() ?? 0;
+    } catch (_) {
+      pos = 0; // 原生通道异常：位置未知，从头播
+    }
+    if (!mounted) return;
+    // 预算与防重入标记复位：重建后是从零开始的另一次取流（_init 里也会清）
+    _autoRecoverFails = 0;
+    _autoRecovering = false;
+    if (pos > 0) {
+      _pendingRestore = true;
+      _pendingSeekMs = pos;
+    } else {
+      _pendingRestore = false;
+      _pendingSeekMs = null;
+    }
+    debugPrint('[player] 重建播放器续播：位置=${pos}ms');
+    await _init();
   }
 
   /// 主动预取 + 平滑换源（v2.17.15+）：在流 URL 到期前换新 URL，消除
@@ -5816,6 +5989,9 @@ class _PlayerPageState extends State<PlayerPage>
       _loaded = false;
       _completed = false;
       _error = null;
+      // 换集即换一次取流：上一集的「免流兼容嫌疑」不跟着走
+      // （新错误出口自己会重新置位）
+      _streamCompatTrouble = false;
       _positionMs = 0;
       _durationMs = 0;
       // 宽高比未知 + 画面变换复位（v2.39.0）：新分 P 的宽高比要等它的
@@ -8411,14 +8587,21 @@ class _PlayerPageState extends State<PlayerPage>
   /// 点缀墨 [kInkClay] **只用在唯一「需要行动」的强调点**——「去登录」是
   /// 用户必须做点什么才能继续播放的动作；「重试」「返回」是可选/退路，保持
   /// 纸白描边，不抢焦点（点缀色不得多点开花）。
+  ///
+  /// ⚠️ 内容套 [SingleChildScrollView]（v2.51.1+）：非全屏时视频区只有 ~231dp
+  /// 高，而这块面板现在最多有三行按钮（去登录 / 关掉免流兼容并重试 / 重试·返回）
+  /// + 图标 + 文案 —— 放不下时**滚动**，而不是 `RenderFlex overflowed` 把
+  /// 「重试」裁掉（真机非全屏竖屏就是这个高度；字体放大后更容易超）。
+  /// 内容放得下时滚动视图按内容高度收缩、依旧居中，与改动前逐像素一致。
   Widget _buildErrorView() {
     return ColoredBox(
       // 覆盖在视频之上的错误面板：半透明墨黑底（保留画面透出感）
       color: kInkBlack.withValues(alpha: 0.87),
       child: Center(
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 32),
-          child: Column(
+        child: SingleChildScrollView(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 32),
+            child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
               const Icon(Icons.error_outline, color: kPlayerOnDim, size: 48),
@@ -8437,6 +8620,22 @@ class _PlayerPageState extends State<PlayerPage>
                   ),
                   onPressed: _goLogin,
                   child: const Text('去登录'),
+                ),
+                const SizedBox(height: 10),
+              ],
+              // 「免流兼容（实验）」嫌疑（v2.51.1+）：开关开着 + 本次是流类失败
+              // （自动续播耗尽 / 原生流级错误）→ 给一键自救：真关掉开关 + 重建
+              // 播放器（UA 是创建期参数）+ 从当前位置续播，省得用户自己去设置页
+              // 找那个开关再回来。样式与「重试」同款（纸白描边）——点缀墨色只留
+              // 给唯一的「去登录」强调点，别多点开花。
+              if (_streamCompatTrouble) ...[
+                OutlinedButton(
+                  onPressed: () => unawaited(_disableStreamCompatAndRetry()),
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: kPlayerOn,
+                    side: const BorderSide(color: kPlayerOnDim),
+                  ),
+                  child: const Text(kStreamCompatFixLabel),
                 ),
                 const SizedBox(height: 10),
               ],
@@ -8464,7 +8663,8 @@ class _PlayerPageState extends State<PlayerPage>
                   ),
                 ],
               ),
-            ],
+              ],
+            ),
           ),
         ),
       ),

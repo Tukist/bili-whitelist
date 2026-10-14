@@ -23,8 +23,8 @@
 //   4. **离线下载请求头**用真 loopback HTTP 收（不是只看常量）：开关切换后
 //      服务端收到的 User-Agent 跟着变、Referer 不变；
 //   5. **API 头表 / 弹幕 WS 握手不动**（`biliHeaders()`、`LiveDanmakuClient.wsHeaders`）；
-//   6. 设置页：[kStreamCompatSwitchKey] 默认关、点开落盘，小字含「实验」「403」
-//      且非空白字符 ≤ 42；
+//   6. 设置页：[kStreamCompatSwitchKey] 默认关、点开落盘，小字含「实验」与
+//      「自动切回普通模式」且非空白字符 ≤ 42（v2.51.1 起小字改成如实描述）；
 //   7. 403 提示：开关开 → 文案含「免流兼容（实验）」指引；关 → 不含（且仍是
 //      改动前的原文）。
 import 'dart:io';
@@ -407,9 +407,11 @@ void main() {
 
   // -------------------------------------------------------------------------
   group('⑥ 设置页：开关 + 小字', () {
-    test('小字（设置页说明）：含「实验」与「403」，非空白字符 ≤ 42', () {
+    test('小字（设置页说明）：含「实验」与「自动切回普通模式」，非空白字符 ≤ 42', () {
       expect(kStreamCompatHint, contains('实验'));
-      expect(kStreamCompatHint, contains('403'));
+      // v2.51.1 文案契约变更（不是放宽）：取不到流会自动回退，小字不再写
+      // 「播放 403 请关掉」，改成如实说明「取不到流会自动切回普通模式」。
+      expect(kStreamCompatHint, contains('自动切回普通模式'));
       final n = kStreamCompatHint.replaceAll(RegExp(r'\s'), '').length;
       expect(n, lessThanOrEqualTo(42),
           reason: '用户要求设置页小字压到两行（当前 $n 字）');

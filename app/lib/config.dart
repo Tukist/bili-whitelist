@@ -36,18 +36,27 @@ const String kBiliAppUA = 'Mozilla/5.0 BiliDroid/7.65.0 (bbcallen@gmail.com) '
     'os/android model/Pixel 7 mobi_app/android build/7650300 channel/bili '
     'innerVer/7650300 osVer/15 network/2';
 
+/// 「免流兼容（实验）」此刻是否**真的在生效**（v2.51.1+）。
+///
+/// = 用户开着这个开关 **且** 本次运行会话还没被自动回退过
+/// （[UiPrefsStore.streamCompatSessionFallback]，见那里的取舍说明）。
+/// [streamUserAgent] 一律走这个判据 —— 全 App（原生播放器取流 / 离线下载 /
+/// 语音转写临时音频）的 UA 只此一处决定，回退因此"只回退自己这一个 UA"。
+bool streamCompatInUse() =>
+    UiPrefsStore.instance.streamCompatEnabled &&
+    !UiPrefsStore.instance.streamCompatSessionFallback;
+
 /// 视频/音频**流类**请求应当使用的 User-Agent（v2.51.0+）。
 ///
-/// 开关（[UiPrefsStore.streamCompatEnabled]，设置页「免流兼容（实验）」）关着时
-/// 返回 [kBrowserUA]（改动前的行为）；打开时返回 [kBiliAppUA]。
+/// 开关（[UiPrefsStore.streamCompatEnabled]，设置页「免流兼容（实验）」）关着
+/// （或本次会话已自动回退，见 [streamCompatInUse]）时返回 [kBrowserUA]
+/// （改动前的行为）；否则返回 [kBiliAppUA]。
 ///
 /// **只用于流**：DASH / mp4 降级流（原生 ExoPlayer）、直播 HLS、离线缓存下载、
 /// 语音转写的临时音频下载。**API 请求（[biliHeaders]）、图片请求、直播弹幕 WS、
 /// 登录页 WebView 一律继续用 [kBrowserUA]** —— API 改 UA 有风控风险（实测精简头
 /// 会被 -412），图片改了对免流毫无帮助（且实测非浏览器 UA 取封面会 403）。
-String streamUserAgent() => UiPrefsStore.instance.streamCompatEnabled
-    ? kBiliAppUA
-    : kBrowserUA;
+String streamUserAgent() => streamCompatInUse() ? kBiliAppUA : kBrowserUA;
 
 /// 视频/音频**流类**请求的完整请求头（v2.51.0+）：只有 Referer + UA，不带 cookie
 /// （离线缓存下载与语音转写临时音频下载同策略，M0 实测）。

@@ -47,6 +47,7 @@ class UiPrefsStore extends ChangeNotifier {
   bool _showTips = true;
   bool _writeActionsEnabled = false;
   bool _streamCompatEnabled = false;
+  bool _streamCompatSessionFallback = false;
   int? _favFolderId;
   bool _loaded = false;
 
@@ -82,12 +83,38 @@ class UiPrefsStore extends ChangeNotifier {
   ///   也就是说这个开关在"本来能播"的设备上有把播放搞挂的真实风险；
   /// - **收益不确定**：流本来就发往 B 站官方 CDN，运营商若按域名放行则现在
   ///   已经在免流；只有"按 App 特征判定"时才可能因此改变，本机无从验证；
-  /// - 所以：默认关 + 文案写明「实验 / 播放 403 就关掉」，把决定权与止损办法
-  ///   一起交给用户（同 [writeActionsEnabled] 的"默认关 + 知情确认"思路）。
+  /// - 所以：默认关 + 文案写明「实验 / 取不到流会自动切回普通模式」，把决定权
+  ///   与止损办法一起交给用户（同 [writeActionsEnabled] 的"默认关 + 知情确认"思路）。
   ///
   /// 三条豁免仍然成立：**API 头表、图片请求、弹幕 WS 握手、登录页 WebView
   /// 一律不受本开关影响**（判定集中在 `config.dart` 的 `streamUserAgent()`）。
   bool get streamCompatEnabled => _streamCompatEnabled;
+
+  /// 「免流兼容（实验）」是否已在**本次运行会话**内被自动回退
+  /// （v2.51.1+，**纯内存、永不落盘**）。
+  ///
+  /// 由来：开关打开后官方 App 特征 UA 可能直接被 CDN 403（仓库实测过这个方向），
+  /// 播放页观察到「流确实起不来」时会**自动回退**到浏览器 UA 并续播
+  /// （见 `player_page.dart` 的 `_autoFallbackStreamCompat`）。回退只影响
+  /// [streamUserAgent] 的取值（[streamCompatInUse]），**不动
+  /// [streamCompatEnabled] 的值、也不动盘上的记录**：
+  /// - 这个开关的收益在**运营商网络**上才成立（例如蜂窝数据免流、Wi-Fi 不免），
+  ///   一次失败就永久关掉它，"换个网络本来能用"的用户自己都找不回来；
+  /// - 会话内回退 + 播放页明说一句，代价最小；想彻底关掉，设置页那个开关随时在。
+  ///
+  /// 生命周期：进程内存（重启 App 即清）；用户在设置页**重新打开**开关
+  /// （[setStreamCompatEnabled] 传 true）也会清 —— 那是"我要再试一次"的明确意图。
+  bool get streamCompatSessionFallback => _streamCompatSessionFallback;
+
+  /// 标记「本次会话内官方 App UA 取不到流，已自动回退浏览器 UA」。
+  /// 幂等；**不落盘、不改** [streamCompatEnabled]（见字段注释）。
+  ///
+  /// 不发 `notifyListeners`：它不驱动任何界面（设置页显示的是用户设置原值），
+  /// 只被 [streamUserAgent] 读，避免失败现场多做一次无谓重建。
+  void markStreamCompatSessionFallback() {
+    if (_streamCompatSessionFallback) return;
+    _streamCompatSessionFallback = true;
+  }
 
   /// 上次收藏到的收藏夹 id（null = 还没有"上次"）。
   ///
@@ -165,7 +192,12 @@ class UiPrefsStore extends ChangeNotifier {
 
   /// 「免流兼容（实验）」开关：语义与 [setShowTips] 完全一致
   /// （立即生效 + 静默持久化）。
+  ///
+  /// 打开时顺带清掉 [streamCompatSessionFallback]：一次自动回退之后用户又手动
+  /// 打开它，语义就是「再试一次」（可能换到了能免流的网络），不该被上一次的
+  /// 回退一直压着。
   Future<void> setStreamCompatEnabled(bool value) async {
+    if (value) _streamCompatSessionFallback = false;
     if (_streamCompatEnabled != value) {
       _streamCompatEnabled = value;
       notifyListeners();
@@ -203,12 +235,14 @@ class UiPrefsStore extends ChangeNotifier {
     bool? showTips,
     bool writeActionsEnabled = false,
     bool streamCompatEnabled = false,
+    bool streamCompatSessionFallback = false,
     int? favFolderId,
     bool loaded = false,
   }) {
     _showTips = showTips ?? true;
     _writeActionsEnabled = writeActionsEnabled;
     _streamCompatEnabled = streamCompatEnabled;
+    _streamCompatSessionFallback = streamCompatSessionFallback;
     _favFolderId = favFolderId;
     _loaded = loaded;
   }
