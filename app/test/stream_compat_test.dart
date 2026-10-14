@@ -6,9 +6,15 @@
 // 于是加一个**默认关闭**的实验开关。v2.51.x 只换流请求 UA；**v2.52.0 起改成
 // 换整条取流链路**：播放改走 App gRPC `PlayView`（下发 `platform=android`
 // 的直链，取流要「App 特征 UA + 不带 Referer」）—— 因为实测「网页直链
-// （`platform=pc`）+ App UA」是**必然 403**。离线缓存下载 / 语音转写临时音频
-// 仍走网页接口，那里 Referer 必须照旧保留（本文件第 4 组用真 loopback 服务器
-// 钉住这一点）。
+// （`platform=pc`）+ App UA」是**必然 403**。
+//
+// **v2.53.0 起离线缓存下载 / 语音转写临时音频也跟着开关走 `PlayView`**：它们
+// 下载的就是流本身（正是免流该覆盖的流量），而 v2.51.x/2.52.0 那版只换了 UA、
+// 直链还是网页接口 → 「pc 链 + App UA」= 必然 403（放着开关时下载/转写可能直接
+// 失败）。两条链的请求头因此改成**按直链形态分流**
+// （`config.biliStreamHeadersFor`，与原生 `DashExoPlayer.networkFactoryFor` 同一
+// 判据）：pc 链 = 浏览器 UA + Referer，android 链 = App UA 且不带 Referer。
+// 本文件第 5 组用真 loopback 服务器把两种形态都钉住。
 //
 // 这个开关有**真实风险**（万一运营商/CDN 策略不认，就会 403），
 // 所以本文件把两件事钉死：
@@ -40,6 +46,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:bili_whitelist_app/api/bilibili_api.dart';
 import 'package:bili_whitelist_app/api/github_api.dart';
 import 'package:bili_whitelist_app/api/live_danmaku_client.dart';
+import 'package:bili_whitelist_app/api/sherpa_audio.dart';
 import 'package:bili_whitelist_app/cache/download_manager.dart';
 import 'package:bili_whitelist_app/config.dart';
 import 'package:bili_whitelist_app/models/whitelist_video.dart';
@@ -352,7 +359,7 @@ void main() {
 
   // -------------------------------------------------------------------------
   group('⑤ 离线下载请求头（真 loopback HTTP，不是只看常量）', () {
-    test('服务端实收：关闭 = 浏览器 UA，开启 = 官方 App UA；Referer 两次都是 B 站页面',
+    test('服务端实收：**直链形态**决定请求头（pc 链=浏览器 UA+Referer，android 链=App UA 且无 Referer）',
         () async {
       final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
       final uas = <String?>[];
@@ -380,13 +387,20 @@ void main() {
       HttpOverrides.global = null;
       addTearDown(() => HttpOverrides.global = oldOverrides);
 
-      Future<void> downloadOnce(String tag, bool compat) async {
+      /// 取流替身：直接给出**指定形态**的直链（v2.53.0 起请求头只看 URL，
+      /// 所以这里要显式把两种形态都造出来 —— 真实世界里前端由哪条取流链决定）。
+      Future<void> downloadOnce(String tag, bool compat,
+          {required bool appShaped}) async {
         UiPrefsStore.instance.resetForTest(streamCompatEnabled: compat);
+        final url = appShaped
+            ? 'http://127.0.0.1:${server.port}/$tag.m4s?platform=android&qn=32'
+            : 'http://127.0.0.1:${server.port}/$tag.m4s?platform=pc&qn=80';
         final mgr = DownloadManager(
-          fetchPlayUrl: ({required String bvid, required int cid}) async =>
-              PlayUrlResult(
+          fetchPlayUrl:
+              ({required String bvid, required int cid}) async =>
+                  PlayUrlResult(
             quality: 80,
-            dashVideoUrls: ['http://127.0.0.1:${server.port}/$tag.m4s'],
+            dashVideoUrls: [url],
             dashAudioUrls: const [],
           ),
           rootDir: root,
@@ -396,15 +410,209 @@ void main() {
         await mgr.downloadVideo(_video(bvid: 'BV1STR_$tag'), 0);
       }
 
-      await downloadOnce('off', false);
-      expect(uas, [kBrowserUA], reason: '关着时下载请求仍用浏览器 UA（改动前行为）');
-      expect(referers, [kBiliReferer], reason: 'Referer 恒定');
+      // ① 网页链（默认形态）：浏览器 UA + Referer（与改动前逐字节一致）
+      await downloadOnce('off', false, appShaped: false);
+      expect(uas, [kBrowserUA], reason: '网页链用浏览器 UA（非浏览器 UA 会 403）');
+      expect(referers, [kBiliReferer], reason: '网页链 Referer 必需');
 
-      await downloadOnce('on', true);
+      // ② **v2.53.0 的 403 修复点**：开关开着但拿到的是网页链（PlayView 取流失败
+      //    回落、或番剧走 pgc 端点）→ 必须用浏览器 UA。旧代码在这里发 App UA，
+      //    实测「pc 签名 + App UA」必 403 → 下载直接失败。
+      await downloadOnce('on_pc', true, appShaped: false);
       expect(uas.length, 2);
-      expect(uas.last, kBiliAppUA,
-          reason: '开启后下载（= 流本身）请求头里的 UA 换成官方 App 特征值');
-      expect(referers.last, kBiliReferer, reason: 'Referer 不跟着换');
+      expect(uas.last, kBrowserUA,
+          reason: '网页链配 App UA 必 403：请求头要跟着**直链**走，不是跟着开关走');
+      expect(referers.last, kBiliReferer);
+
+      // ③ App 形态直链（开关打开时由 PlayView 下发）：App UA 且**不带 Referer**
+      await downloadOnce('on_app', true, appShaped: true);
+      expect(uas.length, 3);
+      expect(uas.last, kBiliAppUA, reason: 'App 形态链要 App 特征 UA');
+      expect(referers.last, isNull,
+          reason: 'App 形态链带 Referer 必 403（2026-10 实测）');
+    });
+
+    test('biliStreamHeadersFor：与原生 networkFactoryFor 同一判据（纯函数逐值钉住）', () {
+      // 判据是 URL 里的 CDN 签名参数，**不是开关状态** —— 同一次会话里两种链会并存
+      for (final on in [false, true]) {
+        UiPrefsStore.instance.resetForTest(streamCompatEnabled: on);
+        expect(
+          biliStreamHeadersFor('https://x.bilivideo.com/a.m4s?platform=android&qn=32'),
+          {'User-Agent': kBiliAppUA},
+          reason: 'App 形态链：只有 UA、没有 Referer（开关原值不该改变这个结论）',
+        );
+        expect(
+          biliStreamHeadersFor('https://x.bilivideo.com/a.m4s?platform=pc&qn=80'),
+          {'User-Agent': kBrowserUA, 'Referer': kBiliReferer},
+        );
+        // 直播 HLS 没有 platform 参数 → 走网页那套（Referer + 浏览器 UA）
+        expect(
+          biliStreamHeadersFor('https://x.bilivideo.com/live/1.m3u8'),
+          {'User-Agent': kBrowserUA, 'Referer': kBiliReferer},
+        );
+      }
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // ⑤b 开关打开时**下载/语音转写改走 PlayView**（v2.53.0）
+  //
+  // 上一版的 bug：那两条链只换了 UA、直链仍是网页接口（`platform=pc`），而
+  // 「pc 链 + App UA」= 必然 403（⇔ 开着开关时下载/转写可能直接失败）。
+  // 现在两条链与播放页同一条路：先试 App gRPC `PlayView`，拿不到就回落网页接口。
+  // -------------------------------------------------------------------------
+  group('⑤b 下载 / 语音转写：开关打开时也走 App 取流链', () {
+    /// 一条 App 形态流（`platform=android`，与 PlayView 下发的一致）。
+    PlayUrlResult appShapedStream(String tag) => PlayUrlResult(
+          quality: 32,
+          dashVideoUrls: ['https://$tag.bilivideo.com/v.m4s?platform=android'],
+          dashAudioUrls: ['https://$tag.bilivideo.com/a.m4s?platform=android'],
+        );
+
+    test('开关开着：离线下载先用 PlayView（不再打网页取流接口）', () async {
+      UiPrefsStore.instance.resetForTest(streamCompatEnabled: true);
+      final root = await Directory.systemTemp.createTemp('stream_compat_pv_');
+      addTearDown(() async {
+        if (await root.exists()) await root.delete(recursive: true);
+      });
+
+      var playViewCalls = 0;
+      final mgr = DownloadManager(
+        // 网页接口一被调就抛错：PlayView 成功时**一次都不该**打它
+        fetchPlayUrl:
+            ({required String bvid, required int cid}) async =>
+                throw StateError('PlayView 成功时不该回落网页接口（测试构造）'),
+        playViewFetcher: ({required String bvid, required int cid}) async {
+          playViewCalls++;
+          return appShapedStream('pv');
+        },
+        downloadFile: (url, savePath, onProgress) async {
+          await File(savePath).writeAsBytes(List<int>.filled(8, 3));
+        },
+        rootDir: root,
+        betweenTasks: Duration.zero,
+        retryDelay: Duration.zero,
+      );
+      await mgr.downloadVideo(_video(bvid: 'BV1STR_PV1'), 0);
+
+      expect(playViewCalls, 1);
+      expect(mgr.getCached('BV1STR_PV1', 0), isNotNull, reason: '下载成功');
+    });
+
+    test('开关开着但 PlayView 拿不到流 → 原样回落网页接口（不改用户设置）', () async {
+      UiPrefsStore.instance.resetForTest(streamCompatEnabled: true);
+      final root = await Directory.systemTemp.createTemp('stream_compat_pv2_');
+      addTearDown(() async {
+        if (await root.exists()) await root.delete(recursive: true);
+      });
+
+      var webCalls = 0;
+      final mgr = DownloadManager(
+        fetchPlayUrl:
+            ({required String bvid, required int cid}) async {
+          webCalls++;
+          return PlayUrlResult(
+            quality: 80,
+            dashVideoUrls: ['https://web.bilivideo.com/v.m4s?platform=pc'],
+            dashAudioUrls: const [],
+          );
+        },
+        playViewFetcher: ({required String bvid, required int cid}) async =>
+            throw StateError('PlayView 取流失败（测试构造）'),
+        downloadFile: (url, savePath, onProgress) async {
+          await File(savePath).writeAsBytes(List<int>.filled(8, 3));
+        },
+        rootDir: root,
+        betweenTasks: Duration.zero,
+        retryDelay: Duration.zero,
+      );
+      await mgr.downloadVideo(_video(bvid: 'BV1STR_PV2'), 0);
+
+      expect(webCalls, 1, reason: '回落后照旧用网页接口');
+      expect(UiPrefsStore.instance.streamCompatEnabled, isTrue,
+          reason: '回落不动用户设置');
+      expect(mgr.getCached('BV1STR_PV2', 0), isNotNull);
+    });
+
+    test('番剧（epId 非空）不试 PlayView：只认 aid/cid 的链不该碰番剧', () async {
+      UiPrefsStore.instance.resetForTest(streamCompatEnabled: true);
+      final root = await Directory.systemTemp.createTemp('stream_compat_pv3_');
+      addTearDown(() async {
+        if (await root.exists()) await root.delete(recursive: true);
+      });
+
+      var playViewCalls = 0;
+      var webCalls = 0;
+      final mgr = DownloadManager(
+        fetchPlayUrl:
+            ({required String bvid, required int cid}) async {
+          webCalls++;
+          return PlayUrlResult(
+            quality: 80,
+            dashVideoUrls: ['https://web.bilivideo.com/v.m4s?platform=pc'],
+            dashAudioUrls: const [],
+          );
+        },
+        playViewFetcher: ({required String bvid, required int cid}) async {
+          playViewCalls++;
+          return appShapedStream('pv');
+        },
+        downloadFile: (url, savePath, onProgress) async {
+          await File(savePath).writeAsBytes(List<int>.filled(8, 3));
+        },
+        rootDir: root,
+        betweenTasks: Duration.zero,
+        retryDelay: Duration.zero,
+      );
+      await mgr.downloadVideo(
+        const WhitelistVideo(
+          bvid: 'BV1STR_EP1',
+          cid: 1001,
+          title: '番剧集',
+          cover: '',
+          duration: 600,
+          upName: '测试UP主',
+          addedAt: '2026-01-01',
+          epId: 99999,
+        ),
+        0,
+      );
+
+      expect(playViewCalls, 0, reason: '番剧不走 PlayView（要另一套 pgc 服务）');
+      expect(webCalls, 1);
+    });
+
+    test('语音转写临时音频：开关开着也走 PlayView（且只取音频轨）', () async {
+      UiPrefsStore.instance.resetForTest(streamCompatEnabled: true);
+      final root = await Directory.systemTemp.createTemp('stream_compat_pv4_');
+      addTearDown(() async {
+        if (await root.exists()) await root.delete(recursive: true);
+      });
+
+      var playViewCalls = 0;
+      final source = SherpaAudioSource(
+        downloadManager: DownloadManager(
+          rootDir: root,
+          betweenTasks: Duration.zero,
+          retryDelay: Duration.zero,
+        ),
+        fetchPlayUrl:
+            ({required String bvid, required int cid}) async =>
+                throw StateError('PlayView 成功时不该回落网页接口（测试构造）'),
+        playViewFetcher: ({required String bvid, required int cid}) async {
+          playViewCalls++;
+          return appShapedStream('pv');
+        },
+        downloadFile: (url, savePath, onProgress) async {
+          await File(savePath).writeAsBytes(List<int>.filled(8, 3));
+        },
+        rootDir: root,
+      );
+      final path = await source.getAudioPath(_video(bvid: 'BV1STR_PV4'), 0);
+
+      expect(playViewCalls, 1);
+      expect(path, endsWith('.m4s'));
+      expect(await File(path).length(), 8);
     });
   });
 

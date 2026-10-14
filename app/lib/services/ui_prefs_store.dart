@@ -1,7 +1,8 @@
 /// 「界面偏好」本地存储（v2.36.0 起）：底部提示条开关 [showTips]
 /// （用户原话：「可以在设置里关掉底部的黑框提示」）+ v2.40.0 的**写操作总开关**
 /// [writeActionsEnabled] 与**上次选的收藏夹** [favFolderId]
-/// + v2.51.0 的「**免流兼容（实验）**」总开关 [streamCompatEnabled]。
+/// + v2.51.0 的「**免流兼容（实验）**」总开关 [streamCompatEnabled]
+/// + v2.53.0 的**上次选的清晰度** [preferredQuality]。
 ///
 /// 为什么单独开一个 store，而不是塞进 [UiCopyStore] 或 [DanmakuSettingsStore]：
 /// - [UiCopyStore] 存的是「一句话被改成了什么」的**文案覆盖表**（key = 文案 id，
@@ -25,6 +26,14 @@ library;
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+/// 默认清晰度档位（1080P）——与取流接口的默认 `qn=80` 同值
+/// （`playview_api.dart` 的 `kPlayViewQn`，两处都写 80 是因为它们分别是
+/// 「请求默认值」与「用户偏好默认值」，语义不同但必须同值）。
+///
+/// ⚠️ 默认值**不能改小**：用户没选过清晰度时行为必须与 v2.52.0 逐字节一致
+/// （取流一直发的就是 `qn=80`）。
+const int kPreferredQualityDefault = 80;
+
 /// 「界面偏好」存储（单例）。
 class UiPrefsStore extends ChangeNotifier {
   /// 底部提示条开关的存储 key（bool；缺省/读失败 = true，默认开）。
@@ -39,6 +48,9 @@ class UiPrefsStore extends ChangeNotifier {
   /// 上次选的收藏夹 id 的存储 key（int；缺省/读失败 = null，没有"上次"）。
   static const String favFolderKey = 'ui:fav_folder_id';
 
+  /// 上次选的清晰度档位（`qn`）的存储 key（int；缺省/读失败 = 1080P）。
+  static const String qualityKey = 'ui:preferred_quality';
+
   /// 全局单例（启动流程读、设置页写、`AppSnack` 每次弹提示前读）。
   static final UiPrefsStore instance = UiPrefsStore._();
 
@@ -49,6 +61,9 @@ class UiPrefsStore extends ChangeNotifier {
   bool _streamCompatEnabled = false;
   bool _streamCompatSessionFallback = false;
   int? _favFolderId;
+
+  /// 上次选的清晰度档位（v2.53.0+，默认 [kPreferredQualityDefault] = 1080P）。
+  int _preferredQuality = kPreferredQualityDefault;
   bool _loaded = false;
 
   /// 是否允许弹「提示 / 成功 / 门禁」类底部提示条（默认 true）。
@@ -109,11 +124,14 @@ class UiPrefsStore extends ChangeNotifier {
   /// 标记「本次会话内官方 App UA 取不到流，已自动回退浏览器 UA」。
   /// 幂等；**不落盘、不改** [streamCompatEnabled]（见字段注释）。
   ///
-  /// 不发 `notifyListeners`：它不驱动任何界面（设置页显示的是用户设置原值），
-  /// 只被 [streamUserAgent] 读，避免失败现场多做一次无谓重建。
+  /// v2.53.0 起**会发 `notifyListeners`**：个人页「取流状态」要把这一次回退
+  /// 显示成「App 形态已在本会话回退」—— 回退是静默发生的（不改用户设置），
+  /// 不重建界面的话用户会一直以为还在走 App 形态（正是要避免的那种误解）。
+  /// 代价只是一次重建，且回退发生在播放失败现场（异步、不在 build 中）。
   void markStreamCompatSessionFallback() {
     if (_streamCompatSessionFallback) return;
     _streamCompatSessionFallback = true;
+    notifyListeners();
   }
 
   /// 上次收藏到的收藏夹 id（null = 还没有"上次"）。
@@ -123,16 +141,24 @@ class UiPrefsStore extends ChangeNotifier {
   /// 反而可能指到一个别的账号的夹 id 上。
   int? get favFolderId => _favFolderId;
 
+  /// 上次选的清晰度档位（`qn`，v2.53.0+，缺省 [kPreferredQualityDefault] = 1080P）。
+  ///
+  /// 存在本地 prefs 而**不写进 Gist 配置**（同 [favFolderId]）：清晰度能拿到
+  /// 哪一档取决于**这台设备/这条网络**的登录态与取流形态（PlayView 匿名只有
+  /// 480P），跨设备同步过去只会同步一个拿不到的档位。
+  int get preferredQuality => _preferredQuality;
+
   /// 启动时读一次；幂等（重复调用只在首次真正读盘，之后直接返回）。
   ///
-  /// 读失败 → 回默认（提示开 / 写操作关 / 免流兼容关 / 无上次收藏夹），不抛。
-  /// 四个值里只要有一个与当前不同就发通知。
+  /// 读失败 → 回默认（提示开 / 写操作关 / 免流兼容关 / 无上次收藏夹 /
+  /// 清晰度 1080P），不抛。五个值里只要有一个与当前不同就发通知。
   Future<void> ensureLoaded() async {
     if (_loaded) return;
     var showTips = true;
     var writeActions = false;
     var streamCompat = false;
     int? favFolder;
+    var quality = kPreferredQualityDefault;
     try {
       final prefs = await SharedPreferences.getInstance();
       showTips = prefs.getBool(showTipsKey) ?? true;
@@ -140,24 +166,30 @@ class UiPrefsStore extends ChangeNotifier {
       streamCompat = prefs.getBool(streamCompatKey) ?? false;
       final fav = prefs.getInt(favFolderKey);
       favFolder = (fav != null && fav > 0) ? fav : null;
+      final q = prefs.getInt(qualityKey);
+      quality = (q != null && q > 0) ? q : kPreferredQualityDefault;
     } catch (_) {
-      // 存储异常：按默认值启动（提示开 / 写操作关 / 免流兼容关 / 无上次收藏夹）
+      // 存储异常：按默认值启动（提示开 / 写操作关 / 免流兼容关 / 无上次收藏夹 /
+      // 清晰度 1080P）
       showTips = true;
       writeActions = false;
       streamCompat = false;
       favFolder = null;
+      quality = kPreferredQualityDefault;
     }
     _loaded = true;
     if (showTips == _showTips &&
         writeActions == _writeActionsEnabled &&
         streamCompat == _streamCompatEnabled &&
-        favFolder == _favFolderId) {
+        favFolder == _favFolderId &&
+        quality == _preferredQuality) {
       return;
     }
     _showTips = showTips;
     _writeActionsEnabled = writeActions;
     _streamCompatEnabled = streamCompat;
     _favFolderId = favFolder;
+    _preferredQuality = quality;
     notifyListeners();
   }
 
@@ -229,6 +261,23 @@ class UiPrefsStore extends ChangeNotifier {
     }
   }
 
+  /// 记住"上次选的清晰度"（v2.53.0+；写失败静默，本次已生效、下次回到上次
+  /// 成功保存的值）。非正数（0/负）按"没选过"处理 → 回到默认 1080P —— 播放页
+  /// 拿它当请求的 `qn`，传 0 出去等于让服务端自己挑，与用户的"我选过"无关。
+  Future<void> setPreferredQuality(int value) async {
+    final next = value > 0 ? value : kPreferredQualityDefault;
+    if (_preferredQuality != next) {
+      _preferredQuality = next;
+      notifyListeners();
+    }
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt(qualityKey, next);
+    } catch (_) {
+      // 写入失败静默
+    }
+  }
+
   /// 测试用：重置内存态（不触碰存储），避免单例跨用例串味。
   @visibleForTesting
   void resetForTest({
@@ -237,6 +286,7 @@ class UiPrefsStore extends ChangeNotifier {
     bool streamCompatEnabled = false,
     bool streamCompatSessionFallback = false,
     int? favFolderId,
+    int preferredQuality = kPreferredQualityDefault,
     bool loaded = false,
   }) {
     _showTips = showTips ?? true;
@@ -244,6 +294,7 @@ class UiPrefsStore extends ChangeNotifier {
     _streamCompatEnabled = streamCompatEnabled;
     _streamCompatSessionFallback = streamCompatSessionFallback;
     _favFolderId = favFolderId;
+    _preferredQuality = preferredQuality;
     _loaded = loaded;
   }
 }

@@ -41,6 +41,7 @@ import 'package:bili_whitelist_app/api/playview_api.dart';
 import 'package:bili_whitelist_app/cache/download_manager.dart';
 import 'package:bili_whitelist_app/models/whitelist_video.dart';
 import 'package:bili_whitelist_app/pages/player_page.dart';
+import 'package:bili_whitelist_app/services/stream_status_store.dart';
 import 'package:bili_whitelist_app/services/ui_prefs_store.dart';
 
 /// secure storage 的 MethodChannel（flutter_secure_storage 9.2.4 用的那个名字；
@@ -821,6 +822,96 @@ void main() {
       expect(fetches, 0, reason: '回退后取流链路已换回网页接口');
       expect(api.webCalls, 2);
       expect(find.text(kPlayViewLowQualityNotice), findsNothing);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // ⑤ 「最近一次取流」记录（v2.53.0）：个人页「取流状态」的数据源
+  //
+  // 用户要"一眼看出现在走的是哪条路"，其中"哪条接口 + 拿到什么清晰度 + 带没带
+  // 登录 Cookie"只有**取流成功那一刻**才知道 → 播放页在这里记一次（落盘，
+  // 重启后个人页仍能看到上次结果）。这一组钉住"接线真的接上了"。
+  // -------------------------------------------------------------------------
+  group('「最近一次取流」记录：player_page 接线', () {
+    /// 走完启动流程（同 ④ 的 pumpPlayer，只多等一拍让记录落地）。
+    Future<void> pumpForRecord(
+      WidgetTester tester, {
+      required _PvApi api,
+      required Future<PlayUrlResult> Function(String, int) fetcher,
+    }) async {
+      tester.view.devicePixelRatio = 1.0;
+      tester.view.physicalSize = const Size(411, 914);
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(MaterialApp(
+        home: PlayerPage(video: _pvVideo(), api: api, playViewFetcher: fetcher),
+      ));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 600));
+      await tester.pump(const Duration(milliseconds: 300));
+      await tester.pump(const Duration(milliseconds: 50));
+      await tester.pump();
+    }
+
+    setUp(() => StreamStatusStore.instance.resetForTest(loaded: true));
+    tearDown(() => StreamStatusStore.instance.resetForTest());
+
+    testWidgets('App 形态取流成功 → 记下 source=app + 实际清晰度 + 带登录 Cookie',
+        (tester) async {
+      UiPrefsStore.instance.resetForTest(streamCompatEnabled: true);
+      _mockSecureStorageFor(tester, {kSessdataStorageKey: kFakeSessdataValid});
+      _PvMocks().install(tester);
+      final api = _PvApi(webStream: _pvStream(quality: 80, tag: 'web'));
+
+      await pumpForRecord(tester, api: api, fetcher: (bvid, cid) async {
+        return _pvStream(quality: 32); // 480P
+      });
+
+      final s = StreamStatusStore.instance;
+      expect(s.source, StreamSource.app, reason: '这次走的是 App 形态');
+      expect(s.quality, 32, reason: '记的是**实际拿到**的档位，不是请求里写死的 80');
+      expect(s.hadLoginCookie, isTrue, reason: '本机有未过期 SESSDATA → 带了登录凭据');
+      expect(s.hasRecord, isTrue);
+
+      // 落盘（重启后个人页仍能看到上次结果）
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getString(StreamStatusStore.sourceKey), 'app');
+      expect(prefs.getInt(StreamStatusStore.qualityKey), 32);
+      expect(prefs.getBool(StreamStatusStore.cookieKey), isTrue);
+      expect(prefs.getInt(StreamStatusStore.atKey), isNotNull);
+    });
+
+    testWidgets('开关关着 → 记 source=web；未登录 → hadLoginCookie=false',
+        (tester) async {
+      UiPrefsStore.instance.resetForTest(); // 开关默认关
+      _mockSecureStorageFor(tester, const {}); // 没登录
+      _PvMocks().install(tester);
+      final api = _PvApi(webStream: _pvStream(quality: 80, tag: 'web'));
+
+      await pumpForRecord(tester, api: api, fetcher: (bvid, cid) async {
+        throw StateError('关着开关时不该走 PlayView');
+      });
+
+      final s = StreamStatusStore.instance;
+      expect(s.source, StreamSource.web);
+      expect(s.quality, 80);
+      expect(s.hadLoginCookie, isFalse);
+    });
+
+    testWidgets('PlayView 失败回落网页接口 → 记的是**真正生效**的那条（web）',
+        (tester) async {
+      UiPrefsStore.instance.resetForTest(streamCompatEnabled: true);
+      _mockSecureStorageFor(tester, const {});
+      _PvMocks().install(tester);
+      final api = _PvApi(webStream: _pvStream(quality: 64, tag: 'web'));
+
+      await pumpForRecord(tester, api: api, fetcher: (bvid, cid) async {
+        throw StateError('PlayView 取流失败（测试构造）');
+      });
+
+      expect(api.webCalls, 1);
+      expect(StreamStatusStore.instance.source, StreamSource.web,
+          reason: '回落后实际走的是网页接口，记录要说实话');
+      expect(StreamStatusStore.instance.quality, 64);
     });
   });
 }

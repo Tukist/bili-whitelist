@@ -140,6 +140,18 @@ class PlayUrlResult {
   /// 其后 = `backup_url`。播放取第 0 条（= [mp4Url]）。
   final List<List<String>> mp4Lines;
 
+  /// 这次响应**列出的档位**（网页接口的 `data.accept_quality`，PlayView 的
+  /// `video_info.stream_list` 全部条目）——v2.53.0 起给播放页的「清晰度」列表用。
+  ///
+  /// 与 [quality] 的分工：[quality] 是**实际下发**的那一档（能播什么看它），
+  /// 这里是**接口声明存在**的档位全集（含这次因登录态/大会员拿不到的那些），
+  /// 播放页据此把「拿不到」的档位列出来并标明原因（见 `player_page` 的
+  /// `qualityBlockedReason`），而不是让用户点一个然后黑屏。
+  ///
+  /// 缺省空表 = 接口没给（旧解析 / 测试手工构造的样本）→ 播放页退化成「只列
+  /// 实际拿到的那一档及更低的档」。
+  final List<int> acceptQuality;
+
   const PlayUrlResult({
     required this.quality,
     this.mp4Url,
@@ -150,6 +162,7 @@ class PlayUrlResult {
     this.dashVideoLines = const [],
     this.dashAudioLines = const [],
     this.mp4Lines = const [],
+    this.acceptQuality = const [],
   });
 
   /// 是否拿到至少一条可播放的流。
@@ -242,6 +255,7 @@ class PgcPlayUrlResult extends PlayUrlResult {
     super.dashVideoLines = const [],
     super.dashAudioLines = const [],
     super.mp4Lines = const [],
+    super.acceptQuality = const [],
     required this.isPreview,
   });
 }
@@ -2107,6 +2121,15 @@ class BiliApi {
         if (e is Map<String, dynamic>) mp4Lines.add(streamLinesOf(e));
       }
     }
+    // 接口声明的档位全集（v2.53.0，播放页「清晰度」列表用）：`accept_quality`
+    // 是 B 站两侧一致的字段名（普通 playurl 在 `data`，pgc 在 `result`，本方法
+    // 两者共用）。只做「正整数 + 去重 + 保持接口顺序」，不在这里判能不能拿到
+    // ——权限判定是播放页的事（它才知道登录态与取流形态）。
+    final acceptQuality = <int>[];
+    for (final q in (d['accept_quality'] as List? ?? const [])) {
+      final v = (q as num?)?.toInt() ?? 0;
+      if (v > 0 && !acceptQuality.contains(v)) acceptQuality.add(v);
+    }
     return PlayUrlResult(
       quality: quality,
       mp4Url: mp4Url,
@@ -2117,6 +2140,7 @@ class BiliApi {
       dashVideoLines: videoLines,
       dashAudioLines: audioLines,
       mp4Lines: mp4Lines,
+      acceptQuality: acceptQuality,
     );
   }
 
@@ -2217,6 +2241,8 @@ class BiliApi {
       dashVideoLines: result.dashVideoLines,
       dashAudioLines: result.dashAudioLines,
       mp4Lines: result.mp4Lines,
+      // 档位全集随解析结果一起带出去（v2.53.0，播放页「清晰度」列表用）
+      acceptQuality: result.acceptQuality,
       isPreview: isPreview,
     );
   }

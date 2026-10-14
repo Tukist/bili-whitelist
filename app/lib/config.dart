@@ -63,14 +63,35 @@ String streamUserAgent() => streamCompatInUse() ? kBiliAppUA : kBrowserUA;
 /// 视频/音频**流类**请求的完整请求头（v2.51.0+）：只有 Referer + UA，不带 cookie
 /// （离线缓存下载与语音转写临时音频下载同策略，M0 实测）。
 ///
-/// 抽出来是为了**两处下载共用一份**、并且被测试直接钉住：Referer 恒定
-/// [kBiliReferer]，UA 随「免流兼容（实验）」开关在 [kBrowserUA] / [kBiliAppUA]
-/// 之间切（[streamUserAgent]）。原生 ExoPlayer 那边不走这里（它由 Kotlin 侧
-/// 组装同一份头，UA 经 `BiliDashPlayer.create(userAgent:)` 传入）。
+/// ⚠️ **v2.53.0 起这条"只按开关换 UA"的头不再用于下载**（见
+/// [biliStreamHeadersFor]）：开关打开时取流已改走 App gRPC `PlayView`，它下发的
+/// 直链是 `platform=android`；而这里恒定带 Referer、UA 又按开关切 —— 拿它去请求
+/// 网页形态直链（`platform=pc`）配 App UA 会 **403**（v2.51.x 那个 bug）。
+/// 保留它是因为它仍然是"开关 → UA"这一层语义的**可测单点**（测试直接钉住
+/// Referer 恒定、UA 跟着开关走），别在下载路径上再用它。
 Map<String, String> biliStreamHeaders() => {
       'User-Agent': streamUserAgent(),
       'Referer': kBiliReferer,
     };
+
+/// 流类请求头的**按 URL 分流**版本（v2.53.0+）：与原生
+/// `DashExoPlayer.networkFactoryFor(url)` 同一判据、同一套头。
+///
+/// 判据是 URL 里的 CDN 签名参数，**不是开关状态**：
+/// - `platform=android`（官方 App 形态直链，由 `PlayView` 下发）→ 只发
+///   [kBiliAppUA]、**故意不带 Referer**（带了必 403）；UA 固定用 App 特征值
+///   而不看开关原值 —— 这条链的取流鉴权要的就是它，URL 本身已经是"这条链是
+///   App 形态"的证据（开关可能在下载过程中被关掉，不能让它把链接搞成 403）；
+/// - 其余（网页/REST/番剧链一律 `platform=pc`，直播 HLS 无该参数）→
+///   浏览器 UA + [kBiliReferer]（M0 实测：非浏览器 UA 取这些链会 403）。
+///
+/// 为什么下载路径必须改成看 URL 而不是看开关：一次会话里两种链会并存
+/// （`PlayView` 取流失败回落网页接口、番剧走 pgc 端点），按开关判会误伤
+/// 其中一条（v2.51.x 的离线下载/语音转写就是这么吃到 403 的）。
+Map<String, String> biliStreamHeadersFor(String url) =>
+    url.contains('platform=android')
+        ? {'User-Agent': kBiliAppUA}
+        : {'User-Agent': kBrowserUA, 'Referer': kBiliReferer};
 
 /// B 站 API 域名。
 const String kBiliApi = 'https://api.bilibili.com';

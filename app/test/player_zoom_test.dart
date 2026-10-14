@@ -18,8 +18,10 @@
 //    4. 缩放态下单指拖动 → 平移画面（**不发 seek**）；
 //    5. 复位：底栏「复位」按钮 / 退出全屏 / 换 bvid（下一集）三条路径；
 //    6. 非全屏时双指手势**不生效**（画面不变换）；
-//    7. v2.49.0：「旋转」按钮常驻（变换可用时）→ 点一下转 90°、连点 4 次回原
+//    7. v2.49.0：「旋转」按钮是画面变换的显式入口 → 点一下转 90°、连点 4 次回原
 //       位；复位按钮文案同时报倍率与角度，一次清掉缩放+旋转；
+//       v2.53.0：这一排（旋转 + 复位）**跟随控制层显隐**（默认隐藏，点画面唤起
+//       才出现），但画面已有变换时常驻（复位是唯一退路，不能藏）；
 //    8. v2.49.0：**横屏置顶**态（非全屏 + 视口横放）也能变换（按钮同样在），
 //       竖屏置顶仍然不给入口（视频区只有 231dp，且 v2.43.0 用例钉着它）。
 //
@@ -793,9 +795,10 @@ void main() {
     testWidgets('点「旋转」按钮 → 画面转 90°；连点 4 次回到原位', (tester) async {
       await pumpFullscreen(tester);
 
-      // 未变换时旋转键**也**在（这是本版的关键：入口要能被发现）
+      // 未变换、控制层可见时旋转键在位（v2.53.0 起**跟随控制层显隐**：
+      // 控制层收着时它一起消失，见本文件末的用例）
       expect(find.byKey(_kViewRotate), findsOneWidget,
-          reason: '全屏下「旋转」按钮常驻，不依赖「已经变换过」');
+          reason: '控制层可见 → 「旋转」按钮与播放控制一起出现，不依赖「已经变换过」');
       expect(_viewRotation(tester), closeTo(0, 1e-6));
 
       await tester.tap(find.byKey(_kViewRotate));
@@ -902,7 +905,8 @@ void main() {
       await g2.up();
       await tester.pump();
 
-      // 显式入口同样在，且点一下真的转（此处是用户报「没有手势旋转」的场景）
+      // 显式入口同样在（有缩放 = 有变换 → 即便控制层被手势收掉也常驻），
+      // 且点一下真的转（此处是用户报「没有手势旋转」的场景）
       expect(find.byKey(_kViewRotate), findsOneWidget);
       await tester.tap(find.byKey(_kViewRotate));
       await tester.pump();
@@ -917,6 +921,57 @@ void main() {
       expect(_viewMatrix(tester), isNull,
           reason: '复位后非全屏不再构建变换节点（画面回到裸 Center）');
       expect(find.byKey(_kViewReset), findsNothing);
+
+      await _flushGestureTimers(tester);
+    });
+
+    // v2.53.0（用户原话）：「视频播放界面的旋转能不能在默认隐藏只有点击唤起的
+    // 时候再出现?」—— 旋转键此前是常驻的，现在整排（旋转 + 复位）跟随控制层；
+    // **唯一例外**：画面已被变换（缩放/旋转非默认）时常驻，理由见
+    // `_buildViewControls` 的注释（复位是用户的唯一退路）。
+    testWidgets('旋转/复位跟随控制层显隐；有变换时常驻', (tester) async {
+      await pumpFullscreen(tester);
+      bool controlsVisible() =>
+          find.byIcon(Icons.fullscreen_exit).evaluate().isNotEmpty;
+      // 起手点：全屏（914×411）左上区，避开顶栏、中央播放簇与底栏
+      const tapPoint = Offset(120, 120);
+
+      expect(controlsVisible(), isTrue, reason: '前置：控制层默认显示');
+      expect(find.byKey(_kViewRotate), findsOneWidget,
+          reason: '控制层可见 → 与播放控制一起出现');
+
+      // 点画面收起控制层
+      await tester.tapAt(tapPoint);
+      await tester.pump(const Duration(milliseconds: 400));
+      expect(controlsVisible(), isFalse, reason: '前置：控制层确实收起了');
+      expect(find.byKey(_kViewRotate), findsNothing,
+          reason: '控制层收着 → 旋转键一起消失（默认隐藏，点画面才唤起）');
+      expect(find.byKey(_kViewReset), findsNothing);
+
+      // 再点一下唤起：与播放控制一起出现（同一帧，不存在错位）
+      await tester.tapAt(tapPoint);
+      await tester.pump(const Duration(milliseconds: 400));
+      expect(controlsVisible(), isTrue, reason: '点画面唤起控制层');
+      expect(find.byKey(_kViewRotate), findsOneWidget);
+
+      // 转 90°（有变换）→ 再收起控制层：这一排常驻
+      await tester.tap(find.byKey(_kViewRotate));
+      await tester.pump();
+      expect(_viewRotation(tester), closeTo(math.pi / 2, 1e-6), reason: '前置：转过 90°');
+      await tester.tapAt(tapPoint);
+      await tester.pump(const Duration(milliseconds: 400));
+      expect(controlsVisible(), isFalse, reason: '前置：控制层又收起了');
+      expect(find.byKey(_kViewRotate), findsOneWidget,
+          reason: '画面转过之后旋转键常驻（不然用户找不到变换入口）');
+      expect(find.byKey(_kViewReset), findsOneWidget,
+          reason: '「复位」更不能藏：它是转完画面之后唯一的退路');
+
+      // 复位 → 变换清空 → 回到"跟随控制层"（此时控制层仍收着）
+      await tester.tap(find.byKey(_kViewReset));
+      await tester.pump();
+      expect(_viewRotation(tester), closeTo(0, 1e-6));
+      expect(find.byKey(_kViewRotate), findsNothing,
+          reason: '无变换 + 控制层收着 → 整排消失（回到默认隐藏）');
 
       await _flushGestureTimers(tester);
     });

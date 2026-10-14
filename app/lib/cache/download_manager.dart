@@ -7,6 +7,7 @@ import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 
 import '../api/bilibili_api.dart';
+import '../api/playview_api.dart';
 // 中转音频目录（audio_tmp/）的路径逻辑只有 sherpa_audio 一处定义，占用统计
 // 复用它的静态解析器 —— 循环 import（sherpa_audio 也 import 本文件拿
 // DownloadManager）在 Dart 里合法，且这里只用它的常量与纯路径函数。
@@ -19,13 +20,19 @@ typedef DownloadProgressCallback = void Function(int received, int total);
 
 /// 取流函数：拿 DASH 双流（无 DASH 则 mp4 单流）。默认走 [BiliApi.fetchPlayUrl]，
 /// 测试可注入 fake（不碰真实网络）。
+///
+/// 它注入的是**网页接口那一步**（不含 App 形态那一步，App 形态用
+/// [PlayViewStreamFetcher] 单独注入，v2.53.0）。
 typedef PlayUrlFetcher = Future<PlayUrlResult> Function({
   required String bvid,
   required int cid,
 });
 
-/// 单文件下载函数：把 [url] 下载到 [savePath]，期间回调进度。默认用独立 dio
-/// （仅 Referer + 浏览器 UA、不带 cookie，M0 实测）；测试可注入 fake。
+/// 单文件下载函数：把 [url] 下载到 [savePath]，期间回调进度。测试可注入 fake。
+///
+/// 默认实现的请求头**按 URL 分流**（v2.53.0 起，见 [biliStreamHeadersFor]）：
+/// 网页形态直链（`platform=pc`）发浏览器 UA + Referer；App 形态直链
+/// （`platform=android`）发 App 特征 UA 且不带 Referer。
 typedef FileDownloader = Future<void> Function(
   String url,
   String savePath,
@@ -220,11 +227,13 @@ class CacheDiskUsage {
 class DownloadManager {
   DownloadManager({
     PlayUrlFetcher? fetchPlayUrl,
+    PlayViewStreamFetcher? playViewFetcher,
     FileDownloader? downloadFile,
     Directory? rootDir,
     this.betweenTasks = const Duration(milliseconds: 800),
     this.retryDelay = const Duration(seconds: 1),
   })  : _fetchUrlOverride = fetchPlayUrl,
+        _playViewOverride = playViewFetcher,
         _downloadOverride = downloadFile,
         _rootDirOverride = rootDir;
 
@@ -242,6 +251,13 @@ class DownloadManager {
   static void debugReset() => _instance = null;
 
   final PlayUrlFetcher? _fetchUrlOverride;
+
+  /// App gRPC `PlayView` 取流替身（**仅测试注入用**；生产传 null = 走
+  /// [fetchPlayViewStream]）。理由与 [_fetchUrlOverride] 相同：这条链要真发 gRPC
+  /// 到 B 站，测试无法插手，而"开关开着时下载确实改走 App 形态链 / 拿不到会回落
+  /// 网页链 / 番剧不走这条"三件事必须能精确断言（v2.53.0）。
+  final PlayViewStreamFetcher? _playViewOverride;
+
   final FileDownloader? _downloadOverride;
   final Directory? _rootDirOverride;
 
@@ -275,7 +291,6 @@ class DownloadManager {
   /// 避免「回收残留」把正在下载的半成品删掉（rename 会因此失败）。
   final Set<String> _writing = {};
 
-  PlayUrlFetcher get _fetchPlayUrl => _fetchUrlOverride ?? _defaultFetchPlayUrl;
   FileDownloader get _downloadFile => _downloadOverride ?? _defaultDownloadFile;
 
   /// 初始化：加载 cache_index.json（幂等；UI 启动流程先 await 再查询缓存）。
@@ -572,9 +587,10 @@ class DownloadManager {
     required bool audioOnly,
   }) async {
     final pageIndex = task.pageIndex;
-    // 1) 实时取流（DASH 双流；无 DASH 降级 mp4 单流）
+    // 1) 实时取流（v2.53.0：开关开着先试 App 形态，拿不到回落网页接口）
     final cid = _cidOf(video, pageIndex);
-    final result = await _fetchPlayUrl(bvid: video.bvid, cid: cid);
+    final result =
+        await _fetchStream(bvid: video.bvid, cid: cid, epId: video.epId);
 
     // 2) 目标文件（.part 半成品下载 → 成功后 rename；失败清理半成品）
     final mediaDir = await _mediaDir();
@@ -746,7 +762,48 @@ class DownloadManager {
   // 默认实现
   // ---------------------------------------------------------------------------
 
-  /// 默认取流：DASH 双流（fnval=16），无 DASH 降级 mp4（fnval=0）。
+  /// 单集取流的**总入口**（v2.53.0）：开关开着且是**普通视频**时先试 App 形态
+  /// （gRPC `PlayView`，见 `api/playview_api.dart`），拿不到就原样落到下面的
+  /// 网页接口 —— 离线缓存下载的就是视频/音频流本身，正是免流该覆盖的流量，
+  /// 而 v2.51.x 那版只换了 UA、链还是网页链，于是「网页链（platform=pc）+
+  /// App UA」= 必然 403（下载直接失败）。
+  ///
+  /// 三条边界：
+  /// - 番剧（[epId] 非空）**不试** `PlayView`：它只认 aid/cid，番剧要另一套 pgc
+  ///   服务（与播放页同一条边界）；
+  /// - `PlayView` 拿不到**可用的流**（老视频无 DASH、接口报错、403…）→ 静默回落
+  ///   网页接口，**不改用户设置**（与播放页同一套做法）；
+  /// - 清晰度：匿名 `PlayView` 与网页接口一样只有 480P/360P（开关的既有代价，
+  ///   设置页副标题已写明）。
+  ///
+  /// ⚠️ 组合次序上 [PlayViewStreamFetcher] 与 [PlayUrlFetcher] 两个替身是**两层**
+  /// 而不是二选一：前者注入 App 形态那一步，后者注入网页接口那一步（既有测试
+  /// 注入的一直是后者，语义因此保持不变）。
+  Future<PlayUrlResult> _fetchStream({
+    required String bvid,
+    required int cid,
+    int? epId,
+  }) async {
+    if (epId == null && streamCompatInUse()) {
+      try {
+        final fetcher = _playViewOverride ?? fetchPlayViewStream;
+        final appStream = await fetcher(bvid: bvid, cid: cid);
+        if (appStream.hasStream) {
+          debugPrint('[download] PlayView 取流 ok quality=${appStream.quality} '
+              'dashV=${appStream.dashVideoUrls.length} '
+              'dashA=${appStream.dashAudioUrls.length}');
+          return appStream;
+        }
+        debugPrint('[download] PlayView 没给出可用流，回落网页接口');
+      } catch (e) {
+        // 实验路径：失败按网页接口继续（真 403 会由下载失败出口报错）
+        debugPrint('[download] PlayView 取流失败，回落网页接口：$e');
+      }
+    }
+    return (_fetchUrlOverride ?? _defaultFetchPlayUrl)(bvid: bvid, cid: cid);
+  }
+
+  /// 默认网页取流：DASH 双流（fnval=16），无 DASH 降级 mp4（fnval=0）。
   Future<PlayUrlResult> _defaultFetchPlayUrl({
     required String bvid,
     required int cid,
@@ -762,18 +819,21 @@ class DownloadManager {
     return result;
   }
 
-  /// 默认下载：独立 dio，仅 Referer + 浏览器 UA（不带 cookie，M0 实测）。
+  /// 默认下载：独立 dio，请求头**按 URL 分流**（v2.53.0+：不再只看开关）。
   ///
-  /// 头走 `biliStreamHeaders()`（v2.51.0+）：设置页「免流兼容（实验）」开关打开时
-  /// UA 换成官方 App 特征值——下载的就是视频/音频流本身，正是免流该覆盖的流量；
-  /// Referer 恒定不变。
+  /// - 网页形态直链（`platform=pc`）：浏览器 UA + Referer（M0 实测缺一不可）；
+  /// - App 形态直链（`platform=android`，开关打开时由 `PlayView` 下发）：
+  ///   App 特征 UA + **不带 Referer**（带了必 403）。
+  ///
+  /// 判据见 `config.biliStreamHeadersFor`（与原生 `DashExoPlayer.networkFactoryFor`
+  /// 同一套）——按 URL 判而不是按开关判，是因为一次会话里两种链会并存。
   Future<void> _defaultDownloadFile(
       String url, String savePath, DownloadProgressCallback? onProgress) async {
     final dio = Dio(
       BaseOptions(
         connectTimeout: const Duration(seconds: 15),
         receiveTimeout: const Duration(seconds: 60),
-        headers: biliStreamHeaders(),
+        headers: biliStreamHeadersFor(url),
       ),
     );
     await dio.download(

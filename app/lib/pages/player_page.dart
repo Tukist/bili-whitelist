@@ -24,6 +24,7 @@ import '../services/danmaku_settings_store.dart';
 import '../services/device_media.dart';
 import '../services/history_store.dart';
 import '../services/realtime_transcriber.dart';
+import '../services/stream_status_store.dart';
 import '../services/ui_prefs_store.dart';
 import '../services/video_shot_service.dart';
 import '../services/watch_stats.dart';
@@ -202,6 +203,179 @@ bool playViewQualityNoticeShown = false;
 @visibleForTesting
 void debugResetPlayViewQualityNotice() => playViewQualityNoticeShown = false;
 
+// -------------------------------------------------------------------------
+// 清晰度选择（v2.53.0+，纯函数，便于单测）
+//
+// 用户原话：「在播放界面下面弄一个可选择播放清晰度的」。
+//
+// 这一节只做**判断**，不碰 IO/UI：接口列了哪些档位（[PlayUrlResult.acceptQuality]）
+// × 这次真的下发到哪一档（[PlayUrlResult.quality]）× 登录态 × 取流形态 →
+// 「哪些能点、哪些不能点、不能点的原因」。播放页照结果渲染 BottomSheet。
+//
+// 为什么要有「拿不到也列出来」：只列能拿到的档位，用户会以为 App 把选项做丢了
+// （"我明明记得有 1080P"）；列出来 + 一句「需登录」，他才知道下一步该干什么。
+// 而**禁用**（`onTap: null`）是硬要求：点一个拿不到的东西只会黑屏或静默回落。
+// -------------------------------------------------------------------------
+
+/// 接口没给档位全集时用的兜底阶梯（从高到低）：B 站最常见的四档。
+///
+/// 只在 `accept_quality` 缺失（旧解析 / 测试手工构造的样本）时兜底——有接口
+/// 数据就以接口为准，不猜。
+const List<int> kQualityFallbackLadder = [80, 64, 32, 16];
+
+/// 「App 形态匿名时被藏起来的高清档」：PlayView 在拿不到 720P+ 时可能**根本不
+/// 列**这些条目（只列 480P/360P），用户就看不到"为什么没有 1080P"。
+///
+/// 判定条件很窄（见 [qualityMenuQualities]）：只在**取流形态是 App** 且接口
+/// 列出的档位**一条都没超过实际下发档**时补上——那时无法区分「这个视频没有
+/// 1080P」与「匿名不给 1080P」，而后者才是常态，所以补一行「需登录」比让用户
+/// 自己猜更诚实。网页接口的 `accept_quality` 是完整的，**不补**（补了会在
+/// 480P 老视频上凭空多出一个"需登录的 1080P"，那是错的）。
+const List<int> kQualityAppGatedLadder = [80, 64];
+
+/// 这一档**这次没拿到**，是不是「登录就能拿到」。
+///
+/// 门限是 720P（[kPlayViewQuality720P]，与「低于它就算被降清晰度」同一分界，
+/// 也是 B 站 `need_login` 的分界——匿名与 App 形态都只给到 480P/360P 这一档
+/// 之下；播放页横幅「未登录仅 720P」说的是同一件事的乐观面）。
+///
+/// 两种情形分开看（这是本判据唯一的条件）：
+/// - **未登录**：720P 及以上都可能是「登录一下就有了」（登录后才谈得上大会员），
+///   所以标「需登录」是**可执行的**指引；
+/// - **已登录 + 网页接口**：连登录都拿不到 → 不是登录问题（大概率是会员/付费
+///   档），交给 [qualityNeedsVip] 或「当前模式下不可用」；
+/// - **已登录 + App 形态**：PlayView 的高清要 `access_key`（官方 App 登录才发，
+///   网页登录拿不到，服务端对此报的正是 `need_login`）→ 仍标「需登录」。
+bool qualityNeedsLogin(
+  int quality, {
+  required bool appMode,
+  required bool loggedIn,
+}) =>
+    quality >= kPlayViewQuality720P && (appMode || !loggedIn);
+
+/// 这一档是不是**需要大会员**（B 站 1080P+ 及以上：高码率/高帧率/4K/HDR/
+/// 杜比视界/8K 全是会员档；1080P 本身只要登录）。
+bool qualityNeedsVip(int quality) => quality >= 112;
+
+/// 拿不到这一档时的**短原因**（列表里禁用行的说明文案）。
+///
+/// 顺序即优先级：会员档先说「需大会员」（那是更高的门槛，用户要动的是登录
+/// 之外的另一步）；再判登录；两道都过还是拿不到（接口列了但没下发）→
+/// 「当前模式下不可用」（例如 480P 老视频的会员档位）。
+String qualityBlockedReason(
+  int quality, {
+  required bool appMode,
+  required bool loggedIn,
+}) {
+  if (qualityNeedsVip(quality)) return '需大会员';
+  if (qualityNeedsLogin(quality, appMode: appMode, loggedIn: loggedIn)) {
+    return '需登录';
+  }
+  return '当前模式下不可用';
+}
+
+/// 清晰度列表的一行。
+class QualityChoice {
+  const QualityChoice({
+    required this.quality,
+    required this.label,
+    required this.enabled,
+    this.reason,
+  });
+
+  /// 档位值（`qn`，与请求参数、`quality` 字段同域）。
+  final int quality;
+
+  /// 短标签（[playViewQualityName]，如 `1080P` / `4K`）。
+  final String label;
+
+  /// 是否可选（false = 只展示，标明 [reason]，**不可点**）。
+  final bool enabled;
+
+  /// 不可选的原因（[enabled] 为真时恒为 null）。
+  final String? reason;
+
+  @override
+  String toString() =>
+      'QualityChoice($quality/$label, enabled=$enabled${reason == null ? '' : ', $reason'})';
+}
+
+/// 「这次能拿到哪些档位」的判据：**已实测拿到的档位（[actualQuality]）及更低
+/// 的档位**。
+///
+/// 为什么可以这样推断：B 站的清晰度是**权限单调**的阶梯——服务端拒绝高档位
+/// （未登录/无大会员）不会反过来拒绝低档位；同一视频的档位表里，成了 480P
+/// 就说明 360P 也能拿。已实测拿到 1080P 而用户想降到 720P/480P 是**最常见的
+/// 反向操作**，若只把"实测那一档"当可选，那个按钮就点不动了。
+///
+/// 推断错了怎么办：真的拿不到时会**回落 + 明说**（见
+/// [_PlayerPageState._noticeQualityFallback]），不会静默黑屏。
+Set<int> qualityObtainable({required List<int> declared, required int actualQuality}) =>
+    {for (final q in declared) if (q > 0 && q <= actualQuality) q};
+
+/// 列表要渲染的档位（从高到低）：接口列出 ∪ 必要的兜底补档。
+///
+/// 三条规则（都在上面的常量注释里说明过理由）：
+/// 1. 接口给了档位全集 → 原样用（去重、降序）；
+/// 2. 接口一个档位都没给 → 兜底阶梯里**不超过实际下发档**的那些（不凭空
+///    宣称有更高清的档位）；
+/// 3. 取流形态是 App 且接口列出的档位一条都没超过实际下发档 → 补
+///    [kQualityAppGatedLadder]（说清"1080P/720P 需登录"）。
+List<int> qualityMenuQualities({
+  required List<int> declared,
+  required int actualQuality,
+  required bool appMode,
+}) {
+  final set = <int>{for (final q in declared) if (q > 0) q};
+  if (set.isEmpty) {
+    if (actualQuality > 0) {
+      set.add(actualQuality);
+      for (final q in kQualityFallbackLadder) {
+        if (q < actualQuality) set.add(q);
+      }
+    }
+  } else if (appMode && set.every((q) => q <= actualQuality)) {
+    set.addAll(kQualityAppGatedLadder);
+  }
+  return set.toList()..sort((a, b) => b.compareTo(a));
+}
+
+/// 组装清晰度列表（纯函数；顺序 = 从高到低，第一行即最高档）。
+List<QualityChoice> buildQualityChoices({
+  required List<int> declared,
+  required int actualQuality,
+  required bool appMode,
+  required bool loggedIn,
+}) {
+  final menu = qualityMenuQualities(
+      declared: declared, actualQuality: actualQuality, appMode: appMode);
+  final obtainable =
+      qualityObtainable(declared: menu, actualQuality: actualQuality);
+  return [
+    for (final q in menu)
+      QualityChoice(
+        quality: q,
+        label: playViewQualityName(q),
+        enabled: obtainable.contains(q),
+        reason: obtainable.contains(q)
+            ? null
+            : qualityBlockedReason(q, appMode: appMode, loggedIn: loggedIn),
+      ),
+  ];
+}
+
+/// 「你选的档位这次拿不到」的提示文案（v2.53.0+）。
+///
+/// 例：`1080P 需登录，已回落 480P`。**必须明说回落到了哪一档**——只说"切换失败"
+/// 用户会以为还在原档位，糊着看一整集。
+String qualityFallbackNotice({
+  required int requested,
+  required int actualQuality,
+  required String reason,
+}) =>
+    '${playViewQualityName(requested)} $reason，已回落 '
+    '${playViewQualityName(actualQuality)}';
+
 /// 开关开着时给失败文案补一句归因；关着时**原样返回**。
 ///
 /// 关着时逐字不变是硬要求：既有文案是用户看惯的、也被既有用例逐字钉住
@@ -347,6 +521,10 @@ enum StreamSwitchCause {
 
   /// 当前 URL 的 deadline 即将到期（主动预取换源）。
   deadline,
+
+  /// 用户换了清晰度（v2.53.0+）：必须重取 playurl（新档位要新的 `qn`），
+  /// 且在**同一批候选**里轮转毫无意义（候选是上一档的 URL）。
+  quality,
 }
 
 /// 候选线路游标推进（纯函数）：返回**下一条**线路的下标；
@@ -382,11 +560,17 @@ String? streamLineAt(List<String> lines, int index) {
 ///   且省一次 playurl 请求）；候选耗尽才重取。
 /// - [StreamSwitchCause.deadline]：**一律重取**——备用线路与当前线路同批、deadline
 ///   相同（见上方实测），轮转延长不了有效期，只有重取才能拿到新签名的 URL。
+/// - [StreamSwitchCause.quality]（v2.53.0+）：**一律重取**——候选线路表是**上一档
+///   清晰度**的 URL（同一次 playurl 响应里的备用 CDN），轮转到它只会用旧档位的
+///   流冒充新选择；新档位必须带新的 `qn` 重新取。
 bool shouldReloadStreamUrl({
   required StreamSwitchCause cause,
   required bool hasNextLine,
 }) =>
-    cause == StreamSwitchCause.deadline || !hasNextLine;
+    switch (cause) {
+      StreamSwitchCause.lineError => !hasNextLine,
+      StreamSwitchCause.deadline || StreamSwitchCause.quality => true,
+    };
 
 // -------------------------------------------------------------------------
 // B 站式播放快捷手势（v2.16.7+）纯函数（便于单测）
@@ -823,9 +1007,10 @@ const double kLandscapeVideoHeightRatio = 0.55;
 /// 进度条行 `_PlayerSeekBar.height`）一共让出 **8dp** 画面。**不往 36 收**：
 /// 那会顶到内容且没有余量，中文字体在不同机型上的行高微差就会裁切。
 ///
-/// 触摸目标：本行 40dp 高，但每格宽 51.4dp（411dp 屏 8 等分），实际可点区
-/// 51.4×40dp 与改动前同量级；真正被 Android ≥44 规范约束的是进度条行
-/// （细轨 + 拖动柄），它的下限单列在 `_PlayerSeekBar.height`。
+/// 触摸目标：本行 40dp 高，但每格宽 51.4dp（411dp 屏 8 等分；v2.53.0 加入
+/// 「清晰度」后是 9 等分 45.7dp），实际可点区与改动前同量级；真正被 Android
+/// ≥44 规范约束的是进度条行（细轨 + 拖动柄），它的下限单列在
+/// `_PlayerSeekBar.height`。
 const double _kBottomButtonRowHeight = 40;
 
 /// 底栏控制行总高 = 进度条行（[_PlayerSeekBar.height]）+ 按钮行
@@ -1752,6 +1937,31 @@ class _PlayerPageState extends State<PlayerPage>
   double _speed = 1.0;
   double _speedBeforeLongPress = 1.0;
 
+  // 清晰度（v2.53.0+，见 [buildQualityChoices] / [_showQualitySheet]）
+  // ---------------------------------------------------------------------
+  // 四个字段分工：
+  // - [_qualityQn]：**这次请求要的档位**（= 用户上次选的，默认 1080P）。它同时
+  //   是底栏「清晰度」列表里的"用户意愿"，也是留给服务端的 `qn`；
+  // - [_streamQuality]：**这次实际下发**的档位（底栏标签显示的是它，不是
+  //   [_qualityQn]——回落之后标签必须跟着回落，否则界面在说谎）；0 = 还没有
+  //   成功取过流（此时清晰度入口禁用）；
+  // - [_acceptQualities]：接口**列出**的档位全集（含拿不到的），列表靠它把
+  //   「需登录/需大会员」的档位也摆出来；
+  // - [_lastStreamWasApp]：这次走的是不是 App 形态（PlayView，实验开关）→
+  //   决定「需登录」的阈值与要不要补一档"被藏起来的 1080P"。
+  late int _qualityQn;
+  int _streamQuality = 0;
+  List<int> _acceptQualities = const [];
+  bool _lastStreamWasApp = false;
+
+  /// 「你选的档位拿不到」是否已在**本页**提示过（一次就够：换集不重弹）。
+  ///
+  /// 与 [playViewQualityNoticeShown] 的区别：那个是**每会话**一次的说明性提示
+  /// （App 形态只有 480P），这个是**每次进新视频**都可能不同的事实（用户这次
+  /// 选的档位、这个视频有没有那一档）。用户**主动切换**清晰度时会被重置 →
+  /// 「我明明点了 1080P」的当场反馈永远不会被吞掉。
+  bool _qualityFallbackNoticed = false;
+
   // 听视频（纯音频）模式：隐藏画面，音频继续
   bool _listenMode = false;
 
@@ -2153,6 +2363,10 @@ class _PlayerPageState extends State<PlayerPage>
     _videoShot = widget.videoShotService ?? VideoShotService();
     // 取流接口：生产自建，测试可注入（见 [PlayerPage.api]）
     _api = widget.api ?? BiliApi();
+    // 清晰度（v2.53.0+）：本次请求的 `qn` = 用户上次选的档位（默认 1080P）。
+    // 取一次就够——[UiPrefsStore.ensureLoaded] 在 `main()` 里早于任何路由跑，
+    // 用户改档位走 [_applyQuality] 自己改 state。
+    _qualityQn = UiPrefsStore.instance.preferredQuality;
     // 历史记录续播：初始定位到对应分 P（越界 / 单 P 回落第 0 集）。
     // 必须在 _init 之前设置，_maybeRestoreProgress 按 _currentPageIndex 取进度。
     //
@@ -2616,7 +2830,10 @@ class _PlayerPageState extends State<PlayerPage>
               : await fetchPlayViewStream(
                   bvid: _video.bvid,
                   cid: _currentCid,
-                  qn: 80,
+                  // 用户选的档位（[UiPrefsStore.preferredQuality]，默认 1080P）
+                  // 一并作为 `PlayViewReq.qn` 传下去（v2.53.0）；服务端仍按
+                  // 登录态最后裁决，拿不到就回落（见 [_noteStreamQuality]）
+                  qn: _qualityQn,
                 );
           debugPrint('[player_page] PlayView 取流 ok quality=${appStream.quality} '
               'dashV=${appStream.dashVideoUrls.length} '
@@ -2641,16 +2858,24 @@ class _PlayerPageState extends State<PlayerPage>
           await _api.fetchPlayUrl(
             bvid: _video.bvid,
             cid: _currentCid,
-            qn: 80,
+            qn: _qualityQn, // 用户选的档位（默认 1080P），v2.53.0 起不再是写死的 80
             fnval: 16, // DASH 双流（M2.1 实测定案：1080P 走路线 A）
           );
+      // 0.9) 「最近一次取流」记录（v2.53.0，个人页「取流状态」用）：
+      //      到这一刻才知道"这次到底走了哪条接口、拿到什么清晰度、带没带登录
+      //      Cookie"，记下来给个人页显示（落盘，重启后仍看得到上次结果）。
+      //      **只记事实**：记录失败在 [_recordStreamStatus] 内部吞掉，绝不影响播放。
+      unawaited(_recordStreamStatus(
+        source: appStream != null ? StreamSource.app : StreamSource.web,
+        quality: result.quality,
+      ));
       // 老视频无 DASH → 重取 fnval=0 拿 durl[0].url（fnval=16 的响应里没有 durl）
       if (result.dashVideoUrls.isEmpty) {
         debugPrint('[player_page] fnval=16 无 DASH，降级 fnval=0');
         result = await _api.fetchPlayUrl(
           bvid: _video.bvid,
           cid: _currentCid,
-          qn: 80,
+          qn: _qualityQn,
           fnval: 0,
         );
       }
@@ -2664,6 +2889,10 @@ class _PlayerPageState extends State<PlayerPage>
         await _playPgcFallback(epId, positionMs);
         return;
       }
+      // 0.95) 记下这次真正要播的档位 + 档位全集（v2.53.0，底栏「清晰度」入口
+      //       与列表用）：放在 `_playStream` 之前，拿的是**最终那份** result
+      //       （fnval=0 降级后的），保证底栏显示的档位与正在播的流一致。
+      _noteStreamQuality(result, appMode: appStream != null);
       await _playStream(result, positionMs: positionMs);
     } on BiliApiException catch (e) {
       // 2) 普通 playurl -404（番剧会员集实测特征）且带 epId → 回退 pgc 端点；
@@ -2750,7 +2979,8 @@ class _PlayerPageState extends State<PlayerPage>
     PgcPlayUrlResult? result;
     Object? error;
     try {
-      result = await _api.fetchPgcPlayUrl(epId);
+      // 番剧集同样尊重用户选的清晰度（v2.53.0；此前是 fetchPgcPlayUrl 的默认 80）
+      result = await _api.fetchPgcPlayUrl(epId, qn: _qualityQn);
     } catch (e) {
       error = e;
       debugPrint('[player_page] pgc 回退取流失败 epId=$epId error=$e');
@@ -2770,6 +3000,9 @@ class _PlayerPageState extends State<PlayerPage>
         _dismissCoverOverlay();
         return;
       }
+      // 档位与档位全集同样记一份（v2.53.0）：番剧走的是 pgc 端点（网页链，
+      // 不是 App 形态），底栏与清晰度列表据此显示
+      _noteStreamQuality(r, appMode: false);
       await _playStream(r, positionMs: positionMs);
       return;
     }
@@ -3301,6 +3534,104 @@ class _PlayerPageState extends State<PlayerPage>
     } finally {
       _autoRecovering = false;
     }
+  }
+
+  /// 记下「最近一次取流」的实测事实（v2.53.0，个人页「取流状态」用）。
+  ///
+  /// 三样都只在**取流成功那一刻**才知道：走了哪条接口（[source]）、实际清晰度
+  /// （[quality]）、请求里带没带登录 Cookie。第三样用 [_hasValidSession] 判 ——
+  /// 两条路径本来就是同一件事：本机有没有**未过期**的 `SESSDATA`（网页接口靠
+  /// dio 拦截器注入，PlayView 靠 `playViewLoginCookie()` 显式塞进请求头）。
+  ///
+  /// 本方法**不抛异常**（读盘/写盘都有兜底）：个人页的一行说明出岔子，
+  /// 绝不能反过来影响播放。
+  Future<void> _recordStreamStatus({
+    required StreamSource source,
+    required int quality,
+  }) async {
+    try {
+      await StreamStatusStore.instance.record(
+        source: source,
+        quality: quality,
+        hadLoginCookie: await _hasValidSession(),
+      );
+    } catch (_) {
+      // 记录失败静默（下次取流成功会再记一次）
+    }
+  }
+
+  /// 记下这次**真正下发**的档位与档位全集（v2.53.0，底栏「清晰度」入口用）。
+  ///
+  /// [result.quality] 是实际下发的那一档（拿不到用户选的档位时服务端给的就是
+  /// 回落后的档位）→ 底栏标签与列表的"当前档"都显示它，界面才不会说谎。
+  /// [result.acceptQuality] 是接口列出的档位全集 → 列表据此把「需登录/需大会员」
+  /// 的档位也摆出来（见 [buildQualityChoices]）。
+  ///
+  /// 顺带触发一次**回落提示**：用户选的档位与实际下发的不一致时明说一句
+  /// （见 [_noticeQualityFallback]）。本方法不抛异常、不改播放流程。
+  void _noteStreamQuality(PlayUrlResult result, {required bool appMode}) {
+    if (!mounted) return;
+    setState(() {
+      _streamQuality = result.quality;
+      _acceptQualities = List<int>.unmodifiable(result.acceptQuality);
+      _lastStreamWasApp = appMode;
+    });
+    unawaited(_noticeQualityFallback(
+      requested: _qualityQn,
+      actualQuality: result.quality,
+      appMode: appMode,
+    ));
+  }
+
+  /// 用户选的档位**这次拿不到**（服务端给了更低的档）时明说一句（v2.53.0+）。
+  ///
+  /// 为什么不能静默：默认档位就是 1080P，未登录 / 开着「免流兼容」时必然拿到
+  /// 480P —— 不说的话用户只会觉得"这 App 画质真差"，而不知道去登录或去关开关。
+  ///
+  /// 四条边界（都是刻意的）：
+  /// - **每页一次**（[_qualityFallbackNoticed]）：换集/换视频不重复唠叨（换新页
+  ///   才再说一次）；用户主动切档位时会复位（见 [_applyQuality]），"我点了
+  ///   1080P 却没生效"的当场反馈永远不被吞；
+  /// - **App 形态下让位给 [kPlayViewLowQualityNotice]**：那条每会话一次的说明
+  ///   说的是同一件事（App 形态只有 480P），两条叠着弹没有信息增量；
+  /// - **实际不低于请求就不提示**（`actualQuality >= requested`）：请求 360P
+  ///   而服务端给了 480P 是好事，说"回落"反而是胡说；
+  /// - **档位未知（<=0）不提示**：宁可少提示，也别凭空吓唬人；
+  /// - **走 [SnackKind.info]**：这不是失败（视频照常播），用户关掉「界面提示」
+  ///   总开关就不弹。
+  Future<void> _noticeQualityFallback({
+    required int requested,
+    required int actualQuality,
+    required bool appMode,
+  }) async {
+    if (_qualityFallbackNoticed) return;
+    // 实际档位**不低于**请求的档位就不算回落：请求 360P 拿到 480P 是好事
+    // （服务端按视频实际档位给），提示"回落"反而是胡说。
+    if (requested <= 0 || actualQuality <= 0 || actualQuality >= requested) {
+      return;
+    }
+    if (appMode && playViewQualityNoticeShown) return;
+    if (!mounted) return;
+    // 先置标记再弹（同 [_noticeIfPlayViewQualityDropped]：用户关掉「界面提示」
+    // 时也算处理过，不必每次播放再判一遍）
+    _qualityFallbackNoticed = true;
+    final reason = qualityBlockedReason(
+      requested,
+      appMode: appMode,
+      loggedIn: await _hasValidSession(),
+    );
+    if (!mounted) return;
+    debugPrint('[player_page] 清晰度回落：请求 $requested → 实际 $actualQuality'
+        '（$reason，appMode=$appMode）');
+    AppSnack.show(
+      context,
+      qualityFallbackNotice(
+        requested: requested,
+        actualQuality: actualQuality,
+        reason: reason,
+      ),
+      kind: SnackKind.info,
+    );
   }
 
   /// App 取流（PlayView）拿到的清晰度**低于 720P 且本机已登录**时，当场说一句
@@ -4670,6 +5001,159 @@ class _PlayerPageState extends State<PlayerPage>
       ),
     );
     if (selected != null) await _applySpeed(selected);
+  }
+
+  // -------------------------------------------------------------------------
+  // 清晰度选择（v2.53.0+）
+  // -------------------------------------------------------------------------
+
+  /// 弹出清晰度列表（BottomSheet，与 [_showSpeedSheet] 同一套写法/配色）。
+  ///
+  /// 行数比倍速少（最多 6~8 档），但仍照抄倍速那套 `isScrollControlled` +
+  /// 70% 屏高约束 + `useSafeArea` + Flexible/ListView：横屏下可用高度只有
+  /// 411dp，固定的 Column 会被裁掉（倍速当初踩过这个坑）。
+  ///
+  /// **列表内容由纯函数 [buildQualityChoices] 决定**：能拿到的档位可选、拿不到
+  /// 的档位照列但标原因（`需登录` / `需大会员` / `当前模式下不可用`）且**点不动**
+  /// —— 点一个拿不到的东西只会黑屏或静默回落，那正是要避免的形态。
+  ///
+  /// 登录态在这里才读（每次打开都重读）：用户可能刚从设置页登录回来。
+  Future<void> _showQualitySheet() async {
+    final loggedIn = await _hasValidSession();
+    if (!mounted) return;
+    final choices = buildQualityChoices(
+      declared: _acceptQualities,
+      actualQuality: _streamQuality,
+      appMode: _lastStreamWasApp,
+      loggedIn: loggedIn,
+    );
+    debugPrint('[player_page] show quality sheet: 当前=$_streamQuality '
+        '请求=$_qualityQn appMode=$_lastStreamWasApp '
+        '选项=${choices.map((c) => c.toString()).join(' | ')}');
+    final selected = await showModalBottomSheet<int>(
+      context: context,
+      backgroundColor: const Color(0xFF202023),
+      isScrollControlled: true,
+      useSafeArea: true,
+      constraints: BoxConstraints(
+        maxHeight: MediaQuery.sizeOf(context).height * 0.7,
+      ),
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Padding(
+              padding: EdgeInsets.only(top: 14, bottom: 6),
+              child: Text('清晰度',
+                  style: TextStyle(color: kPlayerOnDim, fontSize: 13)),
+            ),
+            Flexible(
+              child: ListView.builder(
+                shrinkWrap: true,
+                itemCount: choices.length,
+                itemBuilder: (context, i) {
+                  final c = choices[i];
+                  final current = c.quality == _streamQuality;
+                  return ListTile(
+                    dense: true,
+                    enabled: c.enabled,
+                    title: Text(
+                      c.label,
+                      textAlign: TextAlign.center,
+                      style: TextStyle(
+                        color: c.enabled
+                            ? (current ? kPlayerOn : kPlayerOff)
+                            : kPlayerOnDim,
+                        fontSize: 16,
+                        fontWeight:
+                            current ? FontWeight.bold : FontWeight.normal,
+                      ),
+                    ),
+                    // 右侧：当前档打勾；拿不到的档标原因（文案与列表同层，
+                    // 用户不用点开就知道为什么没有）
+                    trailing: current
+                        ? const Icon(Icons.check, color: kPlayerOn, size: 20)
+                        : (c.enabled
+                            ? const SizedBox(width: 20)
+                            : Text(c.reason ?? '',
+                                style: const TextStyle(
+                                    color: kPlayerOnDim, fontSize: 12))),
+                    // 拿不到的档位**不可点**（onTap: null → 灰掉且不响应）
+                    onTap: c.enabled
+                        ? () => Navigator.of(sheetContext).pop(c.quality)
+                        : null,
+                  );
+                },
+              ),
+            ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+    if (selected != null) await _applyQuality(selected);
+  }
+
+  /// 切换清晰度（v2.53.0+）：记住选择 → **保持播放位置**换源。
+  ///
+  /// 换源复用既有的 [_switchStreamLine]（`cause: quality` → 一定重取 playurl、
+  /// 不轮转备用线路），把当前位置传给 setDataSource：与「自动续播 / 主动预取」
+  /// 同一条路径、同一套位置语义，**不新写切源逻辑**（也不重建播放器 —— 那会
+  /// 白拆一次纹理，画面黑一下）。
+  ///
+  /// 失败回滚：[_qualityQn] 与盘上的偏好都退回原档位（不把一个真的做不到的选择
+  /// 留在设置里），并走 [SnackKind.error] 明说一句。播放器若已被换源弄坏，
+  /// 既有的自动续播（[_onAutoRecover]）会按**回滚后的**档位重取流兜底。
+  ///
+  /// 两条短路：选的还是原来那一档 → 什么都不做；选的正好是**这次下发的**那一档
+  /// （回落之后点"当前档"）→ 只把偏好对齐过去，不白换一次流。
+  Future<void> _applyQuality(int quality) async {
+    final prev = _qualityQn;
+    if (quality == prev) return;
+    // 这次下发的已经是这一档（回落之后用户点了"当前档"）：只把偏好改成它，
+    // **不白换一次流**（换一次要重取 playurl + 重缓冲，画面还会黑一下）。
+    if (quality == _streamQuality) {
+      debugPrint('[player_page] 清晰度偏好对齐当前档位 $quality（无需换源）');
+      setState(() => _qualityQn = quality);
+      await UiPrefsStore.instance.setPreferredQuality(quality);
+      return;
+    }
+    debugPrint('[player_page] 切换清晰度 $prev → $quality');
+    setState(() {
+      _qualityQn = quality;
+      // 用户主动选过 → 允许再提示一次回落（上一次的"说过了"不适用于这次选择）
+      _qualityFallbackNoticed = false;
+    });
+    await UiPrefsStore.instance.setPreferredQuality(quality);
+    var pos = _positionMs;
+    try {
+      pos = await _player?.getPosition() ?? _positionMs;
+    } catch (_) {
+      // 原生通道异常：退回 Dart 侧记的位置（够用，setDataSource 会再定位）
+    }
+    if (!mounted) return;
+    setState(() => _buffering = true); // 换源期间转缓冲，别像卡住
+    try {
+      await _switchStreamLine(
+          positionMs: pos, cause: StreamSwitchCause.quality);
+      // 换源后原生倍速被重置为 1x（同自动续播路径），补一次
+      await _player?.setPlaybackSpeed(_speed);
+    } catch (e) {
+      debugPrint('[player_page] 切换清晰度失败：$e');
+      if (!mounted) return;
+      setState(() {
+        _qualityQn = prev;
+        _buffering = false;
+      });
+      await UiPrefsStore.instance.setPreferredQuality(prev);
+      if (mounted) {
+        AppSnack.show(
+          context,
+          '切换清晰度失败，保持 ${playViewQualityName(prev)}',
+          kind: SnackKind.error,
+        );
+      }
+    }
   }
 
   /// 听视频开关：只隐藏/显示画面，不打断播放（不调 pause/play）。
@@ -6075,7 +6559,7 @@ class _PlayerPageState extends State<PlayerPage>
     }
     return InkWell(
       onTap: downloading ? null : _onDownloadTap,
-      // 图标在上、标签在下（见 [_barIconLabel]）——与同级 7 个按钮同一竖排
+      // 图标在上、标签在下（见 [_barIconLabel]）——与同级 8 个按钮同一竖排
       // 语汇，「已缓存」「下载中」等 3 字标签不再被省略号截断
       child: _barIconLabel(icon: icon, label: label, color: color),
     );
@@ -6985,13 +7469,18 @@ class _PlayerPageState extends State<PlayerPage>
           else if (_gestureSeeking)
             _buildSeekRowOnly(),
           // 5.2 画面变换区（v2.39.0 的复位 / v2.49.0 新增的「旋转」）：
-          //     变换可用（全屏或横屏置顶）时出现——旋转键常驻、复位键只在
-          //     真的缩放/旋转过时出现（见 [_buildViewControls]）。悬浮在底栏
-          //     之上（**不进底栏那一行**——8 等分已经每格 51.4dp，再挤第 9 个
-          //     按钮会把「选集 1/2」「听视频中」压到省略号），且不受控制层显隐
-          //     影响：画面被放大/转过之后若找不到入口，用户只能退出全屏再来
-          //     （那个动作会复位，但不该是唯一出路）。
-          if (_viewTransformEnabled) _buildViewControls(),
+          //     变换可用（全屏或横屏置顶）时才有；**跟随控制层显隐**（v2.53.0，
+          //     用户原话：「视频播放界面的旋转能不能在默认隐藏只有点击唤起的时候
+          //     再出现?」）——默认收着，点画面唤起控制层时与播放控制一起出现，
+          //     再点一起消失。悬浮在底栏之上（**不进底栏那一行**——9 等分已经
+          //     每格 45.7dp，再挤第 10 个按钮会把「选集 1/2」「听视频中」压到
+          //     省略号）。
+          //
+          //     ⚠️ 唯一的例外：**画面已经被变换过**（缩放 ≠1 或旋转 ≠0）时这一排
+          //     常驻。理由见 [_buildViewControls] 的注释（一句话：转过画面之后
+          //     「复位」是用户的唯一出路，控制层一收就藏起来 = 把出口藏起来）。
+          if (_viewTransformEnabled && (_controlsVisible || _viewTransformed))
+            _buildViewControls(),
           // 5.5 手势提示浮层（B 站式快捷手势）：seek 时间 / 亮度 / 音量，
           //     中心偏上、不拦截任何点击（IgnorePointer）。
           if (_hudKind != null)
@@ -7325,9 +7814,11 @@ class _PlayerPageState extends State<PlayerPage>
         ),
         // 写操作行（v2.40.0+，默认关闭）：点赞 / 投币 / 收藏。
         //
-        // 落点为什么在这里（信息块里独立一行，**不是底栏**）：底栏刚在
-        // v2.39.0 收窄到 8 个 40dp 的按钮，第 9 个必然压垮「选集 1/2」这类
-        // 文案（见 _buildBottomBar 的注释）；而信息块这一行本来就贴着
+        // 落点为什么在这里（信息块里独立一行，**不是底栏**）：底栏按钮行是
+        // 40dp 高、411dp 屏上 9 等分后每格 45.7dp，标签靠 FittedBox 缩字才
+        // 不省略（见 _barIconLabel 的注释）——再塞第 10 个按钮就真要把
+        // 「选集 1/2」这类文案压掉了（v2.39.0 的那条约束到 v2.53.0 加「清晰度」
+        // 时已经用掉多半余量）；而信息块这一行本来就贴着
         // 标题/UP 主，是"关于这个视频"的信息集中地，写操作放在这里语义最近。
         //
         // 为什么套 ListenableBuilder：设置页那个总开关可能在播放页还活着
@@ -7907,16 +8398,32 @@ class _PlayerPageState extends State<PlayerPage>
   }
 
   /// 画面变换区（v2.39.0+）：右下角、底栏之上的一组小圆角按钮
-  /// ——**旋转**（v2.49.0 起常驻）+ **复位**（有变换时才出现）。
+  /// ——**旋转** + **复位**（有变换时才出现）。
   ///
   /// 位置：`bottom: 底栏高度 + 上下集行（若有）+ 12`——**不进底栏那一行**
-  /// （8 等分每格 51.4dp，再挤第 9 个按钮会压垮「选集 1/2」这类文案，见 ② 的
+  /// （9 等分每格 45.7dp，再挤第 10 个按钮会压垮「选集 1/2」这类文案，见 ② 的
   /// 约束）；也不放中央（会与播放簇抢点击）。这一带在竖屏 / 横屏置顶 / 全屏
   /// 三种形态下都是空白（中央簇垂直居中、底栏贴底），不会盖住任何既有控件。
   ///
-  /// 复位键是**开关式**可见性（只有画面真的被放大/旋转过才出现，没变换时一个
-  /// 像素都不多）；旋转键则**常驻**——这正是这一版要解决的矛盾：复位键只在
-  /// 「已经变换过」时出现，而用户抱怨的恰恰是**找不到变换入口**。
+  /// ## 可见性（v2.53.0 起跟随控制层）
+  ///
+  /// 用户原话：「视频播放界面的旋转能不能在默认隐藏只有点击唤起的时候再出现?」
+  /// —— 旋转键此前（v2.49.0）是**常驻**的，于是这一排在沉浸观影时也一直悬在
+  /// 画面右下角。现在整排（旋转 + 复位）由调用处按
+  /// `_viewTransformEnabled && (_controlsVisible || _viewTransformed)` 决定是否
+  /// 构建：点画面唤起控制层时与播放控制/底栏**一起出现**（同一帧，不存在
+  /// "控制层出来了、旋转键还没出来"的错位），再点一起消失。
+  ///
+  /// ⚠️ **有变换时仍常驻**（[_viewTransformed] 为真时无视控制层显隐）。理由：
+  /// 1. 画面被放大/转过之后，**「复位」是用户唯一的退路**——控制层一收就把它
+  ///    藏起来，用户会以为"画面坏了"且找不到恢复入口（那时画面里只剩被放大的
+  ///    局部，四周还可能是黑边，观感就是"坏了"）；
+  /// 2. 与「收起的播放控制」不同：底栏/中央簇收起来不影响播放（用户知道自己
+  ///    点了画面在隐藏控制），而变换状态**不会自己消失**、必须留个出口；
+  /// 3. 代价可控：没变换时一个像素都不多（纯粹跟随控制层），只有真变换过才
+  ///    多留这两个小胶囊。
+  ///
+  /// 复位键仍是**开关式**可见性（只有画面真的被放大/旋转过才出现）。
   ///
   /// 底栏偏移里那个上下集行不能漏：多 P 视频（或带播放列表）时底栏是 120dp
   /// 而不是 80dp，按 80 摆就会压在这一行上（v2.49.0 修的既有隐患）。
@@ -8237,8 +8744,13 @@ class _PlayerPageState extends State<PlayerPage>
   /// （11px + 字距 0.6 ≈ 11.6dp/字）下 2 个中文字要 23.2dp、3 个字要 34.8dp、
   /// 4 个字要 46.4dp，**必然**被 `TextOverflow.ellipsis` 截断（实测「选集 1/N」
   /// 显示成「选⋯」、「听视频」显示成「听⋯」，「听视频中」「字幕中」「已缓存」
-  /// 同理）。竖排后标签独占整格宽 51.4dp：3 字（34.8）与 4 字（46.4）都完整
+  /// 同理）。竖排后标签独占整格宽：3 字（34.8）与 4 字（46.4）都完整
   /// 显示，不再有省略号。
+  ///
+  /// v2.53.0 加入「清晰度」后本行是 **9 等分**（411dp 屏每格 45.7dp）：4 字
+  /// 标签（46.4dp）刚好越过格宽 0.7dp → 交给下面的 [FittedBox] 缩掉约 1.5%
+  /// （仍是完整文字、无省略号）；3 字与英文数字标签（「1080P」≈ 40dp）照旧
+  /// 原尺寸。字号不再往下调：[kTypeLabel] 11px 已是这个高度的下限。
   ///
   /// [FittedBox]（`scaleDown`，Flutter 内置组件，不引入新依赖）是最后一道
   /// 保险：极端长度（如「选集 1/100」≈ 56dp 超出整格）整体等比缩到格宽以内
@@ -8282,7 +8794,7 @@ class _PlayerPageState extends State<PlayerPage>
   ///
   /// 单独成方法是因为**手势横滑 seek 时控制层可能是收着的**（用户点画面隐藏
   /// 过）——那时只把这一行浮出来就够了（见 [_buildSeekRowOnly]），没必要把
-  /// 顶栏 / 中央播放簇 / 8 个按钮整套弹出来。两条路径共用同一份行实现，
+  /// 顶栏 / 中央播放簇 / 9 个按钮整套弹出来。两条路径共用同一份行实现，
   /// 进度条盒与气泡坐标系自然一致。
   Widget _buildSeekRow() {
     return SizedBox(
@@ -8366,7 +8878,7 @@ class _PlayerPageState extends State<PlayerPage>
   /// 手势横滑 seek 且控制层收着时，只把进度条行浮出来。
   ///
   /// 为什么不是直接显示整套控制层：横滑 seek 的诉求是「手柄跟着手指 +
-  /// 气泡贴着进度条」，顶栏 / 中央播放簇 / 8 个按钮一起弹出来只会更干扰；
+  /// 气泡贴着进度条」，顶栏 / 中央播放簇 / 9 个按钮一起弹出来只会更干扰；
   /// 而控制层的显隐是用户点画面定下的偏好，不该被一次 seek 改掉
   /// （所以不动 [_controlsVisible]）。
   ///
@@ -8419,8 +8931,9 @@ class _PlayerPageState extends State<PlayerPage>
   /// 底栏「上一集 / 第 N/M 集 / 下一集」行（v2.30.0+ 同合集上下集）。
   ///
   /// 为什么放在底栏、且**单独一行**：
-  /// - 不挤占既有按钮行：那一行在 411dp 宽屏上 8 等分后每格仅 51.4dp，为了
-  ///   不出现省略号才特意改成竖排（见 [_barIconLabel]）；再塞两个按钮必然
+  /// - 不挤占既有按钮行：那一行在 411dp 宽屏上 9 等分后每格仅 45.7dp
+  ///   （v2.53.0 加「清晰度」之前是 8 等分 51.4dp），为了不出现省略号才特意
+  ///   改成竖排 + FittedBox（见 [_barIconLabel]）；再塞三个按钮必然
   ///   压垮「选集 1/2」「听视频中」这些既有文案。所以不碰它；
   /// - 也不用中央控制簇：视频区过矮（[compactEmbedded]）时整个中央簇会被
   ///   收起，放那里会在横屏置顶/超宽视频下消失。底栏在竖屏 / 横屏置顶 /
@@ -8556,8 +9069,8 @@ class _PlayerPageState extends State<PlayerPage>
       key: const ValueKey('player-bottom-bar'),
       decoration: _kBottomBarScrim,
       // 两行结构：进度条行（[_buildSeekRow]，[_PlayerSeekBar.height] = 40）+
-      // 按钮行（[_kBottomButtonRowHeight] = 40：选集/倍速/听视频/字幕/弹幕/
-      // 评论/下载/全屏）；合计 [kPlayerBottomBarHeight] = 80。
+      // 按钮行（[_kBottomButtonRowHeight] = 40：选集/倍速/清晰度/听视频/字幕/
+      // 弹幕/评论/下载/全屏）；合计 [kPlayerBottomBarHeight] = 80。
       //
       // P5：进度条行不用原生 Slider——Slider 在「有界高度」约束下会撑满整个
       // 高度（_RenderSlider 布局取 constraints.maxHeight）并吞掉中心播放/暂停
@@ -8611,6 +9124,29 @@ class _PlayerPageState extends State<PlayerPage>
                         icon: const Icon(Icons.speed,
                             color: kPlayerOn, size: 18),
                         label: _fmtSpeed(_speed),
+                        color: kPlayerOn,
+                      ),
+                    ),
+                  ),
+                  // 清晰度按钮（v2.53.0+）：显示**这次实际下发**的档位（回落过
+                  // 就显示回落后的那一档——标签跟画面走，不跟用户的意愿走），
+                  // 点按弹出清晰度列表。
+                  //
+                  // 为什么标签用 [_streamQuality] 而不是 [_qualityQn]：取流尚未
+                  // 成功（`_streamQuality == 0`）时无档位可说 → 显示「清晰度」并
+                  // 禁用入口（`onTap: null`）；有档位之后它才代表用户选的东西。
+                  // 非开关（档位由文字自明）→ 恒定纸白，无短线。
+                  Expanded(
+                    child: InkWell(
+                      onTap: (_player == null || _streamQuality <= 0)
+                          ? null
+                          : _showQualitySheet,
+                      child: _barIconLabel(
+                        icon: const Icon(Icons.high_quality,
+                            color: kPlayerOn, size: 18),
+                        label: _streamQuality > 0
+                            ? playViewQualityName(_streamQuality)
+                            : '清晰度',
                         color: kPlayerOn,
                       ),
                     ),

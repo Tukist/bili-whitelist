@@ -372,12 +372,23 @@ class PlayViewStreams {
     required this.quality,
     required this.videos,
     required this.audios,
+    this.listedQualities = const [],
   });
 
   /// `video_info.quality`（实际下发清晰度）。
   final int quality;
   final List<PlayViewVideo> videos;
   final List<PlayViewAudio> audios;
+
+  /// `stream_list` 里**列出的全部档位**（含这次拿不到、被过滤掉的那些），
+  /// 按接口顺序去重（v2.53.0，播放页「清晰度」列表用）。
+  ///
+  /// 与 [videos] 的差别：[videos] 只有**真的下发了 `dash_video`** 的档位（能播），
+  /// 这里是接口声明的全集。匿名时 720P+ 的条目会被过滤出 [videos]（不带
+  /// `dash_video` 或带 `err_code`），但它们的档位号在这里仍看得见 —— 播放页
+  /// 据此把「720P/1080P 需登录」如实列给用户，而不是只显示 480P/360P 让他
+  /// 以为是 App 把清晰度选项做丢了。
+  final List<int> listedQualities;
 }
 
 /// 解析 `PlayViewReply`。
@@ -400,17 +411,22 @@ PlayViewStreams parsePlayViewReply(Uint8List reply) {
   final quality = (pbFirst(videoInfo, 1, wantVarint: true) as int?) ?? 0;
 
   final videos = <PlayViewVideo>[];
+  // 接口列出的档位全集（含这次拿不到的），见 [PlayViewStreams.listedQualities]
+  final listed = <int>[];
   for (final s in pbAllBytes(videoInfo, 5)) {
     final dv = pbFirst(s, 2) as Uint8List?;
-    if (dv == null) continue;
     var streamQuality = 0;
     final si = pbFirst(s, 1) as Uint8List?;
     if (si != null) {
       streamQuality = (pbFirst(si, 1, wantVarint: true) as int?) ?? 0;
+      if (streamQuality > 0 && !listed.contains(streamQuality)) {
+        listed.add(streamQuality);
+      }
       if (((pbFirst(si, 4, wantVarint: true) as int?) ?? 0) != 0) {
         continue; // 带错误码的档位（未登录/无权限）不给 dash_video
       }
     }
+    if (dv == null) continue;
     final base = pbFirst(dv, 1) as Uint8List?;
     if (base == null || base.isEmpty) continue;
     videos.add(PlayViewVideo(
@@ -434,7 +450,8 @@ PlayViewStreams parsePlayViewReply(Uint8List reply) {
     ));
   }
 
-  return PlayViewStreams(quality: quality, videos: videos, audios: audios);
+  return PlayViewStreams(
+      quality: quality, videos: videos, audios: audios, listedQualities: listed);
 }
 
 /// 把 [PlayViewStreams] 折成 App 既有的 [PlayUrlResult]。
@@ -445,6 +462,11 @@ PlayViewStreams parsePlayViewReply(Uint8List reply) {
 ///
 /// 音频轨全部保留（`dashAudioUrls` 顺序即服务端顺序），
 /// [pickLowestBandwidthAudio] 之类既有逻辑照常工作。
+///
+/// 另把**档位全集**（[PlayViewStreams.listedQualities]）填进
+/// [PlayUrlResult.acceptQuality]（v2.53.0）：视频轨虽然只留了最高那条，
+/// 「接口列过哪些档位」这个信息不能丢——播放页的「清晰度」列表全靠它说明
+/// 「720P/1080P 为什么这次拿不到」。
 PlayUrlResult toPlayUrlResult(PlayViewStreams streams) {
   if (streams.videos.isEmpty) {
     throw const FormatException('PlayView 没有可用视频轨');
@@ -463,6 +485,14 @@ PlayUrlResult toPlayUrlResult(PlayViewStreams streams) {
     dashAudioLines: [
       for (final a in streams.audios)
         [a.baseUrl, ...a.backupUrls.where((u) => u != a.baseUrl)]
+    ],
+    // 档位全集一并带出去（v2.53.0）：播放页「清晰度」列表要靠它把「这次拿不到
+    // 的档位」列出来（匿名时 720P+ 就是靠这里留下的档位号才说得清为什么没有）
+    acceptQuality: [
+      for (final q in streams.listedQualities) q,
+      for (final v in streams.videos)
+        if (v.quality > 0 && !streams.listedQualities.contains(v.quality))
+          v.quality,
     ],
   );
 }
@@ -518,6 +548,17 @@ Future<String?> playViewLoginCookie({FlutterSecureStorage? storage}) async {
 
 /// 读登录 Cookie 的方式（默认 [playViewLoginCookie]；测试注入替身用）。
 typedef PlayViewCookieReader = Future<String?> Function();
+
+/// `PlayView` 取流替身（**仅测试注入用**）：[fetchPlayViewStream] 的最小调用集。
+///
+/// 用在两条**非播放**的流下载链上（离线缓存下载 / 语音转写临时音频，v2.53.0）：
+/// 那条链同样会按「免流兼容（实验）」开关改走 App 形态，而真发 gRPC 到 B 站
+/// 测试无法插手 —— 与播放页的 `playViewFetcher` 同一个理由、同一种形状
+/// （播放页那个是位置参数 `(bvid, cid)`，这里是命名参数，对齐本模块的调用风格）。
+typedef PlayViewStreamFetcher = Future<PlayUrlResult> Function({
+  required String bvid,
+  required int cid,
+});
 
 // ---------------------------------------------------------------------------
 // 网络调用

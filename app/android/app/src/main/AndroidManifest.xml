@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
     <!-- 播放流 / API 请求 / 白名单同步都需要网络（debug/profile 清单自带，主清单必须声明，否则 release 断网） -->
     <uses-permission android:name="android.permission.INTERNET"/>
     <!-- 应用内版本更新（M1.3）：下载 APK 后通过系统安装器触发安装流程。min_sdk=26 → FileProvider 强制走。 -->
@@ -19,6 +20,20 @@
          .requestNotificationPermission() 里主动请求。
          用户在系统设置里关掉本 App 通知后通知就不显示（播放本身不受影响）。 -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <!-- 流量计量（v2.53.0）：读本 App / 本机的**移动数据**用量（NetworkStatsManager，
+         见 TrafficStatsPlugin.kt）。
+         PACKAGE_USAGE_STATS 是**特殊权限**（"使用情况访问"）：它不是运行时弹窗的
+         普通权限，声明它**不构成任何授权**——按 Android 官方文档（NetworkStatsManager
+         类注释），声明只表示"本 App 有使用该 API 的意图"，作用是让本 App **出现在**
+         「设置 → 应用 → 特殊应用权限 → 使用情况访问」那个列表里；**必须由用户在那里
+         手动打开**（与上面 REQUEST_INSTALL_PACKAGES 同一套路，App 侧只做引导：
+         TrafficStatsPlugin.openUsageAccessSettings()）。
+         ⚠️ 不声明的话本 App 根本不出现在那个列表里 → 用户无从开启 → 这个功能在真机上
+         必然读不到值，所以这一行是必需项，不是为了要权限而加。
+         tools:ignore="ProtectedPermissions" 抑制 IDE 对 system-level 权限的告警。 -->
+    <uses-permission
+        android:name="android.permission.PACKAGE_USAGE_STATS"
+        tools:ignore="ProtectedPermissions"/>
     <application
         android:label="amoTV"
         android:name="${applicationName}"

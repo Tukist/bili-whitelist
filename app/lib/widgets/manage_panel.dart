@@ -18,6 +18,8 @@ import '../theme/app_tokens.dart';
 import '../theme/ink_recipes.dart';
 import 'app_snack.dart';
 import 'inbox_card_styles.dart';
+import 'stream_status_view.dart';
+import 'traffic_panel.dart';
 
 /// 管理面板内容组件（v2.17.10+ 抽取自首页 _ManageSheet；v2.19.0 起由
 /// 底部导航「个人」页内联承载）：
@@ -33,7 +35,8 @@ import 'inbox_card_styles.dart';
 /// 信箱卡片样式（v2.21.0+ 多版式切换）→
 /// GitHub 配置（token/gist）→ 合集管理（重命名/删除）→ 离线缓存管理 →
 /// **网络与播放（v2.51.0+：「免流兼容（实验）」开关，只改视频/音频流请求的
-/// User-Agent，默认关）** →
+/// User-Agent，默认关；v2.53.0 补「取流状态」三态 + 最近一次取流实测信息）** →
+/// **流量计量（v2.53.0+：系统口径移动流量 + 运营商数值快照相减）** →
 /// 翻译服务 → 界面文案（空态/加载/错误/页脚，可改可恢复，v2.19.0 补）→
 /// 启动行为 → 界面提示 → **写操作（v2.40.0+，点赞/投币/收藏总开关，
 /// v2.42.0+ 加入评论，默认关）** → 版本更新（检查更新）。面板只含内容本身（无自己的滚动/
@@ -588,6 +591,21 @@ class _ManagePanelState extends State<ManagePanel> {
             );
           },
         ),
+        const SizedBox(height: 8),
+        // 取流状态（v2.53.0）：三态（普通模式 / App 形态 / 本会话已回退）+
+        // 「最近一次取流」的实测事实（接口来源 / 清晰度 / 带没带登录 Cookie，
+        // 落盘，重启后仍是上次结果）+ 一句如实说明（免流只能看运营商侧）。
+        // 用户要的就是"一眼看出现在走的是哪条路"，所以紧跟开关本身。
+        const StreamStatusView(),
+        const SizedBox(height: 16),
+        const Divider(height: 1),
+        const SizedBox(height: 16),
+        // ---- 流量计量（v2.53.0）----
+        //
+        // 放这一带（紧挨「网络与播放」）的理由：它跟取流走哪条路是同一件事的
+        // 账目侧 —— 用户要知道"到底免掉了多少，以及 App 自己用了多少移动流量"。
+        // 内容（系统口径 + 运营商快照 + 相减）都在 TrafficPanel 内部。
+        const TrafficPanel(),
         const SizedBox(height: 16),
         const Divider(height: 1),
         const SizedBox(height: 16),

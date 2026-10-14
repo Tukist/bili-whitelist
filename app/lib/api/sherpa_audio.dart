@@ -24,6 +24,7 @@ import '../cache/download_manager.dart';
 import '../config.dart';
 import '../models/whitelist_video.dart';
 import 'bilibili_api.dart';
+import 'playview_api.dart';
 
 /// 音频获取错误（message 可直接展示给用户）。
 class AudioSourceException implements Exception {
@@ -44,10 +45,12 @@ class SherpaAudioSource {
   SherpaAudioSource({
     DownloadManager? downloadManager,
     PlayUrlFetcher? fetchPlayUrl,
+    PlayViewStreamFetcher? playViewFetcher,
     FileDownloader? downloadFile,
     Directory? rootDir,
   })  : _manager = downloadManager ?? DownloadManager.instance,
         _fetchOverride = fetchPlayUrl,
+        _playViewOverride = playViewFetcher,
         _downloadOverride = downloadFile,
         _rootDirOverride = rootDir;
 
@@ -64,6 +67,11 @@ class SherpaAudioSource {
 
   final DownloadManager _manager;
   final PlayUrlFetcher? _fetchOverride;
+
+  /// App gRPC `PlayView` 取流替身（**仅测试注入用**；生产传 null = 走真实
+  /// [fetchPlayViewStream]）。理由同 [DownloadManager] 的那个同名字段。
+  final PlayViewStreamFetcher? _playViewOverride;
+
   final FileDownloader? _downloadOverride;
   final Directory? _rootDirOverride;
 
@@ -143,7 +151,8 @@ class SherpaAudioSource {
     final cid = _cidOf(video, pageIndex);
     PlayUrlResult result;
     try {
-      result = await _fetchPlayUrl(bvid: video.bvid, cid: cid);
+      result =
+          await _fetchStream(bvid: video.bvid, cid: cid, epId: video.epId);
     } on BiliApiException catch (e) {
       throw AudioSourceException('音频流获取失败：${e.message}');
     } on DioException catch (e) {
@@ -193,10 +202,38 @@ class SherpaAudioSource {
     return target;
   }
 
-  PlayUrlFetcher get _fetchPlayUrl => _fetchOverride ?? _defaultFetchPlayUrl;
   FileDownloader get _downloadFile => _downloadOverride ?? _defaultDownloadFile;
 
-  /// 默认取流：DASH（fnval=16）拿 audio 流。
+  /// 取流总入口（v2.53.0）：开关开着且是**普通视频**时先试 App 形态
+  /// （gRPC `PlayView`，与播放页/离线下载同一条链；临时音频也是**流**，跟着开关
+  /// 走才不会出现「网页链（platform=pc）+ App UA」那种必然 403 的组合），
+  /// 拿不到就原样回落网页接口。番剧（[epId] 非空）不试（PlayView 只认 aid/cid）。
+  ///
+  /// 两个替身是**两层**而不是二选一：前者（[PlayViewStreamFetcher]）注入 App 形态
+  /// 那一步，后者（[PlayUrlFetcher]）注入网页接口那一步。
+  Future<PlayUrlResult> _fetchStream({
+    required String bvid,
+    required int cid,
+    int? epId,
+  }) async {
+    if (epId == null && streamCompatInUse()) {
+      try {
+        final fetcher = _playViewOverride ?? fetchPlayViewStream;
+        final appStream = await fetcher(bvid: bvid, cid: cid);
+        if (appStream.dashAudioUrls.isNotEmpty) {
+          debugPrint('[sherpa_audio] PlayView 取流 ok quality=${appStream.quality} '
+              'dashA=${appStream.dashAudioUrls.length}');
+          return appStream;
+        }
+        debugPrint('[sherpa_audio] PlayView 没给出音频轨，回落网页接口');
+      } catch (e) {
+        debugPrint('[sherpa_audio] PlayView 取流失败，回落网页接口：$e');
+      }
+    }
+    return (_fetchOverride ?? _defaultFetchPlayUrl)(bvid: bvid, cid: cid);
+  }
+
+  /// 默认网页取流：DASH（fnval=16）拿 audio 流。
   Future<PlayUrlResult> _defaultFetchPlayUrl({
     required String bvid,
     required int cid,
@@ -205,10 +242,12 @@ class SherpaAudioSource {
     return api.fetchPlayUrl(bvid: bvid, cid: cid, qn: 80, fnval: 16);
   }
 
-  /// 默认下载：独立 dio，仅 Referer + 浏览器 UA（与离线缓存下载同策略）。
+  /// 默认下载：独立 dio，请求头**按 URL 分流**（v2.53.0+）。
   ///
-  /// 头走 `biliStreamHeaders()`（v2.51.0+）：这是**语音转写用的临时音频流**下载，
-  /// 属于流类请求 → 跟着「免流兼容（实验）」开关走；Referer 恒定不变。
+  /// 头走 `biliStreamHeadersFor(url)`：这是**语音转写用的临时音频流**下载，
+  /// 属于流类请求 —— 拿到的直链是网页链（`platform=pc`）就发浏览器 UA + Referer，
+  /// 是 App 形态直链（`platform=android`）就发 App 特征 UA 且**不带 Referer**
+  /// （带了必 403）。判据只看 URL，不看开关（一次会话里两种链会并存）。
   Future<void> _defaultDownloadFile(
     String url,
     String savePath,
@@ -218,7 +257,7 @@ class SherpaAudioSource {
       BaseOptions(
         connectTimeout: const Duration(seconds: 15),
         receiveTimeout: const Duration(minutes: 3),
-        headers: biliStreamHeaders(),
+        headers: biliStreamHeadersFor(url),
       ),
     );
     await dio.download(

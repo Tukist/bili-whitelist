@@ -45,6 +45,11 @@ class MainActivity : FlutterActivity() {
         // 从相册选图（v2.50.0）：系统图片选择器 MethodChannel
         imagePick = ImagePickPlugin(this)
         imagePick.register(flutterEngine)
+        // 流量计量（v2.53.0）：NetworkStatsManager + 「使用情况访问」引导。
+        // 不需要持有实例（跳设置页不靠 onActivityResult 回传，Dart 侧在回到前台时
+        // 自己重查权限）→ 与 ApkInstaller / MediaController 一样直接注册即走；
+        // 通道 handler 闭包持有实例引用，不会被回收。
+        TrafficStatsPlugin(this).register(flutterEngine)
     }
 
     /**

@@ -179,7 +179,12 @@ void main() {
       expect(find.text('版本更新'), findsOneWidget);
       // 「新建合集」已移到合集页（v2.19.0）：面板里不再有该分区/输入框
       expect(find.text('新建合集'), findsNothing);
-      expect(find.byType(TextField), findsNWidgets(2)); // 只剩 token / gist
+      // 输入框：GitHub Token / Gist ID（v2.53.0 起多了「流量计量」分区里的运营商
+      // 数值输入框，数量从 2 变 3）；这里同时点名两个 GitHub 输入框，防"数够了
+      // 但不是那两个"这种假通过。
+      expect(find.byType(TextField), findsNWidgets(3));
+      expect(find.widgetWithText(TextField, 'GitHub Token'), findsOneWidget);
+      expect(find.widgetWithText(TextField, 'Gist ID'), findsOneWidget);
       // 未登录文案 + 登录按钮（无 SESSDATA → none）
       expect(find.textContaining('登录后可解锁 1080P'), findsOneWidget);
       expect(find.text('登录'), findsOneWidget);
