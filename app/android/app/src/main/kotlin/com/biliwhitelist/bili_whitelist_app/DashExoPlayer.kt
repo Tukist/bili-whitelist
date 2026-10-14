@@ -30,8 +30,12 @@ import java.net.UnknownHostException
  * 防盗链（M0 实测）：流请求必须带 Referer + 浏览器 UA（双必需），流请求不带 cookie；
  * 流 URL 带 deadline/upsig 数分钟过期 → 播放时必须实时取，不可持久化缓存。
  * ⚠️ v2.51.0 起 **UA 是构造参数**（Dart 侧经 `create(userAgent:)` 传入，设置页
- * 「免流兼容（实验）」开关会把它换成官方 App 特征 UA）；**Referer 恒定不变**，
- * 依然写死在 [dataSourceFactory] 里——开关只动 UA 一个面。
+ * 「免流兼容（实验）」开关会把它换成官方 App 特征 UA）。
+ * ⚠️ v2.52.0 起 **Referer 不再是恒定值**：开关打开时 Dart 侧改走 App gRPC
+ * `PlayView`，它的直链签名是 `platform=android`，该 CDN 策略要求**不带 Referer**
+ * （带了必 403）。因此 Referer 由 [networkFactoryFor] **按 URL 分流**——App 链走
+ * [appStreamDataSourceFactory]（无 Referer），其余链走 [dataSourceFactory]
+ * （带 Referer），两类链在同一次会话里可以并存。
  *
  * 本地缓存播放：Dart 侧传 `file://`（或本地绝对路径）时走 [DefaultDataSource]
  * （file scheme → FileDataSource，无需防盗链头），其余逻辑（MergingMediaSource/
@@ -150,6 +154,41 @@ class DashExoPlayer(
             )
         )
 
+    /**
+     * **App 形态直链**专用的数据源工厂：只有 UA，**故意不发 Referer**（v2.52.0+）。
+     *
+     * 「免流兼容（实验）」开关打开后，Dart 侧改走 App gRPC `PlayView` 取流，
+     * 它下发的直链 CDN 签名是 `platform=android`。该链的防盗链策略与网页链
+     * **相反**：必须是 Android 特征 UA **且不带 Referer**——带任何 Referer
+     * （站点首页 / App 域名 / 视频页都试过）一律 403，去掉就是 206。
+     * （2026-10 实测 10 组对照；网页链 `platform=pc` 恰好反过来：要浏览器 UA +
+     * Referer，带 App UA 反而 403。）
+     *
+     * 由 [networkFactoryFor] 按 URL 自动分流，所以同一个播放器实例混播两种链
+     * （例如 PlayView 取流失败回落网页接口、或番剧走 pgc 端点）也不会串味。
+     */
+    private val appStreamDataSourceFactory = DefaultHttpDataSource.Factory()
+        .setAllowCrossProtocolRedirects(true)
+        .setConnectTimeoutMs(15_000)
+        .setReadTimeoutMs(20_000)
+        .setDefaultRequestProperties(
+            mapOf(
+                "User-Agent" to userAgent, // 无 Referer：App 链带了就 403
+            )
+        )
+
+    /**
+     * 网络流按 URL 选数据源工厂：CDN 签名里 `platform=android` = App 形态直链，
+     * 走 [appStreamDataSourceFactory]（无 Referer）；其余（网页/番剧/REST 链一律
+     * `platform=pc`，直播 HLS 无该参数）走 [dataSourceFactory]（带 Referer）。
+     *
+     * 判据取 URL 里的签名参数而不是「开关状态」：同一次会话里两种链可能并存
+     * （PlayView 失败回落、番剧走 pgc），按开关判会误伤其中一条。
+     */
+    private fun networkFactoryFor(url: String): DefaultHttpDataSource.Factory =
+        if (url.contains("platform=android")) appStreamDataSourceFactory
+        else dataSourceFactory
+
     /** 本地文件数据源：`file://` / 本地绝对路径走本地读取，不设置防盗链头。 */
     private val localDataSourceFactory = DefaultDataSource.Factory(appContext)
 
@@ -236,7 +275,9 @@ class DashExoPlayer(
      * [audioUrl] 传空/Null 时退化为 mp4 单流（老视频降级）。[positionMs] 用于过期续播。
      *
      * 本地缓存（[isLocalUri]）走 [localDataSourceFactory]（无防盗链头）；
-     * 网络流走 [dataSourceFactory]（Referer + UA）。
+     * 网络流按 URL 分流（[networkFactoryFor]）：App 形态直链（`platform=android`）
+     * 走 [appStreamDataSourceFactory]（UA、无 Referer），其余走 [dataSourceFactory]
+     * （Referer + UA）。
      *
      * [meta] 非空时写进 video 源 MediaItem 的 MediaMetadata（标题 / UP 名 / 封面
      * URL）——系统媒体控件与「媒体续播」卡片据此显示，不影响解码与播放。
@@ -268,14 +309,16 @@ class DashExoPlayer(
                 .createMediaSource(buildMediaItem(videoUrl, meta))
         } else {
             val videoFactory =
-                if (isLocalUri(videoUrl)) localDataSourceFactory else dataSourceFactory
+                if (isLocalUri(videoUrl)) localDataSourceFactory
+                else networkFactoryFor(videoUrl)
             val videoSource = ProgressiveMediaSource.Factory(videoFactory)
                 .createMediaSource(buildMediaItem(videoUrl, meta))
             if (audioUrl.isNullOrEmpty()) {
                 videoSource
             } else {
                 val audioFactory =
-                    if (isLocalUri(audioUrl)) localDataSourceFactory else dataSourceFactory
+                    if (isLocalUri(audioUrl)) localDataSourceFactory
+                    else networkFactoryFor(audioUrl)
                 val audioSource = ProgressiveMediaSource.Factory(audioFactory)
                     .createMediaSource(MediaItem.fromUri(audioUrl))
                 MergingMediaSource(videoSource, audioSource)

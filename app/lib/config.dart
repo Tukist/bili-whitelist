@@ -21,17 +21,19 @@ const String kBrowserUA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
 ///
 /// 用途：设置页「免流兼容（实验）」开关打开时，DASH/mp4 流、直播 HLS、离线下载、
 /// 语音转写的临时音频下载改用这个 UA —— 运营商若按「App 特征」判定免流范围，
-/// 浏览器 UA 会被算成「网页流量」（不计入定向免流），换成 BiliDroid 那串格式才是
-/// 官方 App 的样子。
+/// 浏览器 UA 会被算成「网页流量」（不计入定向免流），换成带 os/model/mobi_app/
+/// build/channel/innerVer 的这串才是官方 App 的样子。
 ///
-/// ⚠️ **这是一次性实验值，不是保证能免流的凭据**：
-/// - 版本号（7.65.0 / build 7650300 / osVer 15）是**取的一个合理值**，不对应某一
-///   次抓包；B 站升版本后可能需要跟着调整，格式本身才是关键（`BiliDroid` +
-///   os/model/mobi_app/build/channel/innerVer 这几段）；
-/// - B 站若变更 CDN 防盗链策略（例如改判 Referer/签名），这个值可能失效；
-/// - 仓库里的实测记录是**反方向**的：非浏览器 UA 请求 `.bilivideo.com` 流或
-///   `i*.hdslb.com` 封面可能 403（见 [kBrowserUA] 的注释）。因此本值只挂在
-///   开关后面、只作用于流请求，默认**不使用**；真出 403 就把它关掉。
+/// ⚠️ **它只在 App 形态直链上有效**（2026-10 实测，10 组对照）：
+/// - App gRPC `PlayView` 下发的直链（CDN 签名 `platform=android`）：
+///   **带这串 UA + 不带 Referer** → 206；
+/// - 网页/REST 接口下发的直链（签名 `platform=pc`）：带这串 UA → **403**
+///   （不管带不带 Referer）。
+///
+/// 所以「免流兼容」开关**不是只换 UA**（v2.52.0 起）：打开后取流也改走
+/// `PlayView`（见 `api/playview_api.dart`），UA 与链路配套；只换 UA 而仍用
+/// 网页直链是**必然 403** 的（v2.51.x 那版就是这样，已修正）。
+/// CDN 策略若再变（例如又改判 Referer/签名），这条路径会失效 → 关掉开关即可。
 const String kBiliAppUA = 'Mozilla/5.0 BiliDroid/7.65.0 (bbcallen@gmail.com) '
     'os/android model/Pixel 7 mobi_app/android build/7650300 channel/bili '
     'innerVer/7650300 osVer/15 network/2';
@@ -40,8 +42,8 @@ const String kBiliAppUA = 'Mozilla/5.0 BiliDroid/7.65.0 (bbcallen@gmail.com) '
 ///
 /// = 用户开着这个开关 **且** 本次运行会话还没被自动回退过
 /// （[UiPrefsStore.streamCompatSessionFallback]，见那里的取舍说明）。
-/// [streamUserAgent] 一律走这个判据 —— 全 App（原生播放器取流 / 离线下载 /
-/// 语音转写临时音频）的 UA 只此一处决定，回退因此"只回退自己这一个 UA"。
+/// [streamUserAgent]、`player_page` 的取流链路选择一律走这个判据 ——
+/// 全 App 的免流形态只此一处决定，回退因此"只回退自己这一套"。
 bool streamCompatInUse() =>
     UiPrefsStore.instance.streamCompatEnabled &&
     !UiPrefsStore.instance.streamCompatSessionFallback;

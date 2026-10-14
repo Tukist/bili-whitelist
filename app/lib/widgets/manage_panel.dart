@@ -117,14 +117,33 @@ const Key kWriteActionsSwitchKey = Key('ui-write-actions-switch');
 /// 「免流兼容（实验）」开关的 key（测试锚点；v2.51.0+）。
 const Key kStreamCompatSwitchKey = Key('ui-stream-compat-switch');
 
-/// 「网络与播放」分区的小字说明（v2.51.0+；v2.51.1 改成如实描述）。
+/// 「网络与播放」分区的小字说明（v2.51.0+；v2.51.1 改成如实描述；v2.52.0 换机制）。
 ///
 /// 抽成常量是**为了被测试钉住**：用户要求设置页小字 ≤ 2 行，本串按"非空白字符
 /// ≤ 42"（`test/stream_compat_test.dart`）；且必须说清两件事——这是**实验**、
 /// 以及**取不到流时会自动切回普通模式**（不必用户自己去关）。改文案时留意
 /// 这两条与长度。
+///
+/// v2.52.0 起机制不是「只换 UA」而是**换整条取流链路**（改走 App gRPC
+/// `PlayView`，见 `api/playview_api.dart`），文案跟着改准。
+///
+/// ⚠️ **刻意不写「清晰度可能只到 480P」**：小字已经顶到 42 字上限，多写必然
+/// 破长度（用户要求两行）。那条告诫放在**开关开启态的副标题**
+/// [kStreamCompatSubtitleOn] 里 —— 那里没有长度上限，而且正对"我刚打开这个
+/// 开关"的时机。
 const String kStreamCompatHint =
-    '实验：只改视频流请求的 UA 试探运营商免流；取不到流会自动切回普通模式。';
+    '实验：改用官方App取流接口（更像App流量）；取不到会自动切回普通模式。';
+
+/// 「免流兼容（实验）」开关**开启态**的副标题（v2.52.0+）。
+///
+/// 抽成常量同样是为了被测试钉住（`test/stream_compat_test.dart`）：开启态必须
+/// 说清"可能只到 480P（缺 access_key）"—— 这是本路径最大的代价，用户同意开这个
+/// 开关时就得看到，而不是等画面糊了才猜。关掉态没有这个代价，照旧走网页接口。
+const String kStreamCompatSubtitleOn =
+    '已开启：官方 App 取流；可能只有 480P（缺 access_key），异常自动回退';
+
+/// 「免流兼容（实验）」开关**关闭态**的副标题（默认态 = 改动前的行为）。
+const String kStreamCompatSubtitleOff = '已关闭：用网页接口取流（最稳，默认）';
 
 /// 「粘贴 Cookie 登录」入口按钮的 key（测试锚点；v2.49.1+）。
 const Key kPasteCookieButtonKey = Key('paste-cookie-login');
@@ -541,7 +560,10 @@ class _ManagePanelState extends State<ManagePanel> {
         const SizedBox(height: 4),
         // 小字上限（用户要求两行；测试按"非空白字符 ≤ 42"钉住 kStreamCompatHint）：
         // 只说两件事——① 这是实验；② 取不到流会自动切回普通模式（v2.51.1 起）。
-        // 机制（只换流请求 UA、不动 API/图片/弹幕）留在常量注释与 CHANGELOG 里。
+        // 机制（改走 App gRPC PlayView 取流 + 流请求用 App 特征 UA、无 Referer；
+        // 不动 API/图片/弹幕）留在常量注释与 CHANGELOG 里。
+        // v2.52.0 的清晰度告诫（可能只到 480P）**放在开关副标题**（见
+        // kStreamCompatSubtitleOn）：小字已顶到 42 字上限，塞不进去。
         Text(
           kStreamCompatHint,
           style: theme.textTheme.bodySmall?.copyWith(
@@ -561,9 +583,8 @@ class _ManagePanelState extends State<ManagePanel> {
                   UiPrefsStore.instance.setStreamCompatEnabled(v),
               contentPadding: EdgeInsets.zero,
               title: const Text('免流兼容（实验）'),
-              subtitle: Text(on
-                  ? '已开启：视频/音频流用官方 App 特征 UA；播放 403 就关掉'
-                  : '已关闭：流请求仍用浏览器 UA（最稳，默认）'),
+              subtitle: Text(
+                  on ? kStreamCompatSubtitleOn : kStreamCompatSubtitleOff),
             );
           },
         ),

@@ -7,6 +7,7 @@ import 'package:flutter/services.dart';
 
 import '../main.dart';
 import '../api/bilibili_api.dart';
+import '../api/playview_api.dart';
 import '../api/sherpa_model.dart';
 import '../api/translate_api.dart';
 import '../cache/download_manager.dart';
@@ -160,10 +161,46 @@ const String kStreamCompatFixLabel = '关掉免流兼容并重试';
 
 /// 「免流兼容（实验）」被**自动回退**后的提示条文案（v2.51.1+）。
 ///
-/// 回退本身是静默的（只换 UA、不动用户设置），必须明说一句：否则用户以为免流
-/// 还在生效，白等一整个视频 —— 所以这条提示走 [SnackKind.error]（不被设置里的
-/// 「界面提示」开关挡掉）。
+/// 回退本身是静默的（会话内换回网页接口 + 浏览器 UA、不动用户设置），必须明说一句：
+/// 否则用户以为免流还在生效，白等一整个视频 —— 所以这条提示走 [SnackKind.error]
+/// （不被设置里的「界面提示」开关挡掉）。
 const String kStreamCompatFallbackNotice = '这个网络下「免流兼容」取不到流，已自动切回普通模式，视频继续播放';
+
+/// 「免流兼容（实验）」开着时**清晰度被降**的提示条文案（v2.52.0+）。
+///
+/// 为什么必须说：App 形态取流（`PlayView`）要 App 端的 `access_key` 才给 720P+，
+/// 而网页登录只能拿到 `SESSDATA`（本批已尽力带上，能不能换到高清本机无法验证）。
+/// 于是用户很可能看到画面比平时糊，却不知道是**这个开关**干的 —— 静默降级是
+/// 最该避免的形态，这条提示就是当场把原因说清。
+///
+/// 走 [SnackKind.info]（不是 error）：这不是失败，视频照常播；用户关掉设置里的
+/// 「界面提示」总开关就不弹（那是他明确要静音）。
+const String kPlayViewLowQualityNotice =
+    '「免流兼容」开着时清晰度只到 480P（App 取流接口要 access_key，网页登录拿不到）；想要 1080P 可关掉它';
+
+/// 是否该提示「清晰度被降」：**本机已登录 且 实际取到的清晰度低于 720P**。
+///
+/// - [loggedIn]：本机有未过期的 `SESSDATA`（[BiliApi.readSessdata] 那套判据，
+///   见 `_PlayerPageState._hasValidSession`）。未登录时用户本来就只有 480P，
+///   这不是开关的锅，提示了反而误导；
+/// - `quality <= 0`（解析不出档位）**不算**：宁可少提示，也别凭空吓唬人。
+bool shouldWarnLowPlayViewQuality({
+  required int quality,
+  required bool loggedIn,
+}) =>
+    loggedIn && quality > 0 && quality < kPlayViewQuality720P;
+
+/// 「清晰度只到 480P」提示是否已在**本次运行**给过（每会话一次，v2.52.0+）。
+///
+/// 放在库级（而不是 `_PlayerPageState` 的字段）是**故意的**：一次运行里会开
+/// 很多个播放页（换视频 / 换集 / 从评论跳转），提示的语义是"这次运行已经告诉过
+/// 你了"，不是"这个页面告诉你一次"——每次播放都弹会变成噪声，用户反而学不到
+/// 东西。只读一次就够，因为它是**说明性**的，不是每集的错误。
+bool playViewQualityNoticeShown = false;
+
+/// 测试用：复位上面的会话标记（生产代码**不调用**）。
+@visibleForTesting
+void debugResetPlayViewQualityNotice() => playViewQualityNoticeShown = false;
 
 /// 开关开着时给失败文案补一句归因；关着时**原样返回**。
 ///
@@ -1082,6 +1119,15 @@ class PlayerPage extends StatefulWidget {
   @visibleForTesting
   final BiliApi? api;
 
+  /// PlayView 取流替身（**仅测试注入用**；生产传 null = 走 [fetchPlayViewStream]）。
+  ///
+  /// 与 [api] 同一套注入约定。存在的理由：这条路径是**模块级函数**（生产里会
+  /// 真发 gRPC 到 B 站），测试无法插手；而「清晰度被降时提示一次 / 第二次不再
+  /// 提示 / 关掉开关完全不介入」这几条只能靠可控的取流替身来精确断言。
+  /// 参数是 `(bvid, cid)`，返回的 [PlayUrlResult.quality] 就是**实际清晰度**。
+  @visibleForTesting
+  final Future<PlayUrlResult> Function(String bvid, int cid)? playViewFetcher;
+
   const PlayerPage({
     super.key,
     required this.video,
@@ -1091,6 +1137,7 @@ class PlayerPage extends StatefulWidget {
     this.playlist,
     this.playlistIndex = 0,
     this.api,
+    this.playViewFetcher,
   });
 
   @override
@@ -2552,14 +2599,51 @@ class _PlayerPageState extends State<PlayerPage>
     debugPrint(
         '[player_page] 取流 bvid=${_video.bvid} cid=$_currentCid epId=$epId');
     try {
+      // 0) 「免流兼容（实验）」开着时先走 App gRPC PlayView（v2.52.0+）：
+      //    它下发的是 **App 形态直链**（CDN 签名 `platform=android`，取流要
+      //    「Android 特征 UA + 不带 Referer」），与下面网页接口的
+      //    `platform=pc` 链不是同一条（2026-10 实测：pc 链带 App UA 必 403）。
+      //    取不到就**原样回落**到下面的网页接口，不改变用户设置
+      //    （判据是 [streamCompatInUse]，自动回退由 [_autoFallbackStreamCompat] 处理）。
+      //    番剧（epId 非空）不走这里：PlayView 只认 aid/cid，番剧要另一套
+      //    pgc 服务，这里不为它扩面。
+      PlayUrlResult? appStream;
+      if (epId == null && streamCompatInUse()) {
+        try {
+          final fetcher = widget.playViewFetcher;
+          appStream = fetcher != null
+              ? await fetcher(_video.bvid, _currentCid)
+              : await fetchPlayViewStream(
+                  bvid: _video.bvid,
+                  cid: _currentCid,
+                  qn: 80,
+                );
+          debugPrint('[player_page] PlayView 取流 ok quality=${appStream.quality} '
+              'dashV=${appStream.dashVideoUrls.length} '
+              'dashA=${appStream.dashAudioUrls.length}');
+        } catch (e) {
+          // 静默回落：这条路径本身就是实验性的，失败按「网页接口」继续，
+          // 真出 403 会由播放错误出口走既有的自动回退
+          debugPrint('[player_page] PlayView 取流失败，回落网页接口：$e');
+        }
+      }
+      // 0.5) 清晰度可见性（v2.52.0+）：App 形态取流要 `access_key` 才给 720P+，
+      //      网页登录拿不到 —— 所以这条路径很可能把用户的 1080P 降成 480P。
+      //      取到流就当场说一句（每会话一次），绝不静默降级。
+      //      放在 fetch 的 try 之外：这条提示出任何岔子都不该被当成「取流失败」
+      //      而白回落一次网页接口。
+      if (appStream != null && mounted) {
+        await _noticeIfPlayViewQualityDropped(appStream.quality);
+      }
       // 1) 普通 playurl（WBI）：普通视频/免费番剧集走这里（免费集普通接口
       //    720P 比 pgc 端点的更清晰，优先）
-      var result = await _api.fetchPlayUrl(
-        bvid: _video.bvid,
-        cid: _currentCid,
-        qn: 80,
-        fnval: 16, // DASH 双流（M2.1 实测定案：1080P 走路线 A）
-      );
+      var result = appStream ??
+          await _api.fetchPlayUrl(
+            bvid: _video.bvid,
+            cid: _currentCid,
+            qn: 80,
+            fnval: 16, // DASH 双流（M2.1 实测定案：1080P 走路线 A）
+          );
       // 老视频无 DASH → 重取 fnval=0 拿 durl[0].url（fnval=16 的响应里没有 durl）
       if (result.dashVideoUrls.isEmpty) {
         debugPrint('[player_page] fnval=16 无 DASH，降级 fnval=0');
@@ -3150,10 +3234,11 @@ class _PlayerPageState extends State<PlayerPage>
   /// 新流成功 READY 后清零），仍失败才显示 [kAutoRecoverGiveUpMessage]——
   /// 保留「重试」按钮手动兜底，网络抖动弹错打断观看成为极少情况。
   ///
-  /// 【v2.51.1】预算耗尽时多一步判断：如果「免流兼容（实验）」的 UA 正被使用
-  /// （[streamCompatInUse]），说明本地图 + 重取都救不回来 —— 那个 UA 是本次取流
-  /// 唯一与默认配置不同的东西，于是先**自动回退**（见 [_autoFallbackStreamCompat]）
-  /// 而不是直接放弃；回退后再失败才落到放弃文案。
+  /// 【v2.51.1】预算耗尽时多一步判断：如果「免流兼容（实验）」正被使用
+  /// （[streamCompatInUse]），说明本地图 + 重取都救不回来 —— 那套取流形态（v2.52.0
+  /// 起是「App gRPC PlayView 直链 + App 特征 UA」，更早是「网页直链 + App UA」）
+  /// 是本次取流唯一与默认配置不同的东西，于是先**自动回退**
+  /// （见 [_autoFallbackStreamCompat]）而不是直接放弃；回退后再失败才落到放弃文案。
   Future<void> _onAutoRecover() async {
     if (!mounted || _error != null) return;
     if (_autoRecovering) {
@@ -3218,6 +3303,40 @@ class _PlayerPageState extends State<PlayerPage>
     }
   }
 
+  /// App 取流（PlayView）拿到的清晰度**低于 720P 且本机已登录**时，当场说一句
+  /// （v2.52.0+，文案 [kPlayViewLowQualityNotice]）。
+  ///
+  /// 为什么要有：App 形态鉴权要 `access_key`（官方 App 登录流程才发，网页登录拿
+  /// 不到）才有 720P+，所以「免流兼容」开着时很可能**把用户的 1080P 降成 480P**。
+  /// 不说的话用户只会觉得"今天视频怎么这么糊"，找不到原因 —— 静默降级比降级本身
+  /// 更糟。
+  ///
+  /// 三条边界：
+  /// - **每会话一次**（[playViewQualityNoticeShown]）：提示是说明性的，不是每集的
+  ///   错误；换集/换视频再弹只会变成噪声；
+  /// - **只在已登录时提示**（[shouldWarnLowPlayViewQuality]）：未登录本来就只有
+  ///   480P，那不是这个开关造成的；
+  /// - **走 [SnackKind.info]**：视频照常播、没有失败，用户关掉设置里的「界面提示」
+  ///   总开关就不弹（[_autoFallbackStreamCompat] 那种"你不说我以为免流还生效"的
+  ///   才必须是 error）。
+  ///
+  /// 本方法**不抛异常**（读盘判登录态已由 [_hasValidSession] 自己兜住）：提示
+  /// 出岔子不能影响播放。
+  Future<void> _noticeIfPlayViewQualityDropped(int quality) async {
+    if (playViewQualityNoticeShown) return;
+    if (!shouldWarnLowPlayViewQuality(
+        quality: quality, loggedIn: await _hasValidSession())) {
+      return;
+    }
+    if (!mounted) return;
+    // 先置标记再弹：即使用户关掉了「界面提示」（AppSnack 直接不弹），
+    // 也算"这次运行已经处理过"，不要每次播放都再判一遍
+    playViewQualityNoticeShown = true;
+    debugPrint('[player_page] App 取流的清晰度只有 '
+        '${playViewQualityName(quality)}（$quality），已提示用户一次');
+    AppSnack.show(context, kPlayViewLowQualityNotice, kind: SnackKind.info);
+  }
+
   /// **自动回退**「免流兼容（实验）」（v2.51.1+）：开关的官方 App UA 正被使用、
   /// 且我们已观察到流确实起不来（自动续播预算耗尽）时，把**本次运行会话**的流 UA
   /// 换回浏览器 UA，重建播放器并接着放，而不是让用户卡在黑屏或看一句没用的
@@ -3261,11 +3380,12 @@ class _PlayerPageState extends State<PlayerPage>
     await _rebuildPlayerAndResume();
   }
 
-  /// 重建播放器并从**当前位置**续播（换 UA 后的落地点）。
+  /// 重建播放器并从**当前位置**续播（换取流形态后的落地点）。
   ///
-  /// 为什么必须重建播放器：取流 UA 是**原生创建期**的参数
-  /// （`BiliDashPlayer.create(userAgent:)` → `DashExoPlayer` 的
-  /// `dataSourceFactory`），只换 Dart 侧的取值不动已经建好的那个实例。
+  /// 为什么必须重建播放器：UA 与「要不要发 Referer」都是**原生创建期**的参数
+  /// （`BiliDashPlayer.create(userAgent:)` → `DashExoPlayer` 的 `dataSourceFactory`），
+  /// 只换 Dart 侧的取值不动已经建好的那个实例。取流链路（PlayView ⇄ 网页接口）
+  /// 本身由 Dart 侧的 [streamCompatInUse] 判据决定，重建后自然跟着切。
   ///
   /// 位置交给 [_pendingSeekMs]（onPrepared 时定位、**覆盖**记忆进度、不弹
   /// 「已从上次…继续」）：续播失败的那次播放要接着刚才看的地方，而不是回到
