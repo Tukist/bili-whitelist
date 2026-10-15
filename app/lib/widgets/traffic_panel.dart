@@ -1,32 +1,39 @@
-/// 个人页「流量计量」（v2.53.0）：**系统口径**（App 自己能读的）+ **运营商口径**
-/// （用户手动录入的快照）对照。
+/// 个人页「流量计量」（v2.53.0 起）：**系统口径**（App 自己能读的）+ **运营商口径**
+/// 两个来源对照。
 ///
 /// 用户原话：「可不可以在个人界面加一个剩余免费流量计量」「需要同时有读自己的
 /// 移动数据用量和运营商通用流量用量，相减得结果」。
 ///
 /// ## 先说清楚能做什么、不能做什么（这个模块的全部设计前提）
 ///
-/// - **运营商侧的"剩余免流额度 / 通用流量已用"读不到**：三大运营商都没有公开
-///   接口或授权给第三方 App（都是封闭的营业厅/自家 App 接口），**不要**试图接
-///   运营商数据、也不要申请读短信权限。所以运营商口径只能**用户自己抄一个数**；
+/// - **运营商侧没有官方接口**：三大运营商都没有公开接口或授权给第三方 App
+///   （都是封闭的营业厅/自家 App 接口）。所以：
+///   - v2.53.0 的办法是**用户自己抄一个数**（手动录入）；
+///   - v2.54.0 新增**自动来源**：在 App 内 WebView 里登一次中国移动掌厅
+///     （`wx.10086.cn`），从页面自己调的那些接口里读「通用流量已用」
+///     （`lib/pages/cmcc_page.dart` + `lib/services/cmcc_plan.dart`）。
+///     这是**非官方接口**、随时可能失效，所以**手动录入一直留着兜底**，
+///     界面上也必须能看出这次数字是自动读到的还是手填的；
 /// - **系统侧能读**（需「使用情况访问」这个特殊权限）：本 App 的移动数据用量
 ///   （按 UID 聚合，**Wi-Fi 天然排除**）+ 本机总移动流量（device 口径）作对照；
 /// - **相减给出来的是"疑似"**：本机统计 vs 运营商计费口径本来就有出入（计费延迟、
 ///   四舍五入、系统统计不覆盖全部流量、别的 App 同时在用通用流量），所以界面上
 ///   一律写"疑似/≈"并附口径说明，**不给斩钉截铁的"你免了 X GB"**。
 ///
-/// ## 两个口径各自怎么来
+/// ## 三个口径各自怎么来
 ///
 /// 1. **系统**：[TrafficStatsService]（原生 `NetworkStatsManager`，只查
 ///    `TYPE_MOBILE`）。本月口径 = 本地月初 00:00 → 现在；没开权限时给
 ///    "一句话 + 一个「去开启」按钮"（[kTrafficPermissionLine]），绝不静默失败、
 ///    也不刷屏报错；
-/// 2. **运营商**：用户在输入框里填运营商 App 显示的「通用流量已用」（GB）→
-///    「记录快照」（[TrafficSnapshotStore]，落盘，重启后还在）→ 最近两条并排 →
-///    「算差值」得到：运营商通用增量、本 App 移动增量、**疑似免流**。
+/// 2. **运营商（自动，v2.54.0）**：掌厅抓取成功自动记一条 `source = cmcc` 的快照
+///    （读不到时**什么都不记**，不拿 0 冒充）；
+/// 3. **运营商（手动，兜底）**：用户在输入框里填运营商 App 显示的「通用流量已用」
+///    （GB）→「记录快照」（[TrafficSnapshotStore]，落盘，重启后还在）→ 最近两条
+///    并排 →「算差值」得到：运营商通用增量、本 App 移动增量、**疑似免流**。
 ///
 /// 文案纪律：设置里的小字用户要求"不超过两行"（所有导出常量按非空白字符 ≤ 42
-/// 钉住，见 `test/traffic_panel_test.dart`）。
+/// 钉住，见 `test/traffic_panel_test.dart` 与本版新增的 `test/cmcc_panel_test.dart`）。
 library;
 
 import 'dart:async';
@@ -34,6 +41,9 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 
 import '../cache/download_manager.dart' show fmtBytes;
+import '../pages/cmcc_page.dart';
+import '../services/cmcc_plan.dart';
+import '../services/cmcc_session_store.dart';
 import '../services/traffic_snapshot_store.dart';
 import '../services/traffic_stats_service.dart';
 import 'app_snack.dart';
@@ -63,10 +73,67 @@ const Key kTrafficDiffKey = Key('traffic-diff-result');
 const Key kTrafficOlderSnapshotKey = Key('traffic-snapshot-older');
 const Key kTrafficLatestSnapshotKey = Key('traffic-snapshot-latest');
 
+/// 「中国移动掌厅（实验）」分组的 key（v2.54.0）。
+const Key kTrafficCmccGroupKey = Key('traffic-cmcc-group');
+
+/// 「打开掌厅页面」按钮的 key。
+const Key kTrafficCmccOpenKey = Key('traffic-cmcc-open');
+
+/// 「清除本机手机号」按钮的 key。
+const Key kTrafficCmccForgetKey = Key('traffic-cmcc-forget');
+
+/// 掌厅分组里"上次自动更新"那一行的 key。
+const Key kTrafficCmccReadingKey = Key('traffic-cmcc-reading');
+
+/// 掌厅登录状态那一行的 key。
+const Key kTrafficCmccStateKey = Key('traffic-cmcc-state');
+
+// ---- 掌厅分组的文案（按非空白字符 ≤ 42，见 test/cmcc_panel_test.dart）----
+
+/// 「打开掌厅页面」按钮文案。
+const String kCmccOpenButton = '打开掌厅页面';
+
+/// 打开按钮上面那句：说清要点一次登录。
+const String kCmccOpenHint = '在里面登录一次（手机号 + 短信验证码，可能要过滑块）。';
+
+/// 手机号那一行的标签。
+const String kCmccPhoneLabel = '掌厅账号';
+
+/// 还不知道尾号时的值。
+const String kCmccPhoneUnknown = '还不知道';
+
+/// 「上次自动更新」标签。
+const String kCmccLastUpdateLabel = '上次自动更新';
+
+/// 从来没读到过时的值（**不要写"读不到"**：系统口径那边已经用过这三个字，
+/// 同一个屏幕里出现两次会让"哪一项读不到"分不清）。
+const String kCmccNeverRead = '还没读到过';
+
+/// 自动读数会记快照、能跟手动录入一起算差值的说明。
+const String kCmccAutoSnapshotHint = '自动读到的数会记成快照，和手动录入一起算差值。';
+
+/// 手动兜底仍在的提示（指下面那一组）。
+const String kCmccManualStillHere = '读不到也没关系：下面的手动录入一直可用。';
+
+/// 「清除本机手机号」按钮文案。
+const String kCmccForgetPhoneButton = '清除本机手机号';
+
+/// 快照来源标记：自动读到的那条。
+const String kCmccSourceAutoBadge = '自动读到（掌厅）';
+
+/// 快照来源标记：用户手抄的那条。
+const String kCmccSourceManualBadge = '手填的';
+
+/// 清除后的提示（说清它**不**退出掌厅登录，避免用户误解）。
+const String kCmccForgetPhoneSnack = '已清除本机记录（掌厅登录状态没动）。';
+
 /// 分区小字：先说清"额度读不到"，再说清这里给的是什么。
 ///
-/// 按非空白字符计 27 个（上限 42）。
-const String kTrafficHint = '免流额度读不到；这里用系统统计对照你手填的运营商数值。';
+/// v2.54.0 起运营商数值**可以自动读**（掌厅，「中国移动掌厅（实验）」那一组），
+/// 手填只是兜底 —— 所以这句话改成"自动或手填"，不再只说手填（口径说明本身
+/// 不能过期）。原句（v2.53.0）："免流额度读不到；这里用系统统计对照你手填的
+/// 运营商数值。"，现按非空白字符计 32 个（上限 42，`contains('读不到')` 仍成立）。
+const String kTrafficHint = '免流额度读不到；这里用系统统计对照运营商侧的数值（自动或手填）。';
 
 /// 系统口径分组标题。
 const String kTrafficSystemGroup = '系统口径（不含 Wi-Fi）';
@@ -324,7 +391,17 @@ class _TrafficPanelState extends State<TrafficPanel> with WidgetsBindingObserver
         const SizedBox(height: 12),
         const Divider(height: 1),
         const SizedBox(height: 12),
-        // ---- 运营商口径（只能手动录入 + 快照对比）----
+        // ---- 中国移动掌厅（实验，v2.54.0）：自动读运营商数值 ----
+        //
+        // 放在"系统口径"和"手动录入"中间：它是**自动来源**，但**不可靠**
+        // （非官方接口），所以下面那组手动录入必须一直留着——这里给出的所有
+        // 状态都如实呈现（登录态 / 尾号 / 上次更新时间 / 失败原因 / 轮询计划），
+        // 读不到时不显示 0 冒充。
+        _cmccGroup(theme, small),
+        const SizedBox(height: 12),
+        const Divider(height: 1),
+        const SizedBox(height: 12),
+        // ---- 运营商口径（手动录入，兜底）----
         Text(kTrafficCarrierGroup, style: theme.textTheme.titleSmall),
         const SizedBox(height: 4),
         Text(kTrafficCarrierSource, style: small),
@@ -434,10 +511,11 @@ class _TrafficPanelState extends State<TrafficPanel> with WidgetsBindingObserver
   }
 
   /// 一行「标签 —— 数值」。
-  Widget _kvLine(ThemeData theme, String label, String value) {
+  Widget _kvLine(ThemeData theme, String label, String value, {Key? key}) {
     final style = theme.textTheme.bodySmall
         ?.copyWith(color: theme.colorScheme.onSurfaceVariant);
     return Row(
+      key: key,
       children: [
         Expanded(child: Text(label, style: style)),
         Text(value, style: style),
@@ -445,7 +523,125 @@ class _TrafficPanelState extends State<TrafficPanel> with WidgetsBindingObserver
     );
   }
 
-  /// 一张快照卡：时间 / 运营商数值 / （有的话）当时的系统读数。
+  /// 「中国移动掌厅（实验）」分组（v2.54.0）。
+  ///
+  /// 显示的全是**事实**：登录态、尾号、上次自动更新的时刻与来源（接口 / 页面
+  /// 文字）、通用/定向已用、失败原因、轮询计划（多久读一次 / 为什么停了）。
+  /// 读不到的项显示 `—` 或「还没读到过」，**不显示 0 冒充**。
+  Widget _cmccGroup(ThemeData theme, TextStyle? small) {
+    return ListenableBuilder(
+      listenable: CmccSessionStore.instance,
+      builder: (context, _) {
+        final store = CmccSessionStore.instance;
+        final reading = store.reading;
+        return Column(
+          key: kTrafficCmccGroupKey,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(kCmccGroup, style: theme.textTheme.titleSmall),
+            const SizedBox(height: 4),
+            Text(kCmccIntro, style: small),
+            const SizedBox(height: 6),
+            _kvLine(
+              theme,
+              kCmccPhoneLabel,
+              store.phoneTail ?? kCmccPhoneUnknown,
+            ),
+            const SizedBox(height: 2),
+            _kvLine(
+              theme,
+              '登录状态',
+              cmccLoginStateLabel(store.loginState),
+              key: kTrafficCmccStateKey,
+            ),
+            const SizedBox(height: 2),
+            if (reading == null)
+              _kvLine(
+                theme,
+                kCmccLastUpdateLabel,
+                kCmccNeverRead,
+                key: kTrafficCmccReadingKey,
+              )
+            else ...[
+              _kvLine(
+                theme,
+                kCmccLastUpdateLabel,
+                '${fmtSnapshotTime(reading.at)}'
+                    '（${reading.source == CmccReadingSource.pageText ? '页面文字' : '接口'}）',
+                key: kTrafficCmccReadingKey,
+              ),
+              const SizedBox(height: 2),
+              _kvLine(theme, '通用流量已用', fmtCmccGb(reading.generalUsedGb)),
+              const SizedBox(height: 2),
+              _kvLine(
+                theme,
+                '定向流量已用',
+                reading.hasDirectional
+                    ? fmtCmccGb(reading.directionalUsedGb)
+                    : '—',
+              ),
+              if (!reading.hasDirectional) ...[
+                const SizedBox(height: 2),
+                // 掌厅没给定向读数 → 如实说，**不显示 0** 冒充"有定向但没用"
+                Text(kCmccNoDirectional, style: small),
+              ],
+            ],
+            if (store.lastError != null) ...[
+              const SizedBox(height: 4),
+              Text(
+                store.lastError!,
+                style: small?.copyWith(color: theme.colorScheme.error),
+              ),
+            ],
+            const SizedBox(height: 4),
+            Text(store.pollPlan.reason, style: small),
+            const SizedBox(height: 4),
+            Text(kCmccAutoSnapshotHint, style: small),
+            Text(kCmccManualStillHere, style: small),
+            const SizedBox(height: 6),
+            Wrap(
+              spacing: 8,
+              children: [
+                FilledButton.tonalIcon(
+                  key: kTrafficCmccOpenKey,
+                  onPressed: () => unawaited(_openCmccPage()),
+                  icon: const Icon(Icons.language, size: 18),
+                  label: const Text(kCmccOpenButton),
+                ),
+                if (store.phoneTail != null)
+                  TextButton(
+                    key: kTrafficCmccForgetKey,
+                    onPressed: () => unawaited(_forgetCmccPhone()),
+                    child: const Text(kCmccForgetPhoneButton),
+                  ),
+              ],
+            ),
+            const SizedBox(height: 4),
+            Text(kCmccOpenHint, style: small),
+          ],
+        );
+      },
+    );
+  }
+
+  /// 打开掌厅抓取页（路线 C/B/D 都在那个页面里；它自己会把结果写回 store）。
+  Future<void> _openCmccPage() async {
+    await Navigator.of(context).push(MaterialPageRoute<void>(
+      builder: (_) => const CmccCapturePage(),
+    ));
+    // 回来时刷新一下本块（自动快照可能刚加了一条）
+    if (mounted) setState(() {});
+  }
+
+  /// 清掉本机记的掌厅手机号（**不退出掌厅登录**：WebView 里的 Cookie 不动，
+  /// 因为按域清 cookie 在部分 WebView 上清不干净，全清又会误伤 B 站登录态）。
+  Future<void> _forgetCmccPhone() async {
+    await CmccSessionStore.instance.forgetPhone();
+    if (!mounted) return;
+    AppSnack.show(context, kCmccForgetPhoneSnack, kind: SnackKind.info);
+  }
+
+  /// 一张快照卡：时间 / 来源（自动 or 手填） / 运营商数值 / （有的话）系统读数。
   Widget _snapshotCard(
       ThemeData theme, String title, CarrierSnapshot s, Key key) {
     final small = theme.textTheme.bodySmall
@@ -463,6 +659,12 @@ class _TrafficPanelState extends State<TrafficPanel> with WidgetsBindingObserver
           Text(title, style: small),
           const SizedBox(height: 2),
           Text(fmtSnapshotTime(s.at), style: small),
+          const SizedBox(height: 2),
+          // 来源必须看得见（v2.54.0）：自动读到 vs 手抄，判断可信度时这是关键
+          Text(
+            s.isAuto ? kCmccSourceAutoBadge : kCmccSourceManualBadge,
+            style: small,
+          ),
           const SizedBox(height: 2),
           Text('通用 ${fmtGb(s.carrierGb)}', style: theme.textTheme.bodySmall),
           const SizedBox(height: 2),

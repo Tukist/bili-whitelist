@@ -33,30 +33,52 @@ import 'package:shared_preferences/shared_preferences.dart';
 /// 1 GB 的字节数（运营商计费口径：1GB = 1024MB = 1024³B）。
 const double kBytesPerGb = 1024 * 1024 * 1024;
 
+/// 一条快照的**来源**（v2.54.0：界面必须能看出这个数字是自动读到的还是手填的）。
+enum SnapshotSource {
+  /// 用户从运营商 App 抄进来、手动录入的。
+  manual,
+
+  /// App 从中国移动掌厅页面**自动读到**的（非官方接口，可能失效）。
+  cmcc,
+}
+
+/// 自动快照的最小间隔：短时间内反复刷新（点两下）不该堆出两条快照，
+/// 把用户珍贵的手动快照挤出 [TrafficSnapshotStore.maxSnapshots] 名额。
+const Duration kAutoSnapshotMinGap = Duration(minutes: 5);
+
 /// 一条快照：某时刻"运营商 App 里显示的通用流量已用" + 当时的系统读数。
 class CarrierSnapshot {
   /// 记录时刻（本地时间）。
   final DateTime at;
 
-  /// 运营商 App 里的「通用流量已用」（GB）。
+  /// 运营商侧显示的「通用流量已用」（GB）。
   final double carrierGb;
 
   /// 记录时的**本 App 移动流量**（字节；`< 0` = 当时读不到，不许用 0 冒充）。
   final int appMobileBytes;
 
+  /// 这个数字怎么来的（手动抄 / 掌厅自动读）。
+  final SnapshotSource source;
+
   const CarrierSnapshot({
     required this.at,
     required this.carrierGb,
     this.appMobileBytes = -1,
+    this.source = SnapshotSource.manual,
   });
 
   /// 这条快照有没有可用的系统读数（做差值需要两条都有）。
   bool get hasAppReading => appMobileBytes >= 0;
 
+  /// 是不是自动读到的那条（界面加"自动"标记）。
+  bool get isAuto => source == SnapshotSource.cmcc;
+
   Map<String, Object?> toJson() => {
         'at': at.millisecondsSinceEpoch,
         'carrierGb': carrierGb,
         'appBytes': appMobileBytes,
+        // 老数据没有这个字段 → 读回来按"手动"处理（v2.54.0 之前全是手填的）
+        'src': source == SnapshotSource.cmcc ? 'cmcc' : 'manual',
       };
 
   /// 从盘上的 JSON 还原；结构不对（缺字段/类型错/时间非法）→ null（跳过这一条）。
@@ -71,12 +93,27 @@ class CarrierSnapshot {
       at: at,
       carrierGb: gb.toDouble(),
       appMobileBytes: bytes is num ? bytes.toInt() : -1,
+      source: raw['src'] == 'cmcc' ? SnapshotSource.cmcc : SnapshotSource.manual,
     );
   }
 
   @override
-  String toString() =>
-      'CarrierSnapshot($at, ${carrierGb}GB, app=${appMobileBytes}B)';
+  String toString() => 'CarrierSnapshot($at, ${carrierGb}GB, '
+      'app=${appMobileBytes}B, src=${source.name})';
+}
+
+/// 这次自动读数**该不该**记成快照（纯函数，测试直接钉）。
+///
+/// 规则：只有"最近一条已经是自动快照、且距现在不足 [kAutoSnapshotMinGap]"才拦。
+/// 手动快照永远不拦（用户点了就是要记）；两条自动快照隔得够久就正常记。
+bool mayRecordAutoSnapshot({
+  required CarrierSnapshot? latest,
+  required DateTime now,
+  Duration minGap = kAutoSnapshotMinGap,
+}) {
+  if (latest == null) return true;
+  if (!latest.isAuto) return true;
+  return now.difference(latest.at).abs() >= minGap;
 }
 
 /// 两次快照的差值结果（**算得出与算不出都如实表达**）。
