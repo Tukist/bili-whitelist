@@ -41,10 +41,13 @@ private const val kReqNotification = 9048
  *   [DashExoPlayer]），旧调用不带该参数 → 默认 false（VOD，行为不变）。
  *   `userAgent`（v2.51.0+）为取流请求的 UA，**由 Dart 侧传**（设置页「免流兼容
  *   （实验）」开关决定值）；缺省 / 空串 → 回退 [kBrowserUA]（旧调用行为不变）
- * - `setDataSource(videoUrl, audioUrl, positionMs, title, artist, coverUrl, isLive)`：
+ * - `setDataSource(videoUrl, audioUrl, positionMs, title, artist, coverUrl, isLive, audioOnly)`：
  *   VOD 走 MergingMediaSource 组源后播放；`isLive` = true 走 HlsMediaSource
- *   （B 站直播是 HLS）。后三个字段只写进 MediaItem 元信息，供会话侧消费者 /
- *   Android Auto 读；通知文案见 `updateNowPlaying`。`isLive` 缺省 false（容错旧调用）
+ *   （B 站直播是 HLS）；`audioOnly` = true（v2.55.0+）**只听音频**——只用
+ *   audioUrl 建一条 ProgressiveMediaSource（视频轨零请求，App 内「听视频」用）。
+ *   后三个字段只写进 MediaItem 元信息，供会话侧消费者 /
+ *   Android Auto 读；通知文案见 `updateNowPlaying`。`isLive` / `audioOnly`
+ *   缺省 false（容错旧调用）
  * - `play` / `pause` / `seekTo` / `setVolume` / `setPlaybackSpeed` / `getPosition` / `dispose`
  * - `updateNowPlaying(textureId, title, artist, coverUrl, status, playing, positionMs,
  *   durationMs, hasPrev, hasNext)`：同步媒体通知内容（v2.25.x，见 [DashMediaNotification]）。
@@ -136,19 +139,23 @@ class BiliDashPlayerPlugin : FlutterPlugin, MethodCallHandler, ActivityAware {
                 )
                 "setDataSource" -> {
                     val id = call.argument<Number>("textureId")!!.toLong()
-                    val videoUrl = call.argument<String>("videoUrl")!!
+                    // videoUrl 在「只听音频」（v2.55.0）下是空串：容错成 ""，
+                    // 不再 `!!` 强解（旧 Dart 调用一直传非空，行为不变）
+                    val videoUrl = call.argument<String>("videoUrl") ?: ""
                     val audioUrl = call.argument<String>("audioUrl")
                     val positionMs = call.argument<Number>("positionMs")?.toLong() ?: 0L
                     // 直播标记（v2.27.0+）：**容错**——旧 Dart 侧不带该参数时
                     // 默认 false（保持 VOD 行为，旧测试也不会因此崩）
                     val isLive = call.argument<Boolean>("isLive") ?: false
+                    // 只听音频（v2.55.0+）：缺省 false = 旧的「视频(+音频)」行为
+                    val audioOnly = call.argument<Boolean>("audioOnly") ?: false
                     // 展示元信息（可空）：只影响 MediaItem 元数据，不影响取流/解码
                     val meta = DashExoPlayer.Meta(
                         title = call.argument<String>("title") ?: "",
                         artist = call.argument<String>("artist") ?: "",
                         coverUrl = call.argument<String>("coverUrl") ?: "",
                     )
-                    player(id).prepare(videoUrl, audioUrl, positionMs, meta, isLive)
+                    player(id).prepare(videoUrl, audioUrl, positionMs, meta, isLive, audioOnly)
                     result.success(null)
                 }
                 "play" -> {

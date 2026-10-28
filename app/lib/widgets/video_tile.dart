@@ -2,6 +2,9 @@
 /// 已缓存/多 P 角标（发布时间仅 pubdate 非空时展示，播放量仅 view 非空时展示，
 /// 见 formatPubdate / fmtVideoSubtitle）。
 ///
+/// v2.55.0 起封面左上角还会叠一个「充电专属」角标（[WhitelistVideo.charging]
+/// 为真时；与已缓存角标竖排成一列，不与右下角「共 N 集」抢位置）。
+///
 /// 从 playlist_page 原私有 `_VideoTile` 抽出，首页合集视频列表页
 /// （collection_page）复用同一实现，避免两份样式漂移。
 ///
@@ -14,6 +17,7 @@ import 'package:flutter/material.dart';
 import '../models/whitelist_video.dart';
 import '../pages/article_page.dart' show fmtArticleCount;
 import '../theme/app_tokens.dart';
+import 'charging_badge.dart';
 import 'cover_hero.dart';
 import 'cover_image.dart';
 import 'expandable_text.dart';
@@ -108,28 +112,49 @@ class VideoTile extends StatelessWidget {
         child: Stack(
           children: [
             CoverImage(cover: video.cover),
-            // 已缓存角标（封面左上角，与右下角「共 N 集」角标风格一致）：
-            // 多 P 部分缓存显示 `已缓存 n/m`，全部/单 P 显示 `已缓存`；
-            // 缓存全是仅音频时前缀换成「已缓存音频」（点进去没有画面）
-            if (cachedCount > 0)
+            // 左上角状态角标列：已缓存（v2.29.0+）/ 充电专属（v2.55.0+）。
+            //
+            // 为什么竖着叠一列而不是各占一个角：封面只有 72×45，右下角已经
+            // 被「共 N 集」占用，左上角横排放两个胶囊（`已缓存 3/9` 约 60dp +
+            // `充电专属` 约 45dp）在 72dp 宽里必然互相压住。竖排在 45dp 内
+            // 也放得下（每个胶囊约 16dp 高 + 2dp 间距）。
+            // 两个角标都没有时不建这一列 —— 老数据/普通视频的树与改动前
+            // 只差一个 mainAxisSize.min 的 Column，位置与尺寸逐像素一致。
+            if (cachedCount > 0 || video.charging)
               Positioned(
                 left: 4,
                 top: 4,
-                child: Container(
-                  padding:
-                      const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
-                  decoration: BoxDecoration(
-                    // 已缓存 = 状态角标：中性墨底 + 纸白字（不再是绿色）
-                    color: kInkBlack.withValues(alpha: .88),
-                    borderRadius: BorderRadius.circular(3),
-                  ),
-                  child: Text(
-                    video.isMultiPage && cachedCount < video.pageCount
-                        ? '${cachedAudioOnly ? '已缓存音频' : '已缓存'}'
-                            ' $cachedCount/${video.pageCount}'
-                        : (cachedAudioOnly ? '已缓存音频' : '已缓存'),
-                    style: const TextStyle(color: kPaper, fontSize: 10),
-                  ),
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // 已缓存角标（与右下角「共 N 集」角标风格一致）：
+                    // 多 P 部分缓存显示 `已缓存 n/m`，全部/单 P 显示 `已缓存`；
+                    // 缓存全是仅音频时前缀换成「已缓存音频」（点进去没有画面）
+                    if (cachedCount > 0) ...[
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 5, vertical: 2),
+                        decoration: BoxDecoration(
+                          // 已缓存 = 状态角标：中性墨底 + 纸白字（不再是绿色）
+                          color: kInkBlack.withValues(alpha: .88),
+                          borderRadius: BorderRadius.circular(3),
+                        ),
+                        child: Text(
+                          video.isMultiPage && cachedCount < video.pageCount
+                              ? '${cachedAudioOnly ? '已缓存音频' : '已缓存'}'
+                                  ' $cachedCount/${video.pageCount}'
+                              : (cachedAudioOnly ? '已缓存音频' : '已缓存'),
+                          style: const TextStyle(color: kPaper, fontSize: 10),
+                        ),
+                      ),
+                      if (video.charging) const SizedBox(height: 2),
+                    ],
+                    // 充电专属角标（v2.55.0+）：只有白名单里已知为充电专属
+                    // 的视频才显示（列表接口拿不到可靠标记，见 ChargingBadge
+                    // 与 parseViewCharging 的说明）
+                    if (video.charging) const ChargingBadge(),
+                  ],
                 ),
               ),
             // 多 P 视频：封面右下角「共 N 集」角标（单 P 不显示）

@@ -16,6 +16,11 @@
 /// 结构不变，**零迁移**。
 /// v2.37.0 起视频带可选 `view`（播放量，视频级附加字段向后兼容：
 /// 旧读者忽略，新读者缺省 null = 未知 → 卡片不显示这一段）。
+/// v2.55.0 起视频带可选 `charging`（**充电专属**标记，视频级附加字段向后
+/// 兼容：旧读者忽略，新读者缺省 false = 非充电专属/未知）。来源是 view
+/// 接口的 `data.is_upower_exclusive`（见 whitelist_writer.videoFromMeta 与
+/// `parseViewCharging` 的实测说明）。**只在为 true 时写进 JSON** —— 老数据
+/// 读进来再写回去一个字节都不变，也不产生 `"charging":false` 这种噪声。
 library;
 
 import 'upowner.dart';
@@ -64,6 +69,20 @@ class WhitelistVideo {
   final String desc; // 简介（v2.17.3+ 普通视频导入写入 view data.desc，含 \n；旧数据/番剧 = ''）
   final int? view; // 播放量（v2.37.0+ 能拿到才写：UP 主页 vlist.play / view data.stat.view；旧数据/未知 = null）
 
+  /// 是否 B 站「充电专属视频」（需给 UP 主充电才能看完整内容；v2.55.0+）。
+  ///
+  /// **取值语义：只有 `true` 有意义**——`false` 同时表示「确认不是充电专属」
+  /// 与「没取到/旧数据」（两者在 UI 上完全等价：不显示角标），所以这里用
+  /// 非空 bool 而不是 `bool?` 三态：三态会让 [copyWith] 无法表达「把值改回
+  /// false」（`false ?? old` 与「没传」分不开），而这个值确实需要能被改回去
+  /// （UP 取消充电专属后，播放页那次 view 拿到的 false 要盖掉旧的真值）。
+  ///
+  /// 来源：view 接口 `data.is_upower_exclusive`（实测字段，见
+  /// whitelist_writer 的 `videoFromMeta`）；列表类接口**拿不到可靠的同款
+  /// 标记**（实测反例：搜索结果里的 `is_charge_video` 对已知充电视频仍是 0），
+  /// 所以封面角标只对「白名单里已知为充电专属」的视频显示。
+  final bool charging;
+
   const WhitelistVideo({
     required this.bvid,
     required this.cid,
@@ -79,6 +98,7 @@ class WhitelistVideo {
     this.pubdate,
     this.desc = '',
     this.view,
+    this.charging = false,
   });
 
   factory WhitelistVideo.fromJson(Map<String, dynamic> json) {
@@ -108,6 +128,9 @@ class WhitelistVideo {
       view: json['view'] is num && (json['view'] as num) >= 0
           ? (json['view'] as num).toInt()
           : null,
+      // 旧数据无 charging / 脏类型（字符串 "true"、1、null、嵌套对象）→ false：
+      // **只有 JSON 里明确是布尔 true 才算充电专属**，宁可漏标也不误标
+      charging: json['charging'] == true,
     );
   }
 
@@ -129,6 +152,9 @@ class WhitelistVideo {
         if (desc.isNotEmpty) 'desc': desc,
         // view 非空才输出（未知/旧数据不回写多余字段，保持数据干净）
         if (view != null) 'view': view,
+        // charging 只在为真（true）时输出（v2.55.0+）：老数据读进来写回去
+        // 逐字节不变，也不会出现 "charging":false 这种噪声
+        if (charging) 'charging': charging,
         if (pages != null)
           'pages': pages!.map((p) => p.toJson()).toList(),
       };
@@ -144,9 +170,13 @@ class WhitelistVideo {
   /// [pages]（v2.49.0+）：只在**传了**才替换（`pages ?? this.pages` 语义），
   /// 调用方（播放页运行时补齐分 P 列表）用它把 view 接口的 data.pages 挂到
   /// 条目上；不传时原样保留（既有调用零影响，也没法用它把 pages 清成 null）。
+  ///
+  /// [charging]（v2.55.0+）：同上语义（不传 = 原样保留）。播放页拿到 view 的
+  /// `is_upower_exclusive` 后用它**就地改内存里的条目**（不回写 Gist），
+  /// 卡片角标与播放页标签随即对上。
   WhitelistVideo copyWith(
           {String? collection, int? order, int? epId, int? pubdate, String? desc,
-          int? view, List<PageInfo>? pages}) =>
+          int? view, List<PageInfo>? pages, bool? charging}) =>
       WhitelistVideo(
         bvid: bvid,
         cid: cid,
@@ -162,6 +192,7 @@ class WhitelistVideo {
         pubdate: pubdate ?? this.pubdate,
         desc: desc ?? this.desc,
         view: view ?? this.view,
+        charging: charging ?? this.charging,
       );
 
   /// 分 P 数量：pages 缺失或为空 → 单 P（1）。

@@ -35,6 +35,7 @@ import '../theme/motion_control.dart';
 import '../theme/route_names.dart';
 import '../widgets/app_block.dart';
 import '../widgets/app_snack.dart';
+import '../widgets/charging_badge.dart';
 import '../widgets/comment_list.dart';
 import '../widgets/cover_hero.dart';
 import '../widgets/cover_image.dart';
@@ -149,6 +150,20 @@ int? autoRecoverDelayMs(int attempt) =>
 
 /// 自动续播耗尽（连续失败超过上限）后的错误文案（保留「重试」按钮兜底）。
 const String kAutoRecoverGiveUpMessage = '播放中断（网络或视频流异常），请重试';
+
+/// 「听视频」拿不到独立音频轨时的提示文案（v2.55.0）。
+///
+/// 触发场景：只有 mp4 单流（`durl`，音画在同一个文件里）、番剧试看流、
+/// 服务端没给 `dash.audio`、或本地只缓存了视频没有音频文件。
+/// 此时**不切换**听视频、视频照常播 —— 因为「把画面盖住但视频轨照常下载」
+/// 正是这次要修掉的行为，绝不能静默沿用。
+const String kListenNoAudioNotice = '这个视频拿不到独立音频轨，听视频不可用';
+
+/// 听视频播放出错（音频源坏了）→ 已切回视频画面时的提示文案（v2.55.0）。
+const String kListenFallbackNotice = '听视频播放失败，已切回视频画面';
+
+/// 听视频/恢复画面时重设数据源都失败的错误视图文案（v2.55.0）。
+const String kListenResumeFailedNotice = '恢复画面失败，请重试';
 
 /// 「免流兼容（实验）」开关开着时，流失败文案后面补的归因句（v2.51.1+）。
 ///
@@ -925,6 +940,19 @@ final Map<String, int> _viewAidCache = {};
 /// 只存 **>1 条** 的列表（单 P 不补，见 [_applyViewPages]）。
 final Map<String, List<PageInfo>> _viewPagesCache = {};
 
+// -------------------------------------------------------------------------
+// 充电专属（v2.55.0+）：view 的 is_upower_exclusive → 当前条目 + 会话内缓存
+//
+// 同样搭 [_refreshUpownerMeta] 那次 view 请求的顺风车（零额外请求）。取值
+// 只落到**内存里的条目**（[_applyViewCharging] → copyWith），**不回写 Gist**：
+// 这只是一个展示标记，为它多发一次 PATCH（Gist 整份重传）不值得。
+// 缓存按 bvid 存，理由与 [_viewPagesCache] 一致——同一视频再次进播放页时
+// 走缓存命中路径（不发请求），标签也得立刻对上。
+// -------------------------------------------------------------------------
+
+/// 会话内充电专属缓存（bvid → is_upower_exclusive 的解析结果）。
+final Map<String, bool> _viewChargingCache = {};
+
 /// 播放页：进入即取流（DASH 双流 fnval=16，老视频降级 mp4 单流），
 /// 原生 ExoPlayer MergingMediaSource 合并播放。
 ///
@@ -984,7 +1012,12 @@ final Map<String, List<PageInfo>> _viewPagesCache = {};
 ///   大会员账号完整观看」并引导登录（防误导）；无 epId 的旧数据保持原 -404 友好提示
 /// - 登录过期提醒：SESSDATA 到期 < 7 天时顶部横幅提示重新登录
 ///
-/// 听视频模式：只隐藏/显示画面（Offstage），不调 pause/play，音频持续播放；
+/// 听视频模式（v2.55.0 起是**真·只拉音频轨**）：进入时把数据源换成「只有音频源」
+/// （[BiliDashPlayer.setDataSource] 的 `audioOnly: true`，视频 URL 传空 → 原生只建
+/// 音频 ProgressiveMediaSource，视频轨零请求），画面区域盖封面占位层；退出时恢复
+/// 视频轨并沿用当前播放位置。有本地缓存音频时优先播本地文件（零流量）。
+/// 拿不到独立音频轨（mp4 单流/试看流/只缓存了视频）→ 明示 [kListenNoAudioNotice]
+/// 并保持视频播放，不会静默「关掉画面但照常下载视频」。
 /// 不做系统后台服务，App 退后台时 Flutter 进程存活即可继续出声。
 
 /// 非全屏视频区高度占屏高上限（v2.17.17 横屏置顶模式）：
@@ -1962,8 +1995,15 @@ class _PlayerPageState extends State<PlayerPage>
   /// 「我明明点了 1080P」的当场反馈永远不会被吞掉。
   bool _qualityFallbackNoticed = false;
 
-  // 听视频（纯音频）模式：隐藏画面，音频继续
+  // 听视频（纯音频）模式：v2.55.0 起是**真的只拉音频轨**（视频轨零请求），
+  // 不只是把画面盖住。进入/退出都要重设数据源，见 [_toggleListenMode]。
   bool _listenMode = false;
+
+  /// 听视频模式下当前用的是不是**本地缓存的音频文件**（v2.55.0）。
+  ///
+  /// true → 连音频流量都不花（占位层据此明说一句，别让用户以为还在偷跑流量）。
+  /// 退出听视频 / 进入失败时一律复位 false。
+  bool _listenLocalAudio = false;
 
   /// 本次播放的源是「仅音频缓存」（只缓存了音频 → 没有画面可渲染）。
   ///
@@ -2158,6 +2198,22 @@ class _PlayerPageState extends State<PlayerPage>
     debugPrint('[player_page] 运行时补齐分 P 列表 bvid=${_video.bvid} '
         'pages=${pages.length} current=${_currentPageIndex + 1}'
         '${clamped ? '（原下标越界，已夹到最后一集）' : ''}');
+    return true;
+  }
+
+  /// 把 view 接口的 `is_upower_exclusive` 落到当前条目上（v2.55.0+）：改了返回 true。
+  ///
+  /// 与 [_applyViewPages] 同一套「就地改内存条目」的做法（走 [copyWith]，
+  /// 其余字段一个都不动），区别是这里**允许双向**：old→true（本来没标、接口
+  /// 说是充电专属）与 true→false（UP 取消充电专属后接口给 false）都要跟上，
+  /// 否则用户会看到「UP 已经放开视频了，App 还挂着充电角标」。
+  /// **不回写 Gist**：只为展示标记发一次 PATCH 不值（见 [_viewChargingCache]
+  /// 的说明），下次进页会再对一次。
+  bool _applyViewCharging(bool charging) {
+    if (_video.charging == charging) return false;
+    _video = _video.copyWith(charging: charging);
+    debugPrint('[player_page] 充电专属标记更新 bvid=${_video.bvid} '
+        'charging=$charging');
     return true;
   }
 
@@ -2771,6 +2827,28 @@ class _PlayerPageState extends State<PlayerPage>
         ? _downloads.getCached(_video.bvid, _currentPageIndex)
         : null;
     if (cached != null) {
+      // 听视频（v2.55.0）：本地命中同样**只给音频轨**——缓存里有音频文件就播
+      // 本地音频（零流量），没有（只缓存了视频）则提示并回落到下面的本地视频
+      // 播放，绝不静默开着「听视频」却放着视频。
+      if (_listenMode) {
+        var ok = false;
+        try {
+          ok = await _startListenAudio(positionMs: positionMs);
+        } catch (e) {
+          debugPrint('[player_page] 听视频本地音频失败：$e');
+        }
+        if (ok) {
+          // 与下方本地缓存分支同款：清掉网络候选（本地文件没有换 CDN 这回事）
+          _videoLines = const [];
+          _audioLines = const [];
+          _lineCursor = -1;
+          return;
+        }
+        _leaveListenModeState();
+        if (mounted) {
+          AppSnack.show(context, kListenNoAudioNotice, kind: SnackKind.error);
+        }
+      }
       // 仅音频缓存（videoPath 为空）：**把音频文件当 videoUrl 传**。
       //
       // 为什么走这条通道而不是 audioUrl：播放器原生侧 `prepare` 在 audioUrl
@@ -2945,6 +3023,26 @@ class _PlayerPageState extends State<PlayerPage>
     }
     // 新一批线路：游标归零（0 = 正在用首条），换源时从下标 1 起轮转
     _lineCursor = 0;
+    if (_listenMode) {
+      // 听视频（v2.55.0）：这次取流的结果**只把音频轨交给播放器**（视频轨零
+      // 请求）。网页接口与 App 形态 PlayView 两条链都在这里汇合，所以两边都
+      // 覆盖到了。
+      //
+      // 拿不到独立音频轨（mp4 单流 `durl` / 试看流 / 服务端没给 dash.audio）
+      // → 明确提示 + **回落正常视频播放**（[positionMs] 照旧带着，位置不动）。
+      // 为什么不是「静默继续只播视频」：那正是本次要修掉的老行为。
+      var ok = false;
+      try {
+        ok = await _startListenAudio(positionMs: positionMs);
+      } catch (e) {
+        debugPrint('[player_page] 听视频换源失败：$e');
+      }
+      if (ok) return;
+      _leaveListenModeState();
+      if (mounted) {
+        AppSnack.show(context, kListenNoAudioNotice, kind: SnackKind.error);
+      }
+    }
     await player.setDataSource(videoUrl,
         audioUrl: audioUrl,
         positionMs: positionMs,
@@ -3351,6 +3449,14 @@ class _PlayerPageState extends State<PlayerPage>
   void _onNativeError(int code, String message) {
     debugPrint('[player] onNativeError code=$code msg=$message');
     if (!mounted) return;
+    // 听视频（v2.55.0）：**不可恢复**的音频源错误（本地音频文件被删/损坏、
+    // 音频格式异常等）→ 先回到视频画面并明说一句，而不是停在错误页让用户
+    // 以为「听视频把播放器弄坏了」。可恢复类（2001/2002 网络）仍交给下面的
+    // 自动续播（那条路会按听视频的契约只换音频轨）。
+    if (_listenMode && !kRecoverableNativeErrorCodes.contains(code)) {
+      unawaited(_fallbackFromListenMode());
+      return;
+    }
     // 兜底（v2.45.0+）：原生按「错误码 + cause 链」分类（DashExoPlayer.isRecoverableSourceError），
     // 网络 IO 兜底桶（2001/2002）已在原生侧纳入可恢复；但那套分类本质是白名单，
     // 将来 media3/插件新增包装类型时仍可能漏。这里对「可恢复类」错误码再给一次
@@ -3441,6 +3547,28 @@ class _PlayerPageState extends State<PlayerPage>
     }
     final next = nextStreamLineIndex(
         lineCount: _videoLines.length, usedIndex: _lineCursor)!;
+    if (_listenMode) {
+      // 听视频（v2.55.0）：只换音频线路，视频轨仍然一个字节都不请求。
+      final nextAudio =
+          _audioLines.isEmpty ? null : streamLineAt(_audioLines, next);
+      if (nextAudio != null) {
+        _lineCursor = next;
+        debugPrint('[player_page] 听视频轮转备用音频线路 → 第 $next 条 '
+            '${_hostOf(nextAudio)} 当前位置=${positionMs}ms');
+        await player.setDataSource('',
+            audioUrl: nextAudio,
+            audioOnly: true,
+            positionMs: positionMs,
+            title: _video.title,
+            artist: _video.upName,
+            coverUrl: _video.cover);
+        _netStreamDeadlineMs = streamDeadlineMs(nextAudio);
+        return;
+      }
+      // 备用批次里没有音频轨（极端：重取后 dash.audio 消失）→ 收起听视频，
+      // 按下面正常视频换源（不会静默继续只播音频）
+      _leaveListenModeState();
+    }
     final videoUrl = streamLineAt(_videoLines, next)!;
     final audioUrl = _audioLines.isEmpty ? null : streamLineAt(_audioLines, next);
     _lineCursor = next; // 成对推进：两轨共用这一个游标
@@ -5156,12 +5284,253 @@ class _PlayerPageState extends State<PlayerPage>
     }
   }
 
-  /// 听视频开关：只隐藏/显示画面，不打断播放（不调 pause/play）。
-  void _toggleListenMode() {
-    debugPrint('[player_page] toggle listenMode -> ${!_listenMode}');
-    setState(() => _listenMode = !_listenMode);
+  /// 听视频开关（v2.55.0 起**真·只拉音频轨**）。
+  ///
+  /// 旧实现只是把画面藏起来（Offstage），视频轨照常下载 —— 用户原话：
+  /// 「之前的听视频只是遮盖了播放界面，花的流量是一点也不少」。现在进出都
+  /// 重设数据源：
+  /// - 进入 → [BiliDashPlayer.setDataSource] 带 `audioOnly: true`，原生只建一条
+  ///   音频 `ProgressiveMediaSource`（视频轨零请求）；有本地缓存音频时直接播
+  ///   本地文件（连音频流量都不花，见 [_listenAudioUrl]）；
+  /// - 退出 → [_resumeVideoTrack] 优先复用已解析的 video/audio URL（不重取
+  ///   playurl），本地源走 [_loadStreamAndPlay]（缓存优先，含既有「仅音频缓存」
+  ///   形态）；
+  /// - 两条路都取原生 `getPosition()` 真值当新源的 `positionMs`：**位置不归零**。
+  ///
+  /// 拿不到独立音频轨（mp4 单流 / 试看流 / 只缓存了视频）→ [kListenNoAudioNotice]
+  /// 明说并**保持视频播放**（[SnackKind.error]：不被「界面提示」开关静音）。
+  Future<void> _toggleListenMode() async {
+    if (_listenMode) {
+      await _exitListenMode();
+    } else {
+      await _enterListenMode();
+    }
+  }
+
+  /// 进入听视频：只把音频轨交给播放器。
+  Future<void> _enterListenMode() async {
+    final player = _player;
+    final audioUrl = _listenAudioUrl();
+    if (player == null || audioUrl == null) {
+      // 降级（进入前挡住）：没有播放器或没有独立音频轨 → 不切、视频继续播
+      debugPrint('[player_page] 听视频不可用'
+          '（player=${player != null} audio=${audioUrl != null}）'
+          ' ${_video.bvid}#$_currentPageIndex');
+      if (mounted && player != null) {
+        AppSnack.show(context, kListenNoAudioNotice, kind: SnackKind.error);
+      }
+      return;
+    }
+    int position;
+    try {
+      // 换源必须带上当前位置：不能让「点一下听视频」变成从头播
+      position = await player.getPosition();
+    } catch (_) {
+      position = _positionMs;
+    }
+    if (!mounted) return;
+    setState(() {
+      _listenMode = true;
+      _listenLocalAudio = _isLocalUrl(audioUrl);
+      _buffering = true;
+    });
+    try {
+      final ok = await _startListenAudio(positionMs: position);
+      if (!ok) throw StateError('听视频没有可用音频轨');
+      // 换源后原生倍速会被重置 1x（与自动续播同一处理）
+      await player.setPlaybackSpeed(_speed);
+    } catch (e) {
+      // 切不过去 → 收回界面状态（原生侧 prepare 在建源之前就抛错，
+      // 旧源仍在播，画面/声音都还在）并明说原因
+      debugPrint('[player_page] 切听视频失败：$e');
+      if (!mounted) return;
+      setState(() {
+        _listenMode = false;
+        _listenLocalAudio = false;
+        _buffering = false;
+      });
+      AppSnack.show(context, kListenNoAudioNotice, kind: SnackKind.error);
+      return;
+    }
+    // 音频源已就绪 → 顺手清掉旧的取流错误：此时确实能出声
+    // （典型场景：画面取流失败但本地缓存音频还在 —— 听视频恰好是唯一的出路，
+    //  不清错误视图就会「有声音、屏幕上却挂着错误页」）。
+    if (mounted && _error != null) setState(() => _error = null);
     // 通知副标题跟着变（听视频时显示「后台听视频省流量」，与 B 站一致）
     unawaited(_syncNowPlaying());
+  }
+
+  /// 退出听视频：恢复视频轨（位置沿用当前播放位置）。
+  Future<void> _exitListenMode() async {
+    final player = _player;
+    int position = _positionMs;
+    if (player != null) {
+      try {
+        position = await player.getPosition();
+      } catch (_) {
+        // 通道异常：用界面侧最后一次 tick 的位置（比回到 0 强）
+      }
+    }
+    if (!mounted) return;
+    setState(() {
+      _listenMode = false;
+      _listenLocalAudio = false;
+      _buffering = player != null;
+    });
+    unawaited(_syncNowPlaying());
+    // 通知副标题先跟着变，再换源（换源的 onPrepared 会再同步一次）
+    if (player == null) return;
+    try {
+      await _resumeVideoTrack(positionMs: position);
+    } catch (e) {
+      // 恢复画面失败 → 错误视图（带「重试」按钮），不留黑屏
+      debugPrint('[player_page] 退出听视频恢复画面失败：$e');
+      if (!mounted) return;
+      setState(() {
+        _buffering = false;
+        _error = kListenResumeFailedNotice;
+      });
+      _dismissCoverOverlay();
+    }
+  }
+
+  /// 退出听视频 → 重新把**视频轨**交给播放器（v2.55.0）。
+  ///
+  /// 优先复用已解析的 URL：同一次 playurl 下发的签名地址还在有效期内
+  /// （deadline 通常几分钟），切回来不必再打一次接口（省一次往返，也不触发
+  /// 风控）。没有候选线路（上一次起播就是本地缓存）→ [_loadStreamAndPlay]：
+  /// 缓存命中直接播本地（含既有的「仅音频缓存」形态，此时仍是没有画面的源，
+  /// [_audioOnlyPlayback] 会重新置位）。
+  Future<void> _resumeVideoTrack({required int positionMs}) async {
+    final player = _player;
+    if (player == null) return;
+    // 判据是「手上有没有已解析的网络线路」，不是 [_playSource]：
+    // 本地缓存播放时 [_loadStreamAndPlay] 会把候选清空（见那里的注释），
+    // 所以候选非空 ⇔ 上一次起播走的是网络流 → 直接复用即可。
+    // （用 [_playSource] 判会误伤：「源偏好 = 本地」但这一集没有缓存、
+    // 其实正播网络流的常见情形下会白打一次 playurl。）
+    final videoUrl = streamLineAt(_videoLines, _lineCursor);
+    if (videoUrl == null) {
+      await _loadStreamAndPlay(positionMs: positionMs);
+      return;
+    }
+    final audioUrl =
+        _audioLines.isEmpty ? null : streamLineAt(_audioLines, _lineCursor);
+    _setAudioOnlyPlayback(false);
+    await player.setDataSource(videoUrl,
+        audioUrl: audioUrl,
+        positionMs: positionMs,
+        title: _video.title,
+        artist: _video.upName,
+        coverUrl: _video.cover);
+    // 与 [_playStream] 同款：记录本条线路的 deadline（主动预取判定用）
+    _netStreamDeadlineMs = streamDeadlineMs(videoUrl);
+  }
+
+  /// 把播放器切到「只听音频」：成功 true（v2.55.0）。
+  ///
+  /// **唯一的 `audioOnly: true` 出口** —— 视频 URL 传空串（原生不读它），
+  /// 由此保证视频轨一个字节都不请求。拿不到音频地址（无 `dash.audio` /
+  /// 只有 mp4 单流 / 本地只缓存了视频）→ false，由调用方提示 + 降级。
+  Future<bool> _startListenAudio({required int positionMs}) async {
+    final player = _player;
+    if (player == null) return false;
+    final audioUrl = _listenAudioUrl();
+    if (audioUrl == null) return false;
+    final local = _isLocalUrl(audioUrl);
+    await player.setDataSource(
+      '',
+      audioUrl: audioUrl,
+      audioOnly: true,
+      positionMs: positionMs,
+      title: _video.title,
+      artist: _video.upName,
+      coverUrl: _video.cover,
+    );
+    _listenLocalAudio = local;
+    // 本地音频没有 deadline（也不该触发主动预取）；网络音频按它的 URL 记
+    _netStreamDeadlineMs = local ? null : streamDeadlineMs(audioUrl);
+    return true;
+  }
+
+  /// 听视频模式下可用的音频地址（null = 拿不到独立音频轨）。
+  ///
+  /// 优先级：**本地缓存音频** > 当前网络流的音频轨。
+  /// - 本地命中：缓存索引里 `audioPath` 非空即命中（整段缓存与「仅音频缓存」
+  ///   都有它）。直接返回 `file://` —— 连音频流量都不花。复用既有
+  ///   [DownloadManager.getCached] + [CachedVideo.audioPath] 口径（索引只在
+  ///   下载**完整成功**后写入，所以非空 = 文件完整）。
+  /// - 否则用**正在播的那条**音频轨（与视频轨同一批签名、已验证可用）。
+  ///
+  /// 为什么不在这里改挑最低码率档：音轨一换，退出听视频后视频播放的音质也被
+  /// 永久降到那一档；而省流量的主要来源是「视频轨零请求」（1080P 视频
+  /// 1.5~4Mbps vs 音频 128~192kbps），不差这一档。「仅音频下载」那边仍按
+  /// [pickLowestBandwidthAudio] 存最低档，两者互不影响。
+  String? _listenAudioUrl() {
+    final cached = _downloads.getCached(_video.bvid, _currentPageIndex);
+    if (cached != null && cached.audioPath.isNotEmpty) {
+      return Uri.file(cached.audioPath).toString();
+    }
+    if (_audioLines.isEmpty) return null;
+    return streamLineAt(_audioLines, _lineCursor);
+  }
+
+  /// 是否本地文件地址（`file:` 开头），听视频用它区分「零流量」与网络音频。
+  bool _isLocalUrl(String url) => url.startsWith('file:');
+
+  /// 只收起「听视频」的界面状态（**不碰播放器**）。
+  ///
+  /// 供「取流后才发现拿不到音频轨」的降级路径用：紧接着调用方自己会组视频源，
+  /// 不能再叠一次 setDataSource（[_exitListenMode] 会）。
+  void _leaveListenModeState() {
+    if (!_listenMode && !_listenLocalAudio) return;
+    if (!mounted) {
+      _listenMode = false;
+      _listenLocalAudio = false;
+      return;
+    }
+    setState(() {
+      _listenMode = false;
+      _listenLocalAudio = false;
+    });
+    unawaited(_syncNowPlaying());
+  }
+
+  /// 听视频播放中遇到不可恢复错误 → 回到视频播放（保留位置）+ 明确提示。
+  ///
+  /// 场景：本地音频文件被删/损坏、音频轨格式异常等「音频源本身坏了」。
+  /// 不这么做的话用户会停在错误页，并合理怀疑是「听视频把播放器弄坏了」。
+  Future<void> _fallbackFromListenMode() async {
+    final player = _player;
+    int position = _positionMs;
+    if (player != null) {
+      try {
+        position = await player.getPosition();
+      } catch (_) {
+        // 通道异常：用界面侧位置
+      }
+    }
+    if (!mounted) return;
+    setState(() {
+      _listenMode = false;
+      _listenLocalAudio = false;
+      _buffering = player != null;
+      _error = null;
+    });
+    AppSnack.show(context, kListenFallbackNotice, kind: SnackKind.error);
+    unawaited(_syncNowPlaying());
+    if (player == null) return;
+    try {
+      await _resumeVideoTrack(positionMs: position);
+    } catch (e) {
+      debugPrint('[player_page] 听视频失败后切回视频也失败：$e');
+      if (!mounted) return;
+      setState(() {
+        _buffering = false;
+        _error = kListenResumeFailedNotice;
+      });
+      _dismissCoverOverlay();
+    }
   }
 
   /// 评论按钮行为（v2.17.0+ 竖屏布局重构 / v2.17.17 横屏置顶共用 /
@@ -6746,6 +7115,7 @@ class _PlayerPageState extends State<PlayerPage>
       _previewGen++;
       _prefetchWantMs = null;
       _listenMode = false; // 新视频正常显示画面
+      _listenLocalAudio = false; // 听视频的「本地音频」标记一并复位（v2.55.0）
       // 弹幕：清空旧视频渲染数据（缓存按 cid 保留，重开秒显示）
       _danmaku = const [];
     });
@@ -7244,7 +7614,9 @@ class _PlayerPageState extends State<PlayerPage>
     return Stack(
       fit: StackFit.expand,
       children: [
-          // 1. 播放画面（保持宽高比居中，黑色铺底；听视频模式下隐藏但播放不中断；
+          // 1. 播放画面（保持宽高比居中，黑色铺底；听视频模式下隐藏但**声音不中断**
+          //    ——v2.55.0 起听视频的源里根本没有视频轨，纹理本来也不会有帧，
+          //    Offstage 只是别让旧画面/黑纹理占位；
           //    全屏下支持双指缩放/旋转与缩放态单指平移，见 [_buildVideoPicture]）
           if (_textureId != null)
             Offstage(
@@ -7760,6 +8132,38 @@ class _PlayerPageState extends State<PlayerPage>
           selectable: false,
           animated: true,
         ),
+        // 充电专属标签（v2.55.0+）：只有已知是充电专属时才构建这一行，
+        // 普通视频/旧数据**一个节点都不多**（信息块几何与改动前逐像素一致）。
+        // 落点选在标题正下方而不是塞进下面那行元信息：那一行已被
+        // 「UP 主 + 第 N 集 + Spacer + 发布 日期 · 时长」占满（横屏还要挤），
+        // 再塞一个胶囊会把时长顶掉；而「这个视频要不要充电」是标题级的
+        // 属性，贴在标题下面读起来最顺。
+        // 文案：[kChargingInfoLabel] 完整说清是充电专属，右边一句
+        // [kChargingInfoHint] 解释为什么可能看不了——实测未充电时 playurl
+        // **不报错、只给试看片段**（见 ChargingBadge/parseViewCharging 文档），
+        // 所以这里提前把原因说清楚，而不是等播放"莫名结束"。
+        if (_video.charging)
+          Padding(
+            padding: const EdgeInsets.only(top: 4),
+            child: Row(
+              children: [
+                const ChargingBadge(
+                  key: ValueKey('player-charging-badge'),
+                  label: kChargingInfoLabel,
+                  fontSize: 11,
+                ),
+                const SizedBox(width: 6),
+                Expanded(
+                  child: Text(
+                    kChargingInfoHint,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: subStyle,
+                  ),
+                ),
+              ],
+            ),
+          ),
         const SizedBox(height: 4),
         Row(
           children: [
@@ -7857,16 +8261,24 @@ class _PlayerPageState extends State<PlayerPage>
   /// 到把评论区挤没、整列溢出（余量小时展开区相应矮、超高部分内部滚动）。
   /// 竖屏夹在 [80, 220]；横屏（v2.17.17 横屏置顶模式，屏高低、标题 1 行）
   /// 收紧到 [48, 80]——展开后整行信息区仍给评论区留可见高度。
+  ///
+  /// 充电专属标签那一行（v2.55.0+）也要从余量里扣：它是信息块里**多出来**
+  /// 的固定高度（11px 字 × 1.2 行高 + 4 顶距 ≈ 17，取 21 留余量），不扣就会
+  /// 让「展开的简介 + 固定信息行」超出可用高度（横屏置顶模式最紧）。只在
+  /// `_video.charging` 时扣，普通视频的余量与改动前逐像素一致。
   double _descMaxExpandedHeight(BuildContext context) {
     final screen = MediaQuery.sizeOf(context);
     final landscape =
         screen.width > screen.height; // 与 _buildVideoInfoBar 紧凑判定一致
     final belowVideo = screen.height - _embeddedVideoHeight(screen);
+    final chargingReserve = _video.charging ? 21.0 : 0.0;
     if (landscape) {
-      const reservedForCompactInfoBar = 100.0; // 标题(1行)+UP 行+内边距+简介顶距
+      final reservedForCompactInfoBar =
+          100.0 + chargingReserve; // 标题(1行)+UP 行+内边距+简介顶距
       return (belowVideo - reservedForCompactInfoBar).clamp(48.0, 80.0);
     }
-    const reservedForInfoBar = 120.0; // 标题(≤2行) + UP 行 + 内边距 + 简介顶距
+    final reservedForInfoBar =
+        120.0 + chargingReserve; // 标题(≤2行) + UP 行 + 内边距 + 简介顶距
     return (belowVideo - reservedForInfoBar).clamp(80.0, 220.0);
   }
 
@@ -7905,6 +8317,9 @@ class _PlayerPageState extends State<PlayerPage>
       _restoreWriteCache(bvid);
       final pages = _viewPagesCache[bvid];
       if (pages != null) _applyViewPages(pages);
+      // 充电专属标记同理（v2.55.0+）：缓存命中时不发请求也要把标签对上
+      final charging = _viewChargingCache[bvid];
+      if (charging != null) _applyViewCharging(charging);
       return; // 会话内缓存命中（无需 setState：build 前同步赋值即可）
     }
     // 互动态与 view **并发**发出：两者互不依赖，串行会白白多等一个 RTT
@@ -7941,6 +8356,11 @@ class _PlayerPageState extends State<PlayerPage>
     // （见 [_applyViewPages]）。缓存按 bvid 存，同会话回来时走上面的命中路径。
     final viewPages = parseViewPages(data);
     if (viewPages.length > 1) _viewPagesCache[bvid] = viewPages;
+    // 充电专属（v2.55.0+）：同一个响应顺路取（data.is_upower_exclusive），
+    // 零额外请求；真假都记账（false 也要记，否则「UP 取消充电专属」后
+    // 缓存命中路径会把旧的真值一直留着）
+    final charging = parseViewCharging(data);
+    _viewChargingCache[bvid] = charging;
     // 拉取期间可能换源/退出：按 bvid 对账，防把旧视频的 UP 信息串到新视频
     if (!mounted || _video.bvid != bvid) return;
     setState(() {
@@ -7951,6 +8371,7 @@ class _PlayerPageState extends State<PlayerPage>
       _likeCount = stat.like;
       if (aid != null) _writeAid = aid;
       _applyViewPages(viewPages);
+      _applyViewCharging(charging);
       _applyWriteInitialState();
     });
     debugPrint('[player_page] UP 主信息 bvid=$bvid '
@@ -8577,8 +8998,15 @@ class _PlayerPageState extends State<PlayerPage>
                       ),
                     ),
                     const SizedBox(height: 8),
-                    Text('听视频中 · 点按恢复画面',
-                        style: kTypeBodyS.copyWith(color: kPlayerOnDim)),
+                    // v2.55.0：说清「真的只在拉音频」（旧版只是盖住画面，
+                    // 视频轨照常下载）；命中本地缓存时更要说一句「零流量」。
+                    Text(
+                      _listenLocalAudio
+                          ? '听视频中 · 用本地缓存音频，不耗流量 · 点按恢复画面'
+                          : '听视频中 · 只加载音频，不请求视频画面 · 点按恢复画面',
+                      textAlign: TextAlign.center,
+                      style: kTypeBodyS.copyWith(color: kPlayerOnDim),
+                    ),
                   ],
                 ),
               ),

@@ -13,6 +13,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:bili_whitelist_app/models/whitelist_video.dart';
 import 'package:bili_whitelist_app/theme/app_tokens.dart';
 import 'package:bili_whitelist_app/theme/motion_control.dart';
+import 'package:bili_whitelist_app/widgets/charging_badge.dart';
 import 'package:bili_whitelist_app/widgets/cover_hero.dart';
 import 'package:bili_whitelist_app/widgets/cover_image.dart';
 import 'package:bili_whitelist_app/widgets/video_tile.dart';
@@ -31,6 +32,7 @@ WhitelistVideo _video({
   String title = '测试视频标题',
   List<PageInfo>? pages,
   int? view,
+  bool charging = false,
 }) =>
     WhitelistVideo(
       bvid: bvid,
@@ -43,6 +45,7 @@ WhitelistVideo _video({
       pubdate: pubdate,
       pages: pages,
       view: view,
+      charging: charging,
     );
 
 /// 超长标题：测试字体下（每字符宽 = fontSize = 14）必然超过 2 行。
@@ -315,6 +318,70 @@ void main() {
       expect(find.byType(AnimatedSize), findsOneWidget,
           reason: '开动效 → 展开/收起走 AnimatedSize 高度过渡');
       addTearDown(MotionControl.reset);
+    });
+  });
+
+  // 充电专属角标（v2.55.0）：用户需求「在封面和视频界面标注一下充电视频」。
+  // 断言用**完整文案**（不是「充电」两个字），并且为假时一个节点都不能多
+  // （老数据/普通视频的卡片与改动前一致）。
+  group('充电专属角标（v2.55.0）', () {
+    testWidgets('charging false（老数据/普通视频）→ 不显示角标', (tester) async {
+      await tester.pumpWidget(_wrap(VideoTile(video: _video())));
+      expect(find.byType(ChargingBadge), findsNothing);
+      expect(find.text('充电专属'), findsNothing);
+      expect(find.text('充电'), findsNothing);
+    });
+
+    testWidgets('charging true → 封面上出现「充电专属」角标（完整文案）',
+        (tester) async {
+      await tester.pumpWidget(_wrap(VideoTile(video: _video(charging: true))));
+      expect(find.byType(ChargingBadge), findsOneWidget);
+      expect(find.text('充电专属'), findsOneWidget);
+      // 副信息行不受影响（时长/UP 主照常）
+      expect(find.text('1:30 · UP主'), findsOneWidget);
+    });
+
+    testWidgets('角标不越出封面、不压「共 N 集」、不遮挡时长行', (tester) async {
+      final multi = _video(
+        charging: true,
+        pages: const [
+          PageInfo(cid: 1, part: 'p1', duration: 45),
+          PageInfo(cid: 2, part: 'p2', duration: 45),
+        ],
+      );
+      await tester.pumpWidget(_wrap(VideoTile(video: multi)));
+
+      final coverRect = tester.getRect(find.byType(CoverImage));
+      final badgeRect = tester.getRect(find.byType(ChargingBadge));
+      final episodeRect = tester.getRect(find.text('共 2 集'));
+
+      // ① 角标完整落在封面内（不被裁切）
+      expect(coverRect.contains(badgeRect.topLeft), isTrue);
+      expect(coverRect.contains(badgeRect.bottomRight), isTrue,
+          reason: '角标不能被封面裁掉右下角');
+      // ② 与右下角「共 2 集」不重叠（角标不挡重要信息）
+      expect(badgeRect.overlaps(episodeRect), isFalse,
+          reason: '充电角标不能压住「共 N 集」');
+      // ③ 时长/UP 主行照常（封面上的角标不侵占副信息行）
+      expect(find.text('1:30 · UP主'), findsOneWidget);
+    });
+
+    testWidgets('已缓存 + 充电专属同时存在 → 两个角标都显示且互不重叠',
+        (tester) async {
+      await tester.pumpWidget(_wrap(VideoTile(
+        video: _video(charging: true),
+        cachedCount: 1,
+      )));
+      expect(find.text('已缓存'), findsOneWidget);
+      expect(find.text('充电专属'), findsOneWidget);
+
+      final cachedRect = tester.getRect(find.text('已缓存'));
+      final chargingRect = tester.getRect(find.text('充电专属'));
+      expect(cachedRect.overlaps(chargingRect), isFalse,
+          reason: '两个角标竖排，不能叠在一起');
+      // 都在封面内（封面 72×45）
+      final coverRect = tester.getRect(find.byType(CoverImage));
+      expect(coverRect.contains(chargingRect.bottomRight), isTrue);
     });
   });
 }

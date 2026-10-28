@@ -125,6 +125,10 @@ class WhitelistWriter {
   /// （`curl /x/web-interface/view?bvid=…` 响应：`"stat":{"aid":…,"view":105989388,…}`），
   /// 不是猜测；`fetchVideoMeta` 原样返回整个 `data`，所以这里直接读得到。
   /// 缺失/脏类型/负数 → null（卡片不显示播放量这一段）。
+  /// charging = view 接口 **data.is_upower_exclusive**（充电专属；v2.55.0+）。
+  /// 2026-10 匿名只读探针实测（普通视频 false / 已知充电专属视频 true），
+  /// 解析细节与为什么不看 `is_upower_play` 见 `parseViewCharging` 的注释。
+  /// 缺失/脏类型 → false（不写这个字段，老数据零变化）。
   static WhitelistVideo videoFromMeta(
     Map<String, dynamic> meta, {
     required String fallbackBvid,
@@ -159,6 +163,9 @@ class WhitelistWriter {
       // 0 是合法值（真·零播放）→ 用 _nonNegativeInt 而不是 _positiveInt；
       // 缺失（老接口/降级响应）/脏类型/负数 → null。
       view: _nonNegativeInt(stat['view']),
+      // 充电专属（v2.55.0+）：view 接口 data.is_upower_exclusive，实测布尔。
+      // 缺失/脏类型 → false（不写字段，老数据与普通视频零变化）
+      charging: parseViewCharging(meta),
     );
   }
 

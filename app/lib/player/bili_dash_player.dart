@@ -90,6 +90,13 @@ class BiliDashPlayer {
   /// 组源并播放：[videoUrl] 必填（DASH video 或 mp4 单流）；
   /// [audioUrl] 为空则退化为单流。[positionMs] 用于过期续播（毫秒）。
   ///
+  /// [audioOnly]（v2.55.0+）= **只听音频**：原生侧只用 [audioUrl] 建**一条**
+  /// `ProgressiveMediaSource`，**不构造视频源、也不建 MergingMediaSource** ——
+  /// 视频轨一个字节都不请求（App 内「听视频」的省流量实现点）。
+  /// 此时 [videoUrl] 传空串（原生不再读它，但 Dart 侧仍是必填位置参数，保持
+  /// 所有旧调用点一字不改）；[audioUrl] 必填，缺了原生**直接报错**而不是
+  /// 静默播别的，调用方据此提示「拿不到独立音频轨」并回落视频。
+  ///
   /// [title] / [artist]（UP 名）/ [coverUrl] 只写进原生 MediaItem 的元信息，
   /// 供**会话侧**消费者（Android Auto / 车机 / Wear 这类 MediaController，以及
   /// `dumpsys media_session`）读到；不影响取流与解码。
@@ -102,6 +109,7 @@ class BiliDashPlayer {
   Future<void> setDataSource(
     String videoUrl, {
     String? audioUrl,
+    bool audioOnly = false,
     int positionMs = 0,
     String title = '',
     String artist = '',
@@ -112,6 +120,8 @@ class BiliDashPlayer {
         'textureId': textureId,
         'videoUrl': videoUrl,
         'audioUrl': audioUrl ?? '',
+        // v2.55.0：只听音频（原生只建音频源，视频轨零请求）
+        'audioOnly': audioOnly,
         'positionMs': positionMs,
         'title': title,
         'artist': artist,

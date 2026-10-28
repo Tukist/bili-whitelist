@@ -33,6 +33,7 @@ import 'package:bili_whitelist_app/pages/player_page.dart';
 import 'package:bili_whitelist_app/theme/app_motion.dart';
 import 'package:bili_whitelist_app/theme/motion_control.dart';
 import 'package:bili_whitelist_app/widgets/app_block.dart';
+import 'package:bili_whitelist_app/widgets/charging_badge.dart';
 import 'package:bili_whitelist_app/widgets/cover_hero.dart';
 import 'package:bili_whitelist_app/widgets/expandable_text.dart';
 
@@ -50,6 +51,7 @@ WhitelistVideo _video({
   String title = '块化测试视频',
   String upName = '测试UP主',
   int? pubdate,
+  bool charging = false,
 }) =>
     WhitelistVideo(
       bvid: bvid,
@@ -61,6 +63,7 @@ WhitelistVideo _video({
       addedAt: '2026-01-01',
       desc: desc,
       pubdate: pubdate,
+      charging: charging,
     );
 
 /// 超长标题：测试字体下（每字符宽 = fontSize）远超信息行的 2 行上限。
@@ -79,9 +82,15 @@ final String _kLongTitle = '很长的播放页标题' * 30;
 /// 接口返回的简介正文（setUp 每例复位）。
 String _mockDesc = '一段用于占位的简介文本。';
 
+/// 接口返回的 `is_upower_exclusive`（充电专属；v2.55.0 用例里改它模拟
+/// 「进页那次 view 说这条是充电专属」）。给 null → 响应里**不带这个键**
+/// （老接口/普通视频的形态）。
+bool? _mockCharging;
+
 String get _mockBody => '{"code":0,"data":{'
     '"bvid":"BV1INFO000001","aid":1001,"cid":1001,"duration":200,'
     '"quality":80,'
+    '${_mockCharging == null ? '' : '"is_upower_exclusive":$_mockCharging,'}'
     '"wbi_img":{"img_url":"https://i0.hdslb.com/bfs/wbi/'
     'a2c2f919cb12ebdcf0fbc8a4e0a0f7f5.png","sub_url":"https://i0.hdslb.com/bfs/wbi/'
     'e6f5b9b4b8f3e6f5b9b4b8f3e6f5b9b4.png"},'
@@ -300,6 +309,8 @@ void main() {
     SharedPreferences.setMockInitialValues({});
     // 接口 desc 复位（个别用例会临时置空 → 走「无简介」路径）
     _mockDesc = '一段用于占位的简介文本。';
+    // 接口的充电专属标记复位（默认「响应里没有这个键」= 普通视频形态）
+    _mockCharging = null;
     final oldOverrides = HttpOverrides.current;
     HttpOverrides.global = _FakeHttpOverrides();
     addTearDown(() => HttpOverrides.global = oldOverrides);
@@ -662,5 +673,120 @@ void main() {
     final videoRect = tester.getRect(find.byKey(_kVideoArea));
     expect(tester.getRect(find.byKey(_kInfoBar)).top,
         closeTo(videoRect.bottom, 0.5));
+  });
+
+  // ---------------------------------------------------------------------
+  // 充电专属标签（v2.55.0）：用户需求「在封面和视频界面标注一下充电视频」。
+  //
+  // 三个用例各用**不同的 bvid**：播放页的 view 结果按 bvid 做会话内缓存
+  // （_upMetaCache / _viewChargingCache 都是库级的），共用 bvid 时第二例会
+  // 走缓存命中路径、根本不发请求，`_mockCharging` 改不动它。
+  // ---------------------------------------------------------------------
+  group('充电专属标签（v2.55.0）', () {
+    testWidgets('接口说不是充电专属 → 信息块里没有标签（防误标）', (tester) async {
+      MotionControl.enabled = false;
+      _mockCharging = false; // 响应里明确 is_upower_exclusive:false
+      _installPlayerMock(tester, emitPrepared: () => true);
+      tester.view.devicePixelRatio = 1.0;
+      tester.view.physicalSize = const Size(400, 800);
+      addTearDown(tester.view.reset);
+
+      await _pumpPlayer(tester, _video(bvid: 'BV1CHG0000001'));
+      await tester.pump(const Duration(milliseconds: 600));
+
+      expect(find.byType(ChargingBadge), findsNothing);
+      expect(find.text('充电专属视频'), findsNothing);
+      expect(find.text('需给 UP 主充电后观看完整内容'), findsNothing);
+    });
+
+    testWidgets('白名单已知充电专属（charging true）→ 信息块立即有完整标签 + 一句说明',
+        (tester) async {
+      MotionControl.enabled = false;
+      _mockCharging = true;
+      _installPlayerMock(tester, emitPrepared: () => true);
+      tester.view.devicePixelRatio = 1.0;
+      tester.view.physicalSize = const Size(400, 800);
+      addTearDown(tester.view.reset);
+
+      await _pumpPlayer(
+          tester, _video(bvid: 'BV1CHG0000002', charging: true));
+      await tester.pump(const Duration(milliseconds: 600));
+
+      // 完整文案（不是「充电」两个字）：标签 + 说明都在信息块里
+      expect(
+        find.descendant(
+            of: find.byKey(_kInfoBar), matching: find.text('充电专属视频')),
+        findsOneWidget,
+      );
+      expect(
+        find.descendant(
+            of: find.byKey(_kInfoBar),
+            matching: find.text('需给 UP 主充电后观看完整内容')),
+        findsOneWidget,
+      );
+      expect(find.byKey(const ValueKey('player-charging-badge')),
+          findsOneWidget);
+    });
+
+    testWidgets('运行时刷新：条目里没标、进页那次 view 说是充电专属 → 标签补上且不越界',
+        (tester) async {
+      MotionControl.enabled = false;
+      _mockCharging = true;
+      _installPlayerMock(tester, emitPrepared: () => true);
+      tester.view.devicePixelRatio = 1.0;
+      tester.view.physicalSize = const Size(400, 800);
+      addTearDown(tester.view.reset);
+
+      // 进页时条目 charging=false（老数据形态）→ 标记只能来自 view 响应。
+      // 注意这里**不断言首帧"还没有标签"**：mock 的 HTTP 是同步完成的，
+      // 一帧之内响应就可能已经落地（那样断言会偶发失败）。真正要验的是
+      // 「刷新后标签出现」，下面的 600ms pump 就是等那次响应 + setState。
+      await _pumpPlayer(tester, _video(bvid: 'BV1CHG0000003'));
+
+      // 等 view 响应 + setState
+      await tester.pump(const Duration(milliseconds: 600));
+      expect(find.text('充电专属视频'), findsOneWidget,
+          reason: '运行时按 view 的 is_upower_exclusive 补上标签');
+
+      // 布局：标签与说明都在信息块内，标题/时长照旧（没把信息块撑坏）
+      final infoRect = tester.getRect(find.byKey(_kInfoBar));
+      final badgeRect =
+          tester.getRect(find.byKey(const ValueKey('player-charging-badge')));
+      expect(badgeRect.left, greaterThanOrEqualTo(infoRect.left));
+      expect(badgeRect.right, lessThanOrEqualTo(infoRect.right));
+      expect(infoRect.contains(badgeRect.topLeft), isTrue);
+      expect(infoRect.contains(badgeRect.bottomRight), isTrue);
+      expect(
+        find.descendant(
+            of: find.byKey(_kInfoBar), matching: find.text('块化测试视频')),
+        findsOneWidget,
+      );
+      expect(
+        find.descendant(
+            of: find.byKey(_kInfoBar), matching: find.text('3:20')),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('运行时刷新可双向：条目里标了、接口已放开 → 标签消失',
+        (tester) async {
+      MotionControl.enabled = false;
+      _mockCharging = false; // UP 取消充电专属后接口给 false
+      _installPlayerMock(tester, emitPrepared: () => true);
+      tester.view.devicePixelRatio = 1.0;
+      tester.view.physicalSize = const Size(400, 800);
+      addTearDown(tester.view.reset);
+
+      await _pumpPlayer(
+          tester, _video(bvid: 'BV1CHG0000004', charging: true));
+      // 首帧：条目自带 true → 标签在
+      expect(find.text('充电专属视频'), findsOneWidget);
+      expect(find.text('需给 UP 主充电后观看完整内容'), findsOneWidget);
+
+      await tester.pump(const Duration(milliseconds: 600));
+      expect(find.text('充电专属视频'), findsNothing,
+          reason: '接口说不是充电专属了，标签必须撤掉（不能一直挂着旧真值）');
+      expect(find.byType(ChargingBadge), findsNothing);
+    });
   });
 }

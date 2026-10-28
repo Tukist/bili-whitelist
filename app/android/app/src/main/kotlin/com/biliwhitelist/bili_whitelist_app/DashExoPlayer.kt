@@ -294,6 +294,13 @@ class DashExoPlayer(
      * - 直播的 `player.duration == C.TIME_UNSET` → [emitPrepared] 报
      *   `durationMs = 0`，Dart 侧按「时长未知」处理（这是**预期**行为，
      *   不要改 emitPrepared 的语义）。
+     *
+     * [audioOnly] = true（v2.55.0+，App 内「听视频」）：**只听音频**——
+     * 只用 [audioUrl] 建一条 [ProgressiveMediaSource]，不建视频源、不建
+     * [MergingMediaSource]，因此**视频轨一个字节都不请求**。[videoUrl] 传空串
+     * 即可（本分支不读它）。[audioUrl] 缺失 → 抛 [IllegalArgumentException]
+     * （插件层回 error，Dart 侧提示「拿不到独立音频轨」并回落视频）。
+     * 与 [isLive] 互斥（直播不会进这个分支：Dart 侧只有 VOD 会传 audioOnly）。
      */
     fun prepare(
         videoUrl: String,
@@ -301,12 +308,26 @@ class DashExoPlayer(
         positionMs: Long,
         meta: Meta? = null,
         isLive: Boolean = false,
+        audioOnly: Boolean = false,
     ) {
         this.isLive = isLive
         val mediaSource = if (isLive) {
             // 直播：单条 HLS 源（网络流；直播不存在本地文件形态）
             HlsMediaSource.Factory(dataSourceFactory)
                 .createMediaSource(buildMediaItem(videoUrl, meta))
+        } else if (audioOnly) {
+            // v2.55.0「听视频」：只有音频轨 → **只建一个** ProgressiveMediaSource。
+            // 不建视频源，也就不会构造 MergingMediaSource → 视频轨零请求（省流量
+            // 的全部意义在这里，别为了「少写一个分支」把视频源建了再丢弃）。
+            // 音频地址缺失时**直接抛错**（由插件层回 error）：宁可让 Dart 侧提示
+            // 「拿不到独立音频轨」，也不能静默播点别的把用户骗过去。
+            val audio = audioUrl
+            require(!audio.isNullOrEmpty()) { "audioOnly 模式必须给音频地址" }
+            val audioFactory =
+                if (isLocalUri(audio)) localDataSourceFactory
+                else networkFactoryFor(audio)
+            ProgressiveMediaSource.Factory(audioFactory)
+                .createMediaSource(buildMediaItem(audio, meta))
         } else {
             val videoFactory =
                 if (isLocalUri(videoUrl)) localDataSourceFactory

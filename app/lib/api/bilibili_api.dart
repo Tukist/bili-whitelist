@@ -4595,6 +4595,28 @@ List<PageInfo> parseViewPages(Map<String, dynamic>? meta) {
   return pages;
 }
 
+/// 从 view 接口的 `data` 解析**是否充电专属视频**（纯函数，可单测；v2.55.0+）。
+///
+/// 字段：`data.is_upower_exclusive`（**布尔**）。2026-10 匿名只读探针实测：
+/// - 普通视频（如 `BV1GJ411x7h7` / `BV1zptNerEyc`）：`false`；
+/// - 5 个充电专属样本（`BV1A18cziEZt`、`BV1n4SZB9Eut`、`BV12y3Q6WEhh`、
+///   `BV1pETJztEx1`、`BV1ZG5ozrEVo`，标题里就写着「充电专属」）：`true`；
+///   交叉验证：这几个视频在未充电账号下取流只给**试看片段**
+///   （`BV1n4SZB9Eut` 全长 270s，playurl 的 durl 只有 29977ms ≈ 30s），
+///   即内容确实被充电门槛拦住。
+/// 同一响应里还有 `is_upower_play` / `is_upower_preview`，但：
+/// - `is_upower_play` 在**普通视频上也是 false**（实测 `BV1zptNerEyc`），
+///   语义是「当前账号能不能播这条充电视频」，未充电账号恒 false，
+///   不能拿来判断"是不是充电专属"；
+/// - `is_upower_preview` 只表示"有没有试看片段"（实测 5 个样本全为 true），
+///   同样不是标签依据。
+/// 所以这里**只看 `is_upower_exclusive`**。
+///
+/// 容错：字段缺失 / 脏类型（字符串、数字、null）/ 整个 data 为 null → false
+/// （宁可漏标也不误标；缺字段时行为与改动前逐字一致）。
+bool parseViewCharging(Map<String, dynamic>? meta) =>
+    meta?['is_upower_exclusive'] == true;
+
 // ---------------------------------------------------------------------------
 // 写操作（v2.40.0+）：view 接口里的「我的互动态」与展示计数
 // ---------------------------------------------------------------------------
