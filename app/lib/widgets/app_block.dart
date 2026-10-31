@@ -45,7 +45,11 @@ enum AppBlockVariant {
 /// 不要为一次性需求新增 [AppBlockVariant]。
 @immutable
 class AppBlockSpec {
-  /// 底材色（[kPaper] / [kPaperCool] / [kPaperWarm]，不透明）
+  /// 底材色（[kPaperRaised] / [kPaperCool] / [kPaperWarm]，不透明）。
+  ///
+  /// ★ v2.57.0 起「卡片」一律用 [kPaperRaised]：浅色下它 == [kPaper]
+  /// （逐值不变），暗色下它比页面亮一档 —— 卡片靠**提亮**浮起来，
+  /// 不靠阴影（暗色里阴影根本看不见）。
   final Color background;
 
   /// 四边描边色；null = 不画四边描边（层级改用竖条/底材表达）
@@ -97,7 +101,7 @@ AppBlockSpec appBlockSpec(BuildContext context, AppBlockVariant v) {
     // 不是挂靠级别的表达，所以用短条而不是通栏。
     case AppBlockVariant.videoInfo:
       return AppBlockSpec(
-        background: kPaper,
+        background: kPaperRaised,
         stroke: kRuleStrong,
         strokeWidth: 1,
         radius: kRadiusMd,
@@ -110,7 +114,7 @@ AppBlockSpec appBlockSpec(BuildContext context, AppBlockVariant v) {
     // 评论主体：hairline 框（评论是一大片同级的重复项，框太重会吵）。
     case AppBlockVariant.comment:
       return AppBlockSpec(
-        background: kPaper,
+        background: kPaperRaised,
         stroke: kRule,
         strokeWidth: 1,
         radius: kRadiusMd,
@@ -129,7 +133,7 @@ AppBlockSpec appBlockSpec(BuildContext context, AppBlockVariant v) {
     // 块只画外形，避免双层 padding 叠加后卡片变胖。
     case AppBlockVariant.videoCard:
       return AppBlockSpec(
-        background: kPaper,
+        background: kPaperRaised,
         stroke: kRuleStrong,
         strokeWidth: 1,
         radius: kRadiusMd,
@@ -147,7 +151,7 @@ AppBlockSpec appBlockSpec(BuildContext context, AppBlockVariant v) {
     // 设置项：横向内边距更大（16），与列表页 [kPagePadH] 对齐。
     case AppBlockVariant.setting:
       return AppBlockSpec(
-        background: kPaper,
+        background: kPaperRaised,
         stroke: kRuleStrong,
         strokeWidth: 1,
         radius: kRadiusMd,

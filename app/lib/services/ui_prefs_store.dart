@@ -42,6 +42,10 @@ class UiPrefsStore extends ChangeNotifier {
   /// 写操作总开关的存储 key（bool；缺省/读失败 = false，**默认关**）。
   static const String writeActionsKey = 'ui:write_actions';
 
+  /// 「把观看进度写进 B 站账号历史」开关的存储 key
+  /// （bool；缺省/读失败 = true，**默认开**；v2.57.0+）。
+  static const String historyWriteKey = 'ui:history_write';
+
   /// 「免流兼容（实验）」开关的存储 key（bool；缺省/读失败 = false，**默认关**）。
   static const String streamCompatKey = 'ui:stream_compat';
 
@@ -58,6 +62,9 @@ class UiPrefsStore extends ChangeNotifier {
 
   bool _showTips = true;
   bool _writeActionsEnabled = false;
+
+  /// 「写观看进度到 B 站账号历史」的当前值（v2.57.0 **默认开**，见 getter 注释）。
+  bool _historyWriteEnabled = true;
   bool _streamCompatEnabled = false;
   bool _streamCompatSessionFallback = false;
   int? _favFolderId;
@@ -87,6 +94,27 @@ class UiPrefsStore extends ChangeNotifier {
   /// - 开关本身就是一道**知情确认**：开启前设置页那段说明写清了三个动作各
   ///   自不可逆在哪（见 manage_panel 的「写操作」分区）。
   bool get writeActionsEnabled => _writeActionsEnabled;
+
+  /// **「把观看进度写进 B 站账号历史」开关**（v2.57.0+，默认 **true**）。
+  ///
+  /// 打开后：播放中约每 60s（以及暂停/退出时各一次）把「看到第几秒」发给
+  /// B 站（`x/v2/history/report`），于是本 App 里看过的视频会出现在**账号的
+  /// 观看历史**里（网页端/官方客户端都能看到，带进度）。
+  ///
+  /// 为什么默认**开**（v2.57.0 用户定稿，替换掉最初的"默认关"）：
+  /// 用户原话是「默认开启」——账号历史本来就是"我在看什么"的自然记录，
+  /// 用户既然在用这个 App 看 B 站视频，进度跟账号同步是预期行为，而不是
+  /// 需要额外开启的增强。设置页开关仍在，随时可关。
+  ///
+  /// 默认开**不等于**乱发请求，三条硬约束不变（全部有单测钉着）：
+  /// - **开关关着 → 一个请求都不发**（连取 aid 那次 view 都不去，见
+  ///   [shouldReportHistory]）；
+  /// - **没登录 → 一个请求都不发**：播放页在取 aid 之前先做一次**本地**
+  ///   `bili_jct` 检查（secure storage 读，不是网络），没有就直接返回；
+  ///   即使漏到发请求那一步，[BiliApi.reportHistory] 也会在本机抛 -101，
+  ///   上报器第一次就停手（见 `bili_history_reporter.dart`）；
+  /// - 节流 60s / 失败退避 / 连续 3 次停手 / -412 立刻停手。
+  bool get historyWriteEnabled => _historyWriteEnabled;
 
   /// **「免流兼容（实验）」开关**（v2.51.0+，默认 **false**）：视频/音频**流类**
   /// 请求的 User-Agent 是否换成 `kBiliAppUA`（对齐 B 站官方 Android App 特征，
@@ -150,12 +178,13 @@ class UiPrefsStore extends ChangeNotifier {
 
   /// 启动时读一次；幂等（重复调用只在首次真正读盘，之后直接返回）。
   ///
-  /// 读失败 → 回默认（提示开 / 写操作关 / 免流兼容关 / 无上次收藏夹 /
-  /// 清晰度 1080P），不抛。五个值里只要有一个与当前不同就发通知。
+  /// 读失败 → 回默认（提示开 / 写操作关 / **写历史开** / 免流兼容关 /
+  /// 无上次收藏夹 / 清晰度 1080P），不抛。六个值里只要有一个与当前不同就发通知。
   Future<void> ensureLoaded() async {
     if (_loaded) return;
     var showTips = true;
     var writeActions = false;
+    var historyWrite = true;
     var streamCompat = false;
     int? favFolder;
     var quality = kPreferredQualityDefault;
@@ -163,16 +192,19 @@ class UiPrefsStore extends ChangeNotifier {
       final prefs = await SharedPreferences.getInstance();
       showTips = prefs.getBool(showTipsKey) ?? true;
       writeActions = prefs.getBool(writeActionsKey) ?? false;
+      // 缺省 = true（用户要求默认开启）；只有用户**显式关掉过**才会有 false
+      historyWrite = prefs.getBool(historyWriteKey) ?? true;
       streamCompat = prefs.getBool(streamCompatKey) ?? false;
       final fav = prefs.getInt(favFolderKey);
       favFolder = (fav != null && fav > 0) ? fav : null;
       final q = prefs.getInt(qualityKey);
       quality = (q != null && q > 0) ? q : kPreferredQualityDefault;
     } catch (_) {
-      // 存储异常：按默认值启动（提示开 / 写操作关 / 免流兼容关 / 无上次收藏夹 /
-      // 清晰度 1080P）
+      // 存储异常：按默认值启动（提示开 / 写操作关 / **写历史开** / 免流兼容关 /
+      // 无上次收藏夹 / 清晰度 1080P）
       showTips = true;
       writeActions = false;
+      historyWrite = true;
       streamCompat = false;
       favFolder = null;
       quality = kPreferredQualityDefault;
@@ -180,6 +212,7 @@ class UiPrefsStore extends ChangeNotifier {
     _loaded = true;
     if (showTips == _showTips &&
         writeActions == _writeActionsEnabled &&
+        historyWrite == _historyWriteEnabled &&
         streamCompat == _streamCompatEnabled &&
         favFolder == _favFolderId &&
         quality == _preferredQuality) {
@@ -187,6 +220,7 @@ class UiPrefsStore extends ChangeNotifier {
     }
     _showTips = showTips;
     _writeActionsEnabled = writeActions;
+    _historyWriteEnabled = historyWrite;
     _streamCompatEnabled = streamCompat;
     _favFolderId = favFolder;
     _preferredQuality = quality;
@@ -217,6 +251,22 @@ class UiPrefsStore extends ChangeNotifier {
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setBool(writeActionsKey, value);
+    } catch (_) {
+      // 写入失败静默
+    }
+  }
+
+  /// 「写观看进度到 B 站账号历史」开关：语义与 [setShowTips] 一致
+  /// （立即生效 + 静默持久化）。关掉后下一次判定就停发（播放页每次判定
+  /// 都现读这个值，不需要重启）。
+  Future<void> setHistoryWriteEnabled(bool value) async {
+    if (_historyWriteEnabled != value) {
+      _historyWriteEnabled = value;
+      notifyListeners();
+    }
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(historyWriteKey, value);
     } catch (_) {
       // 写入失败静默
     }
@@ -279,10 +329,17 @@ class UiPrefsStore extends ChangeNotifier {
   }
 
   /// 测试用：重置内存态（不触碰存储），避免单例跨用例串味。
+  ///
+  /// ⚠️ [historyWriteEnabled] 的默认值刻意是 **false**，与出厂默认（true）
+  /// 不同：这个口子是**测试基线**，播放页用例靠"关着"保证零上报请求
+  /// （否则每次 pump 都可能多出一次取 aid 的 view）。要断言"出厂默认开"，
+  /// 请走 [ensureLoaded] + 空的 SharedPreferences（见
+  /// `test/history_write_prefs_test.dart`）。
   @visibleForTesting
   void resetForTest({
     bool? showTips,
     bool writeActionsEnabled = false,
+    bool historyWriteEnabled = false,
     bool streamCompatEnabled = false,
     bool streamCompatSessionFallback = false,
     int? favFolderId,
@@ -291,6 +348,7 @@ class UiPrefsStore extends ChangeNotifier {
   }) {
     _showTips = showTips ?? true;
     _writeActionsEnabled = writeActionsEnabled;
+    _historyWriteEnabled = historyWriteEnabled;
     _streamCompatEnabled = streamCompatEnabled;
     _streamCompatSessionFallback = streamCompatSessionFallback;
     _favFolderId = favFolderId;

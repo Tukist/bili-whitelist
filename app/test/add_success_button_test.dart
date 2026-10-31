@@ -279,7 +279,7 @@ void main() {
   group('AddSuccessCheck（静态勾，SnackBar 复用）', () {
     testWidgets('按给定尺寸画出勾，不带动效', (tester) async {
       await tester.pumpWidget(
-        const MaterialApp(
+        MaterialApp(
           home: Scaffold(
             body: Align(
               alignment: Alignment.topLeft,

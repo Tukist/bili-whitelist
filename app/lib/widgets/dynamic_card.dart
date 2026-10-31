@@ -216,7 +216,7 @@ class DynamicAuthorRow extends StatelessWidget {
     return Container(
       color: Theme.of(context).colorScheme.surfaceContainerHighest,
       alignment: Alignment.center,
-      child: const Icon(Icons.person, size: 17, color: kInkGray30),
+      child: Icon(Icons.person, size: 17, color: kInkGray30),
     );
   }
 }
@@ -284,7 +284,7 @@ class DynamicImages extends StatelessWidget {
       height: h,
       color: grey,
       alignment: Alignment.center,
-      child: const Icon(Icons.image_outlined, size: 22, color: kInkGray30),
+      child: Icon(Icons.image_outlined, size: 22, color: kInkGray30),
     );
     Widget img = Image.network(
       url,
@@ -303,12 +303,12 @@ class DynamicImages extends StatelessWidget {
           img,
           Positioned.fill(
             child: Container(
-              color: kInkBlack.withValues(alpha: 0.45),
+              color: kMediaScrim.withValues(alpha: 0.45),
               alignment: Alignment.center,
               child: Text(
                 '+$more',
-                style: const TextStyle(
-                  color: kPaper,
+                style: TextStyle(
+                  color: kMediaInk,
                   fontSize: 16,
                   fontWeight: FontWeight.w600,
                 ),
@@ -391,7 +391,7 @@ class DynamicVideo extends StatelessWidget {
               const SizedBox(height: kSpace4),
               Row(
                 children: [
-                  const Icon(Icons.play_circle_outline,
+                  Icon(Icons.play_circle_outline,
                       size: 14, color: kInkGray50),
                   const SizedBox(width: 4),
                   // 「视频投稿」+ 该动态的发布时间（相对）。

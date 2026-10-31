@@ -37,6 +37,7 @@ import 'package:bili_whitelist_app/cache/download_manager.dart';
 import 'package:bili_whitelist_app/models/playlist_context.dart';
 import 'package:bili_whitelist_app/models/whitelist_video.dart';
 import 'package:bili_whitelist_app/pages/player_page.dart';
+import 'package:bili_whitelist_app/services/last_episode_store.dart';
 
 const String _kBvMulti = 'BV1EP0000001';
 const String _kBvOther = 'BV1EP0000002';
@@ -491,7 +492,9 @@ Future<void> _pumpPlayer(
   WhitelistVideo video, {
   PlaylistContext? playlist,
   int playlistIndex = 0,
-  int initialPageIndex = 0,
+  // v2.57.0：`null` = 调用方没指定集号（播放页按「上次看到第几 P」记忆落位）；
+  // `0` = 明确要第 1 集。这里是显式形参（不是缺省），所以既有用例语义不变。
+  int? initialPageIndex = 0,
 }) async {
   // 先卸一棵空树：同名 widget 会走 update 而不是 initState（同既有播放页测试）
   await tester.pumpWidget(const SizedBox());
@@ -509,6 +512,27 @@ Future<void> _pumpPlayer(
   await tester.pump();
   await tester.pump(const Duration(milliseconds: 600));
   await tester.pump();
+}
+
+/// 往 prefs 里塞一份「集数记忆」（v2.57.0）。[extra] 用来同时塞别的 key
+/// （例如 `playback_progress:<bvid>_<p>`），一次 setMockInitialValues 全写上。
+void _seedRememberedPage(
+  String bvid,
+  int pageIndex, {
+  Map<String, Object> extra = const {},
+}) {
+  SharedPreferences.setMockInitialValues({
+    LastEpisodeStore.storageKey: jsonEncode({
+      bvid: {'pageIndex': pageIndex, 'updatedAt': 1},
+    }),
+    ...extra,
+  });
+}
+
+/// 读 prefs 里「这个 bvid 记住的第几 P」（没记忆返回 null）。
+Future<int?> _storedPageIndex(String bvid) async {
+  final prefs = await SharedPreferences.getInstance();
+  return LastEpisodeStore.readMap(prefs)[bvid]?['pageIndex'];
 }
 
 /// 点某条请求已发出（含 await 链）后让异步落地。
@@ -810,6 +834,184 @@ void main() {
 
       expect(rec.seeks, contains(30000),
           reason: '切到 P2 后要按 P2 的记忆进度续播（key = bvid+pageIndex）');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // 集数记忆（v2.57.0+）：用户原话「很多视频有集，我需要再次进入的时候有一个
+  // 集数记忆」。缺的从来不是"第几秒"（进度记忆一直按 P 分开），而是"上次看的
+  // 是哪一集" —— 从首页合集 / 白名单列表 / UP 主页 / 收藏夹进来时集号是 null。
+  //
+  // 优先级：**显式 > 记忆 > 0**。每条用例一个独立 bvid（分 P 列表 / UP 元数据
+  // 缓存是库级的，复用会串味）。
+  // -------------------------------------------------------------------------
+  group('集数记忆（v2.57.0）', () {
+    const bvAuto = 'BV1EP0002001';
+    const bvExplicitZero = 'BV1EP0002002';
+    const bvExplicitWins = 'BV1EP0002003';
+    const bvNoMemory = 'BV1EP0002004';
+    const bvOutOfRange = 'BV1EP0002005';
+    const bvNoPages = 'BV1EP0002006';
+    const bvSwitch = 'BV1EP0002007';
+    const bvReenter = 'BV1EP0002008';
+    const bvProgress = 'BV1EP0002009';
+    const bvExplicitRemembers = 'BV1EP0002010';
+
+    testWidgets('调用方没指定集号（null）+ 有记忆 → 直接从记忆的那一集起播',
+        (tester) async {
+      final rec = _PlayerRec();
+      _installMocks(tester, rec);
+      _seedRememberedPage(bvAuto, 2); // 上次看到第 3 集
+      await _pumpPlayer(tester, _multiVideo(bvid: bvAuto),
+          initialPageIndex: null);
+      await _settle(tester); // 让在途请求（buvid/评论首屏）跑完，别留 pending 定时器
+
+      expect(find.textContaining('3/3 P'), findsOneWidget,
+          reason: '从合集/列表进来（不带集号）要回到上次看的第 3 集');
+      expect(rec.lastVideoUrl(), contains('p1003.v.m4s'),
+          reason: '取流必须用第 3 集的 cid —— 只是标签改了不算记住');
+    });
+
+    testWidgets('显式 0 不被记忆覆盖（取流仍按第 1 集）', (tester) async {
+      final rec = _PlayerRec();
+      _installMocks(tester, rec);
+      _seedRememberedPage(bvExplicitZero, 2); // 记忆说第 3 集
+      // 历史记录条目 pageIndex=0 / `?p=1` 都走这条：明确要第 1 集
+      await _pumpPlayer(tester, _multiVideo(bvid: bvExplicitZero),
+          initialPageIndex: 0);
+      await _settle(tester);
+
+      expect(find.textContaining('1/3 P'), findsOneWidget,
+          reason: '显式 0 = 明确第 1 集，绝不能被记忆的第 3 集盖掉');
+      expect(rec.lastVideoUrl(), contains('p1001.v.m4s'));
+    });
+
+    testWidgets('显式集号优先于记忆（记忆 1，显式 2 → 播第 3 集）', (tester) async {
+      final rec = _PlayerRec();
+      _installMocks(tester, rec);
+      _seedRememberedPage(bvExplicitWins, 1);
+      await _pumpPlayer(tester, _multiVideo(bvid: bvExplicitWins),
+          initialPageIndex: 2);
+      await _settle(tester);
+
+      expect(find.textContaining('3/3 P'), findsOneWidget);
+      expect(rec.lastVideoUrl(), contains('p1003.v.m4s'));
+    });
+
+    testWidgets('没指定且无记忆 → 仍是第 1 集（既有行为不变）', (tester) async {
+      final rec = _PlayerRec();
+      _installMocks(tester, rec);
+      await _pumpPlayer(tester, _multiVideo(bvid: bvNoMemory),
+          initialPageIndex: null);
+      await _settle(tester);
+
+      expect(find.textContaining('1/3 P'), findsOneWidget, reason: '没有记忆 → 第 1 集');
+      expect(rec.lastVideoUrl(), contains('p1001.v.m4s'));
+      expect(rec.seeks, isEmpty, reason: '没有该集进度 → 从头播');
+    });
+
+    testWidgets('记忆的集号越界（视频分 P 变少）→ 夹到最后一集，不崩',
+        (tester) async {
+      final rec = _PlayerRec();
+      _installMocks(tester, rec);
+      _seedRememberedPage(bvOutOfRange, 8); // 记忆第 9 集，实际只有 3 集
+      await _pumpPlayer(tester, _multiVideo(bvid: bvOutOfRange),
+          initialPageIndex: null);
+      await _settle(tester);
+
+      expect(tester.takeException(), isNull);
+      expect(find.textContaining('3/3 P'), findsOneWidget, reason: '夹到最后一集');
+      expect(rec.lastVideoUrl(), contains('p1003.v.m4s'));
+    });
+
+    testWidgets('记忆 + 条目没带 pages：先补分 P 列表，再按记忆那一集取流',
+        (tester) async {
+      final rec = _PlayerRec();
+      _installMocks(tester, rec);
+      _seedRememberedPage(bvNoPages, 1); // 上次看到第 2 集
+      // 旧白名单数据 / 老历史记录没有 pages：必须等接口补齐再取流，
+      // 否则会按顶层 cid（P1）取流 —— 那就是"记了集数却播了第 1 集"
+      await _pumpPlayer(tester,
+          _multiVideo(bvid: bvNoPages, withPages: false), initialPageIndex: null);
+      await _settle(tester);
+
+      expect(rec.lastVideoUrl(), contains('p1002.v.m4s'));
+      expect(http.count('cid=1001'), 0, reason: '全程一次都不该按 P1 取流');
+      expect(find.textContaining('2/3 P'), findsOneWidget);
+    });
+
+    testWidgets('切换分 P 后记忆立刻更新（下次进来接着看这一集）', (tester) async {
+      final rec = _PlayerRec();
+      _installMocks(tester, rec);
+      await _pumpPlayer(tester, _multiVideo(bvid: bvSwitch),
+          initialPageIndex: null);
+      await _settle(tester);
+      expect(await _storedPageIndex(bvSwitch), 0,
+          reason: '进页开始播第 1 集 → 记忆落在第 1 集');
+
+      await _tap(tester, _kNextBtn); // → 第 2 集
+      expect(find.textContaining('2/3 P'), findsOneWidget);
+      expect(await _storedPageIndex(bvSwitch), 1,
+          reason: '切到第 2 集后记忆必须跟着走（不然下次还是第 1 集）');
+    });
+
+    testWidgets('退出播放页后记忆仍在：重新进页（同一 bvid）回到刚才那一集',
+        (tester) async {
+      final rec = _PlayerRec();
+      _installMocks(tester, rec);
+      await _pumpPlayer(tester, _multiVideo(bvid: bvReenter),
+          initialPageIndex: null);
+      await _tap(tester, _kNextBtn); // → 第 2 集
+      await _tap(tester, _kNextBtn); // → 第 3 集
+      expect(find.textContaining('3/3 P'), findsOneWidget);
+
+      // 退出播放页（dispose 会再落一次记忆），再像「从合集再点进来」那样
+      // 不带集号重新开一个播放页
+      await tester.pumpWidget(const SizedBox());
+      await tester.pump();
+      final rec2 = _PlayerRec();
+      _installMocks(tester, rec2);
+      await _pumpPlayer(tester, _multiVideo(bvid: bvReenter),
+          initialPageIndex: null);
+      await _settle(tester);
+
+      expect(find.textContaining('3/3 P'), findsOneWidget,
+          reason: '再次进入要回到上次看的第 3 集');
+      expect(rec2.lastVideoUrl(), contains('p1003.v.m4s'));
+    });
+
+    testWidgets('恢复的集与进度一致：记忆第 3 集 → 用的是第 3 集自己的进度',
+        (tester) async {
+      final rec = _PlayerRec();
+      _installMocks(tester, rec);
+      _seedRememberedPage(bvProgress, 2, extra: {
+        // 第 3 集上次看到 30s；第 1 集另有一份 12s 的进度（不该被用到）
+        'playback_progress:${bvProgress}_2': jsonEncode({'positionMs': 30000}),
+        'playback_progress:${bvProgress}_0': jsonEncode({'positionMs': 12000}),
+      });
+      await _pumpPlayer(tester, _multiVideo(bvid: bvProgress),
+          initialPageIndex: null);
+      await _settle(tester);
+
+      expect(find.textContaining('3/3 P'), findsOneWidget);
+      expect(rec.seeks, contains(30000),
+          reason: '进度 key 含 pageIndex：回到第 3 集就得续第 3 集的进度');
+      expect(rec.seeks, isNot(contains(12000)),
+          reason: '第 1 集的进度不能被串到第 3 集上');
+    });
+
+    testWidgets('显式进第 3 集（如历史记录）→ 记忆跟着更新到第 3 集',
+        (tester) async {
+      final rec = _PlayerRec();
+      _installMocks(tester, rec);
+      _seedRememberedPage(bvExplicitRemembers, 0);
+      await _pumpPlayer(tester, _multiVideo(bvid: bvExplicitRemembers),
+          initialPageIndex: 2);
+      await _settle(tester);
+
+      expect(find.textContaining('3/3 P'), findsOneWidget);
+      expect(await _storedPageIndex(bvExplicitRemembers), 2,
+          reason: '用户看了哪一集，记忆就跟到哪一集（下次从合集进来接着看）');
     });
   });
 }

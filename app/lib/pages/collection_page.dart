@@ -700,7 +700,7 @@ class _CollectionPageState extends State<CollectionPage> {
           ),
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx, true),
-            child: const Text('删除', style: TextStyle(color: kError)),
+            child: Text('删除', style: TextStyle(color: kError)),
           ),
         ],
       ),
@@ -916,6 +916,10 @@ class _CollectionPageState extends State<CollectionPage> {
         seasonName: row.key,
         episodes: row.episodes,
         history: _history,
+        // 「上次看到第几集」（v2.57.0+）：整季卡点开后把那一集标出来，用户不用
+        // 自己从头往下数（不做自动滚动：行高随标题行数变化，偏移算不准，
+        // 硬滚反而容易停错位置）。
+        lastWatchedBvid: lastWatchedVideo(row.episodes, _history)?.bvid,
         onPick: (video) {
           Navigator.pop(sheetCtx);
           // 连播的 label 用**季名**（不是合集名）：进播放页后"第 N/M 集"
@@ -1058,7 +1062,7 @@ class _CollectionPageState extends State<CollectionPage> {
           ),
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx, true),
-            child: const Text('删除', style: TextStyle(color: kError)),
+            child: Text('删除', style: TextStyle(color: kError)),
           ),
         ],
       ),
@@ -1619,12 +1623,18 @@ class _SubCollectionCard extends StatelessWidget {
 /// 每一行 = 标题 + 时长 + 已看标记。**标题原样展示**（集号/副标题都在里面，
 /// 再单列一个序号是重复信息）；已看的判据与整季卡上的「已看 X/N」同源
 /// （[isVideoWatched]），两处不会一个说看过、一个说没看过。
+///
+/// v2.57.0+：多一列「上次看到」标记（[lastWatchedBvid]），标的是这一季里
+/// 最近看过的那一集——用户从整季卡进来一眼就能接着看，不用从头数。
+/// 刻意**不做自动滚动**：行高随标题行数（1~2 行）变化，偏移算不准，
+/// 滚错位置比不滚更烦人。
 class _SeasonEpisodeSheet extends StatelessWidget {
   const _SeasonEpisodeSheet({
     required this.seasonName,
     required this.episodes,
     required this.history,
     required this.onPick,
+    this.lastWatchedBvid,
   });
 
   /// 季名（弹层标题）。
@@ -1635,6 +1645,10 @@ class _SeasonEpisodeSheet extends StatelessWidget {
 
   /// 本机播放历史（算已看标记用）。
   final List<HistoryEntry> history;
+
+  /// 这一季里最近看过的那一集的 bvid（v2.57.0+；null = 一集都没看过）。
+  /// 值来自 [lastWatchedVideo]，与「已看」同一口径。
+  final String? lastWatchedBvid;
 
   /// 点了某一集：调用方负责关弹层 + push 播放页。
   final ValueChanged<WhitelistVideo> onPick;
@@ -1682,15 +1696,36 @@ class _SeasonEpisodeSheet extends StatelessWidget {
     WhitelistVideo episode,
   ) {
     final watched = isVideoWatched(episode, history);
+    // 「上次看到」：与已看标记分开（已经看完的一集也可以同时是"上次看到"）
+    final isLastWatched =
+        lastWatchedBvid != null && lastWatchedBvid == episode.bvid;
     return ListTile(
       // 锚点用 bvid（不是下标）：列表将来若加"续播/最新"排序，下标会变、
       // bvid 不会，测试也就不会因为一个无关的排序改动而红
       key: ValueKey('season-ep-${episode.bvid}'),
-      title: Text(
-        episode.title,
-        maxLines: 2,
-        overflow: TextOverflow.ellipsis,
-        style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+      title: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Flexible(
+            child: Text(
+              episode.title,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+            ),
+          ),
+          if (isLastWatched) ...[
+            const SizedBox(width: kSpace4),
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text(
+                '上次看到',
+                style: theme.textTheme.labelSmall
+                    ?.copyWith(color: theme.colorScheme.secondary),
+              ),
+            ),
+          ],
+        ],
       ),
       subtitle: Text(
         fmtDuration(episode.duration),

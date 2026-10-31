@@ -137,7 +137,7 @@ class VideoTile extends StatelessWidget {
                             horizontal: 5, vertical: 2),
                         decoration: BoxDecoration(
                           // 已缓存 = 状态角标：中性墨底 + 纸白字（不再是绿色）
-                          color: kInkBlack.withValues(alpha: .88),
+                          color: kMediaScrim.withValues(alpha: .88),
                           borderRadius: BorderRadius.circular(3),
                         ),
                         child: Text(
@@ -145,7 +145,7 @@ class VideoTile extends StatelessWidget {
                               ? '${cachedAudioOnly ? '已缓存音频' : '已缓存'}'
                                   ' $cachedCount/${video.pageCount}'
                               : (cachedAudioOnly ? '已缓存音频' : '已缓存'),
-                          style: const TextStyle(color: kPaper, fontSize: 10),
+                          style: TextStyle(color: kMediaInk, fontSize: 10),
                         ),
                       ),
                       if (video.charging) const SizedBox(height: 2),
@@ -166,12 +166,12 @@ class VideoTile extends StatelessWidget {
                   padding:
                       const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
                   decoration: BoxDecoration(
-                    color: kInkBlack.withValues(alpha: .72),
+                    color: kMediaScrim.withValues(alpha: .72),
                     borderRadius: BorderRadius.circular(3),
                   ),
                   child: Text(
                     '共 ${video.pageCount} 集',
-                    style: const TextStyle(color: kPaper, fontSize: 10),
+                    style: TextStyle(color: kMediaInk, fontSize: 10),
                   ),
                 ),
               ),
@@ -191,9 +191,9 @@ class VideoTile extends StatelessWidget {
         // 触摸目标达标。
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(kRadiusMd),
-          side: const BorderSide(color: kRuleStrong),
+          side: BorderSide(color: kRuleStrong),
         ),
-        tileColor: kPaper,
+        tileColor: kPaperRaised,
         contentPadding: const EdgeInsets.fromLTRB(
             kSpace8, kSpace4, kSpace8, kSpace4),
         leading: selectMode

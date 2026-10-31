@@ -203,7 +203,7 @@ class _ArticlePageState extends State<ArticlePage> {
         const SizedBox(height: kSpace8),
         _buildStatsRow(detail),
         const SizedBox(height: kSpace16),
-        const Divider(height: 1, thickness: 1, color: kRule),
+        Divider(height: 1, thickness: 1, color: kRule),
         const SizedBox(height: kSpace16),
         _buildContent(detail),
         // 正文与评论区之间的呼吸（紧跟其后就是「评论 N」区头）
@@ -274,7 +274,7 @@ class _ArticlePageState extends State<ArticlePage> {
   Widget _avatarPlaceholder() => Container(
         color: kPaperCool,
         alignment: Alignment.center,
-        child: const Icon(Icons.person, size: 17, color: kInkGray30),
+        child: Icon(Icons.person, size: 17, color: kInkGray30),
       );
 
   /// 统计行：阅读 / 点赞 / 收藏（[kTypeNum] 等宽数字，数字不跳动）。

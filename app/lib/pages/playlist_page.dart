@@ -465,6 +465,8 @@ class _PlaylistPageState extends State<PlaylistPage> {
   /// - **push 而不是替换首页**：返回键随时回首页（用户随时能退，符合"可返回"）
   /// - 带上分享链接的 `?p=` / `?t=` 定位（[ClipboardOpenResult.pageIndex] /
   ///   [positionMs]，与收藏夹/评论链接同一套语义）
+  /// - 链接**没带 `?p=`** 时 `pageIndex` 为 null → 原样传 null，让播放页按本地
+  ///   「上次看到第几 P」记忆落位（v2.57.0+；改前写死 `?? 0` 会钉死在第 1 集）
   Future<void> _openClipboardVideo(
     BuildContext context,
     ClipboardOpenResult result,
@@ -475,7 +477,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
         settings: const RouteSettings(name: kPlayerRouteName),
         builder: (_) => PlayerPage(
           video: video,
-          initialPageIndex: result.pageIndex ?? 0,
+          initialPageIndex: result.pageIndex,
           initialPositionMs: result.positionMs,
         ),
       ),
@@ -1534,7 +1536,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
           ),
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx, true),
-            child: const Text('移除', style: TextStyle(color: kError)),
+            child: Text('移除', style: TextStyle(color: kError)),
           ),
         ],
       ),
@@ -1717,7 +1719,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
       bottomNavigationBar: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          const Divider(height: 1, thickness: 1, color: kRule),
+          Divider(height: 1, thickness: 1, color: kRule),
           NavigationBar(
             selectedIndex: _tab,
             onDestinationSelected: _goToPage,
@@ -2463,7 +2465,7 @@ class _CollectionCard extends StatelessWidget {
                   if (total - watched > 0)
                     Expanded(
                       flex: total - watched,
-                      child: const ColoredBox(color: kRule),
+                      child: ColoredBox(color: kRule),
                     ),
                 ],
               ),

@@ -252,7 +252,8 @@ class _AddSuccessButtonState extends State<AddSuccessButton>
 class AddSuccessCheck extends StatelessWidget {
   const AddSuccessCheck({super.key, required this.color, this.size = 16});
 
-  /// 勾的描边色。SnackBar（墨底）上用 `kPaper`，纸上用 `palette.inkText`。
+  /// 勾的描边色。SnackBar 上用该条提示的**文案色**（浅色 = 纸白、暗色 =
+  /// 夜纸白，见 [AddSuccessSnackContent]），纸上用 `palette.inkText`。
   final Color color;
 
   /// 正方形边长；勾按 16×16 单位坐标系等比缩放。
@@ -268,9 +269,9 @@ class AddSuccessCheck extends StatelessWidget {
 
 /// 成功提示条的内容：小号勾 + 文案（给 `SnackBar` 用）。
 ///
-/// `SnackBar` 是墨底（`kInkBlack`），勾走纸白 `kPaper` —— 配方主墨落在墨底上
-/// 对比度不足 1.5:1，根本读不出来。**文案字符串不做任何改写**（调用方传进来
-/// 是什么就显示什么）。
+/// 勾的颜色取 `SnackBar` 文案色（浅色 = 墨底上的纸白；暗色 = 抬高夜纸底上的
+/// 夜纸白）—— 配方主墨落在墨底上对比度不足 1.5:1，根本读不出来。
+/// **文案字符串不做任何改写**（调用方传进来是什么就显示什么）。
 class AddSuccessSnackContent extends StatelessWidget {
   const AddSuccessSnackContent({super.key, required this.message});
 
@@ -278,14 +279,22 @@ class AddSuccessSnackContent extends StatelessWidget {
   final String message;
 
   @override
-  Widget build(BuildContext context) => Row(
-        children: [
-          const AddSuccessCheck(color: kPaper, size: 24),
-          const SizedBox(width: kSpace8),
-          // Expanded：长文案照旧换行，不被 Row 撑爆（SnackBar 给的宽度是有限的）
-          Expanded(child: Text(message)),
-        ],
-      );
+  Widget build(BuildContext context) {
+    // 勾的颜色**跟 SnackBar 文案同色**（v2.57.0）：浅色是「墨底上的纸白」，
+    // 暗色是「抬高夜纸底上的夜纸白」——夜间模式里 SnackBar 不再反转成白条，
+    // 这里若还固定写 kPaper 就会变成"深色勾压在深色底上"，勾直接消失。
+    // 无主题（widget 单测兜底）时回退到遮罩纸白 = 旧的浅色观感。
+    final ink = Theme.of(context).snackBarTheme.contentTextStyle?.color ??
+        kMediaInk;
+    return Row(
+      children: [
+        AddSuccessCheck(color: ink, size: 24),
+        const SizedBox(width: kSpace8),
+        // Expanded：长文案照旧换行，不被 Row 撑爆（SnackBar 给的宽度是有限的）
+        Expanded(child: Text(message)),
+      ],
+    );
+  }
 }
 
 /// 两圈扩散环：半径由中心向外扩大、alpha 0.35 → 0。

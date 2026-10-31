@@ -20,9 +20,11 @@ import '../models/subtitle.dart';
 import '../models/upowner.dart';
 import '../models/whitelist_video.dart';
 import '../player/bili_dash_player.dart';
+import '../services/bili_history_reporter.dart';
 import '../services/danmaku_settings_store.dart';
 import '../services/device_media.dart';
 import '../services/history_store.dart';
+import '../services/last_episode_store.dart';
 import '../services/realtime_transcriber.dart';
 import '../services/stream_status_store.dart';
 import '../services/ui_prefs_store.dart';
@@ -1295,9 +1297,23 @@ const double kViewRotationStep = math.pi / 2;
 class PlayerPage extends StatefulWidget {
   final WhitelistVideo video;
 
-  /// 初始播放的分 P 下标（历史记录续播用：直接定位到上次看的那一集；
-  /// 默认 0 = 第一集/单 P）。
-  final int initialPageIndex;
+  /// 初始播放的分 P 下标（0 起）。
+  ///
+  /// 三态语义（v2.57.0 起）：
+  /// - `null` = **自动**：调用方没指定集号（合集 / 白名单列表 / UP 主页 /
+  ///   搜索 / 信箱 / 收藏夹等入口），播放页用 [LastEpisodeStore] 里记住的
+  ///   「上次看到第几 P」，没有记忆就是第 1 集；
+  /// - `0` = **明确要第 1 集**（历史记录条目 pageIndex=0 / 离线缓存第 0 集 /
+  ///   分享链接 `?p=1`）：不被记忆覆盖；
+  /// - `>0` = 明确要那一集（同上，历史记录 / `?p=N` / 离线缓存）。
+  ///
+  /// 为什么从 `int`（默认 0）改成可空：`0` 同时承担了「没传」和「明确第 1 集」
+  /// 两种含义，加记忆后必然要区分——否则用户上次看到第 5 P，从首页合集点进来
+  /// 会被"默认 0"钉死在第 1 P。
+  ///
+  /// 优先级：**显式 > 记忆 > 0**；记忆的集号超出当前分 P 数（视频改版 / 分 P
+  /// 变少）时夹取到最后一集，不崩。
+  final int? initialPageIndex;
 
   /// 初始定位进度（毫秒；评论视频链接 ?t / 跳转定位用，v2.17.6+）。
   ///
@@ -1349,7 +1365,7 @@ class PlayerPage extends StatefulWidget {
   const PlayerPage({
     super.key,
     required this.video,
-    this.initialPageIndex = 0,
+    this.initialPageIndex,
     this.initialPositionMs,
     this.videoShotService,
     this.playlist,
@@ -1607,6 +1623,18 @@ class _PlayerPageState extends State<PlayerPage>
   VideoRelation? _relation;
   VideoReqUser? _reqUser;
   int? _writeAid;
+
+  // 观看历史写入（v2.57.0+，写方向）
+  // ---------------------------------------------------------------------
+  // 与上面的点赞/投币/收藏**共用 aid 缓存**（[_viewAidCache]，来自同一次
+  // view 响应），但开关独立（`UiPrefsStore.historyWriteEnabled`，v2.57.0
+  // 起**默认开**）。
+  // [_historyWriter] 懒建：它持有"这次会话上报了几次、还允不允许发"的状态，
+  // 换源/切集都**不重建**（否则每次切集都会把退避与停手状态清零 → 风控态下
+  // 越切越发）。[_historyAidAttempted] 记录"本会话为这个 bvid 现拉过 aid 了"，
+  // 防止每条进度都发一次 view 请求。
+  BiliHistoryReporter? _historyWriter;
+  final Set<String> _historyAidAttempted = <String>{};
 
   /// 点赞数的**可显示值**：初始 = view 的 `stat.like`，本页点赞/取消时 ±1。
   ///
@@ -2122,6 +2150,18 @@ class _PlayerPageState extends State<PlayerPage>
   /// [_ensurePagesForInitialPage]：重试 / 切源会再走 [_init]，不该重复拉 view）。
   bool _initialPagesResolved = false;
 
+  /// 进页「上次看到第几 P」是否已解析（v2.57.0+）。
+  ///
+  /// 与 [_initialPagesResolved] 同款理由：重试 / 换源会再走 [_init]，那时
+  /// `_currentPageIndex` 已经是用户当前所在集，绝不能再按记忆覆盖一次。
+  bool _initialEpisodeResolved = false;
+
+  /// 最近一次写进「集数记忆」的 `<bvid>#<pageIndex>`（v2.57.0+）。
+  ///
+  /// 只用于**省重复写盘**：原生 onPrepared 每次 READY 都发（seek / 重缓冲也会
+  /// 发），不挡的话同一集会被写成好几遍；bvid/集号变了才写。
+  String? _rememberedEpisodeKey;
+
   /// 进页那次 view 请求的 future（[_refreshUpownerMeta]，initState 里启动）。
   ///
   /// 存在的理由只有一个：[_ensurePagesForInitialPage] 要**等**这次响应才能按下
@@ -2245,10 +2285,13 @@ class _PlayerPageState extends State<PlayerPage>
     if (_initialPagesResolved) return;
     _initialPagesResolved = true;
     if (_pages != null) return;
-    if (widget.initialPageIndex <= 0) return;
+    // 判据用**解析后的**当前集号，而不是构造参数（v2.57.0）：参数为 null 时
+    // 集号来自本地记忆（[_resolveRememberedPage]），第 5 P 同样需要先拿到
+    // pages 才能按对的 cid 取流；而解析后为 0（真·第 1 集）就不必多等一个 RTT。
+    if (_currentPageIndex <= 0) return;
     final inflight = _video.epId == null ? _upownerMetaFuture : null;
     if (inflight != null) {
-      debugPrint('[player_page] 进页目标为第 ${widget.initialPageIndex + 1} 集，'
+      debugPrint('[player_page] 进页目标为第 ${_currentPageIndex + 1} 集，'
           '等进页那次 view 补齐分 P 列表 bvid=${_video.bvid}');
       await inflight;
       // 等完再看一次：那次响应里有多 P 就已经补上了；没有（单 P / 接口没给）
@@ -2268,6 +2311,80 @@ class _PlayerPageState extends State<PlayerPage>
       if (_applyViewPages(pages) && mounted) setState(() {});
     } catch (e) {
       debugPrint('[player_page] 初始分 P 列表补齐失败 bvid=$bvid $e');
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // 「上次看到第几 P」记忆（v2.57.0+）
+  // -------------------------------------------------------------------------
+  //
+  // 需求原话：「很多视频有集，我需要再次进入的时候有一个集数记忆」。
+  // 背景：进度记忆（[PlaybackProgress]）本来就是**按 (bvid, pageIndex) 分开存**
+  // 的，历史条目也带 pageIndex —— 所以过去只有「从历史记录进去」能回到原来那一
+  // P；从首页合集 / 白名单列表 / UP 主页 / 搜索 / 信箱 / 收藏夹进来时
+  // `initialPageIndex` 恒为 0，永远从第 1 P 开始。
+  //
+  // 本机记忆（[LastEpisodeStore]）补的就是这一环：调用方**没指定**集号时
+  // （`initialPageIndex == null`）按记忆落位。
+  //
+  // 优先级：**显式 > 记忆 > 0**。写入时机三处：
+  // 1. [_onPrepared]（流真正就绪 = 这一 P 开始播了）——覆盖「从历史/链接进来
+  //    明确指定了别的集」这种情形：用户看了哪一集，记忆就跟到哪一集；
+  // 2. [_switchToPage]（用户手动切 P）；
+  // 3. [_saveExitProgress]（退出播放页 / 换源前）。
+
+  /// 解析「这个视频上次看到第几 P」并落定 [_currentPageIndex]。
+  ///
+  /// 只在进页第一次 [_init] 里跑一次（[_initialEpisodeResolved]）。
+  /// **显式指定优先**：`widget.initialPageIndex != null` 时直接返回——包括
+  /// 显式的 `0`（历史记录里明确记着"第 1 集"，不能被记忆里的第 5 集盖掉）。
+  ///
+  /// 夹取：记忆的集号超出当前 pages 数（视频改版 / 分 P 变少）时落到最后一集。
+  /// pages 还没到手时先按记忆下标落定，等 [_ensurePagesForInitialPage] /
+  /// [_applyViewPages] 补上真实列表后由那里统一夹取（同一口径，见其注释）。
+  Future<void> _resolveRememberedPage() async {
+    if (_initialEpisodeResolved) return;
+    _initialEpisodeResolved = true;
+    // 显式优先：非 null（含 0）一律听调用方的
+    if (widget.initialPageIndex != null) return;
+    final bvid = _video.bvid;
+    int? remembered;
+    try {
+      // 带超时保护：测试环境无 shared_preferences 原生通道时 send 永不返回，
+      // 不能让它阻塞取流（与 [_init] 里 PlaybackProgress 同一模式）。
+      remembered = await LastEpisodeStore.instance
+          .lastPageIndex(bvid)
+          .timeout(const Duration(milliseconds: 500));
+    } catch (_) {
+      return; // 存储不可用 → 按第 1 集播（既有行为）
+    }
+    if (!mounted || _video.bvid != bvid) return;
+    if (remembered == null || remembered <= 0) return;
+    final pages = _pages;
+    final target = (pages == null || remembered < pages.length)
+        ? remembered
+        : pages.length - 1;
+    if (target == _currentPageIndex) return;
+    debugPrint('[player_page] 集数记忆 bvid=$bvid → 第 ${target + 1} 集'
+        '${target != remembered ? '（记忆第 ${remembered + 1} 集越界，已夹到最后一集）' : ''}');
+    setState(() => _currentPageIndex = target);
+  }
+
+  /// 把「[bvid] 看到第 [pageIndex] P」写进本地记忆（调用方传**快照**值）。
+  ///
+  /// 参数而不是读字段：本方法在 await 之后落笔，而播放页会在 await 间隙换源 /
+  /// 切集（与 [_saveExitProgress] 同一类坑，见其注释）。
+  /// 失败静默、同一集重复触发只写一次（见 [_rememberedEpisodeKey]）。
+  Future<void> _rememberPage(String bvid, int pageIndex) async {
+    if (bvid.isEmpty || pageIndex < 0) return;
+    final key = '$bvid#$pageIndex';
+    if (_rememberedEpisodeKey == key) return;
+    _rememberedEpisodeKey = key;
+    try {
+      await LastEpisodeStore.instance.saveLastPageIndex(bvid, pageIndex);
+      debugPrint('[player_page] 记住集数 $bvid → 第 ${pageIndex + 1} 集');
+    } catch (_) {
+      // 写失败静默：本次不记忆，不影响播放
     }
   }
 
@@ -2431,13 +2548,16 @@ class _PlayerPageState extends State<PlayerPage>
     // [WhitelistVideo.pages] 为 null；若夹到 0，缓存查找键会变成 (bvid, 0)，
     // 点「第 3 集」却播第 1 集的缓存。缓存键本来就是 (bvid, pageIndex)，
     // 无 pages 时按传入下标原样使用才是对的（|>0 只可能来自离线缓存页）。
+    //
+    // v2.57.0：`initialPageIndex == null`（调用方没指定）= 先按第 1 集落定，
+    // 真正的集号在 [_init] 的 [_resolveRememberedPage] 里按本地记忆解析
+    // （shared_preferences 是异步的，initState 不能等）。
+    final requested = widget.initialPageIndex ?? 0;
     final pages = _video.pages;
-    final maxIdx = (pages == null || pages.isEmpty)
-        ? widget.initialPageIndex
-        : pages.length - 1;
-    _currentPageIndex = widget.initialPageIndex < 0
-        ? 0
-        : (widget.initialPageIndex > maxIdx ? maxIdx : widget.initialPageIndex);
+    final maxIdx =
+        (pages == null || pages.isEmpty) ? requested : pages.length - 1;
+    _currentPageIndex =
+        requested < 0 ? 0 : (requested > maxIdx ? maxIdx : requested);
     // 评论 ?t 跳转初始定位（v2.17.6+）：>0 时首次 onPrepared 直接 seek 到该处，
     // 覆盖该集记忆进度（链接定位语义优先于历史记忆）。
     final initialMs = widget.initialPositionMs;
@@ -2585,7 +2705,7 @@ class _PlayerPageState extends State<PlayerPage>
       // 原生通道异常：忽略（进度仍保存，音频停不停以原生为准）
     }
     if (mounted) setState(() => _playing = false);
-    await _saveProgress();
+    await _saveProgress(reportHistoryNow: true);
     // 让路期间通知跟随本页（显示已暂停）；新页开始播放时会改绑到它的播放器
     unawaited(_syncNowPlaying());
   }
@@ -2633,9 +2753,13 @@ class _PlayerPageState extends State<PlayerPage>
   void _saveExitProgress() {
     final store = _progressStore;
     final player = _player;
-    if (player == null) return;
     final video = _video;
     final pageIndex = _currentPageIndex;
+    // 退出 / 换源前把「这个视频看到第几 P」也落一次（v2.57.0+）。放在
+    // player 判空**之前**：取流失败后直接退出（播放器都没建起来）也该记住
+    // 用户进的是哪一集，下次进来不必再手动翻。
+    unawaited(_rememberPage(video.bvid, pageIndex));
+    if (player == null) return;
     final cid = _currentCid;
     final durationMs = _durationMs;
     final completed = _completed;
@@ -2650,6 +2774,13 @@ class _PlayerPageState extends State<PlayerPage>
           pageIndex: pageIndex,
           cid: cid,
           durationMs: durationMs,
+        ));
+        // 退出播放页：同样绕过节流上报一次（这一集最后停在哪，以这次为准）
+        unawaited(_reportHistoryProgress(
+          pos,
+          video: video,
+          cid: cid,
+          force: true,
         ));
       }
     }).catchError((Object _) {
@@ -2782,6 +2913,10 @@ class _PlayerPageState extends State<PlayerPage>
       } catch (_) {
         _progressStore = null;
       }
+      // 「上次看到第几 P」（v2.57.0+）：必须在建播放器之前落定——取流 cid、
+      // 缓存命中键、进度恢复 key 全都看 [_currentPageIndex]，晚一步就会先按
+      // 第 1 集播一帧再跳。只在首次进页生效（显式传了集号的入口直接跳过）。
+      await _resolveRememberedPage();
       final player = await BiliDashPlayer.create();
       _eventSub = player.events.listen(_onPlayerEvent, onError: (Object _, StackTrace __) {
         // 事件流中断（如播放器已释放）静默忽略，以错误态兜底
@@ -3425,6 +3560,10 @@ class _PlayerPageState extends State<PlayerPage>
     // 新流开始：观看时长累计基线重建（旧流位置与此无关；若本流 onPrepared
     // 后还要 seek 恢复进度，_maybeRestoreProgress/seek 处会再次置 null）
     _resetWatchBaseline();
+    // 这一集真的开始播了 → 记住「这个视频看到第几 P」（v2.57.0+）。
+    // 放在 onPrepared 而不是进页时：只有真的播起来的集才算"上次看到"，
+    // 同时让「显式从历史第 2 集进来」也把记忆跟到第 2 集。
+    unawaited(_rememberPage(_video.bvid, _currentPageIndex));
     // 媒体通知：标题/UP/封面/状态（首次进入即显示通知）
     unawaited(_syncNowPlaying());
   }
@@ -4113,7 +4252,9 @@ class _PlayerPageState extends State<PlayerPage>
     if (_playing) {
       await player.pause();
       setState(() => _playing = false);
-      _saveProgress(); // 暂停时保存一次进度
+      // 暂停时保存一次进度；这次同时**绕过节流**把进度写进 B 站账号历史
+      // （v2.57.0+：暂停是"这一集就停在这儿"的明确信号，值得一次准点上报）
+      _saveProgress(reportHistoryNow: true);
     } else {
       if (_positionMs >= _durationMs && _durationMs > 0) {
         await player.seekTo(0);
@@ -4172,7 +4313,12 @@ class _PlayerPageState extends State<PlayerPage>
   // -------------------------------------------------------------------------
 
   /// 保存当前播放位置（跳过未开始/已完成）。
-  Future<void> _saveProgress() async {
+  ///
+  /// [reportHistoryNow]（v2.57.0+）：本次要不要**绕过节流**立刻把进度写进
+  /// B 站账号历史。暂停 / 退出 / 让路给新播放页这些"这一集就停在这儿"的
+  /// 时机传 true；每 10s 的定期保存传 false（由 [BiliHistoryReporter] 的
+  /// 60s 节流统一收口）。
+  Future<void> _saveProgress({bool reportHistoryNow = false}) async {
     final store = _progressStore;
     final player = _player;
     if (store == null || player == null || _completed) return;
@@ -4195,7 +4341,88 @@ class _PlayerPageState extends State<PlayerPage>
       cid: cid,
       durationMs: durationMs,
     );
+    // 写方向（v2.57.0+，默认关）：把进度也写进 B 站账号历史。开关关着时
+    // 这里**一个请求都不发**（连 aid 都不去取）。
+    unawaited(_reportHistoryProgress(
+      pos,
+      video: video,
+      cid: cid,
+      force: reportHistoryNow,
+    ));
   }
+
+  /// 把当前播放进度写进 **B 站账号**的观看历史（v2.57.0+，写方向）。
+  ///
+  /// 四道闸门（顺序有讲究）：
+  /// 1. **开关关着 → 直接返回**（在取 aid 之前判：取 aid 本身是一次 view
+  ///    请求，"关着时一个请求都不发"必须包括它）；
+  /// 2. **本次会话已停手（-101 / -412 / 连续失败）→ 直接返回**：不为别的
+  ///    视频再发一次取 aid 的请求；
+  /// 3. **没登录 → 直接返回**（v2.57.0 调整）：`bili_jct` 是从 secure storage
+  ///    **本地**读的（不发网络请求），缺它就说明上报接口注定 -101——开关
+  ///    改成默认开后，这条是"不漏请求"的硬边界；
+  /// 4. **番剧集（epId != null）→ 跳过**：`x/v2/history/report` 只认
+  ///    aid + cid，番剧集要走另一套 pgc 参数，本版不接（见报告里的遗留）。
+  ///
+  /// 过了四道闸门才去取 aid（本会话为这个 bvid **只现拉一次**，
+  /// [BiliApi.fetchVideoAid]）；拉不到就跳过（不阻塞、不提示）。
+  ///
+  /// 失败一律静默：节流/退避/停手全在 [BiliHistoryReporter] 里，这里不弹任何
+  /// 提示（写历史失败对用户没有可操作的下一步，弹窗只会打扰看视频）。
+  Future<void> _reportHistoryProgress(
+    int positionMs, {
+    required WhitelistVideo video,
+    required int cid,
+    bool force = false,
+  }) async {
+    // 闸门 1：最便宜的判定先来（连 secure storage 都不读）
+    final enabled = UiPrefsStore.instance.historyWriteEnabled;
+    if (!enabled) return;
+    // 闸门 2：已经停手就别再为别的视频取 aid
+    if (_historyWriter?.stoppedForSession ?? false) return;
+    // 闸门 3：本地读凭据（不发请求）；读不到（secure storage 不可用）也按
+    // 未登录处理——宁可这次不上报，也不要白发一次注定的 -101
+    String? jct;
+    try {
+      jct = await _api.readBiliJct();
+    } catch (e) {
+      debugPrint('[player_page] 读取登录凭据失败，本次不上报历史: $e');
+      return;
+    }
+    // 闸门 4 与其它前置条件走纯函数判定（[shouldReportHistory]）
+    final ok = shouldReportHistory(
+      enabled: enabled,
+      loggedIn: jct != null && jct.isNotEmpty,
+      isPgc: video.epId != null,
+      cid: cid,
+      positionMs: positionMs,
+    );
+    if (!ok) return;
+    final bvid = video.bvid;
+    var aid = _viewAidCache[bvid];
+    if (aid == null && _historyAidAttempted.add(bvid)) {
+      final fetched = await _api.fetchVideoAid(video);
+      if (fetched != null && fetched > 0) {
+        _viewAidCache[bvid] = fetched;
+        aid = fetched;
+      }
+    }
+    if (aid == null || aid <= 0) return;
+    await _reporter.report(
+      aid: aid,
+      cid: cid,
+      progress: positionMs ~/ 1000,
+      force: force,
+    );
+  }
+
+  /// 懒建的上报器（见 [_historyWriter] 字段注释）。
+  BiliHistoryReporter get _reporter => _historyWriter ??= BiliHistoryReporter(
+        send: ({required int aid, required int cid, required int progress}) =>
+            _api.reportHistory(aid: aid, cid: cid, progress: progress),
+        // 每次判定现读开关：用户在设置里一关，下一次判定立刻停发
+        enabled: () => UiPrefsStore.instance.historyWriteEnabled,
+      );
 
   /// 写入播放历史：记录 **调用方同步取好的那份视频快照** + 进度 + 观看时间。
   ///
@@ -5590,7 +5817,8 @@ class _PlayerPageState extends State<PlayerPage>
   ///
   /// **无定位参数**（维持 v2.17.1+ 行为）：
   /// - 同 bvid 且在播第 0 集（点的是本视频自身第 1 集链接）→ 不暂停不叠页；
-  /// - 其余 → 叠新 [PlayerPage]（从目标视频开头播，进度/历史独立；返回 →
+  /// - 其余 → 叠新 [PlayerPage]（**不带集号**：新页按本地「上次看到第几 P」
+  ///   记忆落位，v2.57.0+；没有记忆即第 1 集。进度/历史独立；返回 →
   ///   本页 [didPopNext] 恢复 A 续播）。
   ///
   /// **带 ?p/?t**（v2.17.6+，语义 = 「跳到该视频该分 P 该时间」，链接定位
@@ -5658,10 +5886,10 @@ class _PlayerPageState extends State<PlayerPage>
 
   /// 叠新 [PlayerPage]（评论链接跳不同视频 / 同 bvid 兜底共用）。
   ///
-  /// [initialPageIndex]/[initialPositionMs] 只在链接带 ?p/?t 时非默认（由调用
-  /// 方按 [openVideoInNewPlayer] 的 pageIndex/positionMs 换算传入）：>0 分 P /
-  /// >0 进度 → 新页首备后直接定位（覆盖其记忆进度）；不带参时维持 v2.17.1+
-  /// 从开头播/记忆进度行为。
+  /// [initialPageIndex] 三态（v2.57.0 起）：`null` = 不带 ?p（交给新页按本地
+  /// 「上次看到第几 P」记忆落位，没有记忆就是第 1 集）；`0`/`>0` = 链接明确
+  /// 指定了集号（`?p=N`），新页按该集起播并覆盖记忆。
+  /// [initialPositionMs] >0 时新页首备后直接定位（覆盖其记忆进度）。
   ///
   /// **不继承本页的播放列表**（v2.30.0+）：评论区的视频链接、搜索结果等来自
   /// 另一个语境，其「上一条/下一条」与当前合集无关——把本页的 [_playlistVideos]
@@ -5669,12 +5897,12 @@ class _PlayerPageState extends State<PlayerPage>
   /// 被点进来的那条路上带 playlist（见 [PlayerPage.playlist]）。
   void _pushNewPlayer(
     WhitelistVideo video, {
-    int initialPageIndex = 0,
+    int? initialPageIndex,
     int? initialPositionMs,
   }) {
     debugPrint('[player_page] 评论链接 push 新播放页(name=$kPlayerRouteName) '
         '${_video.bvid}#$_currentPageIndex -> ${video.bvid}'
-        '${initialPageIndex != 0 ? ' p${initialPageIndex + 1}' : ''}'
+        '${initialPageIndex != null ? ' p${initialPageIndex + 1}' : ''}'
         '${initialPositionMs != null ? ' t=${initialPositionMs}ms' : ''} '
         'title=${video.title}');
     // 先暂停自己（防双音轨）+ 保存进度；再从自己头上叠新播放页。
@@ -6017,7 +6245,7 @@ class _PlayerPageState extends State<PlayerPage>
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 6, 16, 2),
             child: Text('翻译失败：$_translationError',
-                style: const TextStyle(color: kError, fontSize: 12)),
+                style: TextStyle(color: kError, fontSize: 12)),
           ),
       ];
     }
@@ -6134,13 +6362,13 @@ class _PlayerPageState extends State<PlayerPage>
             padding: const EdgeInsets.fromLTRB(16, 6, 16, 0),
             child: Row(
               children: [
-                const Icon(Icons.check_circle,
+                Icon(Icons.check_circle,
                     color: kSuccess, size: 16),
                 const SizedBox(width: 6),
                 Expanded(
                   child: Text(
                     '✅ 实时转写完成（${list.length} 句）· 已作为字幕',
-                    style: const TextStyle(
+                    style: TextStyle(
                         color: kSuccess, fontSize: 13),
                   ),
                 ),
@@ -6164,7 +6392,7 @@ class _PlayerPageState extends State<PlayerPage>
                 padding: const EdgeInsets.fromLTRB(16, 4, 16, 0),
                 child: Text(
                   err ?? '实时转写失败',
-                  style: const TextStyle(color: kError, fontSize: 12),
+                  style: TextStyle(color: kError, fontSize: 12),
                 ),
               ),
             ),
@@ -6849,7 +7077,7 @@ class _PlayerPageState extends State<PlayerPage>
           ),
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx, true),
-            child: const Text('删除', style: TextStyle(color: kError)),
+            child: Text('删除', style: TextStyle(color: kError)),
           ),
         ],
       ),
@@ -6952,6 +7180,15 @@ class _PlayerPageState extends State<PlayerPage>
     if (index == _currentPageIndex) return;
     debugPrint('[player_page] switchToPage ${index + 1}/${pages.length} '
         'cid=${pages[index].cid} part=${pages[index].part}');
+    // 切集前把**旧分 P** 的最后位置写进账号历史（v2.57.0+，写方向）：
+    // 位置取界面上的 _positionMs（同步值，够用——切集是用户动作，不需要
+    // 精确到毫秒），cid 用**切之前**的 _currentCid。失败静默、只发一次。
+    unawaited(_reportHistoryProgress(
+      _positionMs,
+      video: _video,
+      cid: _currentCid,
+      force: true,
+    ));
     _pendingRestore = true; // 切集后 onPrepared 恢复新集记忆进度
     _pendingSeekMs = (seekMs != null && seekMs > 0) ? seekMs : null;
     // 实时转写（sherpa）随集重置：停止 + 清句子（句子时间轴是当前集音频）
@@ -7001,6 +7238,9 @@ class _PlayerPageState extends State<PlayerPage>
     });
     // 切集 = 换分 P：预览图按分 P 提供 → 必须重新拉（index 1-based）
     unawaited(_prepareVideoShot());
+    // 用户手动切了 P → 立刻更新「上次看到第几 P」（v2.57.0+）。不等取流成功：
+    // 记忆关心的是"用户选了哪一集"，取流失败也不该退回去。
+    unawaited(_rememberPage(_video.bvid, index));
     try {
       await _loadStreamAndPlay(positionMs: 0);
       await _player?.setPlaybackSpeed(_speed);
@@ -7650,11 +7890,11 @@ class _PlayerPageState extends State<PlayerPage>
                             width: double.infinity,
                             padding: const EdgeInsets.symmetric(
                                 horizontal: 12, vertical: 8),
-                            color: kInkBlack.withValues(alpha: .6),
-                            child: const Text(
+                            color: kMediaScrim.withValues(alpha: .6),
+                            child: Text(
                               '仅缓存了音频：无画面，可正常听声音',
                               textAlign: TextAlign.center,
-                              style: TextStyle(color: kPaper, fontSize: 12),
+                              style: TextStyle(color: kMediaInk, fontSize: 12),
                             ),
                           ),
                         ),
@@ -7911,7 +8151,7 @@ class _PlayerPageState extends State<PlayerPage>
   /// 信息块（块化 + 补场动效）。
   ///
   /// 外形交给 [AppBlock]（variant=videoInfo）：描边 + 左侧短竖条当「起笔」+
-  /// 圆角，底色沿用规格表的 [kPaper]（与原 `colorScheme.surface` 同值，所以
+  /// 圆角，底色沿用规格表的底材（浅色下 == [kPaper]，暗色下是夜纸抬高面，所以
   /// 原来的底色写法直接删掉，不做双层底）。原来那条 `border(bottom:)` 的
   /// hairline 分隔线也一并删——现在由块的四周描边表达层级，再留一条横线就是
   /// 两套语言打架。
@@ -8895,7 +9135,7 @@ class _PlayerPageState extends State<PlayerPage>
       style: TextButton.styleFrom(
         // 压在任意画面上都要读得清：墨黑 62% 圆角底 + 纸白字（与手势 hud
         // 同一套语汇，不引入新配色）
-        backgroundColor: kInkBlack.withValues(alpha: .62),
+        backgroundColor: kMediaScrim.withValues(alpha: .62),
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
         minimumSize: const Size(0, 32),
         tapTargetSize: MaterialTapTargetSize.shrinkWrap,
@@ -8929,7 +9169,7 @@ class _PlayerPageState extends State<PlayerPage>
         child: Container(
           padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 10),
           decoration: BoxDecoration(
-            color: kInkBlack.withValues(alpha: 0.55),
+            color: kMediaScrim.withValues(alpha: 0.55),
             borderRadius: BorderRadius.circular(8),
           ),
           child: Row(
@@ -9680,7 +9920,7 @@ class _PlayerPageState extends State<PlayerPage>
   Widget _buildErrorView() {
     return ColoredBox(
       // 覆盖在视频之上的错误面板：半透明墨黑底（保留画面透出感）
-      color: kInkBlack.withValues(alpha: 0.87),
+      color: kMediaScrim.withValues(alpha: 0.87),
       child: Center(
         child: SingleChildScrollView(
           child: Padding(
@@ -9700,7 +9940,9 @@ class _PlayerPageState extends State<PlayerPage>
                 FilledButton(
                   style: FilledButton.styleFrom(
                     backgroundColor: kInkClay,
-                    foregroundColor: kPaper,
+                    // 覆盖在画面上的按钮：字恒定用「遮罩上的纸白」（kMediaInk），
+                    // 不随明暗翻转——否则夜间模式下会变成深色字压在赤陶上。
+                    foregroundColor: kMediaInk,
                   ),
                   onPressed: _goLogin,
                   child: const Text('去登录'),
@@ -9842,7 +10084,7 @@ class _SeekPreviewOverlay extends StatelessWidget {
               key: const ValueKey('seek-preview-time'),
               padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
               decoration: BoxDecoration(
-                color: kInkBlack.withValues(alpha: 0.55),
+                color: kMediaScrim.withValues(alpha: 0.55),
                 borderRadius: BorderRadius.circular(kRadiusSm),
               ),
               child:
@@ -10092,7 +10334,7 @@ class _SeekBarPainter extends CustomPainter {
 
     // 暗垫（v2.18.0）：整条轨道先铺一层 kInkBlack 70% 的**同厚度**底——
     // 只垫底不加粗（保持 2px 细轨印刷感），让未播档在浅色画面上也有对比。
-    canvas.drawRect(track, ink..color = kInkBlack.withValues(alpha: 0.7));
+    canvas.drawRect(track, ink..color = kMediaScrim.withValues(alpha: 0.7));
 
     // 未播段（整条轨道底）
     canvas.drawRect(track, ink..color = kPlayerRule);
@@ -10211,7 +10453,7 @@ class _SubtitleLine extends StatelessWidget {
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
       decoration: BoxDecoration(
         // 字幕小药丸：半透明墨黑底（画面透出）+ 纸白字
-        color: kInkBlack.withValues(alpha: 0.45),
+        color: kMediaScrim.withValues(alpha: 0.45),
         borderRadius: BorderRadius.circular(6),
       ),
       child: Text(
@@ -10349,7 +10591,7 @@ class _FavFolderSheet extends StatelessWidget {
           child: Text(
             removing ? '从哪个收藏夹移除' : '收藏到',
             textAlign: TextAlign.center,
-            style: const TextStyle(fontSize: 13, color: kInkGray70),
+            style: TextStyle(fontSize: 13, color: kInkGray70),
           ),
         ),
         Flexible(

@@ -223,7 +223,7 @@ class _OfflinePageState extends State<OfflinePage> {
           ),
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx, true),
-            child: const Text('删除', style: TextStyle(color: kError)),
+            child: Text('删除', style: TextStyle(color: kError)),
           ),
         ],
       ),
@@ -255,7 +255,7 @@ class _OfflinePageState extends State<OfflinePage> {
           ),
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx, true),
-            child: const Text('清空', style: TextStyle(color: kError)),
+            child: Text('清空', style: TextStyle(color: kError)),
           ),
         ],
       ),
@@ -284,7 +284,7 @@ class _OfflinePageState extends State<OfflinePage> {
           ),
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx, true),
-            child: const Text('清理', style: TextStyle(color: kError)),
+            child: Text('清理', style: TextStyle(color: kError)),
           ),
         ],
       ),

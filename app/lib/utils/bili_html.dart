@@ -1145,7 +1145,7 @@ class BiliHtmlView extends StatelessWidget {
         case 'br':
           continue; // 块级裸 <br>：块间距已由各块自己给
         case 'hr':
-          out.add(const Divider(height: kSpace24, thickness: 1, color: kRule));
+          out.add(Divider(height: kSpace24, thickness: 1, color: kRule));
         default:
           // 不认识的标签（div/span/自定义…）：**剥壳留文**，递归子节点
           out.addAll(_blocks(context, el.children, ctx, rank));
@@ -1460,7 +1460,7 @@ class BiliHtmlView extends StatelessWidget {
     final loading = Container(
       color: kPaperCool,
       alignment: Alignment.center,
-      child: const Icon(Icons.image_outlined, size: 22, color: kInkGray30),
+      child: Icon(Icons.image_outlined, size: 22, color: kInkGray30),
     );
     final failed = Container(
       color: kPaperCool,
@@ -1474,7 +1474,7 @@ class BiliHtmlView extends StatelessWidget {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              const Icon(
+              Icon(
                 Icons.broken_image_outlined,
                 size: 20,
                 color: kInkGray50,

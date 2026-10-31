@@ -412,4 +412,48 @@ void main() {
       expect(manager.initCalls, 0, reason: '预热在启动流程，面板自身不该碰索引');
     });
   });
+
+  // ---- 外观（v2.57.0 夜间模式）：三选一入口 ----
+  group('外观分区（浅色 / 深色 / 跟随系统）', () {
+    testWidgets('入口存在、三态齐全，默认选中「浅色」', (tester) async {
+      ThemeStore.instance.resetForTest();
+      addTearDown(ThemeStore.instance.resetForTest);
+
+      final spy = _Spy();
+      await _pumpPanel(tester, _panel(spy));
+
+      expect(find.text('外观'), findsOneWidget);
+      final selector = tester.widget<SegmentedButton<ThemeMode>>(
+        find.byKey(kThemeModeSelectorKey),
+      );
+      expect(selector.segments.length, 3);
+      expect(selector.selected, {ThemeMode.light},
+          reason: '默认必须是浅色（不改老用户观感）');
+      // 三个选项文案都在（≤42 非空白字符，见 dark_mode_test）
+      expect(find.text('浅色'), findsOneWidget);
+      expect(find.text('深色'), findsOneWidget);
+      expect(find.text('跟随系统'), findsOneWidget);
+    });
+
+    testWidgets('点「深色」→ store 立即变 dark（并落盘）', (tester) async {
+      SharedPreferences.setMockInitialValues(<String, Object>{});
+      ThemeStore.instance.resetForTest();
+      addTearDown(ThemeStore.instance.resetForTest);
+
+      final spy = _Spy();
+      await _pumpPanel(tester, _panel(spy));
+
+      await tester.tap(find.text('深色'));
+      await tester.pumpAndSettle();
+
+      expect(ThemeStore.instance.themeMode, ThemeMode.dark);
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getString(ThemeStore.modeStorageKey), 'dark');
+      // 选中态跟着走（按钮不再停在「浅色」）
+      final selector = tester.widget<SegmentedButton<ThemeMode>>(
+        find.byKey(kThemeModeSelectorKey),
+      );
+      expect(selector.selected, {ThemeMode.dark});
+    });
+  });
 }

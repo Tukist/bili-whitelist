@@ -9,6 +9,8 @@ import 'services/inbox_card_style_store.dart';
 import 'services/theme_store.dart';
 import 'services/ui_prefs_store.dart';
 import 'theme/app_theme.dart';
+import 'theme/app_tokens.dart';
+import 'theme/theme_rebuild.dart';
 
 /// 全局路由观察者（v2.17.1+）：播放页 [RouteAware] 订阅它，感知「自己上面
 /// 又叠了一个新的播放页」→ 暂停当前播放（防双音轨）并记进度，返回时恢复
@@ -69,25 +71,87 @@ Future<void> preheatCacheIndex() => DownloadManager.instance.init();
 /// 登录页引导一次（可关闭：关闭=匿名，首页与播放页有明确「未登录仅 720P，
 /// 去登录解锁 1080P」提示入口）；次级入口在管理面板（齿轮 →「B 站账号」
 /// 登录/重新登录），首页不再有常驻登录按钮。
-class BiliWhitelistApp extends StatelessWidget {
+class BiliWhitelistApp extends StatefulWidget {
   const BiliWhitelistApp({super.key});
+
+  @override
+  State<BiliWhitelistApp> createState() => _BiliWhitelistAppState();
+}
+
+class _BiliWhitelistAppState extends State<BiliWhitelistApp>
+    with WidgetsBindingObserver {
+  /// 上一帧实际安装的亮度（v2.57.0）。变化 → 帧后把整棵树标脏一次。
+  Brightness? _installedBrightness;
+
+  @override
+  void initState() {
+    super.initState();
+    // 「跟随系统」时系统明暗一变就要换整套主题：MaterialApp 自己会重挑
+    // theme/darkTheme，但本 App 的底材 token 是模块级的（见 AppSurfaces），
+    // 必须让**我们**重跑一次 build 把新那套 token 装上去。
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
+  }
+
+  @override
+  void didChangePlatformBrightness() {
+    if (!mounted) return;
+    setState(() {});
+  }
+
+  /// 按模式 + 系统亮度算出**实际生效**的亮度。
+  ///
+  /// 与 `ThemeMode.system` 的解析规则一致（系统亮度 = platformDispatcher），
+  /// 只是我们在没有 `BuildContext` 的时候也要知道答案（装 token 早于建页面）。
+  Brightness _effectiveBrightness(ThemeMode mode) {
+    switch (mode) {
+      case ThemeMode.light:
+        return Brightness.light;
+      case ThemeMode.dark:
+        return Brightness.dark;
+      case ThemeMode.system:
+        return WidgetsBinding.instance.platformDispatcher.platformBrightness;
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
     // 监听配色 store（P1.5）：换配方 → 重建 MaterialApp → AnimatedTheme
     // 按 AppPalette.lerp 平滑过渡，全 App 换墨。
+    // v2.57.0：同一个 store 也管明暗模式（浅色 / 深色 / 跟随系统）。
     return ListenableBuilder(
       listenable: ThemeStore.instance,
-      builder: (context, _) => MaterialApp(
-        title: 'amoTV',
-        debugShowCheckedModeBanner: false,
-        navigatorObservers: [routeObserver],
-        // 全局主题（P1 视觉地基 + P1.5 配方）：单墨/双墨编辑印刷，见 lib/theme/。
-        theme: buildAppTheme(ThemeStore.instance.recipe),
-        // 只做浅色纸面，不跟随系统深色（暗底只存在于播放视口内）。
-        themeMode: ThemeMode.light,
-        home: const PlaylistPage(),
-      ),
+      builder: (context, _) {
+        final recipe = ThemeStore.instance.recipe;
+        final mode = ThemeStore.instance.themeMode;
+        final effective = _effectiveBrightness(mode);
+        // 先装好"当前生效的那套"底材/中性色，再建页面：页面里的 kPaper /
+        // kInkBlack / kRule 等 getter 读的就是它。
+        installSurfaces(effective);
+        // 亮度变了 → 页面不会自动重建（token 不是 InheritedWidget）→ 帧后
+        // 显式把整棵树标脏一次，停在旧页面上的内容才会换成新底材。
+        if (_installedBrightness != null &&
+            _installedBrightness != effective) {
+          scheduleFullTreeRebuild();
+        }
+        _installedBrightness = effective;
+        return MaterialApp(
+          title: 'amoTV',
+          debugShowCheckedModeBanner: false,
+          navigatorObservers: [routeObserver],
+          // 全局主题（P1 视觉地基 + P1.5 配方）：单墨/双墨编辑印刷，见 lib/theme/。
+          // 两套都装配（各自按自己的亮度派生），由 themeMode 决定用哪套。
+          theme: buildAppTheme(recipe, Brightness.light),
+          darkTheme: buildAppTheme(recipe, Brightness.dark),
+          themeMode: mode,
+          home: const PlaylistPage(),
+        );
+      },
     );
   }
 }

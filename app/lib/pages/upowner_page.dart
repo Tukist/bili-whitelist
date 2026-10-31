@@ -2097,7 +2097,7 @@ class _UpownerPageState extends State<UpownerPage> {
           ),
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx, true),
-            child: const Text('取消关注', style: TextStyle(color: kError)),
+            child: Text('取消关注', style: TextStyle(color: kError)),
           ),
         ],
       ),

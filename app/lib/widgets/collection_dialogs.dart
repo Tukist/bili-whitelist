@@ -131,7 +131,7 @@ Future<bool?> showDeleteCollectionDialog(
         ),
         TextButton(
           onPressed: () => Navigator.pop(dialogCtx, true),
-          child: const Text('删除', style: TextStyle(color: kError)),
+          child: Text('删除', style: TextStyle(color: kError)),
         ),
       ],
     ),

@@ -69,7 +69,10 @@ class _Case {
   });
 }
 
-const _cases = <_Case>[
+/// 规格表实际值。★ v2.57.0 起底材/描边是**按当前亮度解析的 token**
+/// （见 `app_tokens.dart` 的 AppSurfaces），不再是编译期常量，所以这张表
+/// 只能是 `final`（本文件加载时按**浅色**取值 = 老断言的基线值）。
+final _cases = <_Case>[
   _Case(
     AppBlockVariant.videoInfo,
     kPaper,
@@ -288,7 +291,7 @@ void main() {
         tester,
         AppBlock(
           variant: AppBlockVariant.comment,
-          specOverride: const AppBlockSpec(
+          specOverride: AppBlockSpec(
             background: kPaperWarm,
             stroke: kRuleStrong,
             strokeWidth: 1,

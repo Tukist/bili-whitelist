@@ -1033,7 +1033,12 @@ class _CommentListViewState extends State<CommentListView> {
         settings: const RouteSettings(name: kPlayerRouteName),
         builder: (_) => PlayerPage(
           video: video,
-          initialPageIndex: pageIndex ?? 0,
+          // v2.57.0：链接**没带 `?p=`** 时不替调用方拍板集号 —— 传 null 让播放页
+          // 按本地「上次看到第几 P」记忆落位（评论里点开的视频同样适用）。
+          // 唯一例外是「只带 `?t=`」的链接：那种链接说的是「这个视频的第 45 秒」，
+          // 按 B 站语义即第 1 集的时间点，不能跳到记忆里的另一集上。
+          initialPageIndex:
+              pageIndex ?? (positionMs != null ? 0 : null),
           initialPositionMs: positionMs,
         ),
       ));
@@ -2564,12 +2569,12 @@ class _CommentPictures extends StatelessWidget {
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1),
               decoration: BoxDecoration(
-                color: kInkBlack.withValues(alpha: 0.55),
+                color: kMediaScrim.withValues(alpha: 0.55),
                 borderRadius: BorderRadius.circular(4),
               ),
-              child: const Text(
+              child: Text(
                 '动图',
-                style: TextStyle(color: kPaper, fontSize: 10),
+                style: TextStyle(color: kMediaInk, fontSize: 10),
               ),
             ),
           ),
@@ -2648,7 +2653,7 @@ class _LevelBadge extends StatelessWidget {
       child: Text(
         'Lv$level',
         style: TextStyle(
-          color: kPaper,
+          color: kMediaInk,
           fontSize: compact ? 9 : 10,
           height: 1.3,
           fontWeight: FontWeight.w600,

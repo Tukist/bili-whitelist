@@ -96,12 +96,12 @@ class SeasonTile extends StatelessWidget {
               child: Container(
                 padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 2),
                 decoration: BoxDecoration(
-                  color: kInkBlack.withValues(alpha: .88),
+                  color: kMediaScrim.withValues(alpha: .88),
                   borderRadius: BorderRadius.circular(3),
                 ),
-                child: const Text(
+                child: Text(
                   '整季',
-                  style: TextStyle(color: kPaper, fontSize: 10),
+                  style: TextStyle(color: kMediaInk, fontSize: 10),
                 ),
               ),
             ),
@@ -121,9 +121,9 @@ class SeasonTile extends StatelessWidget {
         // 折叠卡与逐集卡在列表里是邻居，外形一旦不同就会显得"少了点什么"
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(kRadiusMd),
-          side: const BorderSide(color: kRuleStrong),
+          side: BorderSide(color: kRuleStrong),
         ),
-        tileColor: kPaper,
+        tileColor: kPaperRaised,
         contentPadding:
             const EdgeInsets.fromLTRB(kSpace8, kSpace4, kSpace8, kSpace4),
         leading: selectMode

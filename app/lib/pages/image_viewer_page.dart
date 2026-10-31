@@ -216,7 +216,7 @@ class _ImageViewerPageState extends State<ImageViewerPage> {
       left: 0,
       right: 0,
       child: Container(
-        color: kInkBlack.withValues(alpha: 0.2),
+        color: kMediaScrim.withValues(alpha: 0.2),
         padding: const EdgeInsets.symmetric(vertical: 4),
         child: SafeArea(
           bottom: false,
@@ -254,7 +254,7 @@ class _ImageViewerPageState extends State<ImageViewerPage> {
       right: 0,
       bottom: 0,
       child: Container(
-        color: kInkBlack.withValues(alpha: 0.2),
+        color: kMediaScrim.withValues(alpha: 0.2),
         padding: const EdgeInsets.only(top: 6, bottom: 8),
         child: SafeArea(
           top: false,
@@ -279,7 +279,7 @@ class _ImageViewerPageState extends State<ImageViewerPage> {
                       backgroundColor: kPlayerRule,
                       foregroundColor: kPlayerOn,
                       disabledBackgroundColor:
-                          kInkBlack.withValues(alpha: 0.2),
+                          kMediaScrim.withValues(alpha: 0.2),
                     ),
                   ),
           ),
@@ -299,7 +299,7 @@ class _ImageViewerPageState extends State<ImageViewerPage> {
       onPressed: onTap,
       icon: Icon(icon, color: color, size: 26),
       style: IconButton.styleFrom(
-        backgroundColor: kInkBlack.withValues(alpha: 0.35),
+        backgroundColor: kMediaScrim.withValues(alpha: 0.35),
       ),
     );
   }

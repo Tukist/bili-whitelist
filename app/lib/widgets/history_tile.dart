@@ -59,11 +59,11 @@ class HistoryTile extends StatelessWidget {
     // 块化（P0 批次 B）：与视频卡同一套外形 —— 纸底 + 1px 强描边 + kRadiusMd，
     // 不用阴影；**保留 ListTile**（页面测试按 `find.byType(ListTile)` 计数）。
     return Material(
-      color: kPaper,
+      color: kPaperRaised,
       elevation: 0,
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(kRadiusMd),
-        side: const BorderSide(color: kRuleStrong),
+        side: BorderSide(color: kRuleStrong),
       ),
       clipBehavior: Clip.antiAlias,
       child: ListTile(
@@ -90,6 +90,32 @@ class HistoryTile extends StatelessWidget {
                 color: theme.colorScheme.onSurfaceVariant,
               ),
             ),
+            // 来源标记（v2.57.0+，双向同步落地后才有）：本机记录**不显示**
+            // 任何字样（与改动前逐像素一致）；从 B 站同步进来的、以及两边
+            // 都有的，各标一行——否则用户会把「账号里看到过的」误当成
+            // 「本机看过的」。
+            if (entry.source != HistorySource.local)
+              Text(
+                entry.source == HistorySource.both
+                    ? '来自 B 站 · 本机也看过'
+                    : '来自 B 站',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.primary,
+                  fontSize: 11,
+                ),
+              ),
+            // 白名单标记（v2.57.0 调整）：账号历史里的视频**全都进历史**了，
+            // 所以不在白名单的那些要能被认出来。只是标记——**不影响点击**
+            // （播放页本来就能播不在白名单的视频，见 history_page 的
+            // [videoFromHistoryEntry]）。白名单内条目一个字都不加。
+            if (!entry.inWhitelist)
+              Text(
+                '未在白名单',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.outline,
+                  fontSize: 11,
+                ),
+              ),
             Text(
               // 副信息：UP主（· 发布 yyyy-MM-dd）· 观看时间。
               // 这一行有两个日期 → 发布日期加「发布」前缀区分（列表视频卡的

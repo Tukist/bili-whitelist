@@ -1258,7 +1258,7 @@ class _LivePlayerPageState extends State<LivePlayerPage> {
         Align(
           alignment: Alignment.topCenter,
           child: ColoredBox(
-            color: kInkBlack.withValues(alpha: 0.55),
+            color: kMediaScrim.withValues(alpha: 0.55),
             child: SafeArea(
               bottom: false,
               child: Row(
@@ -1323,7 +1323,7 @@ class _LivePlayerPageState extends State<LivePlayerPage> {
           vertical: kSpace12,
         ),
         decoration: BoxDecoration(
-          color: kInkBlack.withValues(alpha: 0.82),
+          color: kMediaScrim.withValues(alpha: 0.82),
           borderRadius: BorderRadius.circular(kRadiusMd),
         ),
         child: Row(
@@ -1346,7 +1346,7 @@ class _LivePlayerPageState extends State<LivePlayerPage> {
         vertical: kSpace8,
       ),
       decoration: BoxDecoration(
-        color: kInkBlack.withValues(alpha: 0.72),
+        color: kMediaScrim.withValues(alpha: 0.72),
         borderRadius: BorderRadius.circular(kRadiusSm),
       ),
       child: Row(
@@ -1380,7 +1380,7 @@ class _LivePlayerPageState extends State<LivePlayerPage> {
           vertical: kSpace16,
         ),
         decoration: BoxDecoration(
-          color: kInkBlack.withValues(alpha: 0.82),
+          color: kMediaScrim.withValues(alpha: 0.82),
           borderRadius: BorderRadius.circular(kRadiusMd),
         ),
         child: Column(
@@ -1519,7 +1519,7 @@ class _LivePlayerPageState extends State<LivePlayerPage> {
                 onPressed: () => Navigator.of(context).pop(),
                 style: OutlinedButton.styleFrom(
                   foregroundColor: kInkBlack,
-                  side: const BorderSide(color: kRuleStrong),
+                  side: BorderSide(color: kRuleStrong),
                   minimumSize: const Size(88, 44),
                 ),
                 child: const Text('返回'),
@@ -1529,7 +1529,7 @@ class _LivePlayerPageState extends State<LivePlayerPage> {
                 onPressed: () => unawaited(_toggleFullscreen()),
                 style: OutlinedButton.styleFrom(
                   foregroundColor: kInkBlack,
-                  side: const BorderSide(color: kRuleStrong),
+                  side: BorderSide(color: kRuleStrong),
                   minimumSize: const Size(88, 44),
                 ),
                 child: const Text('全屏'),

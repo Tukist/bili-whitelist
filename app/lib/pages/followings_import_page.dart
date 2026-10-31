@@ -568,7 +568,7 @@ class _FollowingsRow extends StatelessWidget {
         ),
       ),
       trailing: followed
-          ? const Icon(Icons.check_circle, size: 18, color: kInkGray50)
+          ? Icon(Icons.check_circle, size: 18, color: kInkGray50)
           : null,
     );
   }

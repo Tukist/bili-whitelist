@@ -232,7 +232,7 @@ class SchedulePageState extends State<SchedulePage> {
           ),
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx, true),
-            child: const Text('删除', style: TextStyle(color: kError)),
+            child: Text('删除', style: TextStyle(color: kError)),
           ),
         ],
       ),
@@ -431,7 +431,7 @@ class SchedulePageState extends State<SchedulePage> {
           TextButton(
             key: const ValueKey('schedule-import-confirm'),
             onPressed: () => Navigator.pop(dialogCtx, true),
-            child: const Text('覆盖导入', style: TextStyle(color: kError)),
+            child: Text('覆盖导入', style: TextStyle(color: kError)),
           ),
         ],
       ),
@@ -636,7 +636,7 @@ class SchedulePageState extends State<SchedulePage> {
       width: kScheduleRowHeadW,
       height: kScheduleCellH,
       child: DecoratedBox(
-        decoration: const BoxDecoration(
+        decoration: BoxDecoration(
           color: kPaperCool,
           border: Border(
             right: BorderSide(color: kRule),
@@ -675,7 +675,7 @@ class SchedulePageState extends State<SchedulePage> {
       width: kScheduleCellW,
       height: kScheduleHeadH,
       child: DecoratedBox(
-        decoration: const BoxDecoration(
+        decoration: BoxDecoration(
           color: kPaperCool,
           border: Border(
             right: BorderSide(color: kRule),
@@ -717,7 +717,7 @@ class SchedulePageState extends State<SchedulePage> {
     return Container(
       width: kScheduleRowHeadW,
       height: kScheduleHeadH,
-      decoration: const BoxDecoration(
+      decoration: BoxDecoration(
         color: kPaperCool,
         border: Border(
           right: BorderSide(color: kRule),
@@ -872,7 +872,7 @@ class SchedulePageState extends State<SchedulePage> {
         color: bg,
         border: highlighted
             ? Border.all(color: context.palette.inkFill, width: 2)
-            : const Border(
+            : Border(
                 right: BorderSide(color: kRule),
                 bottom: BorderSide(color: kRule),
               ),
@@ -895,7 +895,7 @@ class SchedulePageState extends State<SchedulePage> {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const Icon(Icons.grid_off_outlined, size: 40, color: kInkGray30),
+            Icon(Icons.grid_off_outlined, size: 40, color: kInkGray30),
             const SizedBox(height: kSpace12),
             Text(
               _data.columns.isEmpty && _data.rows.isEmpty
@@ -983,7 +983,7 @@ class SchedulePageState extends State<SchedulePage> {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         _buildPageHeader(),
-        const Divider(height: 1, thickness: 1, color: kRule),
+        Divider(height: 1, thickness: 1, color: kRule),
         Expanded(
           child: _loading
               ? const SizedBox.shrink()
@@ -1172,7 +1172,7 @@ class _ScheduleCellEditorState extends State<_ScheduleCellEditor> {
             ),
           ),
           child: color == null
-              ? const Icon(
+              ? Icon(
                   Icons.format_color_reset_outlined,
                   size: 18,
                   color: kInkGray50,

@@ -71,7 +71,7 @@ void main() {
     testWidgets('style 原样透给那个 Text', (tester) async {
       await _pump(
         tester,
-        const AnimatedCopyLine(
+        AnimatedCopyLine(
           text: _sentence,
           style: TextStyle(fontSize: 30, color: kError),
         ),

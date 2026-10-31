@@ -7,15 +7,18 @@ import 'route_names.dart';
 
 /// 全局主题装配（P1 视觉地基 + P1.5 配方可切换 + 无障碍对比度护栏）。
 ///
-/// 单墨/双墨编辑印刷：底材是「纸」([kPaper] 系，**不随配方变化**)，内容用
+/// 单墨/双墨编辑印刷：底材是「纸」([kPaper] 系，**不随配方变化**、但**随明暗
+/// 切换**——v2.57.0 起暗色是「夜纸」三层），内容用
 /// 「墨」——主墨（观看）/ 点缀墨（新鲜度）由 [recipe] 决定，默认
 /// [kDefaultInkRecipe]（克莱因蓝 · 陶土，= P1 观感）。
 ///
 /// 颜色分两类：
 /// - **墨相关**（primary/tertiary 及其 container、导航选中、按钮、滑杆、
 ///   输入框聚焦、chip 选中…）→ 一律取 [AppPalette] 派生色，换配方即全库变色；
-/// - **中性/底材/语义/播放页反转底材**（[kInkBlack]/[kInkGray*]/[kRule*]/
-///   [kPaper*]/[kError]/[kSuccess]/[kPlayer*]）→ 与配方无关，固定不变。
+/// - **中性/底材/语义**（[kInkBlack]/[kInkGray*]/[kRule*]/[kPaper*]/[kError]/
+///   [kSuccess]）→ 与配方无关，但由 [AppSurfaces] 按当前亮度解析
+///   （浅色 = 纸面 / 暗色 = 夜纸）；播放页反转底材 [kPlayer*] 与媒体遮罩
+///   [kMediaScrim]/[kMediaInk] 恒不变。
 ///
 /// **墨按用途选档**（见 [AppPalette] 注释）：文字/图标上纸走 `inkText`、
 /// 实心填充底走 `inkFill`（配 `onInk`）、容器底文字走 `inkDeep`；
@@ -26,12 +29,30 @@ import 'route_names.dart';
 /// `app_palette.dart`）。
 ///
 /// 说明：本函数只装配 `ThemeData`，**不改变任何布局/尺寸/交互**。
-ThemeData buildAppTheme([InkRecipe recipe = kDefaultInkRecipe]) {
-  final p = AppPalette.fromRecipe(recipe);
+///
+/// [brightness]（v2.57.0 夜间模式）：浅色 = 纸面（默认，逐值等于 v2.55.0），
+/// 暗色 = 夜纸三层（见 [AppSurfaces.dark]）。两套 ThemeData 由 `main.dart`
+/// 分别装进 `MaterialApp.theme` / `darkTheme`。
+///
+/// 装配期间用 [withSurfaces] 临时安装这套底材，装配完还原：本函数里的
+/// [kPaper]/[kRule]… 一律取"它正在装配的那套"，而不是运行期那套 —— 于是浅色
+/// 主题永远按浅色纸面派生，不会因为用户在暗色模式下而装配出暗色纸的浅色主题。
+ThemeData buildAppTheme([
+  InkRecipe recipe = kDefaultInkRecipe,
+  Brightness brightness = Brightness.light,
+]) {
+  final s = AppSurfaces.of(brightness);
+  return withSurfaces(s, () => _assembleAppTheme(recipe, brightness, s));
+}
+
+ThemeData _assembleAppTheme(
+    InkRecipe recipe, Brightness brightness, AppSurfaces s) {
+  final p = AppPalette.fromRecipe(recipe, surfaces: s);
 
   // 以主墨为种子生成 M3 色板，再把关键槽位显式钉到派生色/ token 上，
   // 保证「同一个语义 = 同一个颜色」，不受种子算法版本影响。
-  final scheme = ColorScheme.fromSeed(seedColor: p.ink).copyWith(
+  final scheme = ColorScheme.fromSeed(seedColor: p.ink, brightness: brightness)
+      .copyWith(
     // primary 在本库主要用于「纸上的链接 / 图标 / 导航选中」→ 用可读档；
     // 实心按钮底另走 filledButtonTheme 的 inkFill + onInk。
     primary: p.inkText,
@@ -56,10 +77,14 @@ ThemeData buildAppTheme([InkRecipe recipe = kDefaultInkRecipe]) {
     outlineVariant: kRule,
     // ★ surfaceContainerHighest 必须指向 kPaperCool：全库多处
     // `surfaceContainerHighest.withValues(alpha: ...)` 的内嵌分区底靠它取色。
+    // 暗色下它是「夜纸·内容」（比页面亮一档）——内嵌分区在暗色下靠"更亮"
+    // 表达凹/凸，而不是靠更暗（暗色里压暗会直接糊进页面）。
     surfaceContainerHighest: kPaperCool,
     surfaceContainerHigh: kPaperCool,
     surfaceContainer: kPaper,
-    surfaceContainerLow: kPaper,
+    // ★ 抬高层（v2.57.0）：M3 的 BottomSheet 取这个槽位。浅色下
+    // kPaperRaised == kPaper，逐值等于 v2.55.0；暗色下是最亮的夜纸层。
+    surfaceContainerLow: kPaperRaised,
   );
 
   // 字阶：把 token 里的 8 档映射到 M3 槽位，颜色显式写死
@@ -78,6 +103,9 @@ ThemeData buildAppTheme([InkRecipe recipe = kDefaultInkRecipe]) {
   return ThemeData(
     useMaterial3: true,
     colorScheme: scheme,
+    // 色板亮度必须显式给：只给 colorScheme 不带 brightness 时，ThemeData 会用
+    // colorScheme.brightness 兜底，但明写一条让"暗色"这件事在主题上可见。
+    brightness: brightness,
     // 派生色挂到主题上：页面 `context.palette.*` 取墨色（换配方自动跟随）
     extensions: [p],
     scaffoldBackgroundColor: kPaper,
@@ -100,8 +128,11 @@ ThemeData buildAppTheme([InkRecipe recipe = kDefaultInkRecipe]) {
       // 标题栏与内容会糊成一片；而本主题已把 scrolledUnderElevation 钉成 0
       // 且 surfaceTint 透明，M3 的滚动 tint 不会出现，故分隔只能靠这条线，
       // 它常驻可见（不随滚动状态变化）。
-      shape: const Border(bottom: BorderSide(color: kRule, width: 1)),
+      // 暗色下 kRule 已加强（见 AppSurfaces.dark 的注释），这条线才看得见。
+      shape: Border(bottom: BorderSide(color: kRule, width: 1)),
       titleTextStyle: kTypeTitleL.copyWith(color: kInkBlack),
+      // 系统栏图标：不钉死，交给 AppBar 按 ThemeData.brightness 自动推导
+      // （暗色 → 白色图标，浅色 → 深色图标）。
     ),
     navigationBarTheme: NavigationBarThemeData(
       height: 64,
@@ -121,18 +152,20 @@ ThemeData buildAppTheme([InkRecipe recipe = kDefaultInkRecipe]) {
         ),
       ),
     ),
-    dividerTheme: const DividerThemeData(
+    dividerTheme: DividerThemeData(
       color: kRule,
       thickness: 1,
       space: 1,
     ),
     cardTheme: CardThemeData(
       elevation: 0,
-      color: kPaper,
+      // 抬高底（v2.57.0）：浅色 == kPaper（逐值不变），暗色 = 最亮那层夜纸，
+      // 卡片靠"比页面稍亮 + 更强描边"浮起来（Bewly 的做法：层级靠提亮）。
+      color: kPaperRaised,
       // 本版 Flutter 的 CardThemeData 没有 side 参数，卡片外框走 shape 的 side。
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(kRadiusMd),
-        side: const BorderSide(color: kRuleStrong, width: 1),
+        side: BorderSide(color: kRuleStrong, width: 1),
       ),
     ),
     // 实心填充底 = inkFill（保证 onInk 在其上 ≥ 4.5:1）
@@ -151,7 +184,7 @@ ThemeData buildAppTheme([InkRecipe recipe = kDefaultInkRecipe]) {
     outlinedButtonTheme: OutlinedButtonThemeData(
       style: OutlinedButton.styleFrom(
         foregroundColor: p.inkText,
-        side: const BorderSide(color: kRule),
+        side: BorderSide(color: kRule),
         elevation: 0,
         textStyle: kTypeTitleS,
         shape: RoundedRectangleBorder(
@@ -167,16 +200,17 @@ ThemeData buildAppTheme([InkRecipe recipe = kDefaultInkRecipe]) {
     ),
     inputDecorationTheme: InputDecorationTheme(
       filled: true,
+      // 暗色下 = 夜纸·内容（比页面亮一档），输入框才看得出是个"槽"
       fillColor: kPaperCool,
       hintStyle: kTypeBody.copyWith(color: kInkGray50),
       labelStyle: kTypeBody.copyWith(color: kInkGray70),
       border: OutlineInputBorder(
         borderRadius: BorderRadius.circular(kRadiusMd),
-        borderSide: const BorderSide(color: kRule),
+        borderSide: BorderSide(color: kRule),
       ),
       enabledBorder: OutlineInputBorder(
         borderRadius: BorderRadius.circular(kRadiusMd),
-        borderSide: const BorderSide(color: kRule),
+        borderSide: BorderSide(color: kRule),
       ),
       focusedBorder: OutlineInputBorder(
         borderRadius: BorderRadius.circular(kRadiusMd),
@@ -184,21 +218,29 @@ ThemeData buildAppTheme([InkRecipe recipe = kDefaultInkRecipe]) {
       ),
       errorBorder: OutlineInputBorder(
         borderRadius: BorderRadius.circular(kRadiusMd),
-        borderSide: const BorderSide(color: kError),
+        borderSide: BorderSide(color: kError),
       ),
       focusedErrorBorder: OutlineInputBorder(
         borderRadius: BorderRadius.circular(kRadiusMd),
-        borderSide: const BorderSide(color: kError, width: 1.5),
+        borderSide: BorderSide(color: kError, width: 1.5),
       ),
     ),
+    // 底部提示条：浅色沿用「近黑底 + 纸白字」的反转条（v2.55.0 观感不变）；
+    // 暗色**不能**继续反转（那会在暗界面里弹出一条刺眼的白条），改成
+    // 「抬高夜纸底 + 夜纸白字」，靠底材比页面亮一档来抢注意力。
     snackBarTheme: SnackBarThemeData(
       elevation: 0,
-      backgroundColor: kInkBlack,
-      contentTextStyle: kTypeBody.copyWith(color: kPaper),
+      backgroundColor: s.isDark ? kPaperRaised : kInkBlack,
+      contentTextStyle:
+          kTypeBody.copyWith(color: s.isDark ? kInkBlack : kPaper),
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(kRadiusMd),
       ),
     ),
+    // 对话框：不单独给 dialogTheme，走 M3 槽位 surfaceContainerHigh
+    // （= kPaperCool：暗色下是「夜纸·内容」，比页面亮一档，足够分层）。
+    // 不显式给 backgroundColor 的理由：给了会把浅色对话框从 kPaperCool 变成
+    // kPaper，属于"默认路径漂移"，不做。
     // 滑杆坐在纸上：轨道/滑块是「非文字 UI 组件」，用纸上的可读墨
     sliderTheme: SliderThemeData(
       activeTrackColor: p.inkText,
@@ -207,10 +249,11 @@ ThemeData buildAppTheme([InkRecipe recipe = kDefaultInkRecipe]) {
       overlayColor: p.inkWash,
     ),
     chipTheme: ChipThemeData(
-      backgroundColor: kPaper,
+      // 抬高底：浅色 == kPaper（逐值不变），暗色 = 最亮那层夜纸
+      backgroundColor: kPaperRaised,
       selectedColor: p.inkWash,
       checkmarkColor: p.inkText,
-      side: const BorderSide(color: kRule),
+      side: BorderSide(color: kRule),
       labelStyle: kTypeLabel.copyWith(color: kInkBlack),
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(kRadiusXs),

@@ -134,6 +134,35 @@ bool isVideoWatched(WhitelistVideo v, List<HistoryEntry> history) {
   return false;
 }
 
+/// 一组视频里**最近看过**的那一条（v2.57.0+，整季卡选集层「上次看到」用）。
+///
+/// 判据与 [isVideoWatched] 同一口径（bvid 归一化 + 分 P 下标落在有效范围内），
+/// 多条命中时按 [HistoryEntry.watchedAt] 取最新的一条；没有命中返回 null。
+///
+/// 为什么不复用「上一次看的 bvid」这种全局口径：整季卡问的是"**这一季**里上次
+/// 看到第几集"，隔壁合集/别的番的观看记录不能算进来。
+WhitelistVideo? lastWatchedVideo(
+  List<WhitelistVideo> videos,
+  List<HistoryEntry> history,
+) {
+  if (videos.isEmpty || history.isEmpty) return null;
+  final byKey = <String, WhitelistVideo>{};
+  for (final v in videos) {
+    final key = _normBvid(v.bvid);
+    if (key.isEmpty) continue;
+    byKey[key] = v;
+  }
+  HistoryEntry? latest;
+  for (final h in history) {
+    final v = byKey[_normBvid(h.bvid)];
+    if (v == null) continue;
+    if (h.pageIndex < 0 || h.pageIndex >= v.pageCount) continue;
+    if (latest == null || h.watchedAt.isAfter(latest.watchedAt)) latest = h;
+  }
+  if (latest == null) return null;
+  return byKey[_normBvid(latest.bvid)];
+}
+
 /// 一组视频里**已看**的条数（v2.41.0+，合集页「整季卡」用）。
 ///
 /// 逐条按 [isVideoWatched] 判，保证两个函数**永远是同一个口径**（不会出现

@@ -4,14 +4,16 @@ import 'app_tokens.dart';
 import 'ink_recipes.dart';
 
 /// 从候选前景里挑与 [background] 对比度最高的那个（平手时取靠前的）。
-/// 默认候选 = 纸白 / 近黑（全库只有这两种「墨上的字」）。
-Color highestContrastOn(
-  Color background, {
-  List<Color> candidates = const [kPaper, kInkBlack],
-}) {
-  var best = candidates.first;
+///
+/// 默认候选 = 当前亮度下的「纸白 / 近黑」两极（全库只有这两种「墨上的字」）：
+/// - 浅色：[kPaper]（0xFFFAFAF7）/ [kInkBlack]（0xFF16181C）；
+/// - 暗色：夜纸（0xFF15171C）/ 夜纸白（0xFFE8EAED）——于是**暗底上会选纸白**，
+///   而不是被压成近黑（v2.57.0）。
+Color highestContrastOn(Color background, {List<Color>? candidates}) {
+  final list = candidates ?? <Color>[kPaper, kInkBlack];
+  var best = list.first;
   var bestRatio = contrastRatio(best, background);
-  for (final c in candidates.skip(1)) {
+  for (final c in list.skip(1)) {
     final r = contrastRatio(c, background);
     if (r > bestRatio) {
       best = c;
@@ -22,20 +24,28 @@ Color highestContrastOn(
 }
 
 /// 把 [color] 的明暗调到与 [other] 达到 [target] 对比度（**保持色相**：
-/// 只朝近黑 / 纸白方向插值，不改 hue）。
+/// 只朝「对比度更高」的那一端插值，不改 hue）。
 ///
 /// - 已达标 → 原样返回（默认配方下多数墨都在此列，观感不变）
 /// - 未达标 → 朝「对比度更高」的那一端逐档插值（每档 5%，最多 20 档）
 ///
-/// 用于把 mono-color 里偏浅的墨（粉蓝 / 薄荷绿 / 橘 …）自动压成
-/// 「纸上的可读文字色」或「合规的实心填充底」。
+/// 「哪一端更高」**按当前亮度算**（v2.57.0）：
+/// - 浅色下未达标的墨 → 朝 [kInkBlack] **压深**（或朝纸白方向压浅，取对比度
+///   更高的那端）；
+/// - 暗色下未达标的墨（例如克莱因蓝 `#002FA7` 在夜纸上只有 ≈1.4:1）→ 朝
+///   **夜纸白提亮**，色相保留、只是变亮 —— 绝不会出现旧逻辑里"朝浅色 [kPaper]
+///   插值把克莱因蓝/赤陶压成纸白"的问题（暗色下 [kPaper] 是**最暗**的那一
+///   端，对比度最低，不可能被选中）。
+///
+/// 用于把 mono-color 里偏浅/偏深的墨自动调成「当前底材上的可读文字色」或
+/// 「合规的实心填充底」。
 Color adjustForContrast(
   Color color,
   Color other, {
   double target = kMinContrastBody,
 }) {
   if (contrastRatio(color, other) >= target) return color;
-  // 往哪端走：取极端值下对比度更高的那端（纸白 or 近黑）
+  // 往哪端走：取极端值下对比度更高的那端（当前亮度的纸白 or 近黑）
   final toward = contrastRatio(kPaper, other) >= contrastRatio(kInkBlack, other)
       ? kPaper
       : kInkBlack;
@@ -135,37 +145,60 @@ class AppPalette extends ThemeExtension<AppPalette> {
   /// 从配方派生。所有派生都走统一公式（不为默认配方写特例）：
   /// 「文字 / 实心底」用途过 [adjustForContrast] 的 4.5:1 护栏，
   /// 「数据编码 / 图形」用途（[inkDeco]）过 [kMinContrastGraphic] 的 3:1 护栏。
-  factory AppPalette.fromRecipe(InkRecipe recipe) {
-    final ink = recipe.ink;
-    final accent = recipe.accent;
-    final inkWash = Color.alphaBlend(ink.withValues(alpha: 0.12), kPaper);
-    final accentWash = Color.alphaBlend(accent.withValues(alpha: 0.15), kPaper);
-    final onInk = highestContrastOn(ink);
-    final onAccent = highestContrastOn(accent);
-    return AppPalette(
-      ink: ink,
-      // 数据编码/图形档：与纸底 ≥ 3:1。原墨已达标（克莱因蓝等 5 套）→ 零漂移；
-      // 浅墨（粉蓝/薄荷绿/橘/青色/植物绿）→ 压深到刚达标，深浅才读得出来。
-      inkDeco: adjustForContrast(ink, kPaper, target: kMinContrastGraphic),
-      // 实心填充底：先把「底上的字」选好，再反过来保证底够深/够浅
-      inkFill: adjustForContrast(ink, onInk),
-      // 纸/wash 上的文字图标：inkWash 比纸暗 → 对它达标即两处都达标
-      inkText: adjustForContrast(ink, inkWash),
-      inkDeep: adjustForContrast(Color.lerp(ink, kInkBlack, 0.3)!, inkWash),
-      inkWash: inkWash,
-      onInk: onInk,
-      accent: accent,
-      accentFill: adjustForContrast(accent, onAccent),
-      accentDeep:
-          adjustForContrast(Color.lerp(accent, kInkBlack, 0.3)!, accentWash),
-      accentWash: accentWash,
-      onAccent: onAccent,
-    );
+  ///
+  /// [surfaces] 决定在**哪套底材**上派生（v2.57.0）：
+  /// - 不传 → 当前运行期那套（页面/`AppPalette.of` 的默认路径，浅色下与
+  ///   v2.55.0 逐值一致）；
+  /// - [buildAppTheme] 显式传它要装配的那套 → 浅色主题永远按浅色纸面派生、
+  ///   暗色主题永远按夜纸派生，互不污染。
+  ///
+  /// 稀释底（[inkWash]/[accentWash]）的 alpha 按亮度分档：浅色 12% / 15%
+  /// （原值不动），暗色 22% / 26% —— 12% 的墨压在夜纸上几乎看不见，选中底、
+  /// 角标底、热力最浅档会直接"消失"。
+  factory AppPalette.fromRecipe(InkRecipe recipe, {AppSurfaces? surfaces}) {
+    final s = surfaces ?? appSurfaces;
+    return withSurfaces(s, () {
+      final ink = recipe.ink;
+      final accent = recipe.accent;
+      final washAlpha = s.isDark ? 0.22 : 0.12;
+      final accentWashAlpha = s.isDark ? 0.26 : 0.15;
+      final inkWash = Color.alphaBlend(ink.withValues(alpha: washAlpha), kPaper);
+      final accentWash =
+          Color.alphaBlend(accent.withValues(alpha: accentWashAlpha), kPaper);
+      final onInk = highestContrastOn(ink);
+      final onAccent = highestContrastOn(accent);
+      return AppPalette(
+        ink: ink,
+        // 数据编码/图形档：与纸底 ≥ 3:1。原墨已达标（克莱因蓝等 5 套）→ 零漂移；
+        // 浅墨（粉蓝/薄荷绿/橘/青色/植物绿）→ 压深到刚达标，深浅才读得出来。
+        // 暗色下同理反向：夜纸上不够亮的墨会被**提亮**到刚达标（保住色相）。
+        inkDeco: adjustForContrast(ink, kPaper, target: kMinContrastGraphic),
+        // 实心填充底：先把「底上的字」选好，再反过来保证底够深/够浅
+        inkFill: adjustForContrast(ink, onInk),
+        // 纸/wash 上的文字图标：inkWash 比纸暗 → 对它达标即两处都达标
+        inkText: adjustForContrast(ink, inkWash),
+        // 暗色下 kInkBlack 是夜纸白 → 这里等价于「往白提亮」，观感正确
+        inkDeep: adjustForContrast(Color.lerp(ink, kInkBlack, 0.3)!, inkWash),
+        inkWash: inkWash,
+        onInk: onInk,
+        accent: accent,
+        accentFill: adjustForContrast(accent, onAccent),
+        accentDeep:
+            adjustForContrast(Color.lerp(accent, kInkBlack, 0.3)!, accentWash),
+        accentWash: accentWash,
+        onAccent: onAccent,
+      );
+    });
   }
 
-  /// 兜底配色（默认配方）。widget 单测不带本 App 主题时靠它，
-  /// 保证取到的墨色 = 真机默认配方的墨色。
-  static final AppPalette fallback = AppPalette.fromRecipe(kDefaultInkRecipe);
+  /// 兜底配色（默认配方 · **恒按浅色纸面派生**）。
+  ///
+  /// widget 单测不带本 App 主题时靠它，保证取到的墨色 = 真机默认配方的墨色。
+  /// ★ 明确钉成 [AppSurfaces.light]（v2.57.0）：它是 `static final`，只会在
+  /// 第一次访问时算一次；若跟着运行期亮度走，某个暗色用例先跑过就会把这套
+  /// 兜底色永久污染成暗色，后续用例全部漂移。
+  static final AppPalette fallback =
+      AppPalette.fromRecipe(kDefaultInkRecipe, surfaces: AppSurfaces.light);
 
   /// 取当前配色（无扩展 → [fallback]）。
   static AppPalette of(BuildContext context) =>

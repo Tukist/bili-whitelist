@@ -270,7 +270,7 @@ class _Cover extends StatelessWidget {
           child: Column(
             mainAxisSize: MainAxisSize.min,
             children: [
-              const Icon(Icons.movie_outlined, size: 36, color: kInkGray30),
+              Icon(Icons.movie_outlined, size: 36, color: kInkGray30),
               const SizedBox(height: kSpace8),
               Text('暂无封面', style: kTypeLabel.copyWith(color: kInkGray70)),
             ],
@@ -559,7 +559,7 @@ class _ClassicLayout extends StatelessWidget {
       height: height,
       child: Container(
         decoration: BoxDecoration(
-          color: kPaper,
+          color: kPaperRaised,
           borderRadius: BorderRadius.circular(kRadiusMd),
           border: Border.all(color: kRuleStrong),
         ),
@@ -592,10 +592,10 @@ class _ClassicLayout extends StatelessWidget {
                       begin: Alignment.topCenter,
                       end: Alignment.bottomCenter,
                       colors: [
-                        kInkBlack.withValues(alpha: 0),
-                        kInkBlack.withValues(alpha: 0.30),
-                        kInkBlack.withValues(alpha: 0.68),
-                        kInkBlack.withValues(alpha: 0.95),
+                        kMediaScrim.withValues(alpha: 0),
+                        kMediaScrim.withValues(alpha: 0.30),
+                        kMediaScrim.withValues(alpha: 0.68),
+                        kMediaScrim.withValues(alpha: 0.95),
                       ],
                       stops: const [0, 0.40, 0.65, 1],
                     ),
@@ -623,14 +623,14 @@ class _ClassicLayout extends StatelessWidget {
                     _Title(
                       text: facts.title,
                       style: kTypeTitleM.copyWith(
-                        color: kPaper,
+                        color: kMediaInk,
                         fontWeight: FontWeight.w700,
                       ),
                     ),
                     const SizedBox(height: kSpace8),
                     _UpRow(
                       facts: facts,
-                      style: kTypeBodyS.copyWith(color: kPaper),
+                      style: kTypeBodyS.copyWith(color: kMediaInk),
                     ),
                     if (facts.pub.isNotEmpty) ...[
                       const SizedBox(height: kSpace8),
@@ -638,7 +638,7 @@ class _ClassicLayout extends StatelessWidget {
                         facts.pub,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
-                        style: kTypeBodyS.copyWith(color: kPaper),
+                        style: kTypeBodyS.copyWith(color: kMediaInk),
                       ),
                     ],
                   ],
@@ -688,7 +688,7 @@ class _EditorialLayout extends StatelessWidget {
       height: height,
       child: Container(
         decoration: BoxDecoration(
-          color: kPaper,
+          color: kPaperRaised,
           borderRadius: BorderRadius.circular(kRadiusMd),
           border: Border.all(color: kRuleStrong),
         ),
@@ -759,7 +759,7 @@ class _EditorialLayout extends StatelessWidget {
                     const SizedBox(height: kSpace8),
                     Row(
                       children: [
-                        const Icon(Icons.schedule, size: 14, color: kInkGray70),
+                        Icon(Icons.schedule, size: 14, color: kInkGray70),
                         const SizedBox(width: kSpace4),
                         Text(
                           facts.duration,
@@ -844,7 +844,7 @@ class _PolaroidLayout extends StatelessWidget {
       height: height,
       child: Container(
         decoration: BoxDecoration(
-          color: kPaper,
+          color: kPaperRaised,
           // 相纸是直角（只用最小的 2dp，区别于其它风格的卡片圆角）
           borderRadius: BorderRadius.circular(kRadiusXs),
           border: Border.all(color: kRuleStrong),
@@ -952,7 +952,7 @@ class _BannerLayout extends StatelessWidget {
       height: height,
       child: Container(
         decoration: BoxDecoration(
-          color: kPaper,
+          color: kPaperRaised,
           borderRadius: BorderRadius.circular(kRadiusMd),
           border: Border.all(color: kRuleStrong),
         ),
@@ -1052,7 +1052,7 @@ class _MinimalLayout extends StatelessWidget {
       height: height,
       child: Container(
         decoration: BoxDecoration(
-          color: kPaper,
+          color: kPaperRaised,
           borderRadius: BorderRadius.circular(kRadiusMd),
           // 极简：只留一根 hairline，不抢封面
           border: Border.all(color: kRule),

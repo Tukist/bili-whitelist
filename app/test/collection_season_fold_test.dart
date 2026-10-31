@@ -195,17 +195,18 @@ Future<void> _longPress(WidgetTester tester, Finder target) async {
   await tester.pumpAndSettle();
 }
 
-HistoryEntry _watched(String bvid, {int pageIndex = 0}) => HistoryEntry(
-  bvid: bvid,
-  pageIndex: pageIndex,
-  cid: 1,
-  title: '已看',
-  cover: '',
-  upName: 'UP',
-  durationMs: 1000,
-  positionMs: 100,
-  watchedAt: DateTime(2026, 8, 1),
-);
+HistoryEntry _watched(String bvid, {int pageIndex = 0, DateTime? at}) =>
+    HistoryEntry(
+      bvid: bvid,
+      pageIndex: pageIndex,
+      cid: 1,
+      title: '已看',
+      cover: '',
+      upName: 'UP',
+      durationMs: 1000,
+      positionMs: 100,
+      watchedAt: at ?? DateTime(2026, 8, 1),
+    );
 
 void main() {
   // -------------------------------------------------------------------------
@@ -370,6 +371,45 @@ void main() {
   });
 
   // -------------------------------------------------------------------------
+  // 纯函数：「上次看到」那一集（v2.57.0+）
+  // -------------------------------------------------------------------------
+  group('lastWatchedVideo：整季里最近看过的那一集', () {
+    final eps = [
+      _ep('某番', 1, 'BV1'),
+      _ep('某番', 2, 'BV2'),
+      _ep('某番', 3, 'BV3'),
+    ];
+
+    test('取 watchedAt 最新的那一集（不是列表里最靠后的）', () {
+      final v = lastWatchedVideo(eps, [
+        _watched('BV1', at: DateTime(2026, 8, 1)),
+        _watched('BV3', at: DateTime(2026, 8, 5)),
+        _watched('BV2', at: DateTime(2026, 8, 3)),
+      ]);
+      expect(v, isNotNull);
+      expect(v!.bvid, 'BV3');
+    });
+
+    test('不在这一季 / 越界分 P 的历史不参与（口径同 isVideoWatched）', () {
+      expect(
+        lastWatchedVideo(eps, [_watched('BVOTHER', at: DateTime(2026, 8, 9))]),
+        isNull,
+        reason: '隔壁番的进度不能算到这一季头上',
+      );
+      expect(
+        lastWatchedVideo(eps, [_watched('BV2', pageIndex: 9)]),
+        isNull,
+        reason: '分 P 数变少后的陈旧记录不算',
+      );
+    });
+
+    test('空列表 / 空历史 → null', () {
+      expect(lastWatchedVideo(const [], const []), isNull);
+      expect(lastWatchedVideo(eps, const []), isNull);
+    });
+  });
+
+  // -------------------------------------------------------------------------
   // 合集页渲染与交互
   // -------------------------------------------------------------------------
   group('合集页：整季卡（渲染）', () {
@@ -491,6 +531,46 @@ void main() {
       expect(page.playlistIndex, 2, reason: '被点的第 3 集在组内的下标');
       expect(page.playlist!.label, '高达', reason: 'label = 季名（不是「アニメ」）');
       expect(page.video.bvid, 'BVG3');
+    });
+
+    testWidgets('选集层标出「上次看到」那一集，且只标一条（v2.57.0+）',
+        (tester) async {
+      final data = _dataWith([
+        _ep('高达', 1, 'BVG1', order: 0),
+        _ep('高达', 2, 'BVG2', order: 1),
+        _ep('高达', 3, 'BVG3', order: 2),
+        _ep('高达', 4, 'BVG4', order: 3),
+      ]);
+      await _pumpCollection(
+        tester,
+        collection: 'アニメ',
+        data: data,
+        // 第 1 集 8/1 看过，第 3 集 8/5 又看了一次 → 上次看到的是第 3 集
+        history: [
+          _watched('BVG1', at: DateTime(2026, 8, 1)),
+          _watched('BVG3', at: DateTime(2026, 8, 5)),
+        ],
+      );
+
+      await tester.tap(_seasonCard('高达'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('上次看到'), findsOneWidget, reason: '只标一条');
+      expect(
+        find.descendant(
+          of: find.byKey(const ValueKey('season-ep-BVG3')),
+          matching: find.text('上次看到'),
+        ),
+        findsOneWidget,
+        reason: '标在最近看过的那一集上（不是第 1 集、不是最后输入的那条）',
+      );
+      expect(
+        find.descendant(
+          of: find.byKey(const ValueKey('season-ep-BVG1')),
+          matching: find.text('上次看到'),
+        ),
+        findsNothing,
+      );
     });
 
     testWidgets('43 集整季：卡只说「43 集」，点开才列 43 条（不再占 43 行）',

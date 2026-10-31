@@ -4542,6 +4542,143 @@ class BiliApi {
       return null;
     }
   }
+
+  // -------------------------------------------------------------------------
+  // 观看历史（v2.57.0+）：读 `x/web-interface/history/cursor`，
+  // 写 `x/v2/history/report`
+  //
+  // 这一对是**同一个需求的两个方向**（用户原话：「浏览历史可不可以同步一下
+  // bilibili 端这边的历史浏览记录，然后这边软件端的历史也会出现在账号的
+  // 浏览记录里面」）：读方向只读，写方向受「写操作」里的独立开关控制。
+  //
+  // ⚠️ 请求头表 [biliHeaders] 的取值**一个字都没动**：两个方法都沿用全局头
+  // + [_injectAuth] 那套 Cookie 注入，与其它接口同一条链路（换 UA 会同时
+  // 影响风控画像与《免流兼容》开关的语义，不属于本需求）。
+  // -------------------------------------------------------------------------
+
+  /// 拉取账号观看历史的一页（`GET x/web-interface/history/cursor`）。
+  ///
+  /// ## 认证（2026-10 匿名探针实测）
+  /// 匿名直连返回 `{"code":-101,"message":"账号未登录"}` —— **必须登录**。
+  /// 所以没 SESSDATA 时在本机就抛 -101，一个请求都不发。
+  ///
+  /// ## 游标（文档：bilibili-API-collect `docs/historytoview/history.md`）
+  /// `max` / `view_at` / `business` 三个参数按**链表 next 指针**用：把上一页
+  /// 响应里的 `data.cursor{max,view_at,business}` 原样回填即可取下一页
+  /// （`ps` 上限 30；`view_at` 是秒级时间戳）。
+  ///
+  /// ## 不传 `type`
+  /// 官方支持 `type=archive|live|article|all` 过滤，这里**故意不传**：过滤
+  /// 由调用方按「business 是不是 archive / 有没有 bvid / cid 认不认得出」做
+  /// （见 `bili_history_api.dart`；v2.57.0 起不问白名单——账号历史里的视频
+  /// 全都要进本机历史）。服务端过滤再多一层会让"番剧集到底有没有 bvid"这种
+  /// 没实测过的边界被服务端替我们决定，客户端过滤至少**丢什么是我们自己的规则**。
+  ///
+  /// 返回 `data` 原样（`{cursor, tab, list}`）；业务码非 0 → 抛
+  /// [BiliApiException]（-101 会顺手清掉死会话，与其它读接口同款）；
+  /// 网络失败（[DioException]）原样上抛。
+  Future<Map<String, dynamic>> fetchHistoryCursor({
+    int? max,
+    int? viewAt,
+    String? business,
+    int ps = 30,
+    String type = 'all',
+  }) async {
+    const path = '/x/web-interface/history/cursor';
+    final sess = await readSessdata();
+    if (sess == null || sess.isEmpty) {
+      throw const BiliApiException(
+        code: -101,
+        message: '请先登录 B 站账号，再同步 B 站观看历史',
+        path: path,
+      );
+    }
+    await _injectAuth();
+    final safePs = ps < 1 ? 1 : (ps > 30 ? 30 : ps);
+    final resp = await _dio.get<Map<String, dynamic>>(
+      path,
+      queryParameters: {
+        'ps': '$safePs',
+        if (max != null && max > 0) 'max': '$max',
+        if (viewAt != null && viewAt > 0) 'view_at': '$viewAt',
+        if (business != null && business.isNotEmpty) 'business': business,
+        if (type.isNotEmpty) 'type': type,
+      },
+    );
+    final data = resp.data;
+    final code = _looseInt(data?['code']);
+    if (code == -101) {
+      // 与其它读接口一致：服务端明确说没登录 → 清掉本地死会话
+      await _discardDeadSession(path);
+      throw const BiliApiException(
+        code: -101,
+        message: '登录已失效，请重新登录 B 站账号',
+        path: path,
+      );
+    }
+    if (code != 0) {
+      throw BiliApiException(
+        code: code ?? -1,
+        message: data?['message'] as String? ?? '拉取观看历史失败',
+        path: path,
+      );
+    }
+    final d = data?['data'];
+    // 历史为空时 B 站可能给 data=null（而不是空 list）→ 当空页处理
+    if (d is! Map<String, dynamic>) return const {'cursor': null, 'list': []};
+    return d;
+  }
+
+  /// 把「看到第几秒」写进账号观看历史（`POST x/v2/history/report`）。
+  ///
+  /// ## 为什么选它而不是网页心跳
+  /// 候选有两个（见 `docs/video/report.md`）：
+  /// - `x/v2/history/report`（**本方法**）：文档语义就是「记录视频观看记录
+  ///   位于 N 秒」，双端认证（Cookie + `csrf`），参数只有
+  ///   `aid` / `cid` / `progress`（秒）/ `platform`。反爬/风控面最小；
+  /// - `x/click-interface/web/heartbeat`：网页播放器每 15s 一次的心跳，
+  ///   参数里有 `realtime` / `start_ts` / `play_type` / `session` 等一堆
+  ///   **文档自己都标注"计算方法为推测"** 的字段。
+  ///
+  /// 决定用 report 的**实测依据**（2026-10 匿名探针，未带任何真实凭据）：
+  /// - `history/report` 匿名 POST → `{"code":-400}`（参数/csrf 校验挡在门口，
+  ///   **成功路径只有真登录才会出现**，所以 code=0 是可信的成功信号）；
+  /// - `heartbeat` 匿名 POST（甚至只给 `aid`+`cid` 什么都不给进度）→
+  ///   `{"code":0}` —— 未登录也回 0，**这个 0 无法区分"写进去了"还是"被静默
+  ///   丢弃"**。拿它当成功信号等于自欺，排错时也看不出问题在哪。
+  ///
+  /// ## 必需参数与 csrf
+  /// `aid`（稿件 avid，**不接受 bvid 单独使用**，文档写的是 aid 必要）、
+  /// `cid`（分 P 用）、`progress`（秒）、`platform=android`（对齐 App 端形态）、
+  /// `csrf`（走 [_postAuth] → 表单里的 `csrf` = `bili_jct`）。
+  /// 错误码：-101 未登录 / -111 csrf 失效 / -400 请求错误 / -412 风控。
+  ///
+  /// ## 不做的事
+  /// - **不重试**（沿 [_postAuth] 的写操作纪律：这条虽然幂等，但失败重试会在
+  ///   风控态下加压，调用方按节流+退避自己决定下一次）；
+  /// - **番剧（ep_id）不接**：本条接口只认 aid/cid，番剧集要另一套 pgc 参数，
+  ///   本版跳过（播放页对 `epId != null` 直接不上报）。
+  Future<void> reportHistory({
+    required int aid,
+    required int cid,
+    required int progress,
+  }) async {
+    const path = '/x/v2/history/report';
+    if (aid <= 0 || cid <= 0) {
+      throw const BiliApiException(
+        code: -400,
+        message: '视频 id 无效，无法写观看历史',
+        path: path,
+      );
+    }
+    final sec = progress < 0 ? 0 : progress;
+    await _postAuth(path, {
+      'aid': '$aid',
+      'cid': '$cid',
+      'progress': '$sec',
+      'platform': 'android',
+    }, referer: 'https://www.bilibili.com/video/av$aid');
+  }
 }
 
 /// 播放页进入评论区前的 aid 解析（纯函数，可单测）：

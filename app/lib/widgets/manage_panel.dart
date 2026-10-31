@@ -32,6 +32,7 @@ import 'traffic_panel.dart';
 ///   动作，干净上下文）
 ///
 /// 内容分区：B 站账号（登录/重新登录）→ 配色主题（P1.5 双墨配方切换）→
+/// **外观（v2.57.0：浅色 / 深色 / 跟随系统三选一，选中立即生效）** →
 /// 信箱卡片样式（v2.21.0+ 多版式切换）→
 /// GitHub 配置（token/gist）→ 合集管理（重命名/删除）→ 离线缓存管理 →
 /// **网络与播放（v2.51.0+：「免流兼容（实验）」开关，只改视频/音频流请求的
@@ -116,6 +117,12 @@ const Key kTipsSwitchKey = Key('ui-tips-switch');
 
 /// 「允许点赞 / 投币 / 收藏」总开关的 key（测试锚点；v2.40.0）。
 const Key kWriteActionsSwitchKey = Key('ui-write-actions-switch');
+
+/// 「把观看进度写进 B 站账号历史」开关的 key（测试锚点；v2.57.0+）。
+const Key kHistoryWriteSwitchKey = Key('ui-history-write-switch');
+
+/// 「外观（浅色 / 深色 / 跟随系统）」三选一的 key（测试锚点；v2.57.0）。
+const Key kThemeModeSelectorKey = Key('ui-theme-mode-selector');
 
 /// 「免流兼容（实验）」开关的 key（测试锚点；v2.51.0+）。
 const Key kStreamCompatSwitchKey = Key('ui-stream-compat-switch');
@@ -402,6 +409,40 @@ class _ManagePanelState extends State<ManagePanel> {
                 overflow: TextOverflow.ellipsis,
               ),
             ),
+          ),
+        ),
+        const SizedBox(height: 16),
+        const Divider(height: 1),
+        const SizedBox(height: 16),
+        // ---- 外观：明暗模式（v2.57.0 夜间模式，选中立即生效）----
+        Text('外观', style: theme.textTheme.titleMedium),
+        const SizedBox(height: 4),
+        Text(
+          '浅色是纸面，深色是夜纸（不用纯黑，靠底材提亮分层）。'
+          '「跟随系统」跟手机的深浅色走。选中立即生效，仅存本机。',
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+        const SizedBox(height: 8),
+        // 选中态要跟着 store 走 → 单独监听 ThemeStore（与上面配色按钮同理）
+        ListenableBuilder(
+          listenable: ThemeStore.instance,
+          builder: (context, _) => SegmentedButton<ThemeMode>(
+            key: kThemeModeSelectorKey,
+            showSelectedIcon: false,
+            expandedInsets: EdgeInsets.zero,
+            segments: const [
+              ButtonSegment(value: ThemeMode.light, label: Text('浅色')),
+              ButtonSegment(value: ThemeMode.dark, label: Text('深色')),
+              ButtonSegment(value: ThemeMode.system, label: Text('跟随系统')),
+            ],
+            selected: {ThemeStore.instance.themeMode},
+            onSelectionChanged: (selection) {
+              // 立即生效（重建 MaterialApp → theme/darkTheme 切换）+ 持久化
+              unawaited(
+                  ThemeStore.instance.selectThemeMode(selection.first));
+            },
           ),
         ),
         const SizedBox(height: 16),
@@ -760,6 +801,41 @@ class _ManagePanelState extends State<ManagePanel> {
             );
           },
         ),
+        // ---- 观看历史写入（v2.57.0+）：与点赞/投币/收藏**同一个分区**，
+        //      因为它也是"改账号状态"的写操作；但**独立开关**——用户可能
+        //      想同步历史却不想让 App 能点赞。文案必须写明"会写进你的
+        //      B 站账号"。
+        //
+        //      v2.57.0 调整：这个开关**默认开启**（用户要求），所以先单独
+        //      说明一句——上面"默认关闭"那句只描述点赞/投币/收藏那道闸，
+        //      不说明的话会被读成两个开关都默认关。----
+        Text(
+          '观看进度默认同步到你的 B 站账号历史（与上面的点赞 / 投币 / 收藏'
+          '互不影响，关掉也不影响播放）。',
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+        const SizedBox(height: 8),
+        ListenableBuilder(
+          listenable: UiPrefsStore.instance,
+          builder: (context, _) {
+            final on = UiPrefsStore.instance.historyWriteEnabled;
+            return SwitchListTile(
+              key: kHistoryWriteSwitchKey,
+              value: on,
+              onChanged: (v) =>
+                  UiPrefsStore.instance.setHistoryWriteEnabled(v),
+              contentPadding: EdgeInsets.zero,
+              title: const Text('把观看进度写进 B 站账号历史'),
+              subtitle: Text(on
+                  ? '已开启：会写进你的 B 站账号——播放中约每分钟上报一次进度，'
+                      '暂停 / 退出时各补一次'
+                  : '已关闭：不会写进你的 B 站账号，本 App 里看过的视频'
+                      '不会出现在账号的观看历史里'),
+            );
+          },
+        ),
         const SizedBox(height: 16),
         const Divider(height: 1),
         const SizedBox(height: 16),
@@ -889,7 +965,7 @@ class _ManagePanelState extends State<ManagePanel> {
           ),
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx, true),
-            child: const Text('退出', style: TextStyle(color: kError)),
+            child: Text('退出', style: TextStyle(color: kError)),
           ),
         ],
       ),
@@ -1188,7 +1264,7 @@ class _TranslateConfigDialogState extends State<_TranslateConfigDialog> {
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text(
+            Text(
               'OpenAI 兼容翻译服务，用于字幕副字幕翻译；'
               'key 仅存本机，可留空=不启用翻译。',
               style: TextStyle(fontSize: 12, color: kInkGray70),
@@ -1760,7 +1836,7 @@ class _CopyEditorSheetState extends State<_CopyEditorSheet> {
           TextButton(
             onPressed: () => Navigator.pop(dialogCtx, true),
             // 与逐条的「恢复默认」区分开（那批按钮此时也在树里，避免歧义）
-            child: const Text('全部恢复', style: TextStyle(color: kError)),
+            child: Text('全部恢复', style: TextStyle(color: kError)),
           ),
         ],
       ),
