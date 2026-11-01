@@ -6,7 +6,6 @@ import '../theme/app_tokens.dart';
 import '../widgets/app_state_view.dart';
 import '../widgets/dot_illustration.dart';
 import 'daily_history_page.dart';
-import 'watch_later_page.dart';
 
 /// 观看统计页（v2.17.10+ 重做：GitHub 官方样式热力 + 总览下移
 /// + 点日进历史 + 底部内联设置区；v2.17.16 热力改**相对制**配色；
@@ -37,10 +36,6 @@ import 'watch_later_page.dart';
 ///   看那一天的历史记录（当天观看视频列表，可续播）**
 /// - **2）总览统计在热力下方**：2×2 卡（今日 / 本周 / 累计 / 最长连续天）+
 ///   副信息「N 天有观看记录 · 平均每天 X 分钟」
-/// - **页头行内的「稍后再看」按钮（v2.58.0+）**：点它 push [WatchLaterPage]
-///   （B 站账号那份稍后再看：可播、可移除）。放在页头行内而不是另起一张卡，
-///   是为了**不增加页面高度**：标题栏那一行本来就比按钮高，行内加按钮不会把
-///   列表里已有的东西往下顶。不占底部导航 Tab 的理由见 [_openWatchLater]
 /// - **3）设置区内联在页底（可选，v2.19.0 起「个人」页正式启用）**：
 ///   接收外部传入的 [settingsSection]（「个人」页以「设置」为题传入
 ///   [ManagePanel]，**统计在上、设置在下**同一滚动流）；null = 不渲染
@@ -265,32 +260,21 @@ class WatchStatsPageState extends State<WatchStatsPage> {
           width: double.infinity,
           padding: const EdgeInsets.fromLTRB(16, 10, 8, 8),
           color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: .4),
-          child: Row(
+          // v2.59.0：原先挂在这一行右端的「稍后再看」按钮搬到了合集页
+          // （与「收藏夹」卡并列，见 playlist_page 的 [_ToViewCard]）。
+          // 这里随之去掉那层 Row + Expanded——只剩一列文字，包在 Row 里
+          // 没有意义；Container 给的是**紧约束**，直接放 Column 的几何与
+          // 改动前逐像素一致（既有「设置区在视口内可见」那条断言不受影响）。
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text('观看统计', style: theme.textTheme.titleSmall),
-                    const SizedBox(height: 2),
-                    Text(
-                      '底部导航「个人」· 点日期格看当天观看历史，设置在本页下方',
-                      style: theme.textTheme.bodySmall?.copyWith(
-                        color: theme.colorScheme.onSurfaceVariant,
-                      ),
-                    ),
-                  ],
+              Text('观看统计', style: theme.textTheme.titleSmall),
+              const SizedBox(height: 2),
+              Text(
+                '底部导航「个人」· 点日期格看当天观看历史，设置在本页下方',
+                style: theme.textTheme.bodySmall?.copyWith(
+                  color: theme.colorScheme.onSurfaceVariant,
                 ),
-              ),
-              // 「稍后再看」入口（v2.58.0+）：放在页头**行内**而不是另起一张卡
-              // —— 标题栏这一行本来就比一个按钮高，行内加按钮**不增加页面
-              // 高度**，列表里已有的东西一个像素都不动（既有「设置区在总览
-              // 之后且可见」那条断言因此保持成立）。
-              TextButton.icon(
-                key: kWatchLaterEntryKey,
-                onPressed: _openWatchLater,
-                icon: const Icon(Icons.watch_later_outlined, size: 18),
-                label: const Text('稍后再看'),
               ),
             ],
           ),
@@ -327,18 +311,6 @@ class WatchStatsPageState extends State<WatchStatsPage> {
         ],
       ],
     );
-  }
-
-  /// 打开稍后再看页（推路由；本页是 PageView 的一页，自己不带 Scaffold）。
-  ///
-  /// 为什么入口挂在「个人」页、而不是底部导航再开一个 Tab：导航已经是 5 项
-  /// （v2.33.0 插「日程」时就提过再挤会糊），而「历史」占一个常驻 Tab 是因为
-  /// 它每天都进；稍后再看是"想起来才看一眼"的地方，与观看统计/设置一样属于
-  /// "账号与本机数据的入口"，放在页头更合适。
-  Future<void> _openWatchLater() async {
-    await Navigator.of(context).push(MaterialPageRoute<void>(
-      builder: (_) => const WatchLaterPage(),
-    ));
   }
 
   /// 总览区：小标题 + 2×2 卡 + 活跃天数/平均每日副信息。

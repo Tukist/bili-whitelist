@@ -2248,6 +2248,103 @@ class BiliApi {
   }
 
   // -------------------------------------------------------------------------
+  // 跨端播放进度（v2.59.0）
+  // -------------------------------------------------------------------------
+
+  /// 读「这一集上次播放到哪」（`x/player/wbi/v2` 的 `data.last_play_time`，
+  /// **单位毫秒**）。返回值 = 位置毫秒；`null` = 没有可用进度。
+  ///
+  /// ## 为什么用这个接口（v2.59.0 探针结论）
+  /// - `x/web-interface/history/cursor`（历史同步那条）**不能按 bvid 查一条**，
+  ///   只能游标翻页；为了"从白名单/合集直接进视频"这一个场景去拉 30 条太贵。
+  /// - `x/player/v2` 与 `x/player/wbi/v2` 返回**同一份 data**（**实测**：匿名
+  ///   GET 两者都是 `code=0`、字段逐个相同，见探针记录）。本项目字幕已经走
+  ///   wbi 那条（[fetchSubtitles]），这里沿用同一条路径 + 同一套签名与 -412
+  ///   重试，少一条需要单独维护的请求形态。
+  ///
+  /// ## 字段语义（**文档存疑 + 第三方实现证据**）
+  /// - 文档（bilibili-API-collect/player.md）只写 `last_play_time` =
+  ///   「上次观看时间?」，带问号、**没给单位**，不能照着实现。
+  /// - wiliwili（PC/Switch 第三方客户端，`video_detail.cpp`）把它**直接当 seek
+  ///   目标**，显示时用 `sec2Time(last_play_time / 1000)` —— 若它是秒级时间戳，
+  ///   除以 1000 会变成 1970 年，只有"毫秒位置"这个解释成立（**推断**）。同一
+  ///   份代码里 `last_play_cid` 与它成对使用（"上次看到这一集的哪儿"）。
+  /// - `last_play_cid` 是**这个进度属于哪一分 P**：与请求的 cid 不一致 =
+  ///   上次看的不是这一集 → 这一集没有"上次进度"可用（返回 null）。
+  /// - 匿名（`data.login_mid == 0`）时 `last_play_time` / `last_play_cid` 都是 0
+  ///   （**实测**，两个不同稿件结果一致）→ 本方法返回 null。
+  ///
+  /// ## 容错
+  /// 任何"看着不像位置"的值一律当没有：≤ 0、≥ 1e11（那是毫秒时间戳的量级，
+  /// 说明字段语义变了）、以及调用方给的 `durationMs` 之外的越界值都由
+  /// [durationMs] 判掉（本方法只做与时长无关的筛，时长边界见播放页的
+  /// `usableRemoteProgressMs`）。宁可从头播，也不 seek 到一个荒谬位置。
+  ///
+  /// 失败：`-101` 抛 [BiliApiException]（调用方一律静默忽略）；网络失败原样上抛。
+  Future<int?> fetchLastPlayProgress({
+    required String bvid,
+    required int cid,
+  }) async {
+    if (bvid.isEmpty || cid <= 0) return null;
+    await _injectAuth();
+    final (imgKey, subKey) = await _ensureWbiKeys();
+    final params = WbiSigner.encodeWbi(
+      {'bvid': bvid, 'cid': '$cid'},
+      imgKey: imgKey,
+      subKey: subKey,
+      withDm: true,
+    );
+    for (var attempt = 0; attempt < 2; attempt++) {
+      final resp = await _dio.get<Map<String, dynamic>>(
+        '/x/player/wbi/v2',
+        queryParameters: params,
+      );
+      final body = resp.data;
+      final code = body?['code'] as int?;
+      if (code == -412 && attempt == 0) {
+        await _refreshWbiKeys();
+        continue;
+      }
+      if (code == -101) {
+        throw const BiliApiException(
+          code: -101,
+          message: '未登录或登录已失效',
+          path: '/x/player/wbi/v2',
+        );
+      }
+      if (code != 0) {
+        throw BiliApiException(
+          code: code ?? -1,
+          message: body?['message'] as String? ?? '播放器信息接口错误',
+          path: '/x/player/wbi/v2',
+        );
+      }
+      final raw = body?['data'];
+      if (raw is! Map) return null;
+      final lastCid = raw['last_play_cid'];
+      final lastTime = raw['last_play_time'];
+      final playedCid = lastCid is num ? lastCid.toInt() : 0;
+      final ms = lastTime is num ? lastTime.toInt() : 0;
+      // 上次看的是别的分 P → 这份进度不属于当前集，不能借用
+      if (playedCid > 0 && playedCid != cid) {
+        debugPrint('[bili_api] 上次进度属于别的分 P'
+            '（last_play_cid=$playedCid ≠ cid=$cid，bvid=$bvid）');
+        return null;
+      }
+      // 0 = 没看过 / 未登录（实测匿名都是 0）；1e11 以上是毫秒时间戳量级
+      if (ms <= 0 || ms >= 100000000000) {
+        debugPrint('[bili_api] 没有可用的上次进度（bvid=$bvid cid=$cid '
+            'last_play_time=$ms）');
+        return null;
+      }
+      debugPrint('[bili_api] 上次进度 bvid=$bvid cid=$cid $ms ms');
+      return ms;
+    }
+    // 两次都 -412（风控）：当成没有进度，不打断播放
+    return null;
+  }
+
+  // -------------------------------------------------------------------------
   // 字幕（M-字幕功能）
   // -------------------------------------------------------------------------
 

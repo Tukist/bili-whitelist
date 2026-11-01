@@ -13,6 +13,7 @@ import '../models/update_info.dart';
 import '../models/upowner.dart';
 import '../models/whitelist_video.dart';
 import '../services/apk_installer.dart';
+import '../services/bili_toview_api.dart';
 import '../services/clipboard_link_probe.dart';
 import '../services/collection_cover_store.dart';
 import '../services/collection_stats.dart';
@@ -50,6 +51,7 @@ import 'schedule_page.dart';
 import 'search_page.dart';
 import 'update_dialog.dart';
 import 'upowner_page.dart';
+import 'watch_later_page.dart';
 import 'watch_stats_page.dart';
 
 // ==================== 底部导航目的地下标（唯一真相） ====================
@@ -97,6 +99,10 @@ const int kTabPersonal = 4;
 ///   收藏夹，三级浏览：首页收藏夹卡 → 收藏夹列表 → 夹内视频直接点播，
 ///   白名单外可播模式，见 [FavoritesPage]/[FavoriteVideosPage]）；收藏夹属
 ///   个人账号数据，未登录先提示并引导登录
+/// - **固定「稍后再看」卡（v2.59.0+）**：与收藏夹卡**同组件同尺寸并排**（各占
+///   一半，用户原话「个人页面顶部的页面稍后再看要移动到合集页面和收藏夹平行」），
+///   点开 = [WatchLaterPage]（B 站账号那份稍后再看）；副标显示条数，拿不到时
+///   显示中性文案；未登录处理与收藏夹卡逐字一致
 /// - 右上角搜索入口：B 站全网搜索 + 白名单内过滤两个 Tab
 /// - 右上角导入入口：粘贴分享链接/文本（视频 BV/b23.tv 短链/完整链接；
 ///   番剧/电影 ep|ss 链接与 b23 番剧短码 → 整季逐集加入白名单，v2.16.2）
@@ -146,12 +152,20 @@ class PlaylistPage extends StatefulWidget {
   final Future<void> Function(BuildContext context, ClipboardOpenResult result)?
       openClipboardVideo;
 
+  /// 测试注入：「稍后再看」卡的导航替身（默认 push 真实 [WatchLaterPage]）。
+  ///
+  /// 与 [openClipboardVideo] 同一套理由：真实 [WatchLaterPage] 一进页面就拉
+  /// 账号那份列表（要真凭据/真网络），而这里要验的只是"登录门禁过了之后
+  /// 到底有没有往那一页去"。页面本身的行为由 `watch_later_page_test.dart` 覆盖。
+  final Future<void> Function(BuildContext context)? openWatchLater;
+
   const PlaylistPage({
     super.key,
     this.github,
     this.openLogin,
     this.clipboardProbe,
     this.openClipboardVideo,
+    this.openWatchLater,
   });
 
   @override
@@ -1013,6 +1027,50 @@ class _PlaylistPageState extends State<PlaylistPage> {
     );
   }
 
+  /// 打开稍后再看页（v2.59.0+：入口从「个人」页头搬到合集页，
+  /// 与「收藏夹」卡并列——用户原话「现在的在个人页面顶部的页面稍后再看要
+  /// 移动到合集页面和收藏夹平行」）。
+  ///
+  /// 登录门禁与 [_openFavorites] **逐字同一套**（两张卡是平行的兄弟，未登录
+  /// 时不该一个提示登录、另一个默默失败）：无 SESSDATA 先提示并引导登录；
+  /// 有会话但已失效 → 页面内遇 -101 自己给可读原因（见 [WatchLaterPage]）。
+  ///
+  /// 返回时**不发请求**，只重建一次：条数由稍后再看页写进会话缓存
+  /// （`cacheToViewCount`），用户在里面移除了几条这里就跟着变（见下面的卡片）。
+  Future<void> _openWatchLater() async {
+    Future<String?> readSess() async {
+      try {
+        return await _writer.api.readSessdata();
+      } catch (_) {
+        return null; // 存储异常按未登录（页面内仍有 -101 兜底）
+      }
+    }
+
+    var sess = await readSess();
+    if (sess == null || sess.isEmpty) {
+      if (!mounted) return;
+      _showSnack('稍后再看需要登录 B 站账号（稍后再看属于个人账号数据）');
+      await _openLogin(context);
+      if (!mounted) return;
+      sess = await readSess();
+      if (sess == null || sess.isEmpty) return; // 仍匿名 → 中止
+    }
+    if (!mounted) return;
+    final opener = widget.openWatchLater;
+    if (opener != null) {
+      await opener(context); // 测试替身：不构造真实页面（它一进就拉真网络）
+    } else {
+      await Navigator.of(context).push(
+        MaterialPageRoute<void>(builder: (_) => const WatchLaterPage()),
+      );
+    }
+    if (!mounted) return;
+    // 回来时**不用发请求**：条数由稍后再看页自己写进会话缓存
+    // （`cacheToViewCount`，见 `services/bili_toview_api.dart`），
+    // 这里只需重建一次让副标读到新值。
+    setState(() {});
+  }
+
   /// 打开导入对话框（解析分享链接 → 加入白名单）。
   void _openImport() {
     showDialog<void>(
@@ -1817,10 +1875,40 @@ class _PlaylistPageState extends State<PlaylistPage> {
           sourceName: _sourceName,
           error: _error,
         ),
-        // 固定「收藏夹」入口卡（v2.17.7+）：不随合集列表滚动、空名单也显示
+        // 固定「收藏夹」/「稍后再看」两张账号入口卡（v2.17.7 / v2.59.0）：
+        // 不随合集列表滚动、空名单也显示，**并排**各占一半（用户原话：
+        // 「移动到合集页面和收藏夹平行」）。
+        //
+        // 并排能不能放下：360dp 屏减去两侧 12 边距与 8 间隙，每张 164dp。
+        // 为此 [_AccountEntryCard] 把代表视觉收到 40dp 并去掉了右箭头
+        // （理由见那个类的注释）——字号/字阶一字不改，只是不再有挤不下的
+        // 第三列。整摞固定高度因此比改动前**还矮**（一张 84 → 两张并排 60），
+        // 合集列表的可见高度不减，既有"卡片都在首屏内"那类断言照旧成立。
+        //
+        // IntrinsicHeight + stretch：两张卡等高（副标长短不同时不能一高一矮
+        // ——那就不叫"平行"了）。
         Padding(
           padding: const EdgeInsets.fromLTRB(12, 4, 12, 0),
-          child: _FavoritesCard(onTap: _openFavorites),
+          child: IntrinsicHeight(
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Expanded(child: _FavoritesCard(onTap: _openFavorites)),
+                const SizedBox(width: kSpace8),
+                Expanded(
+                  child: _ToViewCard(
+                    key: kWatchLaterEntryKey,
+                    onTap: _openWatchLater,
+                    // 会话内已知的条数（null = 还不知道 → 中性文案，不写 0）。
+                    // 卡自己**不发请求**：首页启动为了一个副标数字多打一次网络
+                    // 不值得；值由稍后再看页 / 播放页拉过列表时写进缓存
+                    // （`cacheToViewCount`，见 `services/bili_toview_api.dart`）。
+                    count: toViewCachedCount,
+                  ),
+                ),
+              ],
+            ),
+          ),
         ),
         // 「新建合集」（v2.19.0 从设置区移到合集页）：合集非空时用顶部常驻按钮
         // ——不随列表滚走，随时可点；且**不进** ReorderableListView（排序索引
@@ -2623,16 +2711,105 @@ class _UpdateBadge extends StatelessWidget {
   }
 }
 
-/// 首页固定「收藏夹」入口卡（v2.17.7+）：样式同合集卡（行式 + 64 视觉位，
-/// 底板走 [AppBlock] 的 [AppBlockVariant.collectionCard] 规格：冷底 +
-/// 1px kRuleStrong 描边 + kRadiusMd 圆角 + all(10) 内边距），但用
-/// folder_special 图标 + 独立渐变与副标「我的 B 站收藏」作视觉区分；
-/// 不参与拖拽排序（合集区顶部常驻，未登录/空名单也显示），也没有观看统计
-/// （收藏夹是 B 站账号数据，不属于白名单）。
+/// 首页固定「收藏夹」入口卡（v2.17.7+）：样式同合集卡（底板走 [AppBlock] 的
+/// [AppBlockVariant.collectionCard] 规格：冷底 + 1px kRuleStrong 描边 +
+/// kRadiusMd 圆角 + all(10) 内边距），用 folder_special 图标 + 独立渐变与
+/// 副标「我的 B 站收藏」作视觉区分；不参与拖拽排序（合集区顶部常驻，
+/// 未登录/空名单也显示），也没有观看统计（收藏夹是 B 站账号数据，不属于白名单）。
+///
+/// v2.59.0 起与「稍后再看」卡**并排**共用 [_AccountEntryCard]（用户要的是
+/// "平行"）：为此把代表视觉从 64 收到 40、去掉右箭头（见那个类的注释）。
 class _FavoritesCard extends StatelessWidget {
   final VoidCallback onTap;
 
   const _FavoritesCard({required this.onTap});
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return _AccountEntryCard(
+      icon: Icons.folder_special_outlined,
+      title: '收藏夹',
+      subtitle: '我的 B 站收藏',
+      gradient: [scheme.tertiaryContainer, scheme.primaryContainer],
+      iconColor: scheme.onTertiaryContainer,
+      onTap: onTap,
+    );
+  }
+}
+
+/// 首页固定「稍后再看」入口卡（v2.59.0+）：与 [_FavoritesCard] **同一个**
+/// [_AccountEntryCard]（同宽同高同底板），只有图标/渐变/副标不同。
+///
+/// 为什么副标是"条数"：稍后再看是"攒着待看"的清单，条数直接回答"值不值得
+/// 点进去"。拿不到（未登录 / 请求失败）时显示中性文案 —— **不写 0**：0 的意思
+/// 是"已经清空了"，会让人以为列表被谁清掉。
+class _ToViewCard extends StatelessWidget {
+  final VoidCallback onTap;
+
+  /// 服务端给的条数（null = 还没拿到 / 没拿到）。
+  final int? count;
+
+  const _ToViewCard({super.key, required this.onTap, this.count});
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    final n = count;
+    return _AccountEntryCard(
+      icon: Icons.watch_later_outlined,
+      title: '稍后再看',
+      subtitle: n == null ? 'B 站账号里的稍后再看' : '$n 个视频',
+      gradient: [scheme.secondaryContainer, scheme.primaryContainer],
+      iconColor: scheme.onSecondaryContainer,
+      onTap: onTap,
+    );
+  }
+}
+
+/// 首页账号入口卡的**唯一**版式（v2.59.0 从 [_FavoritesCard] 抽出）：
+/// 40dp 代表视觉（渐变 + 图标）+ 标题 + 副标，底板
+/// [AppBlockVariant.collectionCard]。
+///
+/// 为什么比 v2.17.7 那版挤（64 视觉 + 右箭头 → 40 + 无箭头）：
+/// - **一半宽度**：两张卡并排，360dp 屏每张只有约 164dp；64 视觉 + 12 间隙 +
+///   20 箭头 + 20 块内边距之后只剩 48dp —— 「稍后再看」四个字就 56dp，
+///   必然省略号，那是"挤变形"而不是"平行"。
+/// - **去掉右箭头**：整张卡本来就是一个大点击区（InkWell + 卡片描边就够
+///   表达可点），而箭头在窄卡里恰恰吃掉标题最需要的那 20dp（320dp 屏上
+///   正好是"最后一根稻草"）。
+/// - **高度反而更矮**（40 视觉 → 卡高约 60 vs 原来的 84）：合集页顶部这一摞
+///   全是固定高度（信息条 / 缓存条 / 入口卡 / 新建合集），每多一行都从
+///   合集列表里抢地方——两张卡**并排**比原来一张卡还省 24dp，既有的
+///   "合集卡都在首屏内"那类断言因此照旧成立。
+///
+/// 不参与拖拽排序、不做数据绑定：它只是"点进去"的门，内容在各自的目标页。
+class _AccountEntryCard extends StatelessWidget {
+  /// 代表视觉里的图标（40dp 方块中央）。
+  final IconData icon;
+
+  /// 主标题（单行 + 省略号）。
+  final String title;
+
+  /// 副标（标题下方，弱墨，单行 + 省略号）。
+  final String subtitle;
+
+  /// 代表视觉的背景渐变（两色，左上 → 右下）。
+  final List<Color> gradient;
+
+  /// 图标色（会在本组件里再降到 55% 透明度，与合集卡的代表视觉同口径）。
+  final Color iconColor;
+
+  final VoidCallback onTap;
+
+  const _AccountEntryCard({
+    required this.icon,
+    required this.title,
+    required this.subtitle,
+    required this.gradient,
+    required this.iconColor,
+    required this.onTap,
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -2647,58 +2824,50 @@ class _FavoritesCard extends StatelessWidget {
           onTap: onTap,
           child: Row(
             children: [
-              // 代表视觉：收藏夹专属渐变 + folder_special 图标（区别于合集封面）
               ClipRRect(
-                borderRadius: BorderRadius.circular(8),
+                borderRadius: BorderRadius.circular(6),
                 child: Container(
-                  width: 64,
-                  height: 64,
+                  width: 40,
+                  height: 40,
                   decoration: BoxDecoration(
                     gradient: LinearGradient(
                       begin: Alignment.topLeft,
                       end: Alignment.bottomRight,
-                      colors: [
-                        theme.colorScheme.tertiaryContainer,
-                        theme.colorScheme.primaryContainer,
-                      ],
+                      colors: gradient,
                     ),
                   ),
                   child: Center(
                     child: Icon(
-                      Icons.folder_special_outlined,
-                      size: 32,
-                      color: theme.colorScheme
-                          .onTertiaryContainer
-                          .withValues(alpha: .55),
+                      icon,
+                      size: 22,
+                      color: iconColor.withValues(alpha: .55),
                     ),
                   ),
                 ),
               ),
-              const SizedBox(width: 12),
+              const SizedBox(width: 8),
               Expanded(
                 child: Column(
+                  mainAxisSize: MainAxisSize.min,
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      '收藏夹',
+                      title,
                       maxLines: 1,
                       overflow: TextOverflow.ellipsis,
                       style: theme.textTheme.titleSmall,
                     ),
-                    const SizedBox(height: 4),
+                    const SizedBox(height: 2),
                     Text(
-                      '我的 B 站收藏',
+                      subtitle,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
                       style: theme.textTheme.bodySmall?.copyWith(
                         color: theme.colorScheme.onSurfaceVariant,
                       ),
                     ),
                   ],
                 ),
-              ),
-              Icon(
-                Icons.chevron_right,
-                size: 20,
-                color: theme.colorScheme.outline.withValues(alpha: .55),
               ),
             ],
           ),

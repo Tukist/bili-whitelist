@@ -301,7 +301,11 @@ class HistoryStore {
   ///    都有过"，而不是假装它只来自其中一边；
   /// 6. **白名单归属以远程为准**（v2.57.0 调整）：远程那份的
   ///    [HistoryEntry.inWhitelist] 是"本次同步时白名单里有没有它"的最新事实，
-  ///    所以视频被加进白名单后标记会自动消失，被移出白名单后会自动出现。
+  ///    所以视频被加进白名单后标记会自动消失，被移出白名单后会自动出现；
+  /// 7. **（v2.59.0）远程进度更近的条目单独列出来**（
+  ///    [HistoryMergeResult.remoteProgressWinners]）：调用方据此写进本机
+  ///    进度记忆，让"从白名单/合集点开"也能接着 PC 上的位置播。写不写由
+  ///    [shouldAdoptRemoteProgress] 判，本机更近的一次**绝不会被覆盖**。
   ///
   /// 超出 [maxEntries] 仍按 watchedAt 倒序裁最早（与 [addOrUpdate] 同口径）。
   Future<HistoryMergeResult> mergeRemote(List<HistoryEntry> remote) async {
@@ -314,15 +318,24 @@ class HistoryStore {
       };
       var added = 0;
       var updated = 0;
+      // v2.59.0：远程进度**比本机更新**的那几条 → 交给调用方写进本机进度记忆
+      // （[PlaybackProgress]），这样从任何入口点开都能续播，而不是只有历史页。
+      final progressWinners = <HistoryEntry>[];
       for (final r in remote) {
         if (r.bvid.isEmpty) continue; // 脏条目（空 bvid）不进表
         final cur = byKey[r.key];
         if (cur == null) {
           byKey[r.key] = r;
           added++;
+          if (shouldAdoptRemoteProgress(local: null, remote: r)) {
+            progressWinners.add(r);
+          }
         } else {
           byKey[r.key] = mergeEntry(local: cur, remote: r);
           updated++;
+          if (shouldAdoptRemoteProgress(local: cur, remote: r)) {
+            progressWinners.add(r);
+          }
         }
       }
       if (added == 0 && updated == 0) {
@@ -335,7 +348,11 @@ class HistoryStore {
         _key,
         jsonEncode(trimmed.map((e) => e.toJson()).toList()),
       );
-      return HistoryMergeResult(added: added, updated: updated);
+      return HistoryMergeResult(
+        added: added,
+        updated: updated,
+        remoteProgressWinners: progressWinners,
+      );
     } catch (_) {
       // 存储异常：静默（同步结果会显示"新增/更新 0"，不崩）
       return const HistoryMergeResult(added: 0, updated: 0);
@@ -399,7 +416,47 @@ class HistoryMergeResult {
   final int added;
   final int updated;
 
-  const HistoryMergeResult({required this.added, required this.updated});
+  /// **远程进度比本机更新**、且带有效进度的条目（v2.59.0）。
+  ///
+  /// 这批条目由 [BiliHistorySyncService.sync] 写进本机进度记忆
+  /// （`PlaybackProgress`），续播才有跨端效果；取舍规则见
+  /// [shouldAdoptRemoteProgress]。
+  final List<HistoryEntry> remoteProgressWinners;
+
+  const HistoryMergeResult({
+    required this.added,
+    required this.updated,
+    this.remoteProgressWinners = const [],
+  });
 
   int get total => added + updated;
+}
+
+/// 远程进度是否该写进本机进度记忆（v2.59.0，纯函数，可单测）。
+///
+/// ## 规则（**以观看时间为准，不看"谁进度大"**）
+/// 1. 远程没有进度（[HistoryEntry.positionMs] <= 0）→ 不写（没东西可续播，
+///    写进去只会把本机"从头播"变成"从头播"）；
+/// 2. 本机**没有**这条 (bvid, pageIndex) 的历史记录 → 写（本机没看过，
+///    远程就是唯一线索）；
+/// 3. 远程 `watchedAt` **晚于**本机 → 写（PC 上刚看完的那次更近）；
+/// 4. 远程 `watchedAt` **早于**本机 → **不写**（本机刚看到 20:00、PC 上是
+///    昨天的 5:00，不能被按回去）；
+/// 5. `watchedAt` **完全相同** → 取进度更靠后的那条（同一时刻两条记录的
+///    "看到哪"取更完整的；相等则不写，省一次无意义落盘）。
+///
+/// ## 为什么拿 `HistoryEntry.watchedAt` 当"本机进度新鲜度"
+/// [PlaybackProgress] 只存位置、**不存保存时间**，判不了新鲜度；而本机每次写
+/// 进度（`_saveProgress`）都在同一个方法里写历史条目（`_writeHistory`），两者
+/// 时间戳同源 —— 用历史条目的 `watchedAt` 代表"本机进度写到哪儿了"既准确又
+/// 不用给进度存储加字段。
+bool shouldAdoptRemoteProgress({
+  required HistoryEntry? local,
+  required HistoryEntry remote,
+}) {
+  if (remote.positionMs <= 0) return false;
+  if (local == null) return true;
+  if (remote.watchedAt.isAfter(local.watchedAt)) return true;
+  if (remote.watchedAt.isBefore(local.watchedAt)) return false;
+  return remote.positionMs > local.positionMs;
 }

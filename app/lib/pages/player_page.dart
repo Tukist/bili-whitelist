@@ -21,6 +21,7 @@ import '../models/upowner.dart';
 import '../models/whitelist_video.dart';
 import '../player/bili_dash_player.dart';
 import '../services/bili_history_reporter.dart';
+import '../services/bili_toview_api.dart';
 import '../services/danmaku_settings_store.dart';
 import '../services/device_media.dart';
 import '../services/history_store.dart';
@@ -219,6 +220,68 @@ bool playViewQualityNoticeShown = false;
 /// 测试用：复位上面的会话标记（生产代码**不调用**）。
 @visibleForTesting
 void debugResetPlayViewQualityNotice() => playViewQualityNoticeShown = false;
+
+// -------------------------------------------------------------------------
+// 跨端播放进度（v2.59.0，纯函数 + 小数据类，便于单测）
+//
+// 用户原话：「能不能在网页上看的进度在手机上也有记忆」。
+//
+// 本机进度（[PlaybackProgress]）只有本机写过才有；"从白名单/合集/搜索直接进
+// 视频"这条路根本没经过历史同步，所以这里补一次**远程补查**：本机没有这一集的
+// 记录时，问一次 B 站「上次播放到哪」（`x/player/wbi/v2` 的 `last_play_time`，
+// 毫秒，见 [BiliApi.fetchLastPlayProgress]）。
+//
+// 这一节只管"查到的值能不能用"与"怎么去重"；网络与登录判定在 State 里。
+// -------------------------------------------------------------------------
+
+/// 远程进度低于这个值就当没有（与本地记忆的 5s 门槛同一口径）。
+const int kRemoteProgressMinMs = 5000;
+
+/// 远程进度距结尾不足这个值就当"已看完"，不用它续播
+/// （本地记忆那边是 3s 清记忆；这里给 5s，因为远程值精度只到秒、且有落库延迟）。
+const int kRemoteProgressTailMarginMs = 5000;
+
+/// onPrepared 时最多等远程补查多久（v2.59.0）。
+///
+/// 1.2 秒的理由：补查在**取流之前**就发起（[_PlayerPageState._primeRemoteProgress]），
+/// 而取流本身通常要 0.5~2 秒 —— 等 onPrepared 到达时绝大多数已经回来了。
+/// 真的没回来（弱网/风控）就放弃：宁可从头播，也不要在用户已经开始看之后
+/// 画面突然跳到别处。
+const Duration kRemoteProgressMaxWait = Duration(milliseconds: 1200);
+
+/// 远程上次进度能不能拿来当"初始播放位置"（纯函数，可单测）。
+///
+/// 返回要 seek 的毫秒数；`null` = 不用（从头播 / 按本地记忆播）。
+///
+/// 规则：
+/// - `null` / `<= [kRemoteProgressMinMs]`：太靠前，续播没有意义（还会白弹一条
+///   「已从上次 X 继续」）；
+/// - 已知时长且 `>= duration - [kRemoteProgressTailMarginMs]`：已经看到结尾附近，
+///   再从那儿起播等于"一进去就播完"，不如从头；
+/// - 时长未知（0，onPrepared 没给）时不做上界判断——下界与 API 层的
+///   "不像位置的荒谬值"筛（负数、≥ 1e11）已经把脏数据挡掉了。
+int? usableRemoteProgressMs({
+  required int? remoteMs,
+  required int durationMs,
+}) {
+  if (remoteMs == null || remoteMs <= kRemoteProgressMinMs) return null;
+  if (durationMs > 0 && remoteMs >= durationMs - kRemoteProgressTailMarginMs) {
+    return null;
+  }
+  return remoteMs;
+}
+
+/// 在途/已完成的"这一集上次播放进度"查询。
+///
+/// [key] 是 `'<bvid>_<pageIndex>'`：播放页在 await 间隙可能已经切集/换视频
+/// （本项目踩过这个坑，见 `_saveExitProgress` 的注释），拿到结果时必须先核对
+/// key，否则会把 A 集的位置 seek 到 B 集上。
+class RemoteProgressLookup {
+  const RemoteProgressLookup(this.key, this.future);
+
+  final String key;
+  final Future<int?> future;
+}
 
 // -------------------------------------------------------------------------
 // 清晰度选择（v2.53.0+，纯函数，便于单测）
@@ -955,6 +1018,51 @@ final Map<String, List<PageInfo>> _viewPagesCache = {};
 /// 会话内充电专属缓存（bvid → is_upower_exclusive 的解析结果）。
 final Map<String, bool> _viewChargingCache = {};
 
+// -------------------------------------------------------------------------
+// 稍后再看（v2.59.0+）：播放页写操作那排的「稍后再看」按钮
+//
+// 用户原话：「还有视频播放界面的那个收藏键也可以放入稍后再看。」
+//
+// 这个按钮是**切换式**的（在列表里 → 点 = 移出；不在 → 点 = 加入），所以
+// 第一件事是知道"在不在"。答案在账号那份列表里（`x/v2/history/toview`），
+// 一次 GET 即全量（无分页 + 100 条上限，见 `services/bili_toview_api.dart`
+// 文件头），于是**整个会话只拉一次**，之后所有播放页/切集查缓存；
+// 加入/移出成功后由 [_PlayerPageState._onToViewTap] 就地改这份缓存
+// （不重拉：刚写完再问一次服务端，除了多一个 RTT 什么也不会多）。
+//
+// ⚠️ 与 [_upMetaCache] 一样是**库级**的（跨播放页实例共享），不是 State 字段：
+// 否则"每次进播放页都拉一次"——用户要的是"最多一次"。
+// -------------------------------------------------------------------------
+
+/// 会话内「在稍后再看里」的 bvid 集合。
+final Set<String> _toViewBvidCache = <String>{};
+
+/// 会话内稍后再看条目给的 aid（bvid → aid；`del` 只认 aid，见
+/// [BiliApi.delFromView]）。拿不到时调用方退回 view 的 aid（[_viewAidCache]）。
+final Map<String, int> _toViewAidCache = <String, int>{};
+
+/// 会话内是否**成功拉到过**列表（false = 还没拉，或拉失败过）。
+///
+/// 失败**不置真**：未登录时接口在发请求前就由**本地**登录检查拦下（不耗网络，
+/// 见 [BiliApi.fetchToViewList]），用户随后登录了，下次进播放页还该有机会再查。
+bool _toViewListLoaded = false;
+
+/// 在途的那次列表请求（并发去重：同一页面里多处触发也只发一次）。
+Future<bool>? _toViewListLoading;
+
+/// 测试用：清空上面的会话缓存（生产代码**不调用**）。
+///
+/// 存在的理由与 [debugResetPlayViewQualityNotice] 一样：这些缓存是库级的、
+/// 跨用例存活——不清掉的话第二条用例的"只请求一次"断言会被第一条用例的
+/// 结果命中，测的就不是它自己了。
+@visibleForTesting
+void debugResetToViewCacheForTest() {
+  _toViewBvidCache.clear();
+  _toViewAidCache.clear();
+  _toViewListLoaded = false;
+  _toViewListLoading = null;
+}
+
 /// 播放页：进入即取流（DASH 双流 fnval=16，老视频降级 mp4 单流），
 /// 原生 ExoPlayer MergingMediaSource 合并播放。
 ///
@@ -1653,6 +1761,15 @@ class _PlayerPageState extends State<PlayerPage>
 
   /// 写请求在飞（防连点：一次只放行一个写动作，三个按钮一起置灰）。
   bool _writeBusy = false;
+
+  /// 「稍后再看」的当前态（v2.59.0+）：true = 在列表里，false = 不在，
+  /// **null = 还不知道**（未登录 / 列表没拉到）。
+  ///
+  /// null 时**不构建这颗按钮**（见 [_buildWriteActionsRow]）：切换式按钮画错
+  /// 一个方向就是"点一下把用户没加过的视频加进去 / 把已加过的当成没加"，
+  /// 比少一个按钮糟得多。点赞/投币/收藏那三个是"目标态"语义、失败可回滚，
+  /// 所以它们可以带着乐观起点先画出来；这颗不行。
+  bool? _inToView;
 
   /// 全屏画面变换（缩放 / 旋转 / 平移，v2.39.0+；v2.49.0 起扩到横屏置顶）
   // ---------------------------------------------------------------------
@@ -2462,6 +2579,15 @@ class _PlayerPageState extends State<PlayerPage>
   // 播放进度记忆（本地 shared_preferences，按 bvid+pageIndex 分别记忆）
   PlaybackProgress? _progressStore;
 
+  /// 本会话已发过"远程补查"的 `<bvid>_<pageIndex>`（v2.59.0）。
+  ///
+  /// 去重是硬要求：同一个播放页里来回切集/重试会反复走 [_primeRemoteProgress]，
+  /// 没有它就会为了同一集反复打 `x/player/wbi/v2`（风控面 + 一次白等）。
+  final Set<String> _remoteProgressQueried = {};
+
+  /// 当前在途/已完成的那次远程进度补查（v2.59.0；见 [RemoteProgressLookup]）。
+  RemoteProgressLookup? _remoteProgress;
+
   /// 下一次 onPrepared 时是否恢复记忆进度：
   /// 首次进入 / 手动切集 / 手动重试后为 true（恢复对应集的进度）；
   /// URL 过期续播等自动换源不置 true（沿用续播位置，不被记忆覆盖）。
@@ -2932,6 +3058,11 @@ class _PlayerPageState extends State<PlayerPage>
       final localFileHit = _playSource == PlaySource.local &&
           _downloads.getCached(_video.bvid, _currentPageIndex) != null;
       if (!localFileHit) await _ensurePagesForInitialPage();
+      // 跨端进度补查（v2.59.0）：本机没有这一集的进度记录时，问一次 B 站
+      // 「上次播放到哪」。在这里发起纯粹是**提前量**——取流本身也要等网络，
+      // 等 onPrepared 到达时这条通常已经回来了（[_maybeRestoreProgress] 只给
+      // 它很短的等待预算，绝不为了一个位置把起播拖住）。
+      _primeRemoteProgress();
       await _loadStreamAndPlay(positionMs: 0);
       _ensureTickTimer();
     } catch (e) {
@@ -4471,6 +4602,82 @@ class _PlayerPageState extends State<PlayerPage>
         '${_video.bvid}#$_currentPageIndex');
   }
 
+  // -------------------------------------------------------------------------
+  // 跨端进度补查（v2.59.0，读操作）
+  // -------------------------------------------------------------------------
+
+  /// 发起一次"这一集上次播放到哪"的补查（本机没有记录时才查；同集只查一次）。
+  ///
+  /// 什么时候**不查**（每一道都是"省一次注定没用的请求"）：
+  /// - 进度存储没加载出来（[_progressStore] == null，本次会话不记忆）；
+  /// - 本机**已经有**这一集 `(bvid, pageIndex)` 的进度记录 —— 本机就是最新的事实，
+  ///   远程那条再新也是"另一台设备上的"（B1 的合并规则会处理那种情况）；
+  /// - 本会话已经为这一集查过（[_remoteProgressQueried]）；
+  /// - 番剧集（`epId != null`）：`x/player/wbi/v2` 番剧走 ep_id 那套参数，本版不接；
+  /// - bvid/cid 认不出来（没有可播对象）。
+  ///
+  /// 查询本身在 [_fetchRemoteProgressMs] 里（含登录判定），失败静默。
+  void _primeRemoteProgress() {
+    final store = _progressStore;
+    if (store == null) return;
+    if (_video.epId != null) return;
+    final bvid = _video.bvid;
+    final pageIndex = _currentPageIndex;
+    final pages = _pages;
+    // 下标越界（pages 变短 / 脏数据）时宁可不查，也不能拿别名集的 cid 去问
+    final cid = pages != null && pageIndex < pages.length
+        ? pages[pageIndex].cid
+        : _video.cid;
+    if (bvid.isEmpty || cid <= 0) return;
+    if (store.getProgress(bvid, pageIndex) != null) {
+      debugPrint('[player_page] 本机已有进度记忆，不查远程 $bvid#$pageIndex');
+      return;
+    }
+    final key = '${bvid}_$pageIndex';
+    if (!_remoteProgressQueried.add(key)) return;
+    debugPrint('[player_page] 补查远程进度 $bvid#$pageIndex cid=$cid');
+    _remoteProgress = RemoteProgressLookup(key, _fetchRemoteProgressMs(cid));
+  }
+
+  /// 真正的远程查询：**已登录才发**，任何失败都静默返回 null（不影响播放）。
+  Future<int?> _fetchRemoteProgressMs(int cid) async {
+    final bvid = _video.bvid;
+    try {
+      // 未登录：历史进度接口只会稳定回 -101，一个请求都不发
+      if (!await _hasValidSession()) {
+        debugPrint('[player_page] 未登录，跳过远程进度补查 bvid=$bvid cid=$cid');
+        return null;
+      }
+      final ms = await _api.fetchLastPlayProgress(bvid: bvid, cid: cid);
+      if (ms == null) return null;
+      debugPrint('[player_page] 远程上次进度 bvid=$bvid cid=$cid $ms ms');
+      return ms;
+    } catch (e) {
+      // 网络 / 风控 / 会话失效：静默（用户要的是看视频，不是看一条错误）
+      debugPrint('[player_page] 远程进度补查失败（静默）: $e');
+      return null;
+    }
+  }
+
+  /// 等这一集的远程进度（最多 [maxWait]，见调用处），并做时长边界判定。
+  ///
+  /// 只有 key 与当前集**完全一致**才用：await 期间可能已经切集/换视频，
+  /// 用旧集的位置 seek 新集就是"跳到莫名其妙的进度条位置"。
+  Future<int?> _remoteProgressForCurrent(int durationMs, Duration maxWait) async {
+    final pending = _remoteProgress;
+    final key = '${_video.bvid}_$_currentPageIndex';
+    if (pending == null || pending.key != key) return null;
+    int? remote;
+    try {
+      remote = await pending.future.timeout(maxWait, onTimeout: () => null);
+    } catch (_) {
+      return null;
+    }
+    if (!mounted) return null;
+    if ('${_video.bvid}_$_currentPageIndex' != key) return null; // 期间切集了
+    return usableRemoteProgressMs(remoteMs: remote, durationMs: durationMs);
+  }
+
   /// onPrepared 后定位（仅首次进入 / 切集 / 手动重试后触发）：
   /// - 带明确的 ?t 定位（[_pendingSeekMs]，评论链接跳转 / initialPositionMs
   ///   v2.17.6+）→ 直接 seek 到该位置（**覆盖记忆进度**）且不弹「已从上次…
@@ -4479,6 +4686,8 @@ class _PlayerPageState extends State<PlayerPage>
   /// - 否则按记忆进度恢复：无记忆或 <=5s → 从头播，不打扰；距结尾 <3s →
   ///   视为已看完，清除记忆后从头播；其余 → seekTo(记忆位置) + SnackBar
   ///   「从头播放」action。
+  /// - v2.59.0：本机**没有**记忆时，用一次远程补查的结果（见
+  ///   [_primeRemoteProgress]）——这就是"PC 上看了一半，手机上接着看"。
   Future<void> _maybeRestoreProgress(int durationMs) async {
     if (!_pendingRestore) return;
     _pendingRestore = false;
@@ -4497,7 +4706,20 @@ class _PlayerPageState extends State<PlayerPage>
     }
     final store = _progressStore;
     if (store == null) return;
-    final saved = store.getProgress(_video.bvid, _currentPageIndex);
+    var saved = store.getProgress(_video.bvid, _currentPageIndex);
+    if (saved == null) {
+      // 本机没有这一集的记录 → 用远程补查的结果（通常早就回来了）。
+      // 只等 kRemoteProgressMaxWait：网络慢的时候宁可从头播，也不让
+      // "起播 1 秒后画面突然跳到 40 分"这件事发生。
+      saved = await _remoteProgressForCurrent(
+        durationMs,
+        kRemoteProgressMaxWait,
+      );
+      if (saved != null) {
+        debugPrint('[player_page] 用远程进度续播 '
+            '${_video.bvid}#$_currentPageIndex $saved ms');
+      }
+    }
     if (saved == null || saved <= 5000) return;
     if (durationMs > 0 && saved >= durationMs - 3000) {
       await _clearProgress();
@@ -7240,6 +7462,9 @@ class _PlayerPageState extends State<PlayerPage>
     });
     // 切集 = 换分 P：预览图按分 P 提供 → 必须重新拉（index 1-based）
     unawaited(_prepareVideoShot());
+    // 新的一集同样可能只是"PC 上看过"：本机没记录时补查一次远程进度
+    // （v2.59.0；同集只查一次，_remoteProgressQueried 保证）
+    _primeRemoteProgress();
     // 用户手动切了 P → 立刻更新「上次看到第几 P」（v2.57.0+）。不等取流成功：
     // 记忆关心的是"用户选了哪一集"，取流失败也不该退回去。
     unawaited(_rememberPage(_video.bvid, index));
@@ -8547,8 +8772,15 @@ class _PlayerPageState extends State<PlayerPage>
   /// （番剧简介是季级、逐集导入留空，运行时也不补——见 whitelist_writer
   /// videoFromPgcEpisode 取舍）。**写操作按钮在番剧上也不出现**：pgc 内容的
   /// 点赞/投币是另一套 ep_id 接口，本版不接（见 [_writeActionsAvailable]）。
+  ///
+  /// v2.59.0 起还并发发起一次「稍后再看」状态查询（[_primeToViewState]，
+  /// 会话内最多一次真实请求），给收藏旁边那颗切换式按钮定方向。
   Future<void> _refreshUpownerMeta() async {
     if (_video.epId != null) return; // 番剧：无 UP 入口/无简介/无写操作，不请求
+    // 「稍后再看」按钮的当前态（v2.59.0+）：与下面两条请求**并发**走——
+    // 它答的是另一个问题（在不在账号那份列表里），互不依赖；串行只会让
+    // 按钮晚几百毫秒出现。会话内最多一次真实请求（见 [_primeToViewState]）。
+    unawaited(_primeToViewState());
     final bvid = _video.bvid;
     final cached = _upMetaCache[bvid];
     if (cached != null) {
@@ -8677,10 +8909,16 @@ class _PlayerPageState extends State<PlayerPage>
   /// 标注从"永远挂着"变成"只在真拿不到时挂着"。
   bool get _writeStateKnown => _relation != null || _reqUser != null;
 
-  /// 写操作行：`点赞 N · 投币 · 收藏` 三个轻量按钮 + （降级时）一句如实标注。
+  /// 写操作行：`点赞 N · 投币 · 收藏` 三个轻量按钮 + （降级时）一句如实标注；
+  /// v2.59.0 起收藏右侧多一颗「稍后再看」（拿到列表答案时才出现）。
   ///
-  /// 三个按钮行高只有一行（约 30dp），并且只在总开关打开时才构建——关着时
+  /// 按钮行高只有一行（约 30dp），并且只在总开关打开时才构建——关着时
   /// 信息块高度与改动前逐像素一致。
+  ///
+  /// 宽度预算（360dp 竖屏）：信息块左右各 12 内边距 + 左侧 3dp 竖条 ≈ 333dp
+  /// 可用。四颗按钮最宽态（`已赞 1.2万 · 投币 · 已收藏 · 已加入`）约 320dp，
+  /// 放得下；超出时先让尾部那句降级标注（[Flexible] + 省略号）让位——它本来
+  /// 就是最不重要的一行字。
   Widget _buildWriteActionsRow(BuildContext context) {
     final primary = Theme.of(context).colorScheme.primary;
     return Padding(
@@ -8717,6 +8955,27 @@ class _PlayerPageState extends State<PlayerPage>
             accent: primary,
             onTap: _writeBusy ? null : _onFavTap,
           ),
+          // 「稍后再看」（v2.59.0+）：用户原话「视频播放界面的那个收藏键也可以
+          // 放入稍后再看」——就放在收藏旁边，同一套 [_WriteActionChip]。
+          //
+          // **只在知道答案时才出现**（[_inToView] != null）：这是个切换式按钮，
+          // 方向画反了就是"点一下把用户没加过的视频加进去"，比少一个按钮糟。
+          // 所以未登录（列表接口本地就拦了）/ 列表没拉到 → 整颗不构建，
+          // 与「总开关关着 = 一个像素都不多」同一套零高度处理。
+          if (_inToView != null) ...[
+            const SizedBox(width: 4),
+            _WriteActionChip(
+              key: const ValueKey('write-toview'),
+              icon: _inToView!
+                  ? Icons.watch_later
+                  : Icons.watch_later_outlined,
+              label: _inToView! ? '已加入' : '稍后再看',
+              count: 0,
+              active: _inToView!,
+              accent: primary,
+              onTap: _writeBusy ? null : _onToViewTap,
+            ),
+          ],
           if (!_writeStateKnown) ...[
             const SizedBox(width: 8),
             // 降级如实标注（不是装饰）：没有 req_user 时上面的"已赞/未赞"只是
@@ -8944,6 +9203,138 @@ class _PlayerPageState extends State<PlayerPage>
     }
   }
 
+  // -------------------------------------------------------------------------
+  // 稍后再看（v2.59.0+）
+  // -------------------------------------------------------------------------
+
+  /// 准备「稍后再看」按钮的当前态：命中会话缓存就同步赋值，否则**最多拉一次**
+  /// 列表（[fetchToViewList]，无分页 + 上限 100 条，一次 GET 即全量）。
+  ///
+  /// 失败（未登录 / 风控 / 网络）→ [_inToView] 保持 null，按钮不构建；缓存
+  /// 里的 [_toViewListLoaded] 也**不置真**，下次进播放页还有机会再查一次。
+  Future<void> _primeToViewState() async {
+    if (_video.epId != null) return; // 番剧：写操作整排都不出现，不必查
+    final bvid = _video.bvid;
+    if (_toViewListLoaded) {
+      // 会话内已拉到过：直接查缓存（同步，first build 就能画对）
+      _inToView = _toViewBvidCache.contains(bvid);
+      return;
+    }
+    final ok = await _ensureToViewListLoaded();
+    if (!mounted || _video.bvid != bvid || !ok) return;
+    setState(() => _inToView = _toViewBvidCache.contains(bvid));
+  }
+
+  /// 拉一次稍后再看列表并写进会话缓存（并发去重；返回 false = 这次没拉到）。
+  Future<bool> _ensureToViewListLoaded() {
+    if (_toViewListLoaded) return Future<bool>.value(true);
+    final inflight = _toViewListLoading;
+    if (inflight != null) return inflight;
+    final future = _loadToViewList();
+    _toViewListLoading = future;
+    return future;
+  }
+
+  Future<bool> _loadToViewList() async {
+    try {
+      final data = await _api.fetchToViewList();
+      final parsed = parseToViewList(data);
+      _toViewBvidCache
+        ..clear()
+        ..addAll(parsed.items
+            .map((e) => e.bvid)
+            .where((b) => b.isNotEmpty));
+      _toViewAidCache.clear();
+      for (final item in parsed.items) {
+        if (item.bvid.isEmpty || item.aid <= 0) continue;
+        _toViewAidCache[item.bvid] = item.aid;
+      }
+      _toViewListLoaded = true;
+      // 会话内条数（v2.59.0）：合集页那张「稍后再看」入口卡的副标读它
+      // （卡自己不为了一个数字去发请求）
+      cacheToViewCount(parsed.count);
+      debugPrint('[player_page] 稍后再看列表 条目=${parsed.items.length} '
+          'count=${parsed.count}');
+      return true;
+    } catch (e) {
+      // 静默：按钮整颗不构建，用户看不到"点了会失败"的东西；真去点也不会有
+      // （没有按钮）。日志留痕，方便查"为什么这个账号上没这颗按钮"。
+      debugPrint('[player_page] 稍后再看列表取失败 bvid=$_video.bvid error=$e');
+      return false;
+    } finally {
+      _toViewListLoading = null;
+    }
+  }
+
+  /// 从稍后再看移除时用的 aid：列表条目自己的 aid 优先（那才是"记录本身的
+  /// aid"，[BiliApi.delFromView] 只认它），退一步用 view 的 aid（既有逻辑
+  /// [_ensureWriteAid]，不新写解析）。
+  Future<int?> _toViewAidForRemove() async {
+    final fromList = _toViewAidCache[_video.bvid];
+    if (fromList != null && fromList > 0) return fromList;
+    return _ensureWriteAid();
+  }
+
+  /// 「稍后再看」切换：在列表里 → 移出；不在 → 加入。
+  ///
+  /// **不做乐观切换**（与点赞不同）：加入/移出都不是幂等目标态——尤其"加入"
+  /// 受列表 100 条上限（接口码 90001）影响，先改界面再失败回滚会让用户看到
+  /// 一次闪烁的假状态。这里等服务端确认，成功才改按钮 + 改会话缓存。
+  ///
+  /// 失败给**可读提示**（[toViewErrorText]：未登录 / 风控 / 列表已满 / 网络），
+  /// 走 [_writeSnack] 的错误类提示条——与其它写操作同一套口径，不会被设置里
+  /// 的「显示底部提示条」静默。
+  Future<void> _onToViewTap() async {
+    final bvid = _video.bvid;
+    final removing = _inToView ?? false;
+    setState(() => _writeBusy = true);
+    try {
+      if (removing) {
+        final aid = await _toViewAidForRemove();
+        if (!mounted) return;
+        if (aid == null || aid <= 0) {
+          setState(() => _writeBusy = false);
+          _writeSnack('拿不到这条记录的 id（aid），无法从稍后再看移除');
+          return;
+        }
+        await _api.delFromView(aid: aid);
+        _toViewBvidCache.remove(bvid);
+        _toViewAidCache.remove(bvid);
+        // 条数跟着减（v2.59.0）：合集页那张入口卡的副标读的是会话内条数
+        final known = toViewCachedCount;
+        if (known != null && known > 0) cacheToViewCount(known - 1);
+      } else {
+        // aid 已有就顺手带上（列表条目也用它移除）；没有就只传 bvid——
+        // 接口 aid/bvid 任选其一，不为"多带一个 id"再发一次 view 请求。
+        final aid = _writeAid;
+        await _api.addToView(
+          aid: (aid != null && aid > 0) ? aid : null,
+          bvid: bvid,
+        );
+        _toViewBvidCache.add(bvid);
+        if (aid != null && aid > 0) _toViewAidCache[bvid] = aid;
+        final known = toViewCachedCount;
+        if (known != null) cacheToViewCount(known + 1);
+      }
+      if (!mounted) return;
+      setState(() {
+        _writeBusy = false;
+        _inToView = !removing;
+      });
+      debugPrint('[player_page] 稍后再看 bvid=$bvid '
+          '${removing ? '移出' : '加入'} ok');
+      AppSnack.show(context, removing ? '已从稍后再看移除' : '已加入稍后再看');
+    } on BiliApiException catch (e) {
+      if (!mounted) return;
+      setState(() => _writeBusy = false);
+      _writeSnack(toViewErrorText(e));
+    } on DioException {
+      if (!mounted) return;
+      setState(() => _writeBusy = false);
+      _writeSnack('网络请求失败，稍后再看没改成功');
+    }
+  }
+
   /// 换源时复位写操作态（被 [playVideo] 调用）。
   void _resetWriteActions() {
     _relation = null;
@@ -8953,6 +9344,12 @@ class _PlayerPageState extends State<PlayerPage>
     _liked = false;
     _coined = false;
     _faved = false;
+    // 稍后再看（v2.59.0+）：列表是一整份（与 bvid 无关），所以只要本会话
+    // 拉过一次，换源时就能**同步**给出新视频的答案（不必等
+    // [_refreshUpownerMeta] 回来，也就不会闪一下少一颗按钮）。
+    _inToView = _toViewListLoaded
+        ? _toViewBvidCache.contains(_video.bvid)
+        : null;
     _writeBusy = false;
   }
 

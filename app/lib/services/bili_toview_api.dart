@@ -152,6 +152,20 @@ class ToViewList {
   bool get truncated => count > items.length;
 }
 
+/// 会话内已知的「稍后再看一共几条」（null = 还不知道）。
+///
+/// 谁**真拉过**列表谁负责写：稍后再看页（`watch_later_page.dart` 的 `_load`
+/// 成功 / 移除一条后）、播放页（写操作那排的「稍后再看」按钮会拉一次全量）
+/// 都往这里记一笔。合集页那张入口卡**只读**它——首页启动时为了一个副标数字
+/// 多发一次网络请求不值得（还会把"未登录/失败"变成一条没人看得懂的噪音）。
+///
+/// 拿不到就显示占位文案，**不写 0**：0 的意思是"列表已经空了"，那是在
+/// 编一个我们并不知道的事实。
+int? toViewCachedCount;
+
+/// 记一次条数（纯内存，不落盘：账号那份随时可能在网页端变，落盘只会更旧）。
+void cacheToViewCount(int? count) => toViewCachedCount = count;
+
 int _intOf(Object? raw) {
   if (raw is num) return raw.toInt();
   if (raw is String) return int.tryParse(raw) ?? 0;

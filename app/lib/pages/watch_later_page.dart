@@ -19,7 +19,8 @@ import 'player_page.dart';
 Key addToWatchLaterKey(String bvid) =>
     ValueKey<String>('add-watch-later-$bvid');
 
-/// 个人页「稍后再看」入口的 key（v2.58.0+）。
+/// 「稍后再看」入口卡的 key（v2.58.0+ 挂在个人页页头；**v2.59.0 起搬到合集页**，
+/// 与「收藏夹」卡并列，见 `playlist_page.dart` 的 `_ToViewCard`）。
 const Key kWatchLaterEntryKey = Key('watch-later-entry');
 
 /// 播放页导航回调（测试可注入替身：记录解析出的视频与初始集号，不真推含
@@ -104,6 +105,9 @@ class _WatchLaterPageState extends State<WatchLaterPage> {
       if (result.ok) {
         _items = result.items;
         _count = result.count;
+        // 会话内条数（v2.59.0）：合集页那张「稍后再看」入口卡的副标读它
+        // （卡自己不为了一个数字去发请求，见 `services/bili_toview_api.dart`）
+        cacheToViewCount(result.count);
         _error = null;
         _reloadToken++;
         _entranceLedger.clear();
@@ -196,6 +200,8 @@ class _WatchLaterPageState extends State<WatchLaterPage> {
             if (!(it.aid == item.aid && it.bvid == item.bvid)) it,
         ];
         if (_count > 0) _count--;
+        // 会话内条数跟着减（v2.59.0）：合集页那张入口卡的副标即时对上
+        cacheToViewCount(_count);
       }
     });
     if (result.ok) {
