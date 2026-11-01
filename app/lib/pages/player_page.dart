@@ -4341,8 +4341,10 @@ class _PlayerPageState extends State<PlayerPage>
       cid: cid,
       durationMs: durationMs,
     );
-    // 写方向（v2.57.0+，默认关）：把进度也写进 B 站账号历史。开关关着时
+    // 写方向（v2.57.0+，**默认开**）：把进度也写进 B 站账号历史。开关关着时
     // 这里**一个请求都不发**（连 aid 都不去取）。
+    // 默认值见 [UiPrefsStore.historyWriteEnabled]（v2.57.0 定稿改成开：账号
+    // 历史本来就是"我在看什么"的自然记录，用户要的是它能跟着同步上）。
     unawaited(_reportHistoryProgress(
       pos,
       video: video,

@@ -3954,6 +3954,11 @@ class BiliApi {
       // 所以文案必须说清是"这个评论区不行"而不是"你再试一次"。
       12002 => '该评论区已关闭',
       12015 => (raw == null || raw.isEmpty) ? '评论内容被拦截，请修改后再发' : raw,
+      // 稍后再看专属（v2.58.0+，文档 `docs/historytoview/toview.md` 的添加
+      // 接口错误码表）：90001 是**持久状态**（列表满 100 条），说"稍后再试"
+      // 是误导——用户必须先清掉一条。
+      90001 => '稍后再看已满（上限 100 个视频），请先移除一些',
+      90003 => '稿件已被删除，无法加入稍后再看',
       _ => (raw == null || raw.isEmpty) ? '操作失败' : raw,
     };
     throw BiliApiException(code: code, message: message, path: path);
@@ -4678,6 +4683,118 @@ class BiliApi {
       'progress': '$sec',
       'platform': 'android',
     }, referer: 'https://www.bilibili.com/video/av$aid');
+  }
+
+  // -------------------------------------------------------------------------
+  // 稍后再看（v2.58.0+）：读列表 / 加入 / 移除
+  //
+  // 「双向同步」在这里的含义很窄：**账号那份就是唯一副本**（App 不另存一份，
+  // 免得两边打架），所以只有三个动作 —— 读全量、加一条、删一条。**没有**定时
+  // 轮询、没有后台对账：用户点一次才请求一次。
+  //
+  // 接口形状（2026-11 探针；字段与错误码的出处逐条标注见
+  // `services/bili_toview_api.dart` 文件头）：
+  // - `GET  /x/v2/history/toview`     → `data{count, list[]}`（无分页参数）；
+  // - `POST /x/v2/history/toview/add` → `aid` 或 `bvid` 任选其一 + `csrf`；
+  // - `POST /x/v2/history/toview/del` → `aid` + `csrf`。
+  // 三条都是**登录态专用**：匿名实测（不带任何凭据）全部回 -101 账号未登录。
+  // -------------------------------------------------------------------------
+
+  /// 读账号的稍后再看列表（`GET x/v2/history/toview`）。
+  ///
+  /// 返回 `data` 对象（`{count, list}`）；`data` 为 null（列表为空 / 服务端
+  /// 不下发）时给一个空壳，调用方不必判空。
+  ///
+  /// **没有分页参数**：文档里这个接口没有 `pn`/`ps`，且稍后再看本身有 100 条
+  /// 上限（文档：添加时「最多 100 个视频」）—— 一次请求就是全量（**推断**：
+  /// 无凭据无法实测长列表，字段解析对"只给了一部分"也不做假设）。
+  Future<Map<String, dynamic>> fetchToViewList() async {
+    const path = '/x/v2/history/toview';
+    // 先做**本地**登录检查（读 secure storage，不是网络）：未登录时连请求都
+    // 不发，与 [fetchHistoryCursor] 同款；文案说清是"看稍后再看"。
+    final sess = await readSessdata();
+    if (sess == null || sess.isEmpty) {
+      throw const BiliApiException(
+        code: -101,
+        message: '请先登录 B 站账号，才能查看稍后再看',
+        path: path,
+      );
+    }
+    await _injectAuth();
+    final resp = await _dio.get<Map<String, dynamic>>(path);
+    final data = resp.data;
+    final code = _looseInt(data?['code']);
+    if (code == -101) {
+      // 与其它读接口一致：服务端明确说没登录 → 清掉本地死会话
+      await _discardDeadSession(path);
+      throw const BiliApiException(
+        code: -101,
+        message: '登录已失效，请重新登录 B 站账号',
+        path: path,
+      );
+    }
+    if (code != 0) {
+      throw BiliApiException(
+        code: code ?? -1,
+        message: data?['message'] as String? ?? '获取稍后再看失败',
+        path: path,
+      );
+    }
+    final d = data?['data'];
+    if (d is! Map<String, dynamic>) return const {'count': 0, 'list': []};
+    return d;
+  }
+
+  /// 加入稍后再看（`POST x/v2/history/toview/add`）。
+  ///
+  /// [aid] / [bvid] **任选其一**（文档如此；两个都给时都发，服务端按 aid 认）。
+  /// 卡片菜单只握着 bvid —— 于是这条路上**不需要**先来一次 view 请求取 aid
+  /// （少一次请求、少一次撞风控的机会）。
+  ///
+  /// 走 [_postAuth]（csrf + 表单 + 不重试）。错误码见 [_throwWriteError]，
+  /// 其中 `90001`（列表已满，上限 100）/ `90003`（稿件已删除）是这条接口的
+  /// 专属码（文档）。**重复添加的行为未实测**（文档没有"已存在"码）：按
+  /// "只认 code=0 为成功"处理 —— 若真机上重复添加回非 0，用户会看到一条
+  /// 失败提示，界面也不会假称加进去了。
+  Future<void> addToView({int? aid, String? bvid}) async {
+    const path = '/x/v2/history/toview/add';
+    final hasAid = aid != null && aid > 0;
+    final hasBvid = bvid != null && bvid.isNotEmpty;
+    if (!hasAid && !hasBvid) {
+      throw const BiliApiException(
+        code: -400,
+        message: '缺少稿件 id，无法加入稍后再看',
+        path: path,
+      );
+    }
+    debugPrint('[bili_api] addToView aid=${hasAid ? aid : '-'} '
+        'bvid=${hasBvid ? bvid : '-'}');
+    await _postAuth(path, {
+      if (hasAid) 'aid': '$aid',
+      if (hasBvid) 'bvid': bvid,
+    }, referer: hasBvid
+        ? 'https://www.bilibili.com/video/$bvid'
+        : 'https://www.bilibili.com/video/av$aid');
+  }
+
+  /// 移除一条稍后再看（`POST x/v2/history/toview/del`）。
+  ///
+  /// **只认 aid**（文档：`aid` = 删除的目标记录的 avid）—— 所以列表条目必须
+  /// 保存它自己的 aid（[fetchToViewList] 的 `list[].aid`），不能只留 bvid。
+  /// `viewed` 那个"删除所有已看过的"参数**不接**：它是批量操作，误触代价大，
+  /// 本版只做单条移除。
+  Future<void> delFromView({required int aid}) async {
+    const path = '/x/v2/history/toview/del';
+    if (aid <= 0) {
+      throw const BiliApiException(
+        code: -400,
+        message: '视频 id 无效，无法从稍后再看移除',
+        path: path,
+      );
+    }
+    debugPrint('[bili_api] delFromView aid=$aid');
+    await _postAuth(path, {'aid': '$aid'},
+        referer: 'https://www.bilibili.com/video/av$aid');
   }
 }
 

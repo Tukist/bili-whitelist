@@ -189,6 +189,34 @@ String _trimUrlPunct(String raw) {
   return (pageIndex: pageIndex, positionMs: positionMs);
 }
 
+/// 链接带来的「`?p=` / `?t=`」→ 播放页 [PlayerPage.initialPageIndex] 的**唯一**
+/// 换算规则（v2.58.0+ 收口；纯函数，可单测）。
+///
+/// ## 为什么必须收成一处
+/// 同一个场合（"点了一条带参的链接"）以前有两个入口各写一套：
+/// 评论区的兜底预览传 `pageIndex ?? (positionMs != null ? 0 : null)`，
+/// 剪贴板/分享链接直接传 `result.pageIndex` —— 于是**只带 `?t=` 的链接**在
+/// 两处得到不同结果（一处第 1 集、一处走集数记忆）。这种分叉不会报错，只会在
+/// 某天表现成"同一个链接点两次播的不是同一集"，很难查到根因。
+///
+/// ## 规则（按 B 站语义）
+/// 1. 有 `?p=N`（[pageIndex] 非 null）→ **显式 N**：链接说得很明确，记忆不许
+///    覆盖它；
+/// 2. 没有 `?p` 但有 `?t=`（[positionMs] 非 null）→ **显式 0**：`?t` 指的是
+///    "**这个视频**的第 N 秒"，即第 1 集的时间点；若按集数记忆跳到第 5 集再去
+///    第 N 秒，播的就是另一个视频内容了；
+/// 3. 两者都没有 → **null**：交给播放页按本地「上次看到第几 P」记忆落位
+///    （没有记忆就是第 1 集）。
+///
+/// 调用方：`widgets/comment_list.dart`（链接兜底预览）与
+/// `pages/playlist_page.dart`（剪贴板 / 分享链接开播）**共用本函数**——两处
+/// 注释也指向这里，别再各写一份。
+int? initialPageIndexOfLink({int? pageIndex, int? positionMs}) {
+  if (pageIndex != null) return pageIndex;
+  if (positionMs != null) return 0;
+  return null;
+}
+
 /// 解析 B 站进度参数 `t` → 秒（double，支持小数）。支持范围见
 /// [parseVideoLinkPosition] 注释；格式不支持 → null。
 double? _parseTSeconds(String t) {

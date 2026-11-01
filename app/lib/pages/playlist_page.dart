@@ -26,6 +26,7 @@ import '../services/whitelist_writer.dart';
 import '../sync/whitelist_freshness.dart';
 import '../theme/app_palette.dart';
 import '../theme/app_tokens.dart';
+import '../utils/comment_links.dart' show initialPageIndexOfLink;
 import '../utils/import_parser.dart';
 import '../utils/relative_time.dart';
 import '../widgets/add_success_button.dart';
@@ -465,8 +466,11 @@ class _PlaylistPageState extends State<PlaylistPage> {
   /// - **push 而不是替换首页**：返回键随时回首页（用户随时能退，符合"可返回"）
   /// - 带上分享链接的 `?p=` / `?t=` 定位（[ClipboardOpenResult.pageIndex] /
   ///   [positionMs]，与收藏夹/评论链接同一套语义）
-  /// - 链接**没带 `?p=`** 时 `pageIndex` 为 null → 原样传 null，让播放页按本地
-  ///   「上次看到第几 P」记忆落位（v2.57.0+；改前写死 `?? 0` 会钉死在第 1 集）
+  /// - **初始集号走全 App 唯一的换算规则**（v2.58.0 收口，见
+  ///   `utils/comment_links.dart` 的 [initialPageIndexOfLink]）：有 `?p=` →
+  ///   显式那一集；只有 `?t=` → 显式第 1 集（`?t` 说的是"这个视频的第 N 秒"，
+  ///   不能跳到记忆里的另一集）；都没有 → null，交给播放页按本地「上次看到
+  ///   第几 P」记忆落位。评论区那条路用的是**同一个函数**，别在这里另写一份。
   Future<void> _openClipboardVideo(
     BuildContext context,
     ClipboardOpenResult result,
@@ -477,7 +481,10 @@ class _PlaylistPageState extends State<PlaylistPage> {
         settings: const RouteSettings(name: kPlayerRouteName),
         builder: (_) => PlayerPage(
           video: video,
-          initialPageIndex: result.pageIndex,
+          initialPageIndex: initialPageIndexOfLink(
+            pageIndex: result.pageIndex,
+            positionMs: result.positionMs,
+          ),
           initialPositionMs: result.positionMs,
         ),
       ),

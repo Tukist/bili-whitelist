@@ -38,10 +38,12 @@ import '../cache/download_manager.dart';
 import '../config.dart';
 import '../models/playlist_context.dart';
 import '../models/whitelist_video.dart';
+import '../services/bili_toview_api.dart';
 import '../services/collection_cover_store.dart';
 import '../services/collection_stats.dart';
 import '../services/history_store.dart';
 import '../services/service_locator.dart';
+import '../services/ui_prefs_store.dart';
 import '../services/whitelist_writer.dart';
 import '../sync/whitelist_freshness.dart';
 import '../theme/app_palette.dart';
@@ -55,6 +57,8 @@ import '../widgets/stale_sync_banner.dart';
 import '../widgets/swipe_action_box.dart';
 import '../widgets/video_tile.dart';
 import 'player_page.dart';
+// 「加入稍后再看」菜单项的 key 由那个页面导出（菜单项与测试锚点同源）
+import 'watch_later_page.dart' show addToWatchLaterKey;
 
 /// 未分类合集的展示名（与主页卡片一致）。
 ///
@@ -235,12 +239,20 @@ class CollectionPage extends StatefulWidget {
   /// 测试直接构造本页时不显示提示，不误报）。
   final bool stale;
 
+  /// 稍后再看服务（**测试注入用**；v2.58.0+）。
+  ///
+  /// 生产传 null = 菜单项被点时才用真实依赖构造（页面构造时不去碰网络）。
+  /// 留这个口子是为了让"菜单项点了有没有真的调 add"能用假服务断言，而不必
+  /// 在 widget 测试里打真接口。
+  final BiliToViewService? toView;
+
   const CollectionPage({
     super.key,
     required this.collectionName,
     required this.data,
     required this.saveAndRefresh,
     this.stale = false,
+    this.toView,
   });
 
   @override
@@ -581,8 +593,16 @@ class _CollectionPageState extends State<CollectionPage> {
   // ---------------------------------------------------------------------------
 
   /// 长按视频 → 管理菜单（移动/删除）。从原首页迁移。
+  ///
+  /// v2.58.0 起多一项「**加入稍后再看**」：它**不改白名单 / 不写 Gist**，改的是
+  /// 用户 B 站账号的稍后再看列表。因此：
+  /// - 只在**写操作总开关**（[UiPrefsStore.writeActionsEnabled]）打开时出现——
+  ///   关着时整项不存在（不是置灰：留一个按不动的按钮只会让人怀疑坏了）；
+  /// - 菜单头那句「管理操作会同步到 Gist」讲的是移动/删除，这一项不在其列，
+  ///   所以它自己的 leading/title 就说明了动作，不靠那句副标题背书。
   void _showVideoMenu(WhitelistVideo video) {
     final theme = Theme.of(context);
+    final writeEnabled = UiPrefsStore.instance.writeActionsEnabled;
     showModalBottomSheet<void>(
       context: context,
       builder: (sheetCtx) => SafeArea(
@@ -600,6 +620,17 @@ class _CollectionPageState extends State<CollectionPage> {
               dense: true,
             ),
             const Divider(height: 1),
+            if (writeEnabled)
+              ListTile(
+                key: addToWatchLaterKey(video.bvid),
+                leading: const Icon(Icons.watch_later_outlined),
+                title: const Text('加入稍后再看'),
+                subtitle: const Text('加到 B 站账号的稍后再看（不改白名单）'),
+                onTap: () {
+                  Navigator.pop(sheetCtx);
+                  _addToWatchLater(video);
+                },
+              ),
             ListTile(
               leading: const Icon(Icons.drive_file_move_outlined),
               title: const Text('移动到合集…'),
@@ -622,6 +653,35 @@ class _CollectionPageState extends State<CollectionPage> {
         ),
       ),
     );
+  }
+
+  /// 懒建的稍后再看服务（[CollectionPage.toView] 为空时用真实依赖；只建一次）。
+  ///
+  /// 懒建而不是 `initState` 里建：`BiliToViewService()` 会 new 一个 `BiliApi`，
+  /// 而本页绝大多数打开都跟稍后再看无关 —— 不为一个可能不被点的菜单项提前造
+  /// 依赖。
+  BiliToViewService? _toViewService;
+  BiliToViewService get _toView =>
+      _toViewService ??= widget.toView ?? BiliToViewService();
+
+  /// 「加入稍后再看」（v2.58.0+）：只发 `bvid`（文档：aid/bvid 任选其一），
+  /// 所以这条路上**不需要**先取一次 aid（少一次请求、少一次撞风控的机会）。
+  ///
+  /// 成功/失败都给提示，失败给**可读原因**（未登录 / 风控 / 列表满 90001 /
+  /// 稿件已删除 90003 / 网络）。失败绝不假装成功。
+  Future<void> _addToWatchLater(WhitelistVideo video) async {
+    if (video.bvid.isEmpty) {
+      _showSnack('这条视频没有 bvid，无法加入稍后再看', kind: SnackKind.error);
+      return;
+    }
+    final result = await _toView.addVideo(bvid: video.bvid);
+    if (!mounted) return;
+    if (result.ok) {
+      _showSnack('已加入稍后再看');
+    } else {
+      _showSnack('加入稍后再看失败：${result.error ?? '未知原因'}',
+          kind: SnackKind.error);
+    }
   }
 
   /// 移动到合集：目标列表 = 未分类 + **任意层级**的合集（按层级缩进 + 全路径，

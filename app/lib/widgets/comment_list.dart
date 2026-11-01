@@ -1033,12 +1033,16 @@ class _CommentListViewState extends State<CommentListView> {
         settings: const RouteSettings(name: kPlayerRouteName),
         builder: (_) => PlayerPage(
           video: video,
-          // v2.57.0：链接**没带 `?p=`** 时不替调用方拍板集号 —— 传 null 让播放页
-          // 按本地「上次看到第几 P」记忆落位（评论里点开的视频同样适用）。
-          // 唯一例外是「只带 `?t=`」的链接：那种链接说的是「这个视频的第 45 秒」，
-          // 按 B 站语义即第 1 集的时间点，不能跳到记忆里的另一集上。
-          initialPageIndex:
-              pageIndex ?? (positionMs != null ? 0 : null),
+          // 初始集号走**全 App 唯一**的换算规则（v2.58.0 收口，见
+          // `utils/comment_links.dart` 的 [initialPageIndexOfLink]）：
+          // 有 `?p=` → 显式那一集；只有 `?t=` → 显式第 1 集（`?t` 说的是
+          // "这个视频的第 N 秒"，不能跳到记忆里的另一集）；都没有 → null
+          // （交给播放页按本地「上次看到第几 P」记忆落位）。
+          // 剪贴板/分享链接那条路用的是**同一个函数**，别在这里另写一份。
+          initialPageIndex: initialPageIndexOfLink(
+            pageIndex: pageIndex,
+            positionMs: positionMs,
+          ),
           initialPositionMs: positionMs,
         ),
       ));
