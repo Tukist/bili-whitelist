@@ -34,6 +34,12 @@
 ///   `_onLiveDanmaku` 的注释）；
 /// - **失败静默降级**：取弹幕服务器信息失败 / WS 连不上 → 弹幕区空着，最多在
 ///   开关旁显示一行灰字，**绝不影响播放**。
+///
+/// ## 播放时保持亮屏（v2.60.0+）
+/// 与点播页**同一套**：判据 `shouldKeepScreenOn`（`services/keep_screen_on.dart`）
+/// + 通道封装单例 `KeepScreenOn` → 原生窗口 `FLAG_KEEP_SCREEN_ON`（无权限、
+/// 无 WakeLock）。直播页只是把状态映射过去（`_ended` 当「播完」、`_loading`
+/// 当「缓冲」），并同样在 `dispose` 里**无条件关**（防泄漏）。
 library;
 
 import 'dart:async';
@@ -50,7 +56,9 @@ import '../models/live_play_info.dart';
 import '../player/bili_dash_player.dart';
 import '../services/danmaku_settings_store.dart';
 import '../services/device_media.dart';
+import '../services/keep_screen_on.dart';
 import '../services/live_danmaku_service.dart';
+import '../services/ui_prefs_store.dart';
 import '../services/watch_stats.dart';
 import '../theme/app_palette.dart';
 import '../theme/app_tokens.dart';
@@ -181,7 +189,8 @@ class LivePlayerPage extends StatefulWidget {
   State<LivePlayerPage> createState() => _LivePlayerPageState();
 }
 
-class _LivePlayerPageState extends State<LivePlayerPage> {
+class _LivePlayerPageState extends State<LivePlayerPage>
+    with WidgetsBindingObserver {
   late final BiliApi _api;
 
   BiliDashPlayer? _player;
@@ -203,6 +212,12 @@ class _LivePlayerPageState extends State<LivePlayerPage> {
   bool _notifPermissionRequested = false;
   int _recoverFails = 0; // 本段播放已用掉的重连次数（READY 后清零）
   double _aspectRatio = 16 / 9; // 起播前按 16:9 占位
+
+  /// App 是否在前台（v2.60.0；由 [WidgetsBindingObserver] 维护）。
+  ///
+  /// 与点播页同一套：退到后台（`inactive/hidden/paused/detached`）→ 立刻关掉
+  /// 「保持亮屏」，回到 `resumed` 时仍在播 → 重新亮屏。
+  bool _appForeground = true;
 
   Timer? _renewTimer; // 地址续期
   Timer? _watchTimer; // 观看时长累计（仅播放中）
@@ -264,12 +279,22 @@ class _LivePlayerPageState extends State<LivePlayerPage> {
     unawaited(_init());
     // 弹幕设置（含开关记忆）异步读，读不到就用默认（关），不阻塞播放
     unawaited(_loadDanmakuSettings());
+    // 播放时保持亮屏（v2.60.0）：观察前后台切换（退后台必须立刻关）。
+    // 与点播页同一套服务（KeepScreenOn 单例 + shouldKeepScreenOn 判据）。
+    WidgetsBinding.instance.addObserver(this);
+    // 设置里「播放时保持亮屏」被改 → 立即按新值下发（关掉时正在播也马上关）
+    UiPrefsStore.instance.addListener(_onKeepScreenPrefChanged);
   }
 
   @override
   void dispose() {
     // 代次自增 → 在途的取流/重连结果全部作废（回写会发生 setState after dispose）
     _session++;
+    // 播放时保持亮屏（v2.60.0）：**无条件**关（不看播放态/设置、不走判定）——
+    // 离开直播页要把窗口交还给系统自动息屏，这是防泄漏的最后一关。
+    WidgetsBinding.instance.removeObserver(this);
+    UiPrefsStore.instance.removeListener(_onKeepScreenPrefChanged);
+    unawaited(KeepScreenOn.instance.setEnabled(false));
     _renewTimer?.cancel();
     _controlsTimer?.cancel();
     _hudTimer?.cancel();
@@ -287,6 +312,51 @@ class _LivePlayerPageState extends State<LivePlayerPage> {
     // 离开播放页恢复系统方向与系统 UI（同 VOD 播放页 dispose）
     _restoreSystemUi();
     super.dispose();
+  }
+
+  // -------------------------------------------------------------------------
+  // 播放时保持亮屏（v2.60.0）
+  // -------------------------------------------------------------------------
+  //
+  // 与点播页（`player_page._syncKeepScreenOn`）**同一套**：判据是
+  // [shouldKeepScreenOn]（`services/keep_screen_on.dart`），通道封装是
+  // [KeepScreenOn] 单例（同值不发，去重）。直播页只是把状态映射过去：
+  // - `playing` = [_playing]；
+  // - `buffering` = [_buffering] 或 [_loading]（取流/重连期间没有画面可看）；
+  // - `completed` = [_ended]（主播下播 / 通知 ✕ 停止）；
+  // - `hasError` = [_error] 非空；
+  // - `listenMode` **恒 false**：直播页没有「听视频」模式（本页只播画面）。
+  //
+  // 防泄漏三条同点播页：dispose 无条件关、退后台立刻关、设置关掉立刻关。
+
+  /// 按当前状态下发一次亮屏意图（幂等：值没变时通道层不会真的发调用）。
+  void _syncKeepScreenOn() {
+    if (!mounted) return;
+    unawaited(KeepScreenOn.instance.setEnabled(shouldKeepScreenOn(
+      settingEnabled: UiPrefsStore.instance.keepScreenOnEnabled,
+      playing: _playing,
+      // 取流 / 首次缓冲 / 重连中都没有画面在播，一律不亮屏
+      buffering: _buffering || _loading,
+      completed: _ended,
+      hasError: _error != null,
+      listenMode: false,
+      foreground: _appForeground,
+    )));
+  }
+
+  /// 设置里「播放时保持亮屏」被改 → 立即按新值下发。
+  void _onKeepScreenPrefChanged() {
+    _syncKeepScreenOn();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // 只有 resumed 算「在前台」（与点播页判据一致）：宁可多关一次，
+    // 也不在后台拦着系统息屏。
+    final foreground = state == AppLifecycleState.resumed;
+    if (foreground == _appForeground) return;
+    _appForeground = foreground;
+    _syncKeepScreenOn();
   }
 
   // -------------------------------------------------------------------------
@@ -466,6 +536,8 @@ class _LivePlayerPageState extends State<LivePlayerPage> {
       _reconnecting = false;
       _recoverFails = 0;
     });
+    // 重新取流中（没有画面在播）→ 复核亮屏意图（v2.60.0）
+    _syncKeepScreenOn();
     try {
       // isLive: true 必须在**创建期**告知原生：直播不设 ExoPlayer 的 seek
       // 增量（那两个只能在 Builder 上设），通知栏/锁屏因此没有 seek 按钮
@@ -485,6 +557,8 @@ class _LivePlayerPageState extends State<LivePlayerPage> {
         _error = '播放器初始化失败，请重试';
         _loading = false;
       });
+      // 错误态：屏幕上没有画面可看 → 关掉亮屏（v2.60.0）
+      _syncKeepScreenOn();
       return;
     }
     await _loadAndPlay(session: session);
@@ -501,6 +575,8 @@ class _LivePlayerPageState extends State<LivePlayerPage> {
         _error = '直播取流失败，请检查网络后重试';
         _loading = false;
       });
+      // 取流失败 → 错误态不亮屏（v2.60.0）
+      _syncKeepScreenOn();
       return;
     }
     if (!info.isLive) {
@@ -513,6 +589,8 @@ class _LivePlayerPageState extends State<LivePlayerPage> {
         _ended = true;
         _stopped = false;
       });
+      // 未开播 = 没有画面 → 关掉亮屏（v2.60.0）
+      _syncKeepScreenOn();
       unawaited(_syncNowPlaying());
       return;
     }
@@ -521,12 +599,16 @@ class _LivePlayerPageState extends State<LivePlayerPage> {
       _ended = false;
       _buffering = true;
     });
+    // 起播前缓冲（还没有画面）→ 不亮屏；READY 后 onPrepared 再复核（v2.60.0）
+    _syncKeepScreenOn();
     try {
       await _setSource(player, info);
     } catch (e) {
       debugPrint('[live_player] setDataSource 失败：$e');
       if (!mounted) return;
       setState(() => _error = '直播播放失败，请重试');
+      // 设源失败 → 错误态不亮屏（v2.60.0）
+      _syncKeepScreenOn();
       return;
     }
     _scheduleRenewal(info);
@@ -618,10 +700,14 @@ class _LivePlayerPageState extends State<LivePlayerPage> {
     if (_recoverFails >= kLiveRecoverBackoffMs.length) {
       // 预算用尽：落到错误态（有「重试」按钮手动兜底）
       setState(() => _error = '直播连接失败，请稍后重试');
+      // 重连彻底失败 → 错误态不亮屏（v2.60.0）
+      _syncKeepScreenOn();
       return;
     }
     _reconnecting = true;
     if (mounted) setState(() => _buffering = true);
+    // 重连期间没有画面在播 → 关掉亮屏（v2.60.0；新流 READY 会再复核）
+    _syncKeepScreenOn();
     final session = _session;
     try {
       while (mounted && session == _session && !_ended) {
@@ -661,6 +747,8 @@ class _LivePlayerPageState extends State<LivePlayerPage> {
       // 无论成败都解除「重连中」：成功时新流即将 READY（onPrepared 会再清一次），
       // 失败时已经落到错误态；不解除的话下一次原生错误会被挡在门外
       if (mounted) setState(() => _reconnecting = false);
+      // 重连结束后按最终状态复核一次亮屏意图（v2.60.0）
+      _syncKeepScreenOn();
     }
   }
 
@@ -681,6 +769,8 @@ class _LivePlayerPageState extends State<LivePlayerPage> {
       _stopped = false;
       _reconnecting = false;
     });
+    // 重试 = 重新取流中（`_loading`）→ 复核亮屏意图（v2.60.0）
+    _syncKeepScreenOn();
     await _loadAndPlay(session: _session);
   }
 
@@ -721,6 +811,8 @@ class _LivePlayerPageState extends State<LivePlayerPage> {
     });
     _ensureWatchTimer();
     _scheduleControlsHide();
+    // 画面就绪（含续期换源 / 重连后的再次 READY）→ 按新状态更新亮屏（v2.60.0）
+    _syncKeepScreenOn();
     unawaited(_syncNowPlaying());
   }
 
@@ -738,6 +830,8 @@ class _LivePlayerPageState extends State<LivePlayerPage> {
       _ended = true;
       _stopped = false;
     });
+    // 直播已结束（没有画面在播）→ 关掉亮屏（v2.60.0）
+    _syncKeepScreenOn();
     unawaited(_syncNowPlaying());
   }
 
@@ -763,10 +857,14 @@ class _LivePlayerPageState extends State<LivePlayerPage> {
       case 'play':
         if (mounted) setState(() => _playing = true);
         _ensureWatchTimer();
+        // 通知/耳机键恢复播放 → 重新亮屏（v2.60.0）
+        _syncKeepScreenOn();
         unawaited(_syncNowPlaying());
       case 'pause':
         if (mounted) setState(() => _playing = false);
         _stopWatchTimer();
+        // 暂停 → 关掉亮屏（v2.60.0）
+        _syncKeepScreenOn();
         unawaited(_syncNowPlaying());
       case 'stop':
         // 通知栏 ✕：等同用户主动停止（直播没有"已完成"的语义，文案区分开）
@@ -782,6 +880,8 @@ class _LivePlayerPageState extends State<LivePlayerPage> {
             _stopped = true;
           });
         }
+        // 停止态没有画面在播 → 关掉亮屏（v2.60.0）
+        _syncKeepScreenOn();
         unawaited(_syncNowPlaying());
       default:
         // 'seek'：直播不可 seek（原生已不派发），这里再挡一层
@@ -805,7 +905,11 @@ class _LivePlayerPageState extends State<LivePlayerPage> {
   }
 
   void _onWatchTick() {
-    if (!mounted || !_playing || _buffering || _ended) return;
+    if (!mounted) return;
+    // 亮屏意图跟 500ms tick 复核一次（v2.60.0）：缓冲开始/结束这类状态变化
+    // 最多 500ms 就收敛；值没变时通道层不会真的发调用（去重）。
+    _syncKeepScreenOn();
+    if (!_playing || _buffering || _ended) return;
     _pendingWatchMs += kLiveWatchTickMs;
     if (_pendingWatchMs >= kLiveWatchFlushIntervalMs) _flushWatchTime();
   }
@@ -880,6 +984,8 @@ class _LivePlayerPageState extends State<LivePlayerPage> {
       _stopWatchTimer();
     }
     _scheduleControlsHide();
+    // 播放/暂停切换 → 更新亮屏意图（v2.60.0）
+    _syncKeepScreenOn();
     unawaited(_syncNowPlaying());
   }
 

@@ -36,7 +36,8 @@ import 'traffic_panel.dart';
 /// 信箱卡片样式（v2.21.0+ 多版式切换）→
 /// GitHub 配置（token/gist）→ 合集管理（重命名/删除）→ 离线缓存管理 →
 /// **网络与播放（v2.51.0+：「免流兼容（实验）」开关，只改视频/音频流请求的
-/// User-Agent，默认关；v2.53.0 补「取流状态」三态 + 最近一次取流实测信息）** →
+/// User-Agent，默认关；v2.53.0 补「取流状态」三态 + 最近一次取流实测信息；
+/// v2.60.0 补「播放时保持亮屏」开关，默认开）** →
 /// **流量计量（v2.53.0+：系统口径移动流量 + 运营商数值快照相减）** →
 /// 翻译服务 → 界面文案（空态/加载/错误/页脚，可改可恢复，v2.19.0 补）→
 /// 启动行为 → 界面提示 → **写操作（v2.40.0+，点赞/投币/收藏总开关，
@@ -126,6 +127,19 @@ const Key kThemeModeSelectorKey = Key('ui-theme-mode-selector');
 
 /// 「免流兼容（实验）」开关的 key（测试锚点；v2.51.0+）。
 const Key kStreamCompatSwitchKey = Key('ui-stream-compat-switch');
+
+/// 「播放时保持亮屏」开关的 key（测试锚点；v2.60.0）。
+const Key kKeepScreenOnSwitchKey = Key('ui-keep-screen-on-switch');
+
+/// 「播放时保持亮屏」的标题与两种副标题（v2.60.0）。
+///
+/// 抽成常量是**为了被测试钉住**：设置项文案按「非空白字符 ≤ 42」约束
+/// （与 [kStreamCompatHint] 同一条，见 `test/keep_screen_on_settings_test.dart`）。
+/// 文案必须说清边界：**听视频（音频-only）不亮屏** —— 那时用户就是要熄屏听。
+const String kKeepScreenOnTitle = '播放时保持亮屏';
+const String kKeepScreenOnSubtitleOn =
+    '已开启：播放画面时不自动息屏（暂停、听视频、退到后台照常息屏）';
+const String kKeepScreenOnSubtitleOff = '已关闭：交给系统按息屏设置自动息屏';
 
 /// 「网络与播放」分区的小字说明（v2.51.0+；v2.51.1 改成如实描述；v2.52.0 换机制）。
 ///
@@ -638,6 +652,32 @@ class _ManagePanelState extends State<ManagePanel> {
         // 落盘，重启后仍是上次结果）+ 一句如实说明（免流只能看运营商侧）。
         // 用户要的就是"一眼看出现在走的是哪条路"，所以紧跟开关本身。
         const StreamStatusView(),
+        const SizedBox(height: 8),
+        // ---- 播放时保持亮屏（v2.60.0）----
+        //
+        // 放「网络与播放」的理由：这一区已经是**播放行为 / 取流形态**的归属地
+        // （免流兼容 + 取流状态都在这里），而「看视频时别息屏」正是播放行为；
+        // 「外观」区管的是配色主题（深浅/夜纸），与息屏无关。
+        //
+        // 默认**开**（与 B 站官方 App 一致）：用户原话就是"B 站不会息屏，amoTV
+        // 会"，默认关等于这个功能对大多数人不存在。开关仍在，随时可关。
+        // 开关态要跟着 store 走 → 单独监听 UiPrefsStore
+        ListenableBuilder(
+          listenable: UiPrefsStore.instance,
+          builder: (context, _) {
+            final on = UiPrefsStore.instance.keepScreenOnEnabled;
+            return SwitchListTile(
+              key: kKeepScreenOnSwitchKey,
+              value: on,
+              onChanged: (v) =>
+                  UiPrefsStore.instance.setKeepScreenOnEnabled(v),
+              contentPadding: EdgeInsets.zero,
+              title: const Text(kKeepScreenOnTitle),
+              subtitle: Text(
+                  on ? kKeepScreenOnSubtitleOn : kKeepScreenOnSubtitleOff),
+            );
+          },
+        ),
         const SizedBox(height: 16),
         const Divider(height: 1),
         const SizedBox(height: 16),

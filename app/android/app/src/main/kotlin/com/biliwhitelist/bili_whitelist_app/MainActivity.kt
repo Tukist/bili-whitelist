@@ -50,6 +50,9 @@ class MainActivity : FlutterActivity() {
         // 自己重查权限）→ 与 ApkInstaller / MediaController 一样直接注册即走；
         // 通道 handler 闭包持有实例引用，不会被回收。
         TrafficStatsPlugin(this).register(flutterEngine)
+        // 播放时保持亮屏（v2.60.0）：窗口 FLAG_KEEP_SCREEN_ON。
+        // 不需要权限、也不持 WakeLock（理由见 KeepScreenOnPlugin 文件头）。
+        KeepScreenOnPlugin(this).register(flutterEngine)
     }
 
     /**

@@ -2,7 +2,8 @@
 /// （用户原话：「可以在设置里关掉底部的黑框提示」）+ v2.40.0 的**写操作总开关**
 /// [writeActionsEnabled] 与**上次选的收藏夹** [favFolderId]
 /// + v2.51.0 的「**免流兼容（实验）**」总开关 [streamCompatEnabled]
-/// + v2.53.0 的**上次选的清晰度** [preferredQuality]。
+/// + v2.53.0 的**上次选的清晰度** [preferredQuality]
+/// + v2.60.0 的「**播放时保持亮屏**」开关 [keepScreenOnEnabled]。
 ///
 /// 为什么单独开一个 store，而不是塞进 [UiCopyStore] 或 [DanmakuSettingsStore]：
 /// - [UiCopyStore] 存的是「一句话被改成了什么」的**文案覆盖表**（key = 文案 id，
@@ -55,6 +56,10 @@ class UiPrefsStore extends ChangeNotifier {
   /// 上次选的清晰度档位（`qn`）的存储 key（int；缺省/读失败 = 1080P）。
   static const String qualityKey = 'ui:preferred_quality';
 
+  /// 「播放时保持亮屏」开关的存储 key（bool；缺省/读失败 = true，**默认开**；
+  /// v2.60.0+）。
+  static const String keepScreenOnKey = 'ui:keep_screen_on';
+
   /// 全局单例（启动流程读、设置页写、`AppSnack` 每次弹提示前读）。
   static final UiPrefsStore instance = UiPrefsStore._();
 
@@ -71,6 +76,9 @@ class UiPrefsStore extends ChangeNotifier {
 
   /// 上次选的清晰度档位（v2.53.0+，默认 [kPreferredQualityDefault] = 1080P）。
   int _preferredQuality = kPreferredQualityDefault;
+
+  /// 「播放时保持亮屏」的当前值（v2.60.0 **默认开**，见 getter 注释）。
+  bool _keepScreenOnEnabled = true;
   bool _loaded = false;
 
   /// 是否允许弹「提示 / 成功 / 门禁」类底部提示条（默认 true）。
@@ -176,10 +184,25 @@ class UiPrefsStore extends ChangeNotifier {
   /// 480P），跨设备同步过去只会同步一个拿不到的档位。
   int get preferredQuality => _preferredQuality;
 
+  /// **「播放时保持亮屏」开关**（v2.60.0+，默认 **true**）。
+  ///
+  /// 打开后：播放页**有画面在播**时给窗口加 `FLAG_KEEP_SCREEN_ON`，手机不会
+  /// 自己息屏（用户原话：「让amoTV保持亮屏……这次的 bilibili 不会」—— 与 B 站
+  /// 官方 App 一致）。
+  ///
+  /// 为什么默认**开**：官方 App 就是这个行为，用户是在"对照 B 站"提的需求；
+  /// 默认关等于这个功能对大多数人不存在。开关仍在设置里，随时可关。
+  ///
+  /// 默认开**不等于**一直亮屏（判据集中在 `keep_screen_on.dart` 的
+  /// [shouldKeepScreenOn]，全部有单测钉着）：暂停 / 缓冲 / 播完 / 失败 /
+  /// **听视频（音频-only）** / 离开播放页 / App 退后台 —— 一律不亮屏。
+  bool get keepScreenOnEnabled => _keepScreenOnEnabled;
+
   /// 启动时读一次；幂等（重复调用只在首次真正读盘，之后直接返回）。
   ///
   /// 读失败 → 回默认（提示开 / 写操作关 / **写历史开** / 免流兼容关 /
-  /// 无上次收藏夹 / 清晰度 1080P），不抛。六个值里只要有一个与当前不同就发通知。
+  /// 无上次收藏夹 / 清晰度 1080P / **保持亮屏开**），不抛。七个值里只要有一个
+  /// 与当前不同就发通知。
   Future<void> ensureLoaded() async {
     if (_loaded) return;
     var showTips = true;
@@ -188,6 +211,7 @@ class UiPrefsStore extends ChangeNotifier {
     var streamCompat = false;
     int? favFolder;
     var quality = kPreferredQualityDefault;
+    var keepScreenOn = true;
     try {
       final prefs = await SharedPreferences.getInstance();
       showTips = prefs.getBool(showTipsKey) ?? true;
@@ -199,15 +223,18 @@ class UiPrefsStore extends ChangeNotifier {
       favFolder = (fav != null && fav > 0) ? fav : null;
       final q = prefs.getInt(qualityKey);
       quality = (q != null && q > 0) ? q : kPreferredQualityDefault;
+      // 同上：缺省 = true（与 B 站官方 App 一致），只有显式关过才是 false
+      keepScreenOn = prefs.getBool(keepScreenOnKey) ?? true;
     } catch (_) {
       // 存储异常：按默认值启动（提示开 / 写操作关 / **写历史开** / 免流兼容关 /
-      // 无上次收藏夹 / 清晰度 1080P）
+      // 无上次收藏夹 / 清晰度 1080P / 保持亮屏开）
       showTips = true;
       writeActions = false;
       historyWrite = true;
       streamCompat = false;
       favFolder = null;
       quality = kPreferredQualityDefault;
+      keepScreenOn = true;
     }
     _loaded = true;
     if (showTips == _showTips &&
@@ -215,7 +242,8 @@ class UiPrefsStore extends ChangeNotifier {
         historyWrite == _historyWriteEnabled &&
         streamCompat == _streamCompatEnabled &&
         favFolder == _favFolderId &&
-        quality == _preferredQuality) {
+        quality == _preferredQuality &&
+        keepScreenOn == _keepScreenOnEnabled) {
       return;
     }
     _showTips = showTips;
@@ -224,6 +252,7 @@ class UiPrefsStore extends ChangeNotifier {
     _streamCompatEnabled = streamCompat;
     _favFolderId = favFolder;
     _preferredQuality = quality;
+    _keepScreenOnEnabled = keepScreenOn;
     notifyListeners();
   }
 
@@ -328,6 +357,22 @@ class UiPrefsStore extends ChangeNotifier {
     }
   }
 
+  /// 「播放时保持亮屏」开关（v2.60.0+）：语义与 [setShowTips] 完全一致
+  /// （立即生效 + 静默持久化）。关掉后播放页下一次判定就下发 false（播放页
+  /// 每次判定都现读这个值，且监听本 store 的变更 → 正在播也会立刻关）。
+  Future<void> setKeepScreenOnEnabled(bool value) async {
+    if (_keepScreenOnEnabled != value) {
+      _keepScreenOnEnabled = value;
+      notifyListeners();
+    }
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setBool(keepScreenOnKey, value);
+    } catch (_) {
+      // 写入失败静默
+    }
+  }
+
   /// 测试用：重置内存态（不触碰存储），避免单例跨用例串味。
   ///
   /// ⚠️ [historyWriteEnabled] 的默认值刻意是 **false**，与出厂默认（true）
@@ -335,6 +380,10 @@ class UiPrefsStore extends ChangeNotifier {
   /// （否则每次 pump 都可能多出一次取 aid 的 view）。要断言"出厂默认开"，
   /// 请走 [ensureLoaded] + 空的 SharedPreferences（见
   /// `test/history_write_prefs_test.dart`）。
+  ///
+  /// [keepScreenOnEnabled] 则**保持出厂默认 true**（v2.60.0）：它不发任何请求，
+  /// 没有"默认开着会污染其它用例"的问题；要验「设置关着 → 一次都不亮屏」的
+  /// 用例显式传 false。
   @visibleForTesting
   void resetForTest({
     bool? showTips,
@@ -344,6 +393,7 @@ class UiPrefsStore extends ChangeNotifier {
     bool streamCompatSessionFallback = false,
     int? favFolderId,
     int preferredQuality = kPreferredQualityDefault,
+    bool keepScreenOnEnabled = true,
     bool loaded = false,
   }) {
     _showTips = showTips ?? true;
@@ -353,6 +403,7 @@ class UiPrefsStore extends ChangeNotifier {
     _streamCompatSessionFallback = streamCompatSessionFallback;
     _favFolderId = favFolderId;
     _preferredQuality = preferredQuality;
+    _keepScreenOnEnabled = keepScreenOnEnabled;
     _loaded = loaded;
   }
 }

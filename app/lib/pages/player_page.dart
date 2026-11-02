@@ -25,6 +25,7 @@ import '../services/bili_toview_api.dart';
 import '../services/danmaku_settings_store.dart';
 import '../services/device_media.dart';
 import '../services/history_store.dart';
+import '../services/keep_screen_on.dart';
 import '../services/last_episode_store.dart';
 import '../services/realtime_transcriber.dart';
 import '../services/stream_status_store.dart';
@@ -1487,7 +1488,7 @@ class PlayerPage extends StatefulWidget {
 }
 
 class _PlayerPageState extends State<PlayerPage>
-    with RouteAware, SingleTickerProviderStateMixin {
+    with RouteAware, SingleTickerProviderStateMixin, WidgetsBindingObserver {
   /// 当前播放的视频（initState 初始化为 _video；内部换源（[playVideo]）后
   /// 更新为被换视频）。标题/取流/弹幕/下载/历史/评论等一律以 [_video] 为准
   /// ——换源后仍引用 _video 会把旧视频记进历史/进度、下载与评论串到旧视频
@@ -1569,6 +1570,12 @@ class _PlayerPageState extends State<PlayerPage>
   bool _buffering = true;
   bool _loaded = false;
   bool _completed = false;
+
+  /// App 是否在前台（v2.60.0；由 [WidgetsBindingObserver] 维护）。
+  ///
+  /// 退到后台（`inactive/hidden/paused/detached`）→ 立刻关掉「保持亮屏」：
+  /// 绝不在后台拦着系统息屏。回到 `resumed` 时仍在播 → 重新亮屏。
+  bool _appForeground = true;
   int _positionMs = 0;
   int _durationMs = 0;
   double _aspectRatio = 16 / 9;
@@ -2660,6 +2667,10 @@ class _PlayerPageState extends State<PlayerPage>
     }
     // 拖动预览服务：生产自建，测试可注入（见 [PlayerPage.videoShotService]）
     _videoShot = widget.videoShotService ?? VideoShotService();
+    // 播放时保持亮屏（v2.60.0）：观察前后台切换（退后台必须立刻关）。
+    WidgetsBinding.instance.addObserver(this);
+    // 设置里「播放时保持亮屏」被改 → 立即按新值下发（关掉时正在播也马上关）
+    UiPrefsStore.instance.addListener(_onKeepScreenPrefChanged);
     // 取流接口：生产自建，测试可注入（见 [PlayerPage.api]）
     _api = widget.api ?? BiliApi();
     // 清晰度（v2.53.0+）：本次请求的 `qn` = 用户上次选的档位（默认 1080P）。
@@ -2743,6 +2754,12 @@ class _PlayerPageState extends State<PlayerPage>
   void dispose() {
     // 退订路由观察者（必须：didChangeDependencies 里 subscribe 过）
     routeObserver.unsubscribe(this);
+    // 播放时保持亮屏（v2.60.0）：**无条件**关，且必须早于 super.dispose()——
+    // 退出播放页要把窗口交还给系统自动息屏。不看播放态/设置、不走判定：
+    // 这是防泄漏的最后一关（页面被 pop / 被销毁 / 换源重建都会走到这里）。
+    WidgetsBinding.instance.removeObserver(this);
+    UiPrefsStore.instance.removeListener(_onKeepScreenPrefChanged);
+    unawaited(KeepScreenOn.instance.setEnabled(false));
     _downloads.cached.removeListener(_onCacheStateChanged);
     _downloads.tasks.removeListener(_onCacheStateChanged);
     _realtime.stage.removeListener(_onRealtimeStageChanged);
@@ -2770,6 +2787,53 @@ class _PlayerPageState extends State<PlayerPage>
     _player?.dispose();
     _restoreSystemUi();
     super.dispose();
+  }
+
+  // -------------------------------------------------------------------------
+  // 播放时保持亮屏（v2.60.0）
+  // -------------------------------------------------------------------------
+  //
+  // 用户原话：「让amoTV保持亮屏……这次的 bilibili 不会」—— 对齐 B 站官方 App：
+  // **有画面在播**时不让手机自动息屏。原生侧是窗口 FLAG_KEEP_SCREEN_ON
+  // （`KeepScreenOnPlugin.kt`：无权限、无 WakeLock、跟窗口生命周期走）。
+  //
+  // 判据只有一个（[shouldKeepScreenOn]，`services/keep_screen_on.dart`）：
+  // 设置开 + 在播 + 不在缓冲 + 没播完 + 没报错 + 不在听视频 + App 在前台。
+  // 任一条不成立就关。通道层再去重（同值不发，见 [KeepScreenOn.setEnabled]），
+  // 所以把它挂在 500ms 的 [_tick] 上也不会每帧发一次通道调用。
+  //
+  // 防泄漏三条：
+  //  ① [dispose] 里**无条件**下发 false（不看状态、不走判定）——页面没了就必须关；
+  //  ② 退到后台（[didChangeAppLifecycleState]）立刻关；
+  //  ③ 监听 [UiPrefsStore]：用户关掉开关时正在播也立刻关。
+
+  /// 按当前状态下发一次亮屏意图（幂等：值没变时通道层不会真的发调用）。
+  void _syncKeepScreenOn() {
+    if (!mounted) return;
+    unawaited(KeepScreenOn.instance.setEnabled(shouldKeepScreenOn(
+      settingEnabled: UiPrefsStore.instance.keepScreenOnEnabled,
+      playing: _playing,
+      buffering: _buffering,
+      completed: _completed,
+      hasError: _error != null,
+      listenMode: _listenMode,
+      foreground: _appForeground,
+    )));
+  }
+
+  /// 设置里「播放时保持亮屏」被改（开关本身在设置页）→ 立即按新值下发。
+  void _onKeepScreenPrefChanged() {
+    _syncKeepScreenOn();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    // 只有 resumed 算「在前台」：inactive（下拉通知栏/来电浮层）、hidden、
+    // paused、detached 一律关 —— 宁可多关一次，也不在后台拦着系统息屏。
+    final foreground = state == AppLifecycleState.resumed;
+    if (foreground == _appForeground) return;
+    _appForeground = foreground;
+    _syncKeepScreenOn();
   }
 
   // -------------------------------------------------------------------------
@@ -2831,6 +2895,8 @@ class _PlayerPageState extends State<PlayerPage>
       // 原生通道异常：忽略（进度仍保存，音频停不停以原生为准）
     }
     if (mounted) setState(() => _playing = false);
+    // 让路期间没有画面在播 → 关掉「保持亮屏」（v2.60.0）
+    _syncKeepScreenOn();
     await _saveProgress(reportHistoryNow: true);
     // 让路期间通知跟随本页（显示已暂停）；新页开始播放时会改绑到它的播放器
     unawaited(_syncNowPlaying());
@@ -2862,6 +2928,8 @@ class _PlayerPageState extends State<PlayerPage>
       return;
     }
     if (mounted) setState(() => _playing = true);
+    // 恢复续播 → 重新亮屏（v2.60.0）
+    _syncKeepScreenOn();
     unawaited(_syncNowPlaying()); // 恢复续播：通知重新跟随本页
   }
 
@@ -3488,6 +3556,8 @@ class _PlayerPageState extends State<PlayerPage>
       _error = _errMsg(e);
       _canRetry = canRetry;
     });
+    // 取流失败（不会再有 onPrepared）→ 错误态不亮屏（v2.60.0）
+    _syncKeepScreenOn();
     // 取流失败：不会再有 onPrepared，封面占位层立刻淡出（露出错误视图）
     _dismissCoverOverlay();
   }
@@ -3589,6 +3659,8 @@ class _PlayerPageState extends State<PlayerPage>
       _playing = false;
       _stoppedByNotification = true;
     });
+    // 通知栏 ✕ → 停止态，没有画面在播 → 关掉「保持亮屏」（v2.60.0）
+    _syncKeepScreenOn();
     final store = _progressStore;
     if (pos > 0 && !_completed) {
       if (store != null) {
@@ -3678,6 +3750,8 @@ class _PlayerPageState extends State<PlayerPage>
       // 播放中多次零星网络抖动各自都能拿到完整重试次数
       _autoRecoverFails = 0;
     });
+    // 画面就绪（含切集/续播后的再次 READY）→ 按新状态更新「保持亮屏」（v2.60.0）
+    _syncKeepScreenOn();
     // 宽高比此刻才拿到（或换集后变了）→ 若正在全屏，按新比例**补一次方向锁**
     // （v2.39.0）：覆盖两个窗口——① 用户在全屏按钮可点时（!_loaded）先点了
     // 全屏，那时 [_aspectKnown] 还是 false、只放过自由方向；② 全屏中切集到
@@ -3713,6 +3787,8 @@ class _PlayerPageState extends State<PlayerPage>
     });
     // 观看完成 → 清除进度记忆（下次从头播）
     _clearProgress();
+    // 播完（画面停在最后一帧）→ 关掉「保持亮屏」（v2.60.0）
+    _syncKeepScreenOn();
     unawaited(_syncNowPlaying()); // 通知副标题 → 已播完
   }
 
@@ -3781,6 +3857,8 @@ class _PlayerPageState extends State<PlayerPage>
       _error = '播放失败（$code）：$shown';
       _playing = false;
     });
+    // 错误态：屏幕上没有画面可看 → 关掉「保持亮屏」（v2.60.0）
+    _syncKeepScreenOn();
     // 原生报错：画面不会来了，封面占位层让位给错误视图
     _dismissCoverOverlay();
     unawaited(_syncNowPlaying()); // 通知副标题 → 播放失败
@@ -4243,6 +4321,9 @@ class _PlayerPageState extends State<PlayerPage>
       _saveProgress();
       unawaited(_maybePrefetchSource());
     }
+    // 亮屏意图跟 tick 复核一次（v2.60.0）：缓冲开始/结束这类没有专门钩子的
+    // 状态变化最多 500ms 就收敛；值没变时通道层不会真的发调用（去重）。
+    _syncKeepScreenOn();
   }
 
   /// 确保 [_tick] 轮询定时器在跑（幂等：同一时刻**最多一个**）。
@@ -4383,6 +4464,8 @@ class _PlayerPageState extends State<PlayerPage>
     if (_playing) {
       await player.pause();
       setState(() => _playing = false);
+      // 暂停 → 关掉「保持亮屏」（v2.60.0）
+      _syncKeepScreenOn();
       // 暂停时保存一次进度；这次同时**绕过节流**把进度写进 B 站账号历史
       // （v2.57.0+：暂停是"这一集就停在这儿"的明确信号，值得一次准点上报）
       _saveProgress(reportHistoryNow: true);
@@ -4396,6 +4479,8 @@ class _PlayerPageState extends State<PlayerPage>
       }
       await player.play();
       setState(() => _playing = true);
+      // 继续播放 → 重新亮屏（v2.60.0）
+      _syncKeepScreenOn();
       // 复活 tick：看完（[_onCompleted] 停掉了轮询）后重播，或任何「定时器被取消
       // 过」的路径，都必须在这里重建，否则进度条/时间文本/字幕不再刷新。
       _ensureTickTimer();
@@ -5785,6 +5870,8 @@ class _PlayerPageState extends State<PlayerPage>
       _listenLocalAudio = _isLocalUrl(audioUrl);
       _buffering = true;
     });
+    // 听视频（音频-only）= 用户就是要熄屏听 → 关掉「保持亮屏」（v2.60.0）
+    _syncKeepScreenOn();
     try {
       final ok = await _startListenAudio(positionMs: position);
       if (!ok) throw StateError('听视频没有可用音频轨');
@@ -5828,6 +5915,8 @@ class _PlayerPageState extends State<PlayerPage>
       _listenLocalAudio = false;
       _buffering = player != null;
     });
+    // 退出听视频 → 回到画面（若仍在播则重新亮屏，换源 READY 后会再复核一次）
+    _syncKeepScreenOn();
     unawaited(_syncNowPlaying());
     // 通知副标题先跟着变，再换源（换源的 onPrepared 会再同步一次）
     if (player == null) return;
@@ -5944,6 +6033,8 @@ class _PlayerPageState extends State<PlayerPage>
       _listenMode = false;
       _listenLocalAudio = false;
     });
+    // 听视频已收起（新视频照常显示画面）→ 立即复核亮屏意图（v2.60.0）
+    _syncKeepScreenOn();
     unawaited(_syncNowPlaying());
   }
 
@@ -5968,6 +6059,8 @@ class _PlayerPageState extends State<PlayerPage>
       _buffering = player != null;
       _error = null;
     });
+    // 已回到视频画面（换源完成后 onPrepared 会再复核一次）→ 更新亮屏意图
+    _syncKeepScreenOn();
     AppSnack.show(context, kListenFallbackNotice, kind: SnackKind.error);
     unawaited(_syncNowPlaying());
     if (player == null) return;
@@ -7586,6 +7679,9 @@ class _PlayerPageState extends State<PlayerPage>
       // 弹幕：清空旧视频渲染数据（缓存按 cid 保留，重开秒显示）
       _danmaku = const [];
     });
+    // 换源瞬间没有在播的画面（_playing=false）→ 立刻关掉「保持亮屏」
+    // （新流 READY 的 onPrepared 会再按真实播放意图复核一次；v2.60.0）
+    _syncKeepScreenOn();
     // 3) 复用首次加载流程重新取流（含新 tick 定时器）
     await _init();
     // 换源后重拉新视频的 UP 主信息（阶段 C）
