@@ -71,7 +71,14 @@
             android:theme="@style/LaunchTheme"
             android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
             android:hardwareAccelerated="true"
+            android:supportsPictureInPicture="true"
             android:windowSoftInputMode="adjustResize">
+            <!-- 画中画（小窗播放，v2.63.0）：supportsPictureInPicture 是**清单开关**，
+                 不是权限——本功能不声明任何 uses-permission。
+                 进/出小窗会改窗口尺寸与方向，所以 configChanges 必须含
+                 screenSize|smallestScreenSize|screenLayout|orientation（上面那串
+                 已经有，勿删）：缺任何一项都会导致 Activity 被重建 → Flutter 引擎
+                 重建 → 播放器与播放位置全丢，小窗里会变成黑屏从头开始。 -->
             <!-- Specifies an Android theme to apply to this Activity as soon as
                  the Android process has started. This theme is visible to the user
                  while the Flutter UI initializes. After that, this theme continues

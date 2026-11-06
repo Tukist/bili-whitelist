@@ -28,6 +28,7 @@ import '../services/history_store.dart';
 import '../services/heat_curve.dart';
 import '../services/keep_screen_on.dart';
 import '../services/last_episode_store.dart';
+import '../services/pip_service.dart';
 import '../services/realtime_transcriber.dart';
 import '../services/share_service.dart';
 import '../services/stream_status_store.dart';
@@ -1436,6 +1437,9 @@ enum _MoreAction {
 
   /// 调起系统分享面板。
   share,
+
+  /// 进系统小窗（画中画，v2.63.0）。
+  pip,
 }
 
 class PlayerPage extends StatefulWidget {
@@ -1614,6 +1618,28 @@ class _PlayerPageState extends State<PlayerPage>
   int _positionMs = 0;
   int _durationMs = 0;
   double _aspectRatio = 16 / 9;
+
+  /// 视频真实像素尺寸（v2.63.0；[onPrepared] 下发，0 = 还不知道）。
+  ///
+  /// 只给小窗（画中画）用：系统要的是**宽高比**，用真实像素比算出的小窗形状
+  /// 才与画面一致（`_aspectRatio` 虽然也是同一个比值，但那是给 AspectRatio
+  /// 组件用的布局值，日志/排查时更需要原始宽高）。
+  int _videoWidth = 0;
+  int _videoHeight = 0;
+
+  // 小窗播放（画中画，v2.63.0）
+  // -------------------------------------------------------------------------
+  /// 本机是否支持画中画（[PipService.isSupported]，异步查一次）。
+  ///
+  /// false → 「更多」弹层里**不构建**「小窗播放」这一项（含旧系统 / ROM 没这个
+  /// feature）。这是本功能的降级契约：点了没反应的按钮不如不给。
+  bool _pipSupported = false;
+
+  /// 当前是否处于系统小窗。true → [build] 只渲染视频画面（见 [_buildPipView]）。
+  bool _inPip = false;
+
+  /// 小窗状态事件订阅（只在支持时才订阅，见 [_refreshPipSupport]）。
+  StreamSubscription<PipEvent>? _pipSub;
 
   /// 宽高比是否**真的**来自播放器（[_onPrepared] 的 width/height）。
   ///
@@ -2781,6 +2807,9 @@ class _PlayerPageState extends State<PlayerPage>
         _dismissCoverOverlay,
       );
     }
+    // 小窗播放（v2.63.0）：先问设备支不支持。不支持 → 入口不显示、也不订阅事件
+    // （不订阅很重要：不支持时那条 EventChannel 在生产/测试里都可能没人应答）。
+    unawaited(_refreshPipSupport());
     _init();
   }
 
@@ -2832,6 +2861,8 @@ class _PlayerPageState extends State<PlayerPage>
     _coverTeardownTimer?.cancel();
     _eventSub?.cancel();
     _eventSub = null;
+    _pipSub?.cancel();
+    _pipSub = null;
     _commentScroll.dispose();
     // 补场控制器：必须在 super.dispose() 之前释放——SingleTickerProviderState
     // 在状态销毁时断言「ticker 不能还在跑」，正是靠这里 stop。
@@ -2873,6 +2904,7 @@ class _PlayerPageState extends State<PlayerPage>
       hasError: _error != null,
       listenMode: _listenMode,
       foreground: _appForeground,
+      inPip: _inPip,
     )));
   }
 
@@ -2889,6 +2921,142 @@ class _PlayerPageState extends State<PlayerPage>
     if (foreground == _appForeground) return;
     _appForeground = foreground;
     _syncKeepScreenOn();
+  }
+
+  // -------------------------------------------------------------------------
+  // 小窗播放 / 画中画（v2.63.0）
+  // -------------------------------------------------------------------------
+  //
+  // 用户原话：「然后再搞个小窗模式」—— 系统画中画：播放视频时点「更多 → 小窗
+  // 播放」，画面缩成系统小窗继续播；切到别的 App 也留着；点小窗回全屏播放页。
+  //
+  // 分工（与原生 `PipPlugin.kt` 的契约）：
+  //  - Dart → 原生：`isSupported()`（决定入口显不显示）、`enter(width,height)`
+  //    （宽高比取视频真实像素比，夹到 0.5~2.33）；
+  //  - 原生 → Dart：`pipChanged(inPip)`（进/出小窗）、`pipDismissed`（小窗被
+  //    ✕ 关掉）。
+  //
+  // **不申请任何权限**：PiP 只要清单里 `supportsPictureInPicture="true"`。
+  //
+  // ## 小窗里只留画面
+  //
+  // [build] 在 [_inPip] 时整棵树换成 [_buildPipView]：只有 Texture。顶栏/底栏/
+  // 功能条/信息块/评论区/弹幕/字幕/手势层**全部不在树里**（不是透明盖住，是
+  // 根本不构建）——小窗只有巴掌大，任何控件都是噪点，而且系统小窗上的触摸
+  // 本来也不该被播放页吃掉。
+  //
+  // ## 与既有语义叠加
+  //
+  // - 播放：**不停**。播放器、tick（500ms）、进度上报、历史写入全在原轨道上跑，
+  //   所以退出小窗后位置天然连续（没有任何 re-source）；
+  // - 亮屏：小窗里**不保持亮屏**（[shouldKeepScreenOn] 的 `inPip` 条）。理由：
+  //   小窗的存在意义就是"用户去看别的 App"，此时拦着系统息屏只是耗电；真回到
+  //   全屏会重新按判定下发；
+  // - 听视频（音频-only）：源里根本没有视频轨，小窗里会是纯黑 → 「小窗播放」
+  //   入口在听视频态下**不显示**（见 [_buildMoreItems]）；若用户先进小窗再点回
+  //   全屏切换听视频，那条路照旧可用（PiP 态下没有底栏，用户必须先回全屏）；
+  // - 字幕 / 弹幕 / 热度曲线：小窗里一概不渲染（同上：整棵 UI 树不在），退出
+  //   小窗后按用户原来的开关恢复原样，状态位一个都不改。
+
+  /// 问一次原生「支不支持小窗」，支持才订阅状态事件。
+  ///
+  /// 为什么要等结果再订阅：不支持时那条 EventChannel 没人应答，订阅会产生一次
+  /// 平台错误（测试环境里更会变成一帧未处理异常）。不支持的设备连入口都不显示，
+  /// 也就没有听事件的理由。
+  Future<void> _refreshPipSupport() async {
+    final supported = await PipService.instance.isSupported();
+    if (!mounted) return;
+    if (supported) {
+      _pipSub ??= PipService.instance.events.listen(_onPipEvent);
+    }
+    if (supported != _pipSupported) setState(() => _pipSupported = supported);
+  }
+
+  /// 小窗状态事件（原生回调 → 界面）。
+  void _onPipEvent(PipEvent event) {
+    switch (event) {
+      case PipModeChanged(:final inPip):
+        if (!mounted) return;
+        debugPrint('[player_page] 小窗状态 → $inPip');
+        setState(() => _inPip = inPip);
+        // 进出小窗都会改窗口尺寸/可见性 → 亮屏判定跟着复核（小窗里恒关）
+        _syncKeepScreenOn();
+      case PipWindowDismissed():
+        unawaited(_onPipDismissed());
+    }
+  }
+
+  /// 进小窗（「更多 → 小窗播放」）。
+  ///
+  /// 失败只提示一句：原生不支持 / 系统当前不允许（部分 ROM 在 Activity 正
+  /// 处于后台时 `enterPictureInPictureMode` 直接回 false）。成功**不提示**：
+  /// 画面缩成系统小窗本身就是反馈。
+  Future<void> _enterPip() async {
+    if (!_pipSupported || _inPip) return;
+    final result = await PipService.instance.enter(
+      width: _videoWidth,
+      height: _videoHeight,
+    );
+    debugPrint('[player_page] 进小窗 ok=${result.ok} ${result.message}');
+    if (!mounted || result.ok) return;
+    _showSnack(result.message);
+  }
+
+  /// 小窗被系统关掉（用户点小窗上的 ✕）→ 按既有「停止播放」路径收尾。
+  ///
+  /// 为什么不是"当没发生过"：小窗没了但播放器还在跑，用户既看不到画面也没
+  /// 在手边——那就是既费流量又出声的幽灵播放。这里：
+  /// ① 先暂停原生播放器（不再取流/出声）；
+  /// ② 界面回到"已暂停"（若随后页面被系统销毁，dispose 会再存一次，幂等）；
+  /// ③ 存进度 + 写历史 + 强制上报（复用 [_saveExitProgress]，与退出播放页同一
+  ///    口径：位置取原生 getPosition，比界面 tick 更准）；
+  /// ④ 关「保持亮屏」。
+  ///
+  /// 与通知栏 ✕（[_onStoppedByNotification]）的区别：那条路原生**已经** stop 了，
+  /// 这里原生还在播 → 必须自己 pause。也不置 [_stoppedByNotification]：用户
+  /// 如果回到 App 再点播放，走正常 [_togglePlay] 即可。
+  Future<void> _onPipDismissed() async {
+    debugPrint('[player_page] 小窗被关掉 → 收尾（暂停 + 存进度）');
+    final player = _player;
+    if (player != null) {
+      try {
+        await player.pause();
+      } catch (_) {
+        // 原生已随窗口销毁：忽略，下面的进度保存同样有兜底
+      }
+    }
+    if (mounted) {
+      setState(() {
+        _inPip = false;
+        _playing = false;
+        _buffering = false;
+      });
+    } else {
+      _inPip = false;
+      _playing = false;
+    }
+    _syncKeepScreenOn();
+    _saveExitProgress();
+  }
+
+  /// 小窗态的整棵界面：**只有视频画面**（见本节开头的说明）。
+  ///
+  /// 黑底 + 居中按视频比例的 Texture：系统小窗的形状就是按这个比例给的，所以
+  /// 正常情况下画面填满、无黑边；比例被夹取过（超宽/超窄片源）时两侧留黑，
+  /// 这与全屏播放的黑边语义一致。
+  Widget _buildPipView() {
+    final textureId = _textureId;
+    return ColoredBox(
+      color: Colors.black,
+      child: textureId == null
+          ? const SizedBox.expand()
+          : Center(
+              child: AspectRatio(
+                aspectRatio: _aspectRatio,
+                child: BiliDashTexture(textureId: textureId),
+              ),
+            ),
+    );
   }
 
   // -------------------------------------------------------------------------
@@ -3800,6 +3968,9 @@ class _PlayerPageState extends State<PlayerPage>
       if (width > 0 && height > 0) {
         _aspectRatio = width / height;
         _aspectKnown = true; // 比例是真的了 → 进全屏的方向策略可据此判定
+        // 小窗（v2.63.0）：系统按**真实像素比**决定小窗形状，这里记下原值
+        _videoWidth = width;
+        _videoHeight = height;
       }
       // 新流成功 READY → 自动续播预算清零：每段播放独立预算，
       // 播放中多次零星网络抖动各自都能拿到完整重试次数
@@ -5685,6 +5856,8 @@ class _PlayerPageState extends State<PlayerPage>
         _onDownloadTap();
       case _MoreAction.share:
         await _shareCurrentVideo();
+      case _MoreAction.pip:
+        await _enterPip();
     }
   }
 
@@ -5773,6 +5946,18 @@ class _PlayerPageState extends State<PlayerPage>
       hint: '把标题和链接发给其他 App',
       key: const ValueKey('player-more-share'),
     );
+    // 小窗播放（v2.63.0）：**不支持就不显示**（旧系统 / ROM 没这个 feature），
+    // 听视频态也不显示（那时连视频轨都没拉，小窗里只会是纯黑）。
+    // 放在「分享」之后、列表最末：它会把界面整个缩走，是这一组的"离开"动作。
+    if (_pipSupported && !_listenMode && !_audioOnlyPlayback) {
+      add(
+        _MoreAction.pip,
+        Icons.picture_in_picture_alt_outlined,
+        '小窗播放',
+        hint: '缩成系统小窗，切到别的 App 也能继续看',
+        key: const ValueKey('player-more-pip'),
+      );
+    }
     return items;
   }
 
@@ -8375,6 +8560,10 @@ class _PlayerPageState extends State<PlayerPage>
 
   @override
   Widget build(BuildContext context) {
+    // 小窗（画中画，v2.63.0）：**只留视频画面**——顶栏/底栏/功能条/信息块/
+    // 评论区/弹幕/字幕/手势层全部不构建（见 [_buildPipView] 与本节开头的说明）。
+    // 播放器与 tick 都不受影响，退出小窗后位置天然连续。
+    if (_inPip) return _buildPipView();
     // v2.17.0+ 非全屏布局重构（v2.17.17 起竖屏 / 横屏两态自适应）：
     // - 非全屏 = 常规观看页：视频区顶部置顶（按宽高比的黑盒）+
     //   下方视频信息行 + 内嵌评论区（滚动）——设备竖放为竖屏布局；设备

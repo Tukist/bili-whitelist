@@ -1,6 +1,7 @@
 package com.biliwhitelist.bili_whitelist_app
 
 import android.content.Intent
+import android.content.res.Configuration
 import android.util.Log
 import android.webkit.CookieManager
 import android.webkit.WebStorage
@@ -25,6 +26,17 @@ class MainActivity : FlutterActivity() {
     // 从相册选图当合集封面（v2.50.0）：同样走 SAF，结果在这里转发给
     // ImagePickPlugin（requestCode 与上面那条通道错开）。
     private lateinit var imagePick: ImagePickPlugin
+
+    // 画中画（小窗播放，v2.63.0）：通道 + 事件由 PipPlugin 负责，
+    // 生命周期回调（onPictureInPictureModeChanged / onStop）只能在这里接。
+    private lateinit var pip: PipPlugin
+
+    // 「刚退出 PiP、还没回到前台」——见 onStop 的说明。
+    //
+    // 只有它决定要不要发 pipDismissed：**不能**用"曾经进过小窗"来判，
+    // 因为小窗还在屏幕上时（用户切到别的 App）Activity 也可能收到 onStop，
+    // 那种情况必须**继续播**，不能当成"小窗被关掉"。
+    private var pipExitPending = false
 
     // 应用内嵌插件不走 GeneratedPluginRegistrant（那是给独立插件包用的），
     // 在 configureFlutterEngine 里手动注册 B 站 DASH 播放插件。
@@ -56,6 +68,55 @@ class MainActivity : FlutterActivity() {
         // 播放页「更多 → 分享」（v2.62.0）：Intent.ACTION_SEND + createChooser。
         // 不需要权限、不联网（理由见 SharePlugin 文件头）。
         SharePlugin(this).register(flutterEngine)
+        // 播放页「更多 → 小窗播放」（v2.63.0）：系统画中画 + 状态回推。
+        // 不需要权限（清单里只有 supportsPictureInPicture），理由见 PipPlugin 文件头。
+        pip = PipPlugin(this)
+        pip.register(flutterEngine)
+    }
+
+    /**
+     * 进/出系统小窗（v2.63.0）。**必须在 MainActivity 里接**：这是 Activity 的
+     * 系统回调，PipPlugin 只是把它转成 EventChannel 事件。
+     *
+     * Dart 侧据 `inPip` 裁剪界面：true → 只留视频画面；false → 恢复顶栏/底栏/
+     * 信息块/评论区。播放器本身一刻没停，所以位置天然连续。
+     */
+    override fun onPictureInPictureModeChanged(
+        isInPictureInPictureMode: Boolean,
+        newConfig: Configuration
+    ) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        if (!isInPictureInPictureMode) pipExitPending = true
+        if (::pip.isInitialized) pip.onPipModeChanged(isInPictureInPictureMode)
+    }
+
+    /**
+     * 回到前台 → 清掉「刚退出 PiP」标记：这说明用户是把小窗**点回全屏**
+     * （PiP → 全屏），不是把小窗关掉。点击小窗时系统先发
+     * onPictureInPictureModeChanged(false)，紧接着 onResume，走不到 [onStop]
+     * 的"关闭"分支。
+     */
+    override fun onResume() {
+        super.onResume()
+        pipExitPending = false
+    }
+
+    /**
+     * 小窗被关掉（用户点系统小窗上的 ✕ / 小窗任务被移除）：
+     * 系统会依次给 onPictureInPictureModeChanged(false) → onStop，**不会**
+     * 回到 onResume。这里据此回一个 `pipDismissed`，Dart 侧按既有「停止播放」
+     * 路径收尾（停播、存进度、释放亮屏），而不是让页面停在"小窗已消失、
+     * 声音还在放"的状态。
+     *
+     * 判据**只看 [pipExitPending]**（退出小窗且没回到前台）：不能用"正在 PiP"
+     * 来判——小窗还在屏幕上时 Activity 也可能被 onStop（个别 ROM 会把 PiP
+     * 收成悬浮图标），那时必须继续播，误判成"关闭"会平白打断用户。
+     */
+    override fun onStop() {
+        val dismissed = pipExitPending
+        pipExitPending = false
+        if (dismissed && ::pip.isInitialized) pip.onPipDismissed()
+        super.onStop()
     }
 
     /**

@@ -3,12 +3,14 @@
 // 用户原话：「让amoTV保持亮屏……这次的 bilibili 不会」—— 对齐 B 站官方 App：
 // **有画面在播**时不让手机自动息屏（原生 FLAG_KEEP_SCREEN_ON，无权限、无
 // WakeLock）。本文件覆盖两层：
-//   1. [shouldKeepScreenOn] 判据矩阵（七个条件，任一不满足 → 关）；
+//   1. [shouldKeepScreenOn] 判据矩阵（八个条件，任一不满足 → 关；第八条
+//      `inPip` 是 v2.63.0 小窗模式加的："小窗里不亮屏"）；
 //   2. [KeepScreenOn] 通道封装：真的发 `setKeepScreenOn`、**同值不重复发**
 //      （去重）、异常被吞掉不抛。
 //
-// 播放页什么时候开/关（暂停、播完、报错、听视频、dispose、退后台、设置关）
-// 由 `test/player_keep_screen_on_test.dart` 用播放器桩 + 通道调用序列钉住。
+// 播放页什么时候开/关（暂停、播完、报错、听视频、小窗、dispose、退后台、设置关）
+// 由 `test/player_keep_screen_on_test.dart` / `test/player_pip_test.dart` 用
+// 播放器桩 + 通道调用序列钉住。
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
@@ -23,6 +25,7 @@ bool _invoke({
   bool hasError = false,
   bool listenMode = false,
   bool foreground = true,
+  bool inPip = false,
 }) =>
     shouldKeepScreenOn(
       settingEnabled: settingEnabled,
@@ -32,6 +35,7 @@ bool _invoke({
       hasError: hasError,
       listenMode: listenMode,
       foreground: foreground,
+      inPip: inPip,
     );
 
 /// 记录通道调用（真实可观测：mock handler 收到什么就是发了什么）。
@@ -61,7 +65,7 @@ class _Rec {
 }
 
 void main() {
-  testWidgets('判据：七条全成立才亮屏；任一条不成立就关', (tester) async {
+  testWidgets('判据：八条全成立才亮屏；任一条不成立就关', (tester) async {
     expect(_invoke(), isTrue, reason: '设置开 + 在播 + 有画面 + 前台 = 亮屏');
 
     // 逐条关掉一个维度 → 都必须变成「不亮屏」
@@ -73,6 +77,8 @@ void main() {
     expect(_invoke(listenMode: true), isFalse,
         reason: '听视频（音频-only）：用户就是要熄屏听，亮屏反而费电');
     expect(_invoke(foreground: false), isFalse, reason: 'App 退到后台');
+    expect(_invoke(inPip: true), isFalse,
+        reason: '小窗（画中画）里不亮屏：用户已经去看别的 App 了，拦着息屏纯耗电');
   });
 
   testWidgets('setEnabled(true/false) 各只发一次，载荷与值一致', (tester) async {

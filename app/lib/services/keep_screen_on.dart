@@ -18,6 +18,8 @@ const String kKeepScreenOnChannel = 'bili_whitelist/keep_screen_on';
 /// - [hasError] 为 false：播放失败 / 错误态 → 关（屏幕上没有画面可看）；
 /// - [listenMode] 为 false：**「听视频」（音频-only）模式下不亮屏** —— 那时
 ///   用户就是要熄屏听，亮着屏反而是耗电；
+/// - [inPip] 为 false（v2.63.0）：**小窗（画中画）里不亮屏** —— 小窗的存在意义
+///   就是用户切去看别的 App，这时拦着系统息屏纯属耗电；点回全屏会重新判定；
 /// - [foreground]：App 在前台（`AppLifecycleState.resumed`）。退到后台一律关，
 ///   绝不在后台拦着系统息屏。
 bool shouldKeepScreenOn({
@@ -28,6 +30,7 @@ bool shouldKeepScreenOn({
   required bool hasError,
   required bool listenMode,
   required bool foreground,
+  bool inPip = false,
 }) {
   if (!settingEnabled) return false;
   if (!playing) return false;
@@ -35,6 +38,7 @@ bool shouldKeepScreenOn({
   if (completed) return false;
   if (hasError) return false;
   if (listenMode) return false;
+  if (inPip) return false;
   return foreground;
 }
 
