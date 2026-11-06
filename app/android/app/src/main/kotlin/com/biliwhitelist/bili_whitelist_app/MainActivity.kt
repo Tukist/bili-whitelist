@@ -53,6 +53,9 @@ class MainActivity : FlutterActivity() {
         // 播放时保持亮屏（v2.60.0）：窗口 FLAG_KEEP_SCREEN_ON。
         // 不需要权限、也不持 WakeLock（理由见 KeepScreenOnPlugin 文件头）。
         KeepScreenOnPlugin(this).register(flutterEngine)
+        // 播放页「更多 → 分享」（v2.62.0）：Intent.ACTION_SEND + createChooser。
+        // 不需要权限、不联网（理由见 SharePlugin 文件头）。
+        SharePlugin(this).register(flutterEngine)
     }
 
     /**

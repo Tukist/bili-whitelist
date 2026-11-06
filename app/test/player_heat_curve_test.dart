@@ -27,7 +27,7 @@ import 'package:bili_whitelist_app/widgets/heat_curve_bar.dart';
 
 const String _kBvid = 'BV1HEAT00001';
 
-/// 取流时长（ms）：200s → 默认桶宽 10s = 20 个桶。
+/// 取流时长（ms）：200s → 默认桶宽 5s = 40 个桶（v2.62.0 起桶宽 5s）。
 const int _kDurationMs = 200000;
 
 const Key _kSeekBar = ValueKey('player-seek-bar');
@@ -369,9 +369,10 @@ void main() {
     final curve = _curveOf(tester);
     expect(curve, isNotNull);
     expect(curve!.durationMs, _kDurationMs);
-    expect(curve.values.length, 20, reason: '200s / 10s 一桶 = 20 桶');
+    // v2.62.0：桶宽 10s → 5s，200s 视频从 20 桶变 40 桶（点更多才够光滑）
+    expect(curve.values.length, 40, reason: '200s / 5s 一桶 = 40 桶');
     expect(curve.values.reduce((a, b) => a > b ? a : b), closeTo(1.0, 1e-9),
-        reason: '归一化后峰值恒为 1');
+        reason: '峰值恒为 1（拉伸在峰值处被 clamp 到 1）');
 
     // 位置：曲线带在轨道（进度条行正中）**上方**，且不越出进度条盒
     final seekRect = tester.getRect(find.byKey(_kSeekBar));
@@ -535,10 +536,16 @@ void main() {
     expect(api.cids, [1001]);
     final p1 = _curveOf(tester);
     expect(p1, isNotNull);
+    // v2.62.0：桶宽 10s → 5s，索引整体 ×2
+    // （第 1 桶 = 5~10s；第 32 桶 = 160~165s，属于片尾）
     expect(p1!.values[1], greaterThan(0.5), reason: '第 1 集片头就是高峰');
-    expect(p1.values[18], closeTo(0, 1e-9), reason: '第 1 集片尾没有高峰');
+    expect(p1.values[32], closeTo(0, 1e-9), reason: '第 1 集片尾没有高峰');
 
-    // 底栏「选集」→ 弹窗里点「第2集」
+    // 底栏「更多」→ 弹层里点「选集 1/2」→ 弹窗里点「第2集」
+    // （v2.62.0：选集从底栏收进「更多」，断言目标不变，只多一步入口）
+    await tester.tap(find.byKey(const ValueKey('player-more-button')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
     await tester.tap(find.text('选集 1/2'));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
@@ -552,7 +559,9 @@ void main() {
     expect(p2, isNotNull);
     expect(identical(p1, p2), isFalse, reason: '换集必须重算（新对象）');
     expect(p2!.durationMs, _kDurationMs);
-    expect(p2.values[18], greaterThan(0.5), reason: '第 2 集片尾才是高峰');
+    // v2.62.0：第 2 集的弹幕在 155~183.5s → 峰值落在第 32 桶（160~165s），
+    // 不再是 10s 桶时代的第 18 桶
+    expect(p2.values[32], greaterThan(0.5), reason: '第 2 集片尾才是高峰');
     expect(p2.values[1], closeTo(0, 1e-9));
   });
 

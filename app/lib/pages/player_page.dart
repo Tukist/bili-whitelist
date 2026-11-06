@@ -29,6 +29,7 @@ import '../services/heat_curve.dart';
 import '../services/keep_screen_on.dart';
 import '../services/last_episode_store.dart';
 import '../services/realtime_transcriber.dart';
+import '../services/share_service.dart';
 import '../services/stream_status_store.dart';
 import '../services/ui_prefs_store.dart';
 import '../services/video_shot_service.dart';
@@ -38,6 +39,7 @@ import '../theme/app_motion.dart';
 import '../theme/app_tokens.dart';
 import '../theme/motion_control.dart';
 import '../theme/route_names.dart';
+import '../utils/share_text.dart';
 import '../widgets/app_block.dart';
 import '../widgets/app_snack.dart';
 import '../widgets/charging_badge.dart';
@@ -1141,32 +1143,38 @@ void debugResetToViewCacheForTest() {
 const double kPortraitVideoHeightRatio = 0.6;
 const double kLandscapeVideoHeightRatio = 0.55;
 
-/// 底栏按钮行高度（选集/倍速/听视频/字幕/弹幕/评论/下载/全屏）。
+/// 底栏按钮行高度（竖屏 5 格：倍速 / 清晰度 / 弹幕 / 评论 / 更多；
+/// 全屏 8 格：多出听视频 / 字幕 / 下载 —— **同一行高**，不做两套视觉）。
 ///
 /// [_PlayerPageState._buildSeekRowOnly] 要在进度条行下方留出同样的空档（见其
 /// 注释），两条路径共用本常量。
 ///
-/// 44 → **40**（v2.39.0，用户原话「视频播放窗口下方的功能栏太高。ui美术，
-/// 比例需要改进」）：底栏是**叠在视频区里**的（见 `_buildVideoLayers`），收矮
-/// 只会露出更多画面，不影响视频区 / 评论区高度。竖向内容的实测高度是 36.2dp
-/// （算式见 `_barIconLabel`），44 里有 7.8dp 是纯空白——两行各收 4dp（本行 +
-/// 进度条行 `_PlayerSeekBar.height`）一共让出 **8dp** 画面。**不往 36 收**：
-/// 那会顶到内容且没有余量，中文字体在不同机型上的行高微差就会裁切。
+/// 演进：44 → 40（v2.39.0，用户原话「视频播放窗口下方的功能栏太高。ui美术，
+/// 比例需要改进」）→ **32**（v2.62.0，用户原话「功能栏太高了…略缩模式功能
+/// 不需要这么多」，截图里 9 格标签被挤到右侧截断）。
 ///
-/// 触摸目标：本行 40dp 高，但每格宽 51.4dp（411dp 屏 8 等分；v2.53.0 加入
-/// 「清晰度」后是 9 等分 45.7dp），实际可点区与改动前同量级；真正被 Android
-/// ≥44 规范约束的是进度条行（细轨 + 拖动柄），它的下限单列在
-/// `_PlayerSeekBar.height`。
-const double _kBottomButtonRowHeight = 40;
+/// 32 是**单行横排**形态量出来的下限，不是拍脑袋：
+/// - 竖向内容 = 开关类图标列（图标 18 + 短线槽 2 + 短线 2 = **22**）；
+/// - 上下各留 5dp 呼吸 → 22 + 10 = **32**；文字 11px（行高 13.2）比图标列
+///   矮，不参与决定行高；
+/// - 不往 28 收：那时余量只剩 3dp，中文字体在不同机型上的行高微差就会把标签
+///   顶到裁切（v2.39.0 定下的纪律：宁可留余量，不顶到内容）。
+///
+/// 触摸目标：本行 32dp 高，竖屏五格各 **82.2dp** 宽（411dp 屏 5 等分）、
+/// 全屏八格各 ~114dp 宽（914dp 屏 8 等分，横向空间充足所以格数放回 8）。
+/// Android ≥44 的触摸下限在这里让位给「矮条」的观感（与 B 站底栏同量级，
+/// 且横排后宽度比原来 45.7dp×40dp 的九格宽松一倍）；真正被规范约束的是
+/// 进度条行（细轨 + 拖动柄），它的下限单列在 `_PlayerSeekBar.height`。
+const double _kBottomButtonRowHeight = 32;
 
 /// 底栏控制行总高 = 进度条行（[_PlayerSeekBar.height]）+ 按钮行
-/// （[_kBottomButtonRowHeight]）——v2.39.0 起 40 + 40 = **80**（改动前
-/// 44 + 44 = 88）。
+/// （[_kBottomButtonRowHeight]）——v2.62.0 起 40 + 32 = **72**（v2.39.0 是
+/// 80，再往前是 88）。
 ///
-/// 从两个行高**推导**而不是写死 80：字幕层的悬浮基准
+/// 从两个行高**推导**而不是写死 72：字幕层的悬浮基准
 /// （[subtitleBottomOffset]）必须与控制行顶部保持定值间隙（全屏 30 / 非全屏
 /// 12），写死数字的话下次再调行高就会静默错位——历史上 P5 把控制行 80 → 88
-/// 时就得手工把两个基准各 +8，v2.39.0 再 -8，正是同一个隐患。
+/// 时就得手工把两个基准各 +8，v2.39.0 再 -8、v2.62.0 又 -8，正是同一个隐患。
 /// 上下集行 `_PlaylistRowHeight`（40）**不计入**：它只出现在有播放列表时，
 /// 字幕让开的永远是下面两行。
 const double kPlayerBottomBarHeight =
@@ -1176,10 +1184,10 @@ const double kPlayerBottomBarHeight =
 /// 把「字幕让开控制行」这条几何关系钉进单测（widget 层的字幕文本要在测试里
 /// 真拉到字幕才出现，成本和脆弱度都高于直接测这条关系）。
 ///
-/// 语义（v2.17.0+，v2.39.0 改控制行高度后仍成立）：
+/// 语义（v2.17.0+，v2.39.0 / v2.62.0 改控制行高度后仍成立）：
 /// - 控制层**可见**：抬到控制行顶部之上，全屏 30 / 非全屏 12——这两个间隙是
 ///   历史观感值（全屏画面大、留白可以更松），与 [kPlayerBottomBarHeight] 相加
-///   得到实际 bottom（全屏 110 / 非全屏 92，改动前是 118 / 100）。
+///   得到实际 bottom（v2.62.0 起全屏 102 / 非全屏 84；v2.39.0 是 110 / 92）。
 /// - 控制层**隐藏**（沉浸观影）：贴画面底部，全屏 24 / 非全屏 16——与控制行
 ///   无关的历史取值，故不随控制行高度变化（防字幕跑偏）。
 double subtitleBottomOffset({
@@ -1404,6 +1412,31 @@ const double kMaxViewScale = 4.0;
 
 /// 旋转档位步进（弧度）：π/2 = 90°。手势里的连续旋转角只用于判定换档。
 const double kViewRotationStep = math.pi / 2;
+
+/// 底栏「更多」弹层里的动作（v2.62.0）。
+///
+/// 为什么用枚举 + `showModalBottomSheet` 的返回值（而不是每个 ListTile 里
+/// 直接 `pop()` 完再干活）：弹层收起有 ~200ms 的动画，动作里若还要**再弹
+/// 一个弹层**（选集列表 / 字幕设置 / 下载菜单 / 系统分享面板），同帧叠上去
+/// 两层 pop/push 会互相打架（测试里表现为「同时找到两个 sheet 的同名项」）。
+/// 返回值这条路让「先完全收起，再执行」变成结构保证——与 [_showSpeedSheet]
+/// 返回档位、[_showQualitySheet] 返回清晰度是同一套写法。
+enum _MoreAction {
+  /// 选集（仅多 P 视频）。
+  episodes,
+
+  /// 听视频（音频-only）开关。
+  listen,
+
+  /// 字幕设置面板。
+  subtitles,
+
+  /// 下载 / 缓存菜单。
+  download,
+
+  /// 调起系统分享面板。
+  share,
+}
 
 class PlayerPage extends StatefulWidget {
   final WhitelistVideo video;
@@ -5598,6 +5631,180 @@ class _PlayerPageState extends State<PlayerPage>
   }
 
   // -------------------------------------------------------------------------
+  // 「更多」弹层 + 系统分享（v2.62.0）
+  // -------------------------------------------------------------------------
+
+  /// 「更多」底部弹层：底栏按钮行装不下的功能都在这里。
+  ///
+  /// 写法照 [_showSpeedSheet] / [_showQualitySheet]：`isScrollControlled` 放开
+  /// 高度、`maxHeight` 限在 70% 屏高（横屏可用高度只有 411dp，固定 Column 会被
+  /// 裁）、`useSafeArea` 处理刘海与手势条、`Flexible + ListView(shrinkWrap)`
+  /// 兜底滚动。条目一律 `ListTile`（图标 + 名称），行为与原底栏按钮**逐条
+  /// 一致**——这里只是换了个入口，没有改任何动作的语义。
+  ///
+  /// 返回值驱动（见 [_MoreAction] 的注释）：弹层完全收起后才执行动作。
+  Future<void> _showMoreSheet() async {
+    debugPrint('[player_page] show more sheet, fullscreen=$_fullscreen');
+    final action = await showModalBottomSheet<_MoreAction>(
+      context: context,
+      backgroundColor: const Color(0xFF202023),
+      isScrollControlled: true,
+      useSafeArea: true,
+      constraints: BoxConstraints(
+        maxHeight: MediaQuery.sizeOf(context).height * 0.7,
+      ),
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Padding(
+              padding: EdgeInsets.only(top: 14, bottom: 6),
+              child: Text('更多功能',
+                  style: TextStyle(color: kPlayerOnDim, fontSize: 13)),
+            ),
+            Flexible(
+              child: ListView(
+                shrinkWrap: true,
+                children: _buildMoreItems(sheetContext),
+              ),
+            ),
+            const SizedBox(height: 8),
+          ],
+        ),
+      ),
+    );
+    if (!mounted || action == null) return;
+    switch (action) {
+      case _MoreAction.episodes:
+        await _showEpisodeSheet();
+      case _MoreAction.listen:
+        await _toggleListenMode();
+      case _MoreAction.subtitles:
+        await _showSubtitleSheet();
+      case _MoreAction.download:
+        _onDownloadTap();
+      case _MoreAction.share:
+        await _shareCurrentVideo();
+    }
+  }
+
+  /// 「更多」弹层的条目（顺序 = 使用频率由高到低）。
+  ///
+  /// 每一项的状态文案与原底栏标签**完全一致**（「听视频中」「字幕中」
+  /// 「已缓存」…）——这样「功能挪进弹层」不会让用户失去状态感知，既有测试
+  /// 里对这些文案的断言也只需多一步「先打开更多」。
+  ///
+  /// 条目列表**不随全屏态变化**（全屏时听视频/字幕/下载在按钮行里也有一份）：
+  /// 同一个动作两个入口不冲突，而「弹层内容跟着模式变」会让用户记不住哪一项
+  /// 在哪儿；唯一天然随数据变的是「选集」（只有多 P 才有）。
+  List<Widget> _buildMoreItems(BuildContext sheetContext) {
+    final items = <Widget>[];
+
+    /// 一项：图标 + 名称（+ 可选副标题），点按回传 [_MoreAction]。
+    void add(
+      _MoreAction action,
+      IconData icon,
+      String label, {
+      String? hint,
+      Key? key,
+    }) {
+      items.add(ListTile(
+        key: key,
+        dense: true,
+        leading: Icon(icon, color: kPlayerOn),
+        title: Text(label,
+            style: const TextStyle(color: kPlayerOn, fontSize: 15)),
+        subtitle: hint == null
+            ? null
+            : Text(
+                hint,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(color: kPlayerOnDim, fontSize: 12),
+              ),
+        onTap: () => Navigator.of(sheetContext).pop(action),
+      ));
+    }
+
+    // 选集（仅多 P）：标签保留「选集 N/M」，当前集的分 P 名放进副标题。
+    if (_video.isMultiPage) {
+      add(
+        _MoreAction.episodes,
+        Icons.queue_music,
+        '选集 ${_currentPageIndex + 1}/${_video.pageCount}',
+        hint: _currentPartTitle.isEmpty ? null : _currentPartTitle,
+        key: const ValueKey('player-more-episodes'),
+      );
+    }
+    add(
+      _MoreAction.listen,
+      _listenMode ? Icons.headset : Icons.headset_off,
+      _listenMode ? '听视频中' : '听视频',
+      key: const ValueKey('player-more-listen'),
+    );
+    add(
+      _MoreAction.subtitles,
+      _subtitleEnabled ? Icons.subtitles : Icons.subtitles_off,
+      _subtitleEnabled ? '字幕中' : '字幕',
+      key: const ValueKey('player-more-subtitles'),
+    );
+    // 下载：三态与原 [_buildDownloadControl] 一一对应（未缓存 / 下载中 NN% /
+    // 已缓存），点进去是原来那个「离线下载 / 缓存操作」菜单。
+    final task = _currentTask;
+    final downloading = task != null &&
+        (task.status == DownloadStatus.queued ||
+            task.status == DownloadStatus.downloading);
+    final cached = _currentCached;
+    add(
+      _MoreAction.download,
+      downloading
+          ? Icons.downloading
+          : (cached != null ? Icons.check_circle_outline : Icons.download_outlined),
+      downloading
+          ? (task.progress == null ? '下载中' : '下载中 ${task.percent}%')
+          : (cached != null ? '已缓存' : '下载缓存'),
+      key: const ValueKey('player-more-download'),
+    );
+    // 分享：纯文本，未登录/离线都能用（见 [_shareCurrentVideo]）。
+    add(
+      _MoreAction.share,
+      Icons.share_outlined,
+      '分享',
+      hint: '把标题和链接发给其他 App',
+      key: const ValueKey('player-more-share'),
+    );
+    return items;
+  }
+
+  /// 分享当前视频（v2.62.0）：调起系统分享面板，内容是「标题 + 视频链接」。
+  ///
+  /// 链接规则见 [buildVideoShareUrl]：
+  /// - 多 P 带 `?p=N`（1 起）—— 对方点开落在同一集；
+  /// - 播放超过 10s 时带 `?t=秒` —— 落在同一位置。**10s 以下不带**：片头几秒
+  ///   的定位对谁都没意义，反倒给链接加了一串看不懂的尾巴。
+  ///
+  /// **不发任何网络请求**：分享只是把一段文本递给原生。所以未登录、离线、
+  /// 视频取流失败（错误态）时照样可用——这也是它没挂在登录/联网前置条件下的
+  /// 原因。
+  ///
+  /// 失败（系统里没有能收纯文本的 App / 原生异常 / 通道不存在）→ 一条 SnackBar
+  /// 说清原因，不抛异常、不影响播放。成功则**不提示**：系统分享面板本身就是
+  /// 反馈。
+  Future<void> _shareCurrentVideo() async {
+    final url = buildVideoShareUrl(
+      bvid: _video.bvid,
+      page: _video.isMultiPage ? _currentPageIndex + 1 : null,
+      positionSeconds: _positionMs >= 10000 ? _positionMs ~/ 1000 : null,
+    );
+    final text = buildVideoShareText(title: _video.title, url: url);
+    debugPrint('[player_page] 分享 ${_video.bvid} → $url');
+    final result =
+        await ShareService.shareText(subject: _video.title, text: text);
+    if (!mounted || result.ok) return;
+    _showSnack(result.message);
+  }
+
+  // -------------------------------------------------------------------------
   // 倍速 / 长按 2x / 听视频
   // -------------------------------------------------------------------------
 
@@ -7517,11 +7724,12 @@ class _PlayerPageState extends State<PlayerPage>
       ..hideCurrentSnackBar()
       ..showSnackBar(SnackBar(
         content: Text(message),
-        // 悬浮在底部控制行（进度条行 40 + 按钮行 40 = 80px，v2.39.0 起，
-        // 与 [kPlayerBottomBarHeight] 同一口径）之上，
-        // 避免「从头播放」action 与全屏按钮区域重叠误触
+        // 悬浮在底部控制行（[kPlayerBottomBarHeight] = 72px：进度条行 40 +
+        // 按钮行 32，v2.62.0 起；v2.39.0 是 80）之上，避免「从头播放」
+        // action 与进度条/全屏键那一带重叠误触
         behavior: SnackBarBehavior.floating,
-        margin: const EdgeInsets.only(left: 16, right: 16, bottom: 80),
+        margin: EdgeInsets.only(
+            left: 16, right: 16, bottom: kPlayerBottomBarHeight),
         action: SnackBarAction(label: actionLabel, onPressed: onAction),
       ));
   }
@@ -7568,8 +7776,8 @@ class _PlayerPageState extends State<PlayerPage>
     }
     return InkWell(
       onTap: downloading ? null : _onDownloadTap,
-      // 图标在上、标签在下（见 [_barIconLabel]）——与同级 8 个按钮同一竖排
-      // 语汇，「已缓存」「下载中」等 3 字标签不再被省略号截断
+      // 图标 + 标签横排（见 [_barIconLabel]，v2.62.0 起）——与同级按钮同一
+      // 语汇；「已缓存」「下载中」等 3~4 字标签在 5 格 / 8 格布局里都放得下
       child: _barIconLabel(icon: icon, label: label, color: color),
     );
   }
@@ -8393,14 +8601,15 @@ class _PlayerPageState extends State<PlayerPage>
               ),
             ),
           // 2.5 字幕层：Texture 之上、控制层之下（听视频模式隐藏）。
-          // 底部控制行 [kPlayerBottomBarHeight] = 80px（进度条行 40 + 按钮行 40，
-          // 见 _buildBottomBar），字幕悬浮在其上方。主字幕大号在上，副字幕
-          // 小号在其下（见 _SubtitleOverlay）。
+          // 底部控制行 [kPlayerBottomBarHeight] = 72px（进度条行 40 + 按钮行 32，
+          // v2.62.0 起；v2.39.0 是 80，见 _buildBottomBar），字幕悬浮在其上方。
+          // 主字幕大号在上，副字幕小号在其下（见 _SubtitleOverlay）。
           // v2.17.0+：字幕相对**视频区矩形**底部定位（不再相对整屏）；基准值
           // 全交给纯函数 [subtitleBottomOffset]（控制行可见时 = 控制行高度 +
           // 定值间隙，全屏 30 / 非全屏 12；控制行隐藏时贴画面底部 24 / 16）。
-          // 这样控制行高度再变也只需改一处，字幕不会静默错位——P5（80 → 88）
-          // 与 v2.39.0（88 → 80）两次都踩过「数字散落两处」。纯函数同时可单测。
+          // 这样控制行高度再变也只需改一处，字幕不会静默错位——P5（80 → 88）、
+          // v2.39.0（88 → 80）、v2.62.0（80 → 72）三次都靠它自动跟随。
+          // 纯函数同时可单测。
           if (!_listenMode &&
               _subtitleEnabled &&
               (_mainSubtitleText.isNotEmpty ||
@@ -8513,9 +8722,10 @@ class _PlayerPageState extends State<PlayerPage>
           //     变换可用（全屏或横屏置顶）时才有；**跟随控制层显隐**（v2.53.0，
           //     用户原话：「视频播放界面的旋转能不能在默认隐藏只有点击唤起的时候
           //     再出现?」）——默认收着，点画面唤起控制层时与播放控制一起出现，
-          //     再点一起消失。悬浮在底栏之上（**不进底栏那一行**——9 等分已经
-          //     每格 45.7dp，再挤第 10 个按钮会把「选集 1/2」「听视频中」压到
-          //     省略号）。
+          //     再点一起消失。悬浮在底栏之上（**不进底栏那一行**——按钮行
+          //     v2.62.0 收成 5 格、每格 82.2dp 虽然宽松了，但这一排是画面
+          //     变换工具、与播放控制不同频，塞进底栏会让「最常用的 5 个」
+          //     这条标准失效）。
           //
           //     ⚠️ 唯一的例外：**画面已经被变换过**（缩放 ≠1 或旋转 ≠0）时这一排
           //     常驻。理由见 [_buildViewControls] 的注释（一句话：转过画面之后
@@ -8887,12 +9097,11 @@ class _PlayerPageState extends State<PlayerPage>
         ),
         // 写操作行（v2.40.0+，默认关闭）：点赞 / 投币 / 收藏。
         //
-        // 落点为什么在这里（信息块里独立一行，**不是底栏**）：底栏按钮行是
-        // 40dp 高、411dp 屏上 9 等分后每格 45.7dp，标签靠 FittedBox 缩字才
-        // 不省略（见 _barIconLabel 的注释）——再塞第 10 个按钮就真要把
-        // 「选集 1/2」这类文案压掉了（v2.39.0 的那条约束到 v2.53.0 加「清晰度」
-        // 时已经用掉多半余量）；而信息块这一行本来就贴着
-        // 标题/UP 主，是"关于这个视频"的信息集中地，写操作放在这里语义最近。
+        // 落点为什么在这里（信息块里独立一行，**不是底栏**）：底栏按钮行
+        // v2.62.0 起只留 5 格最常用的动作（倍速/清晰度/弹幕/评论/更多），
+        // 点赞/投币/收藏属于「关于这个视频的写操作」，与播放控制不同频；
+        // 而信息块这一行本来就贴着标题/UP 主，是"关于这个视频"的信息集中地，
+        // 写操作放在这里语义最近（v2.40.0 起就是这个位置，本批未动）。
         //
         // 为什么套 ListenableBuilder：设置页那个总开关可能在播放页还活着
         // 的时候被改（播放页在路由栈下层），监听 store 才能一回来就对上。
@@ -9663,9 +9872,10 @@ class _PlayerPageState extends State<PlayerPage>
   /// ——**旋转** + **复位**（有变换时才出现）。
   ///
   /// 位置：`bottom: 底栏高度 + 上下集行（若有）+ 12`——**不进底栏那一行**
-  /// （9 等分每格 45.7dp，再挤第 10 个按钮会压垮「选集 1/2」这类文案，见 ② 的
-  /// 约束）；也不放中央（会与播放簇抢点击）。这一带在竖屏 / 横屏置顶 / 全屏
-  /// 三种形态下都是空白（中央簇垂直居中、底栏贴底），不会盖住任何既有控件。
+  /// （按钮行 v2.62.0 只留 5 个最常用的动作，「旋转/复位」是画面变形的
+  /// 工具，不占那 5 格；挪进底栏会让「最常用」这条标准失效）；也不放中央
+  /// （会与播放簇抢点击）。这一带在竖屏 / 横屏置顶 / 全屏三种形态下都是
+  /// 空白（中央簇垂直居中、底栏贴底），不会盖住任何既有控件。
   ///
   /// ## 可见性（v2.53.0 起跟随控制层）
   ///
@@ -10006,64 +10216,62 @@ class _PlayerPageState extends State<PlayerPage>
     );
   }
 
-  /// 底部按钮行的单个按钮内容：**图标在上、标签在下**的竖排单元（v2.18.0）。
+  /// 底部按钮行的单个按钮内容：**图标 + 标签横排**的紧凑单元（v2.62.0）。
   ///
-  /// 为什么改成竖排：8 等分格在 411dp 宽屏（Pixel 7 档）上每格仅 51.4dp，
-  /// 横排时「图标 20 + 间距 4」先吃掉 24dp，标签只剩 27.4dp——而 [kTypeLabel]
-  /// （11px + 字距 0.6 ≈ 11.6dp/字）下 2 个中文字要 23.2dp、3 个字要 34.8dp、
-  /// 4 个字要 46.4dp，**必然**被 `TextOverflow.ellipsis` 截断（实测「选集 1/N」
-  /// 显示成「选⋯」、「听视频」显示成「听⋯」，「听视频中」「字幕中」「已缓存」
-  /// 同理）。竖排后标签独占整格宽：3 字（34.8）与 4 字（46.4）都完整
-  /// 显示，不再有省略号。
+  /// 竖排 → 横排的取舍（这是本批「功能栏太高」的主要手段）：
+  /// - 竖排时代的高度 = 图标列 22 + 间距 1 + 文字 13.2 = **36.2dp**，靠
+  ///   [_kBottomButtonRowHeight]=40 才装得下；横排后**高度只由图标列决定**
+  ///   （22），行高可以收到 32 —— 竖向让出 8dp 画面，观感也从「两块厚饼」
+  ///   变成一条细带；
+  /// - 竖排当初是为了避免标签被截断（9 等分 45.7dp 装不下 4 个中文字）。
+  ///   现在只留 5 格（411dp 屏每格 **82.2dp**），横排后标签仍有 ~59dp 可用，
+  ///   「听视频中」「已缓存」这类 4 字标签（46.4dp）都放得下；
+  /// - [FittedBox]（`scaleDown`，Flutter 内置组件，不引入新依赖）仍是最后一道
+  ///   保险：窄屏 / 超长标签（如「选集 10/100」）整体等比缩进剩余宽度，
+  ///   **不省略、不溢出**（结构上不会有 `RenderFlex overflow`）。
   ///
-  /// v2.53.0 加入「清晰度」后本行是 **9 等分**（411dp 屏每格 45.7dp）：4 字
-  /// 标签（46.4dp）刚好越过格宽 0.7dp → 交给下面的 [FittedBox] 缩掉约 1.5%
-  /// （仍是完整文字、无省略号）；3 字与英文数字标签（「1080P」≈ 40dp）照旧
-  /// 原尺寸。字号不再往下调：[kTypeLabel] 11px 已是这个高度的下限。
-  ///
-  /// [FittedBox]（`scaleDown`，Flutter 内置组件，不引入新依赖）是最后一道
-  /// 保险：极端长度（如「选集 1/100」≈ 56dp 超出整格）整体等比缩到格宽以内
-  /// 而**不省略**；正常长度缩放比 = 1，字号仍是 [kTypeLabel]，字阶不乱。
-  /// 竖排单元高 = 图标（开关类 18 + 短线槽 2 + 短线 2 = 22，非开关类 18）
-  /// + 间距 + 单行文字 13.2：最坏情况（开关类按钮，如「听视频中」「字幕中」）
-  /// 22 + 1 + 13.2 = **36.2** ＜ 按钮行 [_kBottomButtonRowHeight] 40，仍留
-  /// 3.8dp 余量（v2.39.0 起把图标 20 → 18、间距 2 → 1，就是为了在行高收 4dp
-  /// 之后保住这段余量——图标或文字一旦顶到行高它俩就会被竖向挤压裁切）。
-  /// 点击回调、按钮顺序全部照旧。
+  /// 垂直居中：Row 默认 `CrossAxisAlignment.center`，图标列（22 高）在 32 高的
+  /// 行里上下各余 5dp；文字（13.2）对齐图标列中线微偏下 4dp——这是刻意的：
+  /// 开启态图标下方那条短线会把它往下拉，居中对齐后两种状态的字不会跳。
   Widget _barIconLabel({
     required Widget icon,
     required String label,
     required Color color,
   }) {
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        icon,
-        const SizedBox(height: 1),
-        SizedBox(
-          // 撑满整格宽（Column 交叉轴对子级是松约束，infinity 会夹到格宽），
-          // 让 FittedBox 拿到确定的可用宽度
-          width: double.infinity,
-          child: FittedBox(
-            fit: BoxFit.scaleDown,
-            child: Text(
-              label,
-              // softWrap: false 且不设 maxLines：文本按自然宽度单行排版（不受
-              // 格宽约束 → 结构上不可能出现省略号），超宽交给 FittedBox 缩放
-              softWrap: false,
-              style: kTypeLabel.copyWith(color: color),
+    return Padding(
+      // 左右各 6：五格 82.2dp 下留给内容的宽度 = 70.2，够「图标 18 + 间距 5 +
+      // 4 字标签 46.4」，又让相邻两格的文字之间留有呼吸（不会读成一长串）
+      padding: const EdgeInsets.symmetric(horizontal: 6),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          icon,
+          const SizedBox(width: 5),
+          // Flexible（loose）：图标先拿定尺寸，剩下多少给标签；标签超宽时由
+          // 下面的 FittedBox 等比缩到这一份宽度里
+          Flexible(
+            child: FittedBox(
+              fit: BoxFit.scaleDown,
+              child: Text(
+                label,
+                // softWrap: false 且不设 maxLines：文本按自然宽度单行排版（不受
+                // 格宽约束 → 结构上不可能出现省略号），超宽交给 FittedBox 缩放
+                softWrap: false,
+                style: kTypeLabel.copyWith(color: color),
+              ),
             ),
           ),
-        ),
-      ],
+        ],
+      ),
     );
   }
 
-  /// 进度条行：两端时间文本 + 自绘 [_PlayerSeekBar] + 预览浮层。
+  /// 进度条行：两端时间文本 + 自绘 [_PlayerSeekBar] + 预览浮层 + 全屏键
+  /// （v2.62.0 起「全屏」也压在这一行右端，见 [_seekFullscreenButton]）。
   ///
   /// 单独成方法是因为**手势横滑 seek 时控制层可能是收着的**（用户点画面隐藏
   /// 过）——那时只把这一行浮出来就够了（见 [_buildSeekRowOnly]），没必要把
-  /// 顶栏 / 中央播放簇 / 9 个按钮整套弹出来。两条路径共用同一份行实现，
+  /// 顶栏 / 中央播放簇 / 按钮行整套弹出来。两条路径共用同一份行实现，
   /// 进度条盒与气泡坐标系自然一致。
   Widget _buildSeekRow() {
     return SizedBox(
@@ -10142,7 +10350,39 @@ class _PlayerPageState extends State<PlayerPage>
           ),
           Text(_fmtMs(_durationMs),
               style: kTypeNum.copyWith(color: kPlayerOn)),
+          // 全屏键（v2.62.0）：从按钮行挪到进度条行右端——「时间 / 进度 /
+          // 全屏」压在同一行，与 B 站官方 App 的形态一致，且**零新增高度**
+          // （这一行本来就是 40dp）。按钮行因此只剩 5 格。
+          _seekFullscreenButton(),
         ],
+      ),
+    );
+  }
+
+  /// 进度条行右端的全屏键（v2.62.0）。
+  ///
+  /// 为什么不是留在按钮行：按钮行收成 5 格（倍速 / 清晰度 / 弹幕 / 评论 /
+  /// 更多）之后没位置了，而全屏又必须**常在**——它是全屏态唯一的显性出口
+  /// （顶栏返回键也能退，但「返回」和「退出全屏」在用户心里不是一回事）。
+  /// 挂在进度条行右端是本批成本最低的做法：不加高度、不动手势层、不动
+  /// 按钮行，且这个位置正是 B 站官方 App 放全屏键的地方。
+  ///
+  /// 尺寸：40 宽 × 行高 40 —— 宽度略低于 Android 44dp 的触摸下限，但它左右
+  /// 都不挨着别的可点元素（左边是时长文本、右边是行尾），实际误触风险为零。
+  Widget _seekFullscreenButton() {
+    return SizedBox(
+      key: const ValueKey('player-seek-fullscreen'),
+      width: 40,
+      height: _PlayerSeekBar.height,
+      child: InkWell(
+        onTap: _toggleFullscreen,
+        child: Center(
+          child: Icon(
+            _fullscreen ? Icons.fullscreen_exit : Icons.fullscreen,
+            color: kPlayerOn,
+            size: 20,
+          ),
+        ),
       ),
     );
   }
@@ -10150,7 +10390,7 @@ class _PlayerPageState extends State<PlayerPage>
   /// 手势横滑 seek 且控制层收着时，只把进度条行浮出来。
   ///
   /// 为什么不是直接显示整套控制层：横滑 seek 的诉求是「手柄跟着手指 +
-  /// 气泡贴着进度条」，顶栏 / 中央播放簇 / 9 个按钮一起弹出来只会更干扰；
+  /// 气泡贴着进度条」，顶栏 / 中央播放簇 / 整个按钮行一起弹出来只会更干扰；
   /// 而控制层的显隐是用户点画面定下的偏好，不该被一次 seek 改掉
   /// （所以不动 [_controlsVisible]）。
   ///
@@ -10203,10 +10443,9 @@ class _PlayerPageState extends State<PlayerPage>
   /// 底栏「上一集 / 第 N/M 集 / 下一集」行（v2.30.0+ 同合集上下集）。
   ///
   /// 为什么放在底栏、且**单独一行**：
-  /// - 不挤占既有按钮行：那一行在 411dp 宽屏上 9 等分后每格仅 45.7dp
-  ///   （v2.53.0 加「清晰度」之前是 8 等分 51.4dp），为了不出现省略号才特意
-  ///   改成竖排 + FittedBox（见 [_barIconLabel]）；再塞三个按钮必然
-  ///   压垮「选集 1/2」「听视频中」这些既有文案。所以不碰它；
+  /// - 不挤占按钮行：那一行 v2.62.0 起只有 5 格（倍速/清晰度/弹幕/评论/
+  ///   更多），每格 82.2dp，「上一集 / 下一集」这种整行导航塞进去就没地方
+  ///   放标签了（横排单元装不下「上一集」+ 图标的同时还保住其余 5 格）；
   /// - 也不用中央控制簇：视频区过矮（[compactEmbedded]）时整个中央簇会被
   ///   收起，放那里会在横屏置顶/超宽视频下消失。底栏在竖屏 / 横屏置顶 /
   ///   横屏全屏三种形态下都渲染；
@@ -10333,25 +10572,59 @@ class _PlayerPageState extends State<PlayerPage>
     );
   }
 
+  /// 按钮行的一格（v2.62.0）：[Expanded] + [InkWell] + [_barIconLabel]。
+  ///
+  /// 抽出来只为让 [_buildBottomBar] 的按钮顺序一眼可读（五个 Expanded 包
+  /// InkWell 包 _barIconLabel 的三层嵌套抄五遍，读代码时全是括号）。
+  /// 开关类图标的「开启短线」在 [icon] 里（见 [_barToggleIcon]），颜色由
+  /// 调用方按状态给——两者合起来才是完整的状态表达。
+  Widget _barCell({
+    Key? key,
+    required VoidCallback? onTap,
+    VoidCallback? onLongPress,
+    required Widget icon,
+    required String label,
+    required Color color,
+  }) {
+    return Expanded(
+      child: InkWell(
+        key: key,
+        onTap: onTap,
+        onLongPress: onLongPress,
+        child: _barIconLabel(icon: icon, label: label, color: color),
+      ),
+    );
+  }
+
   Widget _buildBottomBar() {
     return Container(
       // 测试锚点：底栏整体（几何断言量它的高度 = 上下集行 40 + 进度条行 40 +
-      // 按钮行 40；无播放列表时不含第一项）。手势 seek 单独浮出的那一份
+      // 按钮行 32；无播放列表时不含第一项）。手势 seek 单独浮出的那一份
       // （[_buildSeekRowOnly]）**不挂 key**——它是另一条渲染路径，锚点会撞车。
       key: const ValueKey('player-bottom-bar'),
       decoration: _kBottomBarScrim,
-      // 两行结构：进度条行（[_buildSeekRow]，[_PlayerSeekBar.height] = 40）+
-      // 按钮行（[_kBottomButtonRowHeight] = 40：选集/倍速/清晰度/听视频/字幕/
-      // 弹幕/评论/下载/全屏）；合计 [kPlayerBottomBarHeight] = 80。
+      // 两行结构（v2.62.0）：进度条行（[_buildSeekRow]，[_PlayerSeekBar.height]
+      // = 40，右端带全屏键）+ 按钮行（[_kBottomButtonRowHeight] = **32**）；
+      // 合计 [kPlayerBottomBarHeight] = **72**（v2.39.0 是 80，再往前 88）。
+      //
+      // v2.62.0 的两处改动（用户原话「功能栏太高了…略缩模式功能不需要这么
+      // 多」，配图里 9 格标签被挤到右侧截断）：
+      // 1. **压扁**：按钮单元从「图标在上、标签在下」改成横排一行，行高
+      //    40 → 32（算式见 [_kBottomButtonRowHeight]）；
+      // 2. **精简**：竖屏只留 5 格（倍速 / 清晰度 / 弹幕 / 评论 / 更多），
+      //    其余的（选集 / 听视频 / 字幕 / 下载 / 分享）进「更多」弹层
+      //    （[_showMoreSheet]）。全屏态横向空间充足，放 8 格——同一套横排
+      //    语汇、同一套高度，不做两套视觉。
       //
       // P5：进度条行不用原生 Slider——Slider 在「有界高度」约束下会撑满整个
       // 高度（_RenderSlider 布局取 constraints.maxHeight）并吞掉中心播放/暂停
       // 与返回按钮的点击，且两端内建 24px 边距让细轨几何不可控。改为自绘后
       // 轨道位置 / 命中区 / 柄形状全部自定（见 [_PlayerSeekBar] 类注释）。
       // 行高沿革：P5 曾把进度条行 36 → 44 以满足 ≥44 触摸目标（控制行 80 → 88）；
-      // v2.39.0 用户要求「功能栏太高、比例要改进」→ 两行各回 40（控制行 **80**），
-      // 字幕悬浮基准改用 [kPlayerBottomBarHeight] 推导自动跟随（见 [_buildVideoLayers]
-      // 字幕层的 bottom 取值与 [kPlayerBottomBarHeight] 注释）。底栏叠在视频区里，
+      // v2.39.0 用户要求「功能栏太高、比例要改进」→ 两行各回 40（控制行 **80**）；
+      // v2.62.0 按钮行再收 40 → 32（控制行 **72**）。字幕悬浮基准全程用
+      // [kPlayerBottomBarHeight] 推导自动跟随（见 [_buildVideoLayers] 字幕层
+      // 的 bottom 取值与 [kPlayerBottomBarHeight] 注释）。底栏叠在视频区里，
       // 收矮只多露画面，不动视频区/评论区几何。
       // v2.17.0+：底部 SafeArea 只在全屏吃系统底 inset——非全屏（竖屏 /
       // 横屏置顶）时本行位于视频区黑盒底部（屏幕中部，不在屏底），系统
@@ -10368,37 +10641,30 @@ class _PlayerPageState extends State<PlayerPage>
             // 收藏夹…）这里一个像素都不多，底栏与改动前逐像素一致。
             if (_hasEpisodeNav) _buildPlaylistRow(),
             _buildSeekRow(),
+            // 按钮行（v2.62.0）：**竖屏 5 格 / 全屏 8 格**，格数与顺序都钉在
+            // `test/player_bottom_bar_items_test.dart` 里。
+            //
+            // 竖屏为什么是这 5 个（调用频率 + 「有状态可看」两条标准）：
+            // - 倍速：高频，标签带当前档位；
+            // - 清晰度：高频，标签带**本次实际下发**的档位；
+            // - 弹幕：高频开关，开启态有短线 + 变色两重表达；
+            // - 评论：竖屏下就是「滚到下面的评论区」的一键入口，与 B 站同位；
+            // - 更多：其余功能的唯一入口。
+            // 进「更多」的：选集（多 P 才出现，中间位置信息由上下集行
+            // 「2/3 P」照看）、听视频、字幕、下载、分享。
             SizedBox(
+              key: const ValueKey('player-button-row'),
               height: _kBottomButtonRowHeight,
               child: Row(
                 children: [
-                  // 选集按钮：仅多 P 显示（当前集 1/N），点按弹出选集列表。
-                  // 非开关（导航动作）→ 恒定纸白，无「开启标记」短线。
-                  if (_video.isMultiPage)
-                    Expanded(
-                      child: InkWell(
-                        onTap: _player == null ? null : _showEpisodeSheet,
-                        child: _barIconLabel(
-                          icon: const Icon(Icons.queue_music,
-                              color: kPlayerOn, size: 18),
-                          label:
-                              '选集 ${_currentPageIndex + 1}/${_video.pageCount}',
-                          color: kPlayerOn,
-                        ),
-                      ),
-                    ),
                   // 倍速按钮：显示当前档位，点按弹出九档选择。
                   // 非开关（档位由文字自明）→ 恒定纸白，无短线。
-                  Expanded(
-                    child: InkWell(
-                      onTap: _player == null ? null : _showSpeedSheet,
-                      child: _barIconLabel(
-                        icon: const Icon(Icons.speed,
-                            color: kPlayerOn, size: 18),
-                        label: _fmtSpeed(_speed),
-                        color: kPlayerOn,
-                      ),
-                    ),
+                  _barCell(
+                    key: const ValueKey('player-speed-button'),
+                    onTap: _player == null ? null : _showSpeedSheet,
+                    icon: const Icon(Icons.speed, color: kPlayerOn, size: 18),
+                    label: _fmtSpeed(_speed),
+                    color: kPlayerOn,
                   ),
                   // 清晰度按钮（v2.53.0+）：显示**这次实际下发**的档位（回落过
                   // 就显示回落后的那一档——标签跟画面走，不跟用户的意愿走），
@@ -10407,99 +10673,88 @@ class _PlayerPageState extends State<PlayerPage>
                   // 为什么标签用 [_streamQuality] 而不是 [_qualityQn]：取流尚未
                   // 成功（`_streamQuality == 0`）时无档位可说 → 显示「清晰度」并
                   // 禁用入口（`onTap: null`）；有档位之后它才代表用户选的东西。
-                  // 非开关（档位由文字自明）→ 恒定纸白，无短线。
-                  Expanded(
-                    child: InkWell(
-                      onTap: (_player == null || _streamQuality <= 0)
-                          ? null
-                          : _showQualitySheet,
-                      child: _barIconLabel(
-                        icon: const Icon(Icons.high_quality,
-                            color: kPlayerOn, size: 18),
-                        label: _streamQuality > 0
-                            ? playViewQualityName(_streamQuality)
-                            : '清晰度',
-                        color: kPlayerOn,
-                      ),
-                    ),
+                  _barCell(
+                    key: const ValueKey('player-quality-button'),
+                    onTap: (_player == null || _streamQuality <= 0)
+                        ? null
+                        : _showQualitySheet,
+                    icon: const Icon(Icons.high_quality,
+                        color: kPlayerOn, size: 18),
+                    label: _streamQuality > 0
+                        ? playViewQualityName(_streamQuality)
+                        : '清晰度',
+                    color: kPlayerOn,
                   ),
-                  // 听视频按钮：开关态「纸白 + 图标下方 2×10 纸白短线」
-                  // （短线 = 颜色之外的第二状态载体，Android 无障碍规范：
-                  // 不得只用颜色表达状态）
-                  Expanded(
-                    child: InkWell(
+                  // 听视频 / 字幕（**仅全屏**常驻，v2.62.0）：竖屏收进「更多」。
+                  // 状态照样在图标上表达（开启 = 纸白 + 图标下方短线）。
+                  if (_fullscreen) ...[
+                    _barCell(
+                      key: const ValueKey('player-listen-button'),
                       onTap: _player == null ? null : _toggleListenMode,
-                      child: _barIconLabel(
-                        icon: _barToggleIcon(
-                          _listenMode ? Icons.headset : Icons.headset_off,
-                          on: _listenMode,
-                        ),
-                        label: _listenMode ? '听视频中' : '听视频',
-                        color: _listenMode ? kPlayerOn : kPlayerOff,
+                      icon: _barToggleIcon(
+                        _listenMode ? Icons.headset : Icons.headset_off,
+                        on: _listenMode,
                       ),
+                      label: _listenMode ? '听视频中' : '听视频',
+                      color: _listenMode ? kPlayerOn : kPlayerOff,
                     ),
-                  ),
-                  // 字幕按钮：开关态同上；点按弹出字幕设置（_showSubtitleSheet）
-                  Expanded(
-                    child: InkWell(
+                    _barCell(
+                      key: const ValueKey('player-subtitle-button'),
                       onTap: _player == null ? null : _showSubtitleSheet,
-                      child: _barIconLabel(
-                        icon: _barToggleIcon(
-                          _subtitleEnabled
-                              ? Icons.subtitles
-                              : Icons.subtitles_off,
-                          on: _subtitleEnabled,
-                        ),
-                        label: _subtitleEnabled ? '字幕中' : '字幕',
-                        color: _subtitleEnabled ? kPlayerOn : kPlayerOff,
+                      icon: _barToggleIcon(
+                        _subtitleEnabled
+                            ? Icons.subtitles
+                            : Icons.subtitles_off,
+                        on: _subtitleEnabled,
                       ),
+                      label: _subtitleEnabled ? '字幕中' : '字幕',
+                      color: _subtitleEnabled ? kPlayerOn : kPlayerOff,
                     ),
-                  ),
+                  ],
                   // 弹幕按钮：开关态同上。
                   // 点按 = 开关；长按 = 弹幕设置（屏蔽词/类型/透明度）。
-                  Expanded(
-                    child: InkWell(
-                      onTap: _player == null ? null : _toggleDanmaku,
-                      onLongPress:
-                          _player == null ? null : _showDanmakuSettings,
-                      child: _barIconLabel(
-                        icon: _barToggleIcon(
-                          _danmakuEnabled
-                              ? Icons.chat_bubble
-                              : Icons.chat_bubble_outline,
-                          on: _danmakuEnabled,
-                        ),
-                        label: '弹幕',
-                        color: _danmakuEnabled ? kPlayerOn : kPlayerOff,
-                      ),
+                  _barCell(
+                    key: const ValueKey('player-danmaku-button'),
+                    onTap: _player == null ? null : _toggleDanmaku,
+                    onLongPress:
+                        _player == null ? null : _showDanmakuSettings,
+                    icon: _barToggleIcon(
+                      _danmakuEnabled
+                          ? Icons.chat_bubble
+                          : Icons.chat_bubble_outline,
+                      on: _danmakuEnabled,
                     ),
+                    label: '弹幕',
+                    color: _danmakuEnabled ? kPlayerOn : kPlayerOff,
                   ),
                   // 评论按钮（v2.17.0+；v2.17.17 横屏置顶共用）：非全屏
                   // （竖屏/横屏置顶）= 滚动定位到下方内嵌评论区；
                   // 横屏全屏 = 打开原独立评论页（见 _onCommentsButtonTap）。
                   // 非开关 → 恒定纸白，无短线。
-                  Expanded(
-                    child: InkWell(
-                      onTap: _player == null ? null : _onCommentsButtonTap,
-                      child: _barIconLabel(
-                        icon: const Icon(Icons.comment_outlined,
-                            color: kPlayerOn, size: 18),
-                        label: '评论',
-                        color: kPlayerOn,
-                      ),
-                    ),
+                  _barCell(
+                    key: const ValueKey('player-comments-button'),
+                    onTap: _player == null ? null : _onCommentsButtonTap,
+                    icon: const Icon(Icons.comment_outlined,
+                        color: kPlayerOn, size: 18),
+                    label: '评论',
+                    color: kPlayerOn,
                   ),
-                  // 下载按钮：未缓存「下载」/ 下载中进度环+百分比 / 已缓存「已缓存」
-                  Expanded(child: _buildDownloadControl()),
-                  // 全屏按钮（非开关动作；图标 20 与同级按钮对齐）
-                  Expanded(
-                    child: IconButton(
-                      color: kPlayerOn,
-                      iconSize: 18,
-                      icon: Icon(
-                          _fullscreen ? Icons.fullscreen_exit : Icons.fullscreen),
-                      onPressed: _toggleFullscreen,
-                    ),
+                  // 下载（**仅全屏**，v2.62.0 起竖屏收进「更多」）：
+                  // 未缓存「下载」/ 下载中进度环+百分比 / 已缓存「已缓存」
+                  if (_fullscreen) Expanded(child: _buildDownloadControl()),
+                  // 更多（v2.62.0）：选集 / 听视频 / 字幕 / 下载 / 分享。
+                  // 非开关 → 恒定纸白。
+                  //
+                  // 唯一**不随 `_player` 置灰**的一格：里面装着「分享」，而分享
+                  // 只是把一段文本递给原生（不读流、不联网），取流失败/离线时
+                  // 照样该能用（见 [_shareCurrentVideo]）。其余动作自带 null 守卫。
+                  _barCell(
+                    key: const ValueKey('player-more-button'),
+                    onTap: _showMoreSheet,
+                    icon: const Icon(Icons.more_horiz,
+                        color: kPlayerOn, size: 18),
+                    label: '更多',
+                    color: kPlayerOn,
                   ),
                 ],
               ),
@@ -10833,11 +11088,13 @@ class _PlayerSeekBar extends StatelessWidget {
   ///
   /// 44 → **40**（v2.39.0，见 [_PlayerPageState._kBottomButtonRowHeight] 的
   /// 取值理由）：这一行是**整条轨道通宽**的可点/可拖面（`HitTestBehavior.opaque`
-  /// 铺满 40 高），水平方向 300+dp，垂直方向收 4dp 后横向拖动的跟手区域不变
-  /// ——真正要求 ≥44 的场景是「点一下定位」的竖向容差，而这里点按与拖动都
-  /// 落在同一条 2px 细轨的**放大命中带**上（本组件自己按 dx 取值，dy 不参与），
-  /// 收矮不改变命中语义。旧注解里「44 是为满足 Android ≥44 触摸目标」的说法
-  /// 在 v2.39.0 按「改矮 8dp 让出画面」的用户诉求重新权衡后不再成立，如实更新。
+  /// 铺满 40 高），水平方向 250+dp（411dp 屏：两端时间文本 + 8dp 留白 + 右端
+  /// 40dp 全屏键之后约 257dp，v2.62.0 起），垂直方向收 4dp 后横向拖动的跟手
+  /// 区域不变——真正要求 ≥44 的场景是「点一下定位」的竖向容差，而这里点按与
+  /// 拖动都落在同一条 2px 细轨的**放大命中带**上（本组件自己按 dx 取值，dy
+  /// 不参与），收矮不改变命中语义。旧注解里「44 是为满足 Android ≥44 触摸
+  /// 目标」的说法在 v2.39.0 按「改矮 8dp 让出画面」的用户诉求重新权衡后不再
+  /// 成立，如实更新。
   static const double height = 40;
 
   /// 轨道粗细（px）。

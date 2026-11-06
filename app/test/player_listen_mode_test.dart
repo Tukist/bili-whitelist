@@ -465,12 +465,47 @@ Future<void> _pumpPlayerReady(WidgetTester tester) async {
   await tester.pump(const Duration(milliseconds: 300));
 }
 
-/// 点一下底栏听视频开关并在假时钟里走完 setDataSource + onPrepared。
+/// 打开底栏「更多」弹层（v2.62.0 起听视频 / 字幕 / 下载 / 分享 都收在这里，
+/// 底栏按钮行只留 5 个最常用的动作）。
+Future<void> _openMore(WidgetTester tester) async {
+  await tester.tap(find.byKey(const ValueKey('player-more-button')));
+  await tester.pump();
+  await tester.pump(const Duration(milliseconds: 300)); // 弹层展开动画
+}
+
+/// 关闭「更多」弹层（点弹层上方的遮罩区，与真机操作一致）。
+Future<void> _closeMore(WidgetTester tester) async {
+  await tester.tapAt(const Offset(4, 4));
+  await tester.pump();
+  await tester.pump(const Duration(milliseconds: 300)); // 收起动画
+}
+
+/// 点「更多」弹层里的听视频开关并在假时钟里走完 setDataSource + onPrepared。
+///
+/// 断言目标与改动前完全一致（进入后 videoUrl 为空 / audioOnly=true / 位置不
+/// 清零…），只是入口多了一步：v2.62.0 把「听视频」从底栏挪进了弹层。
 Future<void> _tapListenToggle(WidgetTester tester, String label) async {
+  await _openMore(tester);
   await tester.tap(find.text(label));
   await tester.pump();
+  await tester.pump(const Duration(milliseconds: 300)); // 弹层收起
   await tester.pump();
   await tester.pump(const Duration(milliseconds: 50));
+}
+
+/// 打开「更多」弹层读「听视频」这一项的状态文案，读完关掉弹层。
+///
+/// 替代旧断言 `expect(find.text('听视频中'), findsOneWidget)`（那时按钮常驻
+/// 底栏）——状态容器换到弹层里，**断言的文本与唯一性都没放松**。
+Future<void> _expectListenLabel(WidgetTester tester, String label) async {
+  await _openMore(tester);
+  expect(find.text(label), findsOneWidget,
+      reason: '「更多」弹层的听视频开关文案应为「$label」');
+  if (label == '听视频') {
+    expect(find.text('听视频中'), findsNothing,
+        reason: '未开启态不该出现「听视频中」');
+  }
+  await _closeMore(tester);
 }
 
 Future<void> _mount(WidgetTester tester, WhitelistVideo video) async {
@@ -538,7 +573,7 @@ void main() {
         reason: 'Dart 侧也不许自己去抓流（流请求只由原生播放器发）');
 
     // 占位层如实说明「只加载音频」
-    expect(find.text('听视频中'), findsOneWidget);
+    await _expectListenLabel(tester, '听视频中');
     expect(find.textContaining('只加载音频，不请求视频画面'), findsOneWidget);
 
     // 2) 退出：恢复视频轨（复用已解析 URL，不重取 playurl）+ 位置不丢
@@ -548,7 +583,7 @@ void main() {
     expect(rec.lastVideoUrl, _videoStreamUrl, reason: '退出后视频轨必须回来');
     expect(rec.lastAudioOnly, isFalse, reason: '不再是只听音频');
     expect(rec.lastPositionMs, _kResumeMs, reason: '退出也不回 0');
-    expect(find.text('听视频'), findsOneWidget, reason: '底栏恢复未开启态');
+    await _expectListenLabel(tester, '听视频'); // 底栏恢复未开启态
     expect(
         state.requests.where((u) => u.path.contains('playurl')).length, 1,
         reason: '退出只复用已有 URL，不再打一次 playurl');
@@ -609,11 +644,10 @@ void main() {
 
     await _tapListenToggle(tester, '听视频');
 
-    // 不切模式：不重设数据源（原来的视频继续播），底栏仍是未开启态
+    // 不切模式：不重设数据源（原来的视频继续播），开关仍是未开启态
     expect(rec.dataSources, hasLength(1),
         reason: '拿不到音频轨时不许「静默只播视频」地硬切进去');
-    expect(find.text('听视频'), findsOneWidget);
-    expect(find.text('听视频中'), findsNothing);
+    await _expectListenLabel(tester, '听视频');
     // 明确提示（错误类提示，不被「界面提示」开关静音）
     expect(find.text(kListenNoAudioNotice), findsOneWidget);
   });
@@ -650,6 +684,6 @@ void main() {
     expect(rec.lastPositionMs, _kResumeMs, reason: '回落也带着位置');
     expect(find.text(kListenNoAudioNotice), findsOneWidget,
         reason: '回落必须有可读提示');
-    expect(find.text('听视频'), findsOneWidget, reason: '听视频开关已收起');
+    await _expectListenLabel(tester, '听视频'); // 听视频开关已收起
   });
 }

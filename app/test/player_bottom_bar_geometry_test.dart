@@ -1,18 +1,25 @@
-// 播放页底栏绝对几何断言（v2.39.0 新增）widget + 纯函数测试。
+// 播放页底栏绝对几何断言（v2.39.0 新增，v2.62.0 随「压扁 + 精简」更新）widget
+// + 纯函数测试。
 //
-// 背景（用户原话）：「现在视频播放窗口下方的功能栏太高。ui美术，比例需要改进」
-// ——底栏是**叠在视频区里**的（Stack 上层），所以要真正确认「收矮了 8dp 且没有
-// 收过头」，必须量绝对高度。改动前整个仓库**没有任何测试断言底栏绝对高度**
-// （只有「视频区底部 == 信息行顶部」这类相对关系），所以这里补上：
+// 背景（用户原话，v2.39.0）：「现在视频播放窗口下方的功能栏太高。ui美术，比例
+// 需要改进」；v2.62.0 又说「功能栏太高了…略缩模式功能不需要这么多」——底栏是
+// **叠在视频区里**的（Stack 上层），所以要真正确认「收矮了且没有收过头」，必须
+// 量绝对高度。改动前整个仓库**没有任何测试断言底栏绝对高度**（只有「视频区
+// 底部 == 信息行顶部」这类相对关系），所以这里补上：
 //
-// 1. 纯函数：底栏总高 [kPlayerBottomBarHeight] = 80（进度条行 40 + 按钮行 40），
-//    上下集行 40 单独算；字幕悬浮基准 [subtitleBottomOffset] 与控制行高度的
-//    关系（可见态的间隙恒为全屏 30 / 非全屏 12）——即「字幕基准与播放器几何
-//    一致」。字幕文本要在 widget 层真拉到字幕才出现（要跑通字幕接口 + 切轨道），
-//    代价与脆弱度都高于直接测这条几何关系，故走纯函数。
+// 1. 纯函数：底栏总高 [kPlayerBottomBarHeight] = 72（进度条行 40 + 按钮行 32，
+//    v2.39.0 是 80），上下集行 40 单独算；字幕悬浮基准
+//    [subtitleBottomOffset] 与控制行高度的关系（可见态的间隙恒为全屏 30 /
+//    非全屏 12）——即「字幕基准与播放器几何一致」。字幕文本要在 widget 层真
+//    拉到字幕才出现（要跑通字幕接口 + 切轨道），代价与脆弱度都高于直接测这条
+//    几何关系，故走纯函数。
 // 2. widget：竖屏 411×914（与真机 Pixel 7 逻辑尺寸同档）下量三行与合计——
-//    无播放列表 80、有播放列表 120；进度条行 40、上下集行 40；且底栏**整体落
-//    在视频区内底边**（证明「收矮只多露画面、不动视频区几何」）。
+//    无播放列表 72、有播放列表 112；进度条行 40、上下集行 40、按钮行 **32**；
+//    且底栏**整体落在视频区内底边**（证明「收矮只多露画面、不动视频区几何」）。
+//
+// v2.62.0 的期望值为什么整体下调 8：按钮行 40 → 32（单行横排，算式见
+// `_kBottomButtonRowHeight` 注释）。这里**照旧写死字面量**——拿常量比自己会
+// 变成恒真断言。
 //
 // 环境：mock 播放器通道（setDataSource → onPrepared）+ 假 HTTP（playurl 给
 // DASH 双流，走正常播放态而不是错误态）+ 内存 DownloadManager 替身。
@@ -37,14 +44,20 @@ const Key _kVideoArea = ValueKey('player-video-area');
 const Key _kBottomBar = ValueKey('player-bottom-bar');
 const Key _kSeekBar = ValueKey('player-seek-bar');
 const Key _kPlaylistRowKey = ValueKey('player-playlist-row');
+const Key _kButtonRow = ValueKey('player-button-row');
+const Key _kSeekFullscreen = ValueKey('player-seek-fullscreen');
 
 /// 设计值（与 `_kBottomButtonRowHeight` / `_PlayerSeekBar.height`
 /// 同源，这里**写字面量**才是有效断言：拿常量比自己会变成恒真）。
 const double _kSeekRow = 40;
-const double _kButtonRow = 40;
+const double _kButtonRowHeight = 32;
 const double _kPlaylistRow = 40;
-const double _kBarTotal = 80;
-const double _kBarTotalWithPlaylist = 120;
+const double _kBarTotal = 72;
+const double _kBarTotalWithPlaylist = 112;
+
+/// v2.62.0 的目标上限：功能条（按钮行）≤ 48dp。比 32 高，所以这条断言留着
+/// 是防「下次又长回去」的护栏，不是当前实测值。
+const double _kBarHeightBudget = 48;
 
 WhitelistVideo _video(String bvid, String title) => WhitelistVideo(
       bvid: bvid,
@@ -367,13 +380,15 @@ void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
 
   group('底栏几何（纯函数 / 常量）', () {
-    test('底栏总高 = 进度条行 40 + 按钮行 40 = 80；上下集行 40 不计入', () {
+    test('底栏总高 = 进度条行 40 + 按钮行 32 = 72；上下集行 40 不计入', () {
       expect(kPlayerBottomBarHeight, _kBarTotal,
-          reason: 'v2.39.0：两行各 44 → 40（改动前合计 88）');
-      expect(kPlayerBottomBarHeight, _kSeekRow + _kButtonRow,
+          reason: 'v2.62.0：按钮行 40 → 32（v2.39.0 的 80 再让出 8dp 画面）');
+      expect(kPlayerBottomBarHeight, _kSeekRow + _kButtonRowHeight,
           reason: '总高必须由两行推导（字幕基准挂在它上面）');
       expect(kPlayerBottomBarHeight + _kPlaylistRow, _kBarTotalWithPlaylist,
-          reason: '有上下集行时底栏合计 120（改动前 128，让出 8dp 画面）');
+          reason: '有上下集行时底栏合计 112（v2.39.0 是 120）');
+      expect(_kButtonRowHeight, lessThanOrEqualTo(_kBarHeightBudget),
+          reason: 'v2.62.0 验收线：功能条（按钮行）≤ 48dp');
     });
 
     test('字幕基准 = 控制行高度 + 定值间隙（可见态）；隐藏态不随控制行变', () {
@@ -381,23 +396,23 @@ void main() {
       expect(
         subtitleBottomOffset(fullscreen: true, controlsVisible: true),
         _kBarTotal + 30,
-        reason: '全屏可见 = 80 + 30 = 110（改动前 118，间隙 30 不变）',
+        reason: '全屏可见 = 72 + 30 = 102（v2.39.0 是 110，间隙 30 不变）',
       );
       expect(
         subtitleBottomOffset(fullscreen: false, controlsVisible: true),
         _kBarTotal + 12,
-        reason: '非全屏可见 = 80 + 12 = 92（改动前 100，间隙 12 不变）',
+        reason: '非全屏可见 = 72 + 12 = 84（v2.39.0 是 92，间隙 12 不变）',
       );
       // 显式钉住字面量：改成别的数就说明观感基准被动了，必须有意识
-      expect(subtitleBottomOffset(fullscreen: true, controlsVisible: true), 110);
-      expect(subtitleBottomOffset(fullscreen: false, controlsVisible: true), 92);
+      expect(subtitleBottomOffset(fullscreen: true, controlsVisible: true), 102);
+      expect(subtitleBottomOffset(fullscreen: false, controlsVisible: true), 84);
       // 控制层隐藏（沉浸观影）：贴画面底部，与控制行高度无关
       expect(subtitleBottomOffset(fullscreen: true, controlsVisible: false), 24);
       expect(subtitleBottomOffset(fullscreen: false, controlsVisible: false), 16);
     });
   });
 
-  testWidgets('竖屏无播放列表：底栏高 80（40 + 40），贴在视频区内底边', (tester) async {
+  testWidgets('竖屏无播放列表：底栏高 72（40 + 32），贴在视频区内底边', (tester) async {
     SharedPreferences.setMockInitialValues({});
     HttpOverrides.global = _FakeHttpOverrides();
     addTearDown(() => HttpOverrides.global = null);
@@ -414,22 +429,36 @@ void main() {
     final barRect = tester.getRect(find.byKey(_kBottomBar));
     expect(find.byKey(_kPlaylistRowKey), findsNothing, reason: '无播放列表');
     expect(barRect.height, _kBarTotal,
-        reason: '底栏合计 80（进度条行 40 + 按钮行 40）');
+        reason: '底栏合计 72（进度条行 40 + 按钮行 32）');
     expect(tester.getRect(find.byKey(_kSeekBar)).height, _kSeekRow,
-        reason: '进度条行 40（v2.39.0 由 44 收矮）');
-    // 按钮行 = 合计 - 进度条行（按钮行自身没有 key，用差值得出）
+        reason: '进度条行 40（v2.39.0 由 44 收矮，v2.62.0 未动）');
+    // 按钮行自身挂了 key（v2.62.0），直接量它：既验证 = 32，也验证 ≤ 48 的
+    // 验收线（拿差值算的话，「按钮行没渲染」会被算成 0 而静默通过）
+    final buttonRowRect = tester.getRect(find.byKey(_kButtonRow));
+    expect(buttonRowRect.height, _kButtonRowHeight,
+        reason: '按钮行 32（v2.62.0 由 40 收矮；单行横排，竖向内容 22dp）');
+    expect(buttonRowRect.height, lessThanOrEqualTo(_kBarHeightBudget),
+        reason: '功能条高度 ≤ 48dp（本批验收线）');
     expect(barRect.height - tester.getRect(find.byKey(_kSeekBar)).height,
-        _kButtonRow,
-        reason: '按钮行 40（8 个按钮的竖排单元实测 36.2，余量 3.8）');
-    // 底栏叠在视频区里：底边与视频区底边重合，顶边 = 视频区底 - 80
+        buttonRowRect.height,
+        reason: '合计 = 进度条行 + 按钮行（没有第三行）');
+    // 全屏键（v2.62.0）从按钮行挪到进度条行右端：与进度条行同高，不新增高度
+    final fullscreenRect = tester.getRect(find.byKey(_kSeekFullscreen));
+    expect(fullscreenRect.height, _kSeekRow,
+        reason: '全屏键与进度条行同高（40），不额外占高度');
+    expect(fullscreenRect.right, closeTo(barRect.right, 0.5),
+        reason: '全屏键贴在底栏右端（B 站同位置）');
+    // 底栏叠在视频区里：底边与视频区底边重合，顶边 = 视频区底 - 72
     expect(barRect.bottom, closeTo(videoRect.bottom, 0.5),
         reason: '底栏贴视频区内底边（画面区没被撑高）');
     expect(barRect.top, closeTo(videoRect.bottom - _kBarTotal, 0.5));
     expect(barRect.height, lessThan(videoRect.height),
         reason: '底栏是叠层，不是把视频区顶高');
+    // 布局无溢出：文本超宽由 FittedBox 等比缩，不应抛 RenderFlex overflow
+    expect(tester.takeException(), isNull);
   });
 
-  testWidgets('竖屏有播放列表：底栏高 120（40 + 40 + 40），三行顺序自上而下', (tester) async {
+  testWidgets('竖屏有播放列表：底栏高 112（40 + 40 + 32），三行顺序自上而下', (tester) async {
     SharedPreferences.setMockInitialValues({});
     HttpOverrides.global = _FakeHttpOverrides();
     addTearDown(() => HttpOverrides.global = null);
@@ -455,13 +484,16 @@ void main() {
     final seekRect = tester.getRect(find.byKey(_kSeekBar));
 
     expect(barRect.height, _kBarTotalWithPlaylist,
-        reason: '底栏合计 120（上下集行 40 + 进度条行 40 + 按钮行 40）');
+        reason: '底栏合计 112（上下集行 40 + 进度条行 40 + 按钮行 32）');
     expect(playlistRect.height, _kPlaylistRow, reason: '上下集行 40（未改动）');
     expect(seekRect.height, _kSeekRow, reason: '进度条行 40');
+    expect(tester.getRect(find.byKey(_kButtonRow)).height, _kButtonRowHeight,
+        reason: '按钮行 32');
     expect(playlistRect.top, closeTo(barRect.top, 0.5), reason: '上下集行在底栏最上');
     expect(seekRect.top, closeTo(playlistRect.bottom, 0.5),
         reason: '进度条行紧接其下（顺序未变）');
     expect(barRect.bottom, closeTo(videoRect.bottom, 0.5));
     expect(barRect.top, closeTo(videoRect.bottom - _kBarTotalWithPlaylist, 0.5));
+    expect(tester.takeException(), isNull);
   });
 }

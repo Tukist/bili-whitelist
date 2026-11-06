@@ -106,5 +106,13 @@
             <action android:name="android.intent.action.VIEW"/>
             <data android:mimeType="application/vnd.android.package-archive"/>
         </intent>
+        <!-- 播放页「更多 → 分享」（v2.62.0）：SharePlugin 用
+             queryIntentActivities 判断「系统里有没有 App 能收 text/plain」。
+             API 30+ 的包可见性默认过滤掉看不见的包，不声明这条 query 的话
+             查询恒为空 → 正常设备也会被误判成"没有可分享的 App"。 -->
+        <intent>
+            <action android:name="android.intent.action.SEND"/>
+            <data android:mimeType="text/plain"/>
+        </intent>
     </queries>
 </manifest>

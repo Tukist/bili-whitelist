@@ -824,7 +824,12 @@ void main() {
     );
     expect(h.fetchCalls, ['$_kBvid#1'], reason: '进页 prepare 第 1 集');
 
-    // 底栏「选集」→ 弹窗里点「第2集」
+    // 底栏「更多」→ 弹层里点「选集 1/2」→ 选集弹窗里点「第2集」
+    // （v2.62.0：选集从底栏收进「更多」，断言目标不变，只多一步入口）
+    await tester.tap(find.byKey(const ValueKey('player-more-button')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300));
+    expect(find.text('选集 1/2'), findsOneWidget, reason: '「更多」里带着当前集号');
     await tester.tap(find.text('选集 1/2'));
     await tester.pump();
     await tester.pump(const Duration(milliseconds: 300));
@@ -1053,7 +1058,12 @@ void main() {
     await _pumpPlayer(tester, rec, _video(), service: svc);
 
     final bar = tester.getRect(find.byKey(_kSeekBar));
-    final drag = await _startSeekDrag(tester, bar.width * 0.1);
+    // 起手点 2%（不是 10%）：toX 会先向右「抖」40px 越过 touch slop，
+    // 而 v2.62.0 把全屏键挪进进度条行后轨道窄了 40dp（297 → 257），
+    // 10% 起手 + 40px 抖动会越过 50s 落到第 1 张雪碧图，与本用例
+    // 「全程留在第 0 张（<50s）」的前提冲突。2% 起手抖动后 ≈34s，仍在第 0 张；
+    // 断言本身（同张图内换格、迟到结果必须落地）一条没改。
+    final drag = await _startSeekDrag(tester, bar.width * 0.02);
     // 拖到轨道 5% 处（10s → shot 2，仍是第 0 张）：途中每换一格发一次请求
     await drag.toX(bar.width * 0.05);
 
@@ -1162,8 +1172,11 @@ void main() {
 
     // 第一次拖动就落在预取好的那张图内 → 缩略图立刻有（不再现下现解）
     final bar = tester.getRect(find.byKey(_kSeekBar));
-    final drag = await _startSeekDrag(tester, bar.width * 0.1);
-    await drag.toX(bar.width * 0.2); // 20~40s → shot 4~8，仍是第 0 张
+    // 起手点 2%（不是 10%）：见「同张雪碧图内换格」用例的说明——轨道收窄
+    // 40dp 后，10% 起手 + toX 的 40px 抖动会落到第 1 张雪碧图，那就测不到
+    // 「命中预取」了。2% 起手抖动后 ≈34s、落点 ≈39s，都在第 0 张。
+    final drag = await _startSeekDrag(tester, bar.width * 0.02);
+    await drag.toX(bar.width * 0.2); // 34~39s → shot 6~7，仍是第 0 张
     expect(find.byKey(_kThumb), findsOneWidget, reason: '首次拖动就有缩略图');
     expect(h.loadedUrls.length, 1, reason: '命中预取 → 不重复下载');
 
@@ -1250,12 +1263,17 @@ void main() {
     await swipe.by(const Offset(120, 0), settle: true);
 
     // ① 控制层仍收着，但**进度条行单独浮出来**（手柄要看得见）
-    expect(find.byIcon(Icons.fullscreen), findsNothing,
-        reason: '不把整套控制层弹出来（显隐是用户点画面定下的偏好）');
+    //
+    // v2.62.0：这里原先用「找不到 Icons.fullscreen」来证明「没弹整套控制层」，
+    // 但全屏键本批挪进了**进度条行**（与同一行的时长/轨道一起浮出），这条路
+    // 由不再有区分度。改成直接找按钮行的 key ——「整套控制层」= 顶栏 + 中央簇
+    // + 按钮行，其中最容易被误弹的就是按钮行，断言目标未变。
+    expect(find.byKey(const ValueKey('player-button-row')), findsNothing,
+        reason: '不把整个按钮行弹出来（显隐是用户点画面定下的偏好）');
     final bar = tester.getRect(find.byKey(_kSeekBar));
     expect(bar.height, 40, reason: '进度条行 40（v2.39.0 底栏收矮 8dp，见 ② 用例）');
-    expect(bar.bottom, closeTo(videoRect.bottom - 40, 0.5),
-        reason: '行位置与底栏里那一行一致（下方留出按钮行的高度 40）');
+    expect(bar.bottom, closeTo(videoRect.bottom - 32, 0.5),
+        reason: '行位置与底栏里那一行一致（下方留出按钮行的高度 32，v2.62.0 由 40 收矮）');
     expect(_barShowHandle(tester), isTrue, reason: '手势 seek 中手柄可见');
     expect(_barPositionMs(tester), greaterThan(0),
         reason: '位置跟着目标走 → 手柄与已播段跟手');
@@ -1304,7 +1322,12 @@ void main() {
     final bar = tester.getRect(find.byKey(_kSeekBar));
     final left1 = _overlayRect(tester).left;
 
-    await swipe.by(const Offset(80, 0));
+    // 第二段拖得更远（80 → 200px，v2.62.0）：全屏键挪进进度条行后轨道窄了
+    // 40dp（297 → 257），而气泡固定按缩略图宽度（120dp）预留位置 —— 轨道越窄，
+    // 「气泡左缘仍被夹在轨道左端」的那个区间（前 ~23% 时长）就越长。拖 80px
+    // 落在这个夹取区间里会让两次读数都是 0（不是功能坏了，是采样点落在钳位
+    // 区）。断言本身没放松：仍是「同一段手势里位置越靠后 → 气泡越靠右」。
+    await swipe.by(const Offset(200, 0));
     final left2 = _overlayRect(tester).left;
     expect(left2, greaterThan(left1),
         reason: '位置越靠后 → 气泡越靠右（按位置比例映射，与拖进度条同一套换算）');

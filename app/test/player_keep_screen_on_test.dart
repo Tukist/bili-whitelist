@@ -304,6 +304,20 @@ Future<void> _settle(WidgetTester tester) async {
   await tester.pump();
 }
 
+/// 打开底栏「更多」弹层（v2.62.0：听视频 / 字幕 / 下载 / 分享 都收在这里）。
+Future<void> _openMore(WidgetTester tester) async {
+  await tester.tap(find.byKey(const ValueKey('player-more-button')));
+  await tester.pump();
+  await tester.pump(const Duration(milliseconds: 300));
+}
+
+/// 关闭「更多」弹层（点弹层上方的遮罩区）。
+Future<void> _closeMore(WidgetTester tester) async {
+  await tester.tapAt(const Offset(4, 4));
+  await tester.pump();
+  await tester.pump(const Duration(milliseconds: 300));
+}
+
 Future<void> _mount(WidgetTester tester, _Mocks mocks) async {
   tester.view.devicePixelRatio = 1.0;
   tester.view.physicalSize = const Size(411, 914);
@@ -408,12 +422,18 @@ void main() {
     await _mount(tester, mocks);
     expect(mocks.keepCalls, [true]);
 
+    // v2.62.0：底栏把「听视频」收进「更多」弹层 → 先开弹层再点开关
+    await _openMore(tester);
     await tester.tap(find.text('听视频'));
     await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300)); // 弹层收起
     await tester.pump(const Duration(milliseconds: 100));
     await _settle(tester);
 
+    // 状态容器换到弹层里，断言的文本与唯一性不变
+    await _openMore(tester);
     expect(find.text('听视频中'), findsOneWidget, reason: '确实进入了听视频');
+    await _closeMore(tester);
     expect(mocks.keepCalls.last, isFalse,
         reason: '听视频时用户就是要熄屏听 → 不许亮屏');
 

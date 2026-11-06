@@ -396,8 +396,15 @@ void _mockPlayerChannel(WidgetTester tester, _PlayerRec rec) {
           null));
 }
 
-/// 打开缓存操作菜单：点底栏「已缓存」，等弹出动画。
+/// 打开缓存操作菜单：底栏「更多」→ 弹层「已缓存」→ 缓存操作菜单，等弹出动画。
+///
+/// v2.62.0：下载/缓存从底栏按钮行收进「更多」弹层（底栏只留 5 个最常用动作），
+/// 入口多一步；后面「切到网络流 / 切回本地」的断言全部照旧。弹层里的这一项
+/// 文案仍是「已缓存」（状态语义没变）。
 Future<void> _openCacheMenu(WidgetTester tester) async {
+  await tester.tap(find.byKey(const ValueKey('player-more-button')));
+  await tester.pump();
+  await tester.pump(const Duration(milliseconds: 300)); // 弹层展开
   await tester.tap(find.text('已缓存'));
   await tester.pump();
   await tester.pump(const Duration(milliseconds: 400));

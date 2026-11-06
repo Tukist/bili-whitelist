@@ -764,7 +764,15 @@ void main() {
       // 补上 pages 后：选集 UI 与上下集按钮都出现了
       expect(find.byKey(_kPlaylistRow), findsOneWidget);
       expect(find.textContaining('2/3 P'), findsOneWidget);
+      // v2.62.0：选集从底栏收进「更多」弹层 —— 先把弹层打开再断言「选集 2/3」
+      // （多 P 判定仍由这条文案承载，唯一性断言未放松），断言完关掉弹层
+      await tester.tap(find.byKey(const ValueKey('player-more-button')));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
       expect(find.text('选集 2/3'), findsOneWidget, reason: '多 P 判定同样跟着补上');
+      await tester.tapAt(const Offset(4, 4));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 300));
       expect(_enabled(tester, _kPrevBtn), isTrue, reason: 'P2 有上一集');
       expect(_enabled(tester, _kNextBtn), isTrue);
     });

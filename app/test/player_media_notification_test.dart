@@ -468,7 +468,13 @@ void main() {
     _Mocks(rec).install(tester);
     await _pumpPlayer(tester, rec);
 
-    await tester.tap(find.text('听视频'));
+    // v2.62.0：底栏把「听视频」收进「更多」弹层 → 先开弹层再点开关
+    await tester.tap(find.byKey(const ValueKey('player-more-button')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300)); // 弹层展开
+    await tester.tap(find.byKey(const ValueKey('player-more-listen')));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 300)); // 弹层收起
     await tester.pump();
 
     expect(rec.nowPlaying.last['status'], '后台听视频省流量',
