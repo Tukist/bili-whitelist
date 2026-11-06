@@ -1,5 +1,5 @@
-/// 弹幕显示设置（v2.16.6+，v2.16.13+ 显示区域/开关记忆）：是否开启 /
-/// 屏蔽词 / 屏蔽类型 / 全局透明度 / 显示区域。
+/// 弹幕显示设置（v2.16.6+，v2.16.13+ 显示区域/开关记忆）：
+/// 是否开启 / 屏蔽词 / 屏蔽类型 / 全局透明度 / 显示区域 / 热度曲线（v2.61.0+）。
 ///
 /// 纯数据 + 纯逻辑（无 Flutter UI 依赖，可单测）：
 /// - [shouldBlock]：发射前过滤判定（命中任一屏蔽词 或 所属类型被屏蔽 → 不显示）
@@ -67,6 +67,10 @@ class DanmakuSettings {
   /// 全局透明度（0.2~1.0，1.0=完全不透明，绘制时乘到弹幕颜色 alpha）。
   final double opacity;
 
+  /// 进度条上方的「热度高潮线」（弹幕密度曲线，v2.61.0+）。**默认开**：
+  /// 它与弹幕是否显示无关（弹幕层关着也能只显示曲线），数据同一份。
+  final bool heatCurve;
+
   const DanmakuSettings({
     this.blockWords = const [],
     this.blockScroll = false,
@@ -75,6 +79,7 @@ class DanmakuSettings {
     this.enabled = false,
     this.displayAreaPercent = kDanmakuDisplayAreaMax,
     this.opacity = kDanmakuOpacityMax,
+    this.heatCurve = true,
   });
 
   /// 构造时的入参约束依赖调用方传入已清洗的词；本方法提供标准清洗入口
@@ -128,6 +133,7 @@ class DanmakuSettings {
     bool? enabled,
     int? displayAreaPercent,
     double? opacity,
+    bool? heatCurve,
   }) {
     return DanmakuSettings(
       blockWords: blockWords ?? this.blockWords,
@@ -140,6 +146,7 @@ class DanmakuSettings {
       opacity: (opacity ?? this.opacity)
           .clamp(kDanmakuOpacityMin, kDanmakuOpacityMax)
           .toDouble(),
+      heatCurve: heatCurve ?? this.heatCurve,
     );
   }
 
@@ -162,6 +169,8 @@ class DanmakuSettings {
         'displayAreaPercent': displayAreaPercent,
         // 存 0~1 浮点，四舍五入到万分位避免重复读写的二进制尾巴
         'opacity': (opacity * 10000).round() / 10000.0,
+        // v2.61.0+：热度曲线开关（旧版本读不到 → fromJson 兜默认 true）
+        'heatCurve': heatCurve,
       };
 
   /// 反序列化：字段缺失/类型非法回退默认；blockWords 走 [normalizeWords]
@@ -187,6 +196,9 @@ class DanmakuSettings {
               kDanmakuOpacityMax)
           .clamp(kDanmakuOpacityMin, kDanmakuOpacityMax)
           .toDouble(),
+      // 热度曲线：默认**开**（v2.61.0 之前没有这个字段，不能沿用 flag() 的
+      // false 兜底，否则老用户升级后功能默认静默关闭）；脏值同样回默认开
+      heatCurve: json['heatCurve'] is bool ? json['heatCurve'] as bool : true,
     );
   }
 
@@ -196,5 +208,6 @@ class DanmakuSettings {
       'area=$displayAreaPercent% '
       'words=$blockWords scroll=${blockScroll ? 'X' : '·'}'
       ' top=${blockTop ? 'X' : '·'} bottom=${blockBottom ? 'X' : '·'}'
-      ' opacity=${(opacity * 100).round()}%)';
+      ' opacity=${(opacity * 100).round()}%'
+      ' heat=${heatCurve ? '开' : '关'})';
 }

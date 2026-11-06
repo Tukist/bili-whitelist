@@ -8,6 +8,7 @@ import 'package:flutter_secure_storage/flutter_secure_storage.dart';
 
 import '../config.dart';
 import '../models/article.dart';
+import '../models/article_search_result.dart';
 import '../models/comment.dart';
 import '../models/danmaku.dart';
 import '../models/dynamic_item.dart';
@@ -1975,6 +1976,104 @@ class BiliApi {
         .where((r) => r.roomId > 0 && r.title.isNotEmpty)
         .toList();
     return LiveSearchPageResult(
+      results: results,
+      totalCount: totalCount,
+      hasMore: _computeHasMore(loaded: results.length, totalCount: totalCount),
+    );
+  }
+
+  /// 搜索 B 站专栏（`x/web-interface/wbi/search/type`，search_type=article，
+  /// v2.61.0+）。
+  ///
+  /// 与 [searchVideo] 同封装：WBI 签名 + buvid 指纹 Cookie + 完整浏览器头
+  /// （登录态存在时也会注入 SESSDATA）。**匿名实测可用**（2026-11-06）：不需要
+  /// 登录，返回 20 条真实专栏。
+  ///
+  /// [order] 排序方式——**实测专栏搜索支持**（2026-11-06 同一关键词四档结果的
+  /// 顺序、id 与阅读数都不同，不是服务端忽略参数）：`totalrank` 综合（默认）/
+  /// `click` 最多播放 / `pubdate` 最新发布 / `stow` 最多收藏。所以搜索页对
+  /// 专栏范围照常展示排序 chip。
+  ///
+  /// 返回单页结果 + 总条数 + 是否还有更多（[ArticleSearchPageResult]）。
+  ///
+  /// 错误处理（UI 据此提示）：
+  /// - code=-412 → 抛 [BiliApiException]「搜索接口被风控拦截，请稍后再搜」
+  /// - code=0 但 `data` 只有 `v_voucher`（没有 `result`）→ 抛
+  ///   [BiliApiException]「专栏搜索触发风控校验，请稍后重试」。这是**实测**
+  ///   的第三种形态（连续快速翻页会触发，`code` 仍为 0）：它与「真的没结果」
+  ///   在响应结构上唯一的分辨点就是 `result` 缺席 + `v_voucher` 在场，
+  ///   不能静默当空结果（会让用户以为这词一条专栏都没有）。
+  /// - 其他业务码 → 抛 [BiliApiException]（带接口 message）
+  /// - 网络失败（[DioException]）→ 原样上抛（UI 提示网络失败）
+  /// - code=0 且 `result` 为空数组 → 空 [ArticleSearchPageResult]（真的没结果）
+  ///
+  /// ⚠️ 与 [searchVideo] 同一风控约束：调用方必须控制频率（防抖/手动搜索）。
+  Future<ArticleSearchPageResult> searchArticle(
+    String keyword, {
+    int page = 1,
+    String order = 'totalrank',
+  }) async {
+    await _injectAuth();
+    final (imgKey, subKey) = await _ensureWbiKeys();
+    final params = WbiSigner.encodeWbi(
+      {
+        'search_type': kArticleSearchType,
+        'keyword': keyword,
+        'page': '$page',
+        'page_size': '20',
+        'order': order,
+      },
+      imgKey: imgKey,
+      subKey: subKey,
+    );
+    debugPrint('[bili_api] searchArticle keyword=$keyword page=$page order=$order');
+    final resp = await _dio.get<Map<String, dynamic>>(
+      '/x/web-interface/wbi/search/type',
+      queryParameters: params,
+    );
+    final data = resp.data;
+    final code = data?['code'] as int?;
+    if (code == -412) {
+      throw const BiliApiException(
+        code: -412,
+        message: '搜索接口被风控拦截，请稍后再搜',
+        path: '/x/web-interface/wbi/search/type',
+      );
+    }
+    if (code != 0) {
+      throw BiliApiException(
+        code: code ?? -1,
+        message: data?['message'] as String? ?? '搜索失败',
+        path: '/x/web-interface/wbi/search/type',
+      );
+    }
+    final d = data?['data'] as Map<String, dynamic>?;
+    // 命中数：与 searchVideo 一致，null 时 UI 用「装满 20」兜底
+    final totalRaw = d?['numResults'];
+    final totalCount = (totalRaw is num) ? totalRaw.toInt() : null;
+    final raw = d?['result'];
+    if (raw is! List) {
+      // 风控校验页（实测）：code=0 + 只有 v_voucher + 没有 result
+      if (d != null && d['v_voucher'] != null) {
+        throw const BiliApiException(
+          code: -412,
+          message: '专栏搜索触发风控校验，请稍后重试',
+          path: '/x/web-interface/wbi/search/type',
+        );
+      }
+      return ArticleSearchPageResult(
+        results: const [],
+        totalCount: totalCount,
+        hasMore: false,
+      );
+    }
+    final results = raw
+        .whereType<Map<String, dynamic>>()
+        .map(ArticleSearchResult.fromSearchJson)
+        // 没有 cv 号的条目点不进阅读页，丢弃
+        .where((r) => r.cvid > 0)
+        .toList();
+    return ArticleSearchPageResult(
       results: results,
       totalCount: totalCount,
       hasMore: _computeHasMore(loaded: results.length, totalCount: totalCount),

@@ -1,7 +1,9 @@
 /// 搜索页：三个 Tab ——
 /// - 「全部 B 站」：搜 B 站全网（[BiliApi.searchVideo] 视频 / [BiliApi.searchMedia]
-///   番剧·电影·电视剧，v2.16.5+ / [BiliApi.searchLive] 直播间，v2.28.0+），
-///   视频与剧集结果可一键「加入/整季导入」白名单，直播结果点进站内直播间
+///   番剧·电影·电视剧，v2.16.5+ / [BiliApi.searchLive] 直播间，v2.28.0+ /
+///   [BiliApi.searchArticle] 专栏，v2.61.0+），
+///   视频与剧集结果可一键「加入/整季导入」白名单，直播结果点进站内直播间，
+///   专栏结果点进站内专栏阅读页（[ArticlePage]）
 /// - 「我的白名单」：对当前白名单数据本地过滤（标题 / UP 主包含关键词）
 /// - 「搜索 UP 主」（v2.13.0+）：搜 B 站全网用户（[BiliApi.searchUpowner]），
 ///   结果可一键「关注」（= 加入白名单 UP 主，v2.17.12+ 统一文案）
@@ -30,10 +32,11 @@
 /// 切 Tab / 切类型不影响历史（三个 Tab 共用一份）。
 ///
 /// 翻页与排序（v2.12.1 / v2.16.5）：
-/// - 搜索范围 chip 行：视频 / 番剧 / 电影 / 电视剧 / 直播；切换取消防抖、
+/// - 搜索范围 chip 行：视频 / 番剧 / 电影 / 电视剧 / 直播 / 专栏；切换取消防抖、
 ///   重置分页状态并重新执行 page=1 搜索（media 与直播范围时隐藏排序行——
-///   这两类接口都不支持排序）
-/// - 排序 chip 行（仅视频范围）：综合 / 最多播放 / 最新发布 / 最多收藏
+///   这两类接口都不支持排序；**专栏支持**排序，照常显示，v2.61.0+）
+/// - 排序 chip 行（视频与专栏范围；两类接口实测都支持 order）：综合 / 最多播放 /
+///   最新发布 / 最多收藏
 /// - 上拉加载更多：结果列表底部 ≤200px 触发，自动请求 page+1；按 bvid /
 ///   season_id 去重追加；`hasMore` 为 false 时显示「没有更多了」
 /// - **直播结果不翻页**（v2.28.0+）：只展示第 1 页，见 [_loadMore]
@@ -44,12 +47,12 @@
 /// UP 主 Tab：复用同一套防抖逻辑（不分页排序 chip，因为 search_type=bili_user
 /// 接口只支持默认排序），结果列表用 [UpownerTile] 展示，点整行跳 [UpownerPage]。
 ///
-/// 代次守卫（v2.28.0+）：[_searchGen] 每次发起新搜索自增，三个 `_do*Search`
-/// 与三个 `_loadMore*` 拿到响应时先比对——不相等就丢弃。范围/排序 chip 一点
-/// 就重查，来回快速切时旧响应会晚到并覆盖新结果（此前完全没有守卫）。
+/// 代次守卫（v2.28.0+）：[_searchGen] 每次发起新搜索自增，五个 `_do*Search`
+/// 与四个 `_loadMore*`（直播不翻页）拿到响应时先比对——不相等就丢弃。范围/
+/// 排序 chip 一点就重查，来回快速切时旧响应会晚到并覆盖新结果。
 ///
 /// 块化与动效（批次 4）：
-/// - 四套结果列表（视频 / 番剧媒体 / 直播 / UP 主）各自挂在
+/// - 五套结果列表（视频 / 番剧媒体 / 直播 / UP 主 / 专栏）各自挂在
 ///   [StaggeredListScope] 下，
 ///   每条结果包 [StaggeredEntrance]：首屏逐条推入，翻页追加用更短更密的节奏；
 ///   代次串为 `search.<kind>#<代次>`，每次「重新搜索」自增（换关键词 / 重搜 /
@@ -71,6 +74,7 @@ import 'package:flutter/material.dart';
 
 import '../api/bilibili_api.dart';
 import '../api/github_api.dart';
+import '../models/article_search_result.dart';
 import '../models/live_search_result.dart';
 import '../models/media_search_result.dart';
 import '../models/search_result.dart';
@@ -94,6 +98,7 @@ import '../widgets/smoke_silhouette.dart';
 import '../widgets/staggered_entrance.dart';
 import '../widgets/stale_sync_banner.dart';
 import '../widgets/upowner_tile.dart';
+import 'article_page.dart';
 import 'live_player_page.dart';
 import 'player_page.dart';
 import 'upowner_page.dart';
@@ -108,7 +113,8 @@ enum _SearchScope {
   bangumi(MediaSearchTypes.bangumi, '番剧'),
   film(MediaSearchTypes.film, '电影'),
   tv(MediaSearchTypes.tv, '电视剧'),
-  live(kLiveSearchType, '直播');
+  live(kLiveSearchType, '直播'),
+  article(kArticleSearchType, '专栏');
 
   final String searchType;
   final String label;
@@ -117,20 +123,27 @@ enum _SearchScope {
 
   /// 是否为 media（番剧/电影/电视剧）范围：结果可整季导入。
   ///
-  /// 显式穷举而不是 `this != video`：加了 [live] 之后后者会把直播误判成 media，
-  /// 一路走错分支（media 结果区 + 整季导入）。
+  /// 显式穷举而不是 `this != video`：加了 [live] / [article] 之后后者会把
+  /// 它们误判成 media，一路走错分支（media 结果区 + 整季导入）。
   bool get isMedia => switch (this) {
         bangumi || film || tv => true,
-        video || live => false,
+        video || live || article => false,
       };
 
   /// 是否为直播范围（v2.28.0+）：结果点进站内直播间，不可导入白名单。
   bool get isLive => this == live;
 
+  /// 是否为专栏范围（v2.61.0+）：结果点进专栏阅读页，不可加入白名单。
+  ///
+  /// 与 [isLive] 分开而不是复用 `!isMedia && != video`：两种范围的**跳转目标
+  /// 与卡片形态完全不同**（阅读页 vs 直播间），混在一起早晚写错分支。
+  bool get isArticle => this == article;
+
   /// 结果空态提示里的内容词（「没有找到相关番剧」等）。
   String get emptyMessage => switch (this) {
         video => '视频',
         live => '直播间',
+        article => '专栏',
         bangumi || film || tv => label,
       };
 }
@@ -289,8 +302,19 @@ class _SearchPageState extends State<SearchPage>
   bool _liveSearching = false;
   String? _liveError;
 
-  /// 搜索代次（v2.28.0+）：每次**发起**新搜索自增。三个 `_do*Search` 与
-  /// 三个 `_loadMore*` 在拿到响应后比对——不一致说明这次响应属于已经被
+  /// 专栏搜索状态（v2.61.0+）：与视频 / media / 直播互相独立。
+  ///
+  /// 与 media 同一套分页语义（`numResults` 判 hasMore、按去重键追加），
+  /// 只是结果类型与跳转目标不同（点卡片 → 专栏阅读页 [ArticlePage]）。
+  List<ArticleSearchResult>? _articleResults;
+  bool _articleSearching = false;
+  String? _articleError;
+  int _articlePage = 1;
+  bool _articleHasMore = true;
+  bool _articleLoadingMore = false;
+
+  /// 搜索代次（v2.28.0+）：每次**发起**新搜索自增。五个 `_do*Search` 与
+  /// 四个 `_loadMore*` 在拿到响应后比对——不一致说明这次响应属于已经被
   /// 取代的搜索（换了关键词 / 切了范围 / 切了排序），必须丢弃。
   ///
   /// 加它的直接原因：范围 chip 与排序 chip 都是一点就重查，快速来回切时
@@ -314,15 +338,16 @@ class _SearchPageState extends State<SearchPage>
 
   // ---- 交错入场（批次 4）---------------------------------------------------
 
-  /// 四套结果列表各一本「已入场」账本：活在列表项之外（State 持有），
+  /// 五套结果列表各一本「已入场」账本：活在列表项之外（State 持有），
   /// ListView 回收元素再出现时不重播。
   final EntranceLedger _videoLedger = EntranceLedger();
   final EntranceLedger _mediaLedger = EntranceLedger();
   final EntranceLedger _liveLedger = EntranceLedger();
   final EntranceLedger _upownerLedger = EntranceLedger();
+  final EntranceLedger _articleLedger = EntranceLedger();
 
   /// 数据代次：每次「重新搜索」（换关键词 / 手动重搜 / 切范围 / 切排序）
-  /// 自增 —— 四套列表的代次串里都带上它，配合清空的账本重演一次。
+  /// 自增 —— 五套列表的代次串里都带上它，配合清空的账本重演一次。
   int _reloadToken = 0;
 
   /// 本批次起点（翻页追加时置为「追加前的条数」）：新增项按
@@ -330,6 +355,7 @@ class _SearchPageState extends State<SearchPage>
   int _videoBatchStart = 0;
   int _mediaBatchStart = 0;
   int _upownerBatchStart = 0;
+  int _articleBatchStart = 0;
 
   /// 重新搜索 = 换了一批数据：代次 +1（generation 变）+ 清空账本
   /// （同一个 bvid / seasonId / mid 允许再演一次）。
@@ -482,6 +508,12 @@ class _SearchPageState extends State<SearchPage>
         _upownerPage = 1;
         _upownerHasMore = true;
         _upownerLoadingMore = false;
+        _articleResults = null;
+        _articleError = null;
+        _articleSearching = false;
+        _articlePage = 1;
+        _articleHasMore = true;
+        _articleLoadingMore = false;
       });
       return;
     }
@@ -493,6 +525,13 @@ class _SearchPageState extends State<SearchPage>
         _mediaPage = 1;
         _mediaHasMore = true;
         _mediaLoadingMore = false;
+      });
+    } else if (idx == 0 && _scope.isArticle) {
+      // 专栏范围（v2.61.0+）：重置自己这一组翻页状态
+      setState(() {
+        _articlePage = 1;
+        _articleHasMore = true;
+        _articleLoadingMore = false;
       });
     } else if (idx == 0) {
       setState(() {
@@ -544,6 +583,12 @@ class _SearchPageState extends State<SearchPage>
         _upownerPage = 1;
         _upownerHasMore = true;
         _upownerLoadingMore = false;
+        _articleResults = null;
+        _articleError = null;
+        _articleSearching = false;
+        _articlePage = 1;
+        _articleHasMore = true;
+        _articleLoadingMore = false;
       });
       return;
     }
@@ -556,6 +601,8 @@ class _SearchPageState extends State<SearchPage>
       await _doUpownerSearch();
     } else if (_scope.isLive) {
       await _doLiveSearch();
+    } else if (_scope.isArticle) {
+      await _doArticleSearch();
     } else if (_scope.isMedia) {
       await _doMediaSearch();
     } else {
@@ -626,6 +673,13 @@ class _SearchPageState extends State<SearchPage>
         _mediaPage = 1;
         _mediaHasMore = true;
         _mediaLoadingMore = false;
+      } else if (scope.isArticle) {
+        _articleResults = null;
+        _articleError = null;
+        _articleSearching = false;
+        _articlePage = 1;
+        _articleHasMore = true;
+        _articleLoadingMore = false;
       } else {
         _results = null;
         _searchError = null;
@@ -754,6 +808,54 @@ class _SearchPageState extends State<SearchPage>
     }
   }
 
+  /// 专栏搜索（Tab=0 + 范围=专栏，v2.61.0+）：`search_type=article`。
+  ///
+  /// 与 media 搜索同一套结构（代次守卫 / 独立翻页状态 / 失败分类），差别只在
+  /// 结果类型与跳转目标。**支持排序**（实测 order 四档有效，见
+  /// [BiliApi.searchArticle]），所以排序 chip 对专栏范围照常展示。
+  ///
+  /// 风控校验（`code=0` + 只有 `v_voucher`）由 API 层抛成 [BiliApiException]，
+  /// 这里按「搜索失败 + 重试」呈现，**不会**被当成「没有找到相关专栏」。
+  Future<void> _doArticleSearch() async {
+    final keyword = _keywordCtrl.text.trim();
+    final gen = ++_searchGen;
+    _restartEntrance(_articleLedger);
+    _articleBatchStart = 0;
+    setState(() {
+      _articleSearching = true;
+      _articleError = null;
+      _articlePage = 1;
+      _articleHasMore = true;
+      _articleLoadingMore = false;
+    });
+    try {
+      final page = await _api.searchArticle(
+        keyword,
+        order: _currentOrder,
+      );
+      if (!mounted || gen != _searchGen) return; // 过期响应丢弃
+      setState(() {
+        _articleResults = page.results;
+        _articleHasMore = page.hasMore;
+        _articleSearching = false;
+      });
+    } on BiliApiException catch (e) {
+      if (!mounted || gen != _searchGen) return;
+      setState(() {
+        _articleResults = null;
+        _articleSearching = false;
+        _articleError = '搜索失败：${e.message}';
+      });
+    } on DioException {
+      if (!mounted || gen != _searchGen) return;
+      setState(() {
+        _articleResults = null;
+        _articleSearching = false;
+        _articleError = '网络请求失败，请检查网络后重试';
+      });
+    }
+  }
+
   /// UP 主搜索（Tab=2）：search_type=bili_user，不带排序 chip。
   Future<void> _doUpownerSearch() async {
     final keyword = _keywordCtrl.text.trim();
@@ -817,10 +919,55 @@ class _SearchPageState extends State<SearchPage>
       await _loadMoreUpowner();
     } else if (_scope.isLive) {
       return;
+    } else if (_scope.isArticle) {
+      await _loadMoreArticle();
     } else if (_scope.isMedia) {
       await _loadMoreMedia();
     } else {
       await _loadMoreVideo();
+    }
+  }
+
+  /// 专栏翻页（v2.61.0+）：守卫/去重/失败语义与 media 翻页一致
+  /// （按 cv 号去重追加，排序沿用当前 chip）。
+  Future<void> _loadMoreArticle() async {
+    if (_articleSearching || _articleLoadingMore || !_articleHasMore) return;
+    final base = _articleResults;
+    if (base == null) return;
+    final keyword = _keywordCtrl.text.trim();
+    if (keyword.isEmpty) return;
+    final gen = _searchGen; // 期间若有新搜索，本次追加作废
+    setState(() => _articleLoadingMore = true);
+    final nextPage = _articlePage + 1;
+    try {
+      final page = await _api.searchArticle(
+        keyword,
+        page: nextPage,
+        order: _currentOrder,
+      );
+      if (!mounted || gen != _searchGen) return;
+      final existing = base.map((a) => a.cvid).toSet();
+      final appended = <ArticleSearchResult>[
+        ...base,
+        for (final a in page.results)
+          if (!existing.contains(a.cvid)) a,
+      ];
+      setState(() {
+        _articleResults = appended;
+        _articlePage = nextPage;
+        _articleHasMore = page.hasMore;
+        _articleLoadingMore = false;
+        // 本批新增项的入场序号从 0 起算（旧项已记账不会重播）
+        _articleBatchStart = base.length;
+      });
+    } on BiliApiException catch (e) {
+      if (!mounted || gen != _searchGen) return;
+      setState(() => _articleLoadingMore = false);
+      _showSnack('加载失败：${e.message}，点击重试');
+    } on DioException {
+      if (!mounted || gen != _searchGen) return;
+      setState(() => _articleLoadingMore = false);
+      _showSnack('网络请求失败，请检查网络后重试');
     }
   }
 
@@ -1166,7 +1313,9 @@ class _SearchPageState extends State<SearchPage>
                           ? '搜索 B 站${_scope.label}（可整季导入）'
                           : (_tabCtrl.index == 0 && _scope.isLive
                               ? '搜索 B 站直播间（点结果直接进直播间）'
-                              : '搜索 B 站视频或白名单')),
+                              : (_tabCtrl.index == 0 && _scope.isArticle
+                                  ? '搜索 B 站专栏（点结果直接阅读）'
+                                  : '搜索 B 站视频或白名单'))),
                   border: InputBorder.none,
                   isDense: true,
                 ),
@@ -1276,21 +1425,29 @@ class _SearchPageState extends State<SearchPage>
     return Column(
       children: [
         _buildScopeBar(),
-        if (_scope == _SearchScope.video) _buildOrderBar(),
+        // 排序行：视频与专栏范围都显示（两类接口实测都支持 order）；
+        // media / 直播接口不支持排序 → 不给假 chip。
+        if (_scope == _SearchScope.video || _scope.isArticle) _buildOrderBar(),
         const Divider(height: 1),
         Expanded(
           child: _scope.isLive
               ? _buildLiveResults()
-              : (_scope.isMedia ? _buildMediaResults() : _buildGlobalResults()),
+              : (_scope.isArticle
+                  ? _buildArticleResults()
+                  : (_scope.isMedia
+                      ? _buildMediaResults()
+                      : _buildGlobalResults())),
         ),
       ],
     );
   }
 
-  /// 搜索范围 chip 横行（视频/番剧/电影/电视剧/直播，v2.16.5+，直播 v2.28.0+）。
+  /// 搜索范围 chip 横行（视频/番剧/电影/电视剧/直播/专栏，v2.16.5+，
+  /// 直播 v2.28.0+，专栏 v2.61.0+）。
   ///
   /// media / 直播范围下不显示排序行（这两类接口都不支持 order），排序 chip
-  /// 只在视频范围出现。切换即清结果重搜第 1 页。
+  /// 在视频与**专栏**范围出现（专栏接口实测支持 order）。切换即清结果重搜
+  /// 第 1 页。
   Widget _buildScopeBar() {
     return SingleChildScrollView(
       scrollDirection: Axis.horizontal,
@@ -1803,6 +1960,152 @@ class _SearchPageState extends State<SearchPage>
           title: r.title,
           upName: r.uname,
           upMid: r.uid,
+        ),
+      ),
+    );
+  }
+
+  // ---- 专栏结果（v2.61.0+） ----
+
+  /// 专栏搜索结果区：状态机与 media/直播结果区对齐（搜索中 / 失败重试 /
+  /// 空提示 / 列表 + 底部翻页状态）。
+  ///
+  /// 空态文案与失败态**分开**：风控校验（`v_voucher`）由 API 层抛异常走到
+  /// 失败态，用户看到的是「稍后重试」而不是「没有找到相关专栏」。
+  Widget _buildArticleResults() {
+    if (_articleSearching) {
+      return const AppLoadingHero(seed: 'search.article');
+    }
+    if (_articleError != null) {
+      return AppErrorView(
+        message: _articleError!,
+        onRetry: _doSearch,
+        illustrationSeed: 'search.article',
+      );
+    }
+    final results = _articleResults;
+    if (results == null) {
+      return const AppStateView(
+        kind: AppStateKind.empty,
+        title: '输入关键词，搜索 B 站专栏\n'
+            '点结果直接进阅读页（不写入白名单）',
+        illustrationSeed: 'search.article',
+      );
+    }
+    if (results.isEmpty) {
+      return const AppStateView(
+        kind: AppStateKind.empty,
+        title: '没有找到相关专栏，换个关键词试试',
+        illustrationSeed: 'search.article.result',
+      );
+    }
+    final theme = Theme.of(context);
+    final showLoadingMore = _articleLoadingMore;
+    final showNoMore = !_articleHasMore && !showLoadingMore;
+    final extraSlots = (showLoadingMore || showNoMore) ? 1 : 0;
+    final appendBatch = _articleBatchStart > 0;
+    // 交错入场：专栏结果按 cvid 记账（与另外三套列表同一套节奏）
+    return StaggeredListScope(
+      generation: 'search.article#$_reloadToken',
+      ledger: _articleLedger,
+      child: ListView.separated(
+        controller: _scrollCtrl,
+        itemCount: results.length + extraSlots,
+        separatorBuilder: (_, __) => const Divider(height: 1, indent: 112),
+        itemBuilder: (context, i) {
+          if (i >= results.length) {
+            return _buildBottomStatus(
+              showLoadingMore,
+              showNoMore,
+              seed: 'search.article',
+            );
+          }
+          final a = results[i];
+          final int rawIndex = i - _articleBatchStart;
+          return StaggeredEntrance(
+            entryKey: 'cv:${a.cvid}',
+            index: rawIndex < 0 ? 0 : rawIndex,
+            step: appendBatch ? kStaggerStepAppend : kStaggerStep,
+            duration: appendBatch ? kDurEntranceAppend : kDurEntrance,
+            maxIndex: appendBatch ? kStaggerMaxIndexAppend : kStaggerMaxIndex,
+            child: _buildArticleTile(theme, a),
+          );
+        },
+      ),
+    );
+  }
+
+  /// 专栏结果卡片：封面 + 标题 + （作者 · 阅读 · 日期）+ 摘要一行。
+  ///
+  /// 与视频卡同一套 [ListTile] 骨架（同样的 96×60 封面、2 行标题、字号），
+  /// 因此一屏条数与其它范围一致。**没有「加入」按钮**：白名单里存的是视频
+  /// bvid 与 UP 主 mid，专栏两个都不是（与直播结果同一取舍），尾部只给
+  /// 「点进去读」的 chevron。
+  Widget _buildArticleTile(ThemeData theme, ArticleSearchResult a) {
+    final metaParts = <String>[
+      if (a.author.isNotEmpty) a.author,
+      '${_fmtPlay(a.view)} 阅读',
+      if (formatPubdate(a.pubDate).isNotEmpty) formatPubdate(a.pubDate),
+    ];
+    return ListTile(
+      leading: ClipRRect(
+        borderRadius: BorderRadius.circular(4),
+        child: CoverImage(cover: a.cover, width: 96, height: 60),
+      ),
+      title: ExpandableText(
+        text: a.title,
+        // 与其它范围同一套：2 行截断，超行才有「展开/收起」
+        style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+        foldLines: 2,
+        selectable: false,
+        animated: true,
+      ),
+      subtitle: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            metaParts.join(' · '),
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+          // 摘要：接口给什么显示什么（旧专栏可能没有摘要 → 整行不出现，
+          // 不留一条空行把卡片撑高）
+          if (a.desc.trim().isNotEmpty)
+            Text(
+              a.desc.trim().replaceAll(RegExp(r'\s+'), ' '),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: theme.colorScheme.outline,
+              ),
+            ),
+        ],
+      ),
+      // 右侧只有「点进去」的暗示：这一栏没有可提交的动作
+      trailing: Icon(
+        Icons.chevron_right,
+        color: theme.colorScheme.outline,
+      ),
+      onTap: () => _openArticle(a),
+    );
+  }
+
+  /// 点专栏结果 → 站内专栏阅读页（复用既有 [ArticlePage]，不另写阅读页）。
+  ///
+  /// 传 [initialTitle] 让首屏标题不闪「专栏」；传本页 [_api] 复用会话
+  /// （buvid / Cookie），测试也能继续走同一个注入替身。
+  void _openArticle(ArticleSearchResult a) {
+    if (a.cvid <= 0) return; // 脏数据兜底（API 层已过滤）
+    debugPrint('[search] 站内读专栏 cv${a.cvid}');
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => ArticlePage(
+          cvid: a.cvid,
+          initialTitle: a.title,
+          api: _api,
         ),
       ),
     );

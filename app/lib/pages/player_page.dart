@@ -25,6 +25,7 @@ import '../services/bili_toview_api.dart';
 import '../services/danmaku_settings_store.dart';
 import '../services/device_media.dart';
 import '../services/history_store.dart';
+import '../services/heat_curve.dart';
 import '../services/keep_screen_on.dart';
 import '../services/last_episode_store.dart';
 import '../services/realtime_transcriber.dart';
@@ -46,6 +47,7 @@ import '../widgets/cover_image.dart';
 import '../widgets/danmaku_overlay.dart';
 import '../widgets/danmaku_settings_sheet.dart';
 import '../widgets/expandable_text.dart';
+import '../widgets/heat_curve_bar.dart';
 import '../widgets/upowner_badge.dart';
 import 'comment_page.dart';
 import 'login_page.dart';
@@ -2318,6 +2320,26 @@ class _PlayerPageState extends State<PlayerPage>
   /// 弹幕缓存（cid → 全量列表）：切集后同 cid 再开秒显示，不重复请求。
   final Map<int, List<Danmaku>> _danmakuCache = {};
 
+  /// 正在拉取的 cid 集合（v2.61.0+）：弹幕层与热度曲线共用同一份数据，
+  /// 两边同时触发时只发一次请求（否则一个页面会打两次 list.so）。
+  final Set<int> _danmakuFetching = {};
+
+  // 热度高潮线（v2.61.0+）---------------------------------------------------
+  //
+  // 数据源就是上面这份弹幕（当前 cid）—— 官方的「高能进度条」接口实测已
+  // 下线（见 `lib/services/heat_curve.dart` 顶部的探针结论）。曲线在
+  // **数据到齐时算一次**并缓存，绘制层只读，不每帧重算。
+
+  /// 当前集的热度曲线；null = 数据未就绪 / 开关关闭 / 弹幕为空（**不画线**）。
+  HeatCurve? _heatCurve;
+
+  /// 上次算曲线时的「cid@时长」键：切 P（cid 变）或时长变（换源/重取流）
+  /// 才会重算，同一集里 tick 每帧刷新不触发计算。
+  String? _heatCurveKey;
+
+  /// 热度曲线开关（默认开，随弹幕设置持久化；见 [DanmakuSettings.heatCurve]）。
+  bool get _heatCurveEnabled => _danmakuSettings.heatCurve;
+
   /// pages 列表：空/缺失视为单 P（返回 null）。
   List<PageInfo>? get _pages {
     final pages = _video.pages;
@@ -3758,6 +3780,9 @@ class _PlayerPageState extends State<PlayerPage>
     // 另一个方向的视频（如横屏集 → 竖屏集）。已锁对时重复下发同一组方向是
     // 幂等的，不会转屏。
     if (_fullscreen) unawaited(_applyFullscreenOrientation());
+    // 时长此刻才拿到/变化 → 热度曲线的纵轴范围定了，重算一次（v2.61.0+；
+    // 同一集同一时长只算一次，这里的重复调用是空操作）
+    _rebuildHeatCurve();
     // 首次进入 / 切集后恢复该集记忆进度（不打断自动播放）
     _maybeRestoreProgress(durationMs);
     // 画面就绪 → 封面占位层淡出（换源时这一层早已卸载，调用是空操作）
@@ -6308,8 +6333,9 @@ class _PlayerPageState extends State<PlayerPage>
         // 开关记忆（v2.16.13）：上次开着 → 本次进播放页自动开（不用再点）
         _danmakuEnabled = s.enabled;
       });
-      // 记忆为开 → 自动拉当前集弹幕（切集走 _switchPage 同样按开启状态拉取）
-      if (s.enabled) _loadDanmaku();
+      // 记忆为开 → 自动拉当前集弹幕（切集走 _switchPage 同样按开启状态拉取）。
+      // v2.61.0+：热度曲线开着也要这份数据（弹幕层关着也能只显示曲线）
+      if (s.enabled || s.heatCurve) _loadDanmaku();
     } catch (_) {
       // 超时/存储异常：保持默认设置（不影响播放）
     }
@@ -6331,9 +6357,18 @@ class _PlayerPageState extends State<PlayerPage>
       builder: (sheetContext) => DanmakuSettingsSheet(
         initial: _danmakuSettings,
         onChanged: (s) {
+          final heatWas = _danmakuSettings.heatCurve;
           setState(() => _danmakuSettings = s);
           // 持久化（fire-and-forget：失败静默，下次进页读不到用默认）
           DanmakuSettingsStore.instance.save(s);
+          // 热度曲线开关变化（v2.61.0+）：关 → 立刻不画；开 → 数据已缓存就
+          // 立刻画出来，没缓存就补拉一次当前集弹幕（与弹幕层共用缓存/在途去重）
+          if (s.heatCurve != heatWas) {
+            _rebuildHeatCurve();
+            if (s.heatCurve && _danmakuCache[_currentCid] == null) {
+              _loadDanmaku();
+            }
+          }
         },
       ),
     );
@@ -6345,21 +6380,35 @@ class _PlayerPageState extends State<PlayerPage>
   /// - fetchDanmaku 本身失败静默返回空（接口异常不阻塞播放）
   /// - 拉取为空（视频无弹幕 / 老视频弹幕被关闭 / 接口异常）→ 轻提示一次，
   ///   开关保持开启但无数据可渲染（不打扰播放）
+  ///
+  /// v2.61.0+：同一 cid 已有在途请求时**直接返回**（热度曲线与弹幕层共用这份
+  /// 数据，两边同时触发不该打两次接口）；数据到手/命中缓存后重算热度曲线。
   Future<void> _loadDanmaku() async {
     final cid = _currentCid;
     final cached = _danmakuCache[cid];
     if (cached != null) {
       debugPrint('[player_page] 弹幕缓存命中 cid=$cid ${cached.length} 条');
       if (mounted) setState(() => _danmaku = cached);
+      _rebuildHeatCurve();
       return;
     }
-    final list = await _api.fetchDanmaku(cid);
+    if (_danmakuFetching.contains(cid)) {
+      debugPrint('[player_page] 弹幕已在拉取中 cid=$cid，跳过重复请求');
+      return;
+    }
+    _danmakuFetching.add(cid);
+    final List<Danmaku> list;
+    try {
+      list = await _api.fetchDanmaku(cid);
+    } finally {
+      _danmakuFetching.remove(cid);
+    }
     if (!mounted) return;
     // 拉取期间切了集 → 丢弃过期结果（新集 _loadDanmaku 会再触发）
     if (_currentCid != cid) return;
     _danmakuCache[cid] = list;
     debugPrint('[player_page] 弹幕拉取完成 cid=$cid ${list.length} 条'
-        ' enabled=$_danmakuEnabled');
+        ' enabled=$_danmakuEnabled heat=$_heatCurveEnabled');
     setState(() {
       // 仅开关仍开启时挂载渲染数据（用户期间已关闭则保持空）
       _danmaku = _danmakuEnabled ? list : const [];
@@ -6367,6 +6416,52 @@ class _PlayerPageState extends State<PlayerPage>
     if (list.isEmpty && _danmakuEnabled) {
       _showSnack('该视频暂无弹幕');
     }
+    // 热度曲线用同一份数据（与弹幕层开关无关）
+    _rebuildHeatCurve();
+  }
+
+  /// 重算当前集的热度曲线（v2.61.0+）。
+  ///
+  /// 只在**数据/时长/开关变化**时被调用（弹幕到手、onPrepared 拿到时长、
+  /// 切集换源、开关切换），同一集内 tick 刷新不进来 —— 曲线不在 build 里算。
+  ///
+  /// 不画线的情形（[_heatCurve] 置 null）：
+  /// - 开关关闭；
+  /// - 当前 cid 的弹幕还没拉到手（缓存里没有）；
+  /// - 时长为 0（onPrepared 还没回来）；
+  /// - 弹幕为空 / 全被脏时间过滤 / 桶数不足 2（[buildHeatCurve] 返回 null）。
+  void _rebuildHeatCurve() {
+    if (!mounted) return;
+    if (!_heatCurveEnabled) {
+      if (_heatCurve != null || _heatCurveKey != null) {
+        setState(() {
+          _heatCurve = null;
+          _heatCurveKey = null;
+        });
+      }
+      return;
+    }
+    final cid = _currentCid;
+    final list = _danmakuCache[cid];
+    final durationMs = _durationMs;
+    if (list == null || durationMs <= 0) {
+      if (_heatCurve != null || _heatCurveKey != null) {
+        setState(() {
+          _heatCurve = null;
+          _heatCurveKey = null;
+        });
+      }
+      return;
+    }
+    final key = '$cid@$durationMs';
+    if (key == _heatCurveKey) return; // 同一集同一时长：已算过，不重算
+    final curve = buildHeatCurve(list, durationMs: durationMs);
+    setState(() {
+      _heatCurve = curve;
+      _heatCurveKey = key;
+    });
+    debugPrint('[player_page] 热度曲线 cid=$cid ${list.length} 条弹幕 → '
+        '${curve == null ? '无曲线（数据不足）' : '${curve.values.length} 桶'}');
   }
 
   // -------------------------------------------------------------------------
@@ -7546,6 +7641,10 @@ class _PlayerPageState extends State<PlayerPage>
       // 弹幕：切集清空渲染数据（缓存按 cid 保留）；开关状态保留，
       // 下方 _loadStreamAndPlay 成功后若开关仍开则自动拉新集弹幕
       _danmaku = const [];
+      // 热度曲线按 cid 算 → 切集必须立刻清掉，等新集数据到齐再画
+      // （v2.61.0+）。不清的话会短暂画出上一集的曲线（假数据）
+      _heatCurve = null;
+      _heatCurveKey = null;
       // 拖动预览：清掉上一集的帧 + 复位节流/代次与预取位置（新集要重新 prepare）
       _previewFrame = null;
       _previewShot = -1;
@@ -7565,8 +7664,9 @@ class _PlayerPageState extends State<PlayerPage>
       await _loadStreamAndPlay(positionMs: 0);
       await _player?.setPlaybackSpeed(_speed);
       if (mounted) setState(() => _buffering = false);
-      // 切集后弹幕开关仍开 → 自动拉取新集弹幕（新 cid 数据）
-      if (_danmakuEnabled) await _loadDanmaku();
+      // 切集后弹幕开关仍开 → 自动拉取新集弹幕（新 cid 数据）；
+      // v2.61.0+：热度曲线开着同样要这份数据（弹幕层关着也能只显示曲线）
+      if (_danmakuEnabled || _heatCurveEnabled) await _loadDanmaku();
     } catch (e) {
       if (!mounted) return;
       await _handleLoadFailure(e);
@@ -7678,6 +7778,9 @@ class _PlayerPageState extends State<PlayerPage>
       _listenLocalAudio = false; // 听视频的「本地音频」标记一并复位（v2.55.0）
       // 弹幕：清空旧视频渲染数据（缓存按 cid 保留，重开秒显示）
       _danmaku = const [];
+      // 热度曲线：换 bvid = 换 cid，旧曲线必须清掉（等新视频数据到齐再画）
+      _heatCurve = null;
+      _heatCurveKey = null;
     });
     // 换源瞬间没有在播的画面（_playing=false）→ 立刻关掉「保持亮屏」
     // （新流 READY 的 onPrepared 会再按真实播放意图复核一次；v2.60.0）
@@ -7686,9 +7789,12 @@ class _PlayerPageState extends State<PlayerPage>
     await _init();
     // 换源后重拉新视频的 UP 主信息（阶段 C）
     _upownerMetaFuture = _refreshUpownerMeta();
-    // 换源后弹幕开关仍开 → 自动拉新视频弹幕（与切集一致；异常静默）
+    // 换源后弹幕开关仍开 → 自动拉新视频弹幕（与切集一致；异常静默）。
+    // v2.61.0+：热度曲线开着也要（新 bvid 的新 cid）
     try {
-      if (_danmakuEnabled && _error == null) await _loadDanmaku();
+      if ((_danmakuEnabled || _heatCurveEnabled) && _error == null) {
+        await _loadDanmaku();
+      }
     } catch (_) {
       // 弹幕拉取异常静默（不阻塞换源播放）
     }
@@ -10006,6 +10112,9 @@ class _PlayerPageState extends State<PlayerPage>
                         onDrag: _onSeekStart,
                         onDragEnd: _onSeekEnd,
                         onDragPosition: _onSeekDragPosition,
+                        // 热度高潮线（v2.61.0+）：null = 数据未就绪/开关关闭
+                        // → 不画线（不伪造一条平线）
+                        heat: _heatCurve,
                       ),
                       // 拖动预览浮层：拖动中才在树里，松手即消失（无淡出——
                       // 跟手的东西淡出会读成「没跟上手」）。位置跟随手指
@@ -10696,6 +10805,13 @@ class _PlayerSeekBar extends StatelessWidget {
   /// 越界（手指滑出轨道）时原样回报，由调用方决定怎么摆。
   final void Function(double dragX, double trackWidth)? onDragPosition;
 
+  /// 热度高潮线（v2.61.0+）：null / 不足以成线 = **不画**（连占位的空盒子都
+  /// 不建），进度条视觉与改动前逐像素一致。
+  ///
+  /// 它画在轨道**上方**那条空着的带里（见 [_kHeatBandTop] / [_kHeatBandHeight]），
+  /// 整层 [IgnorePointer]，不改变下面 [GestureDetector] 的命中区。
+  final HeatCurve? heat;
+
   const _PlayerSeekBar({
     super.key,
     required this.positionMs,
@@ -10705,7 +10821,13 @@ class _PlayerSeekBar extends StatelessWidget {
     this.onDrag,
     this.onDragEnd,
     this.onDragPosition,
+    this.heat,
   });
+
+  /// 热度曲线带：上沿 2px（避开裁切）、高 14px，底边到 y=16；轨道在
+  /// 正中（y=19..21），两者**不重叠**（留 3px 呼吸）。
+  static const double _kHeatBandTop = 2;
+  static const double _kHeatBandHeight = 14;
 
   /// 触摸目标高度（与 [_PlayerPageState._buildBottomBar] 的进度条行一致）。
   ///
@@ -10780,15 +10902,34 @@ class _PlayerSeekBar extends StatelessWidget {
             onHorizontalDragEnd: draggable
                 ? (d) => onDragEnd!(valueAt(d.localPosition.dx))
                 : null,
-            child: CustomPaint(
-              size: Size(width, height),
-              painter: _SeekBarPainter(
-                progress: durationMs > 0 ? positionMs / max : 0,
-                buffered: (bufferedMs == null || durationMs <= 0)
-                    ? 0
-                    : bufferedMs! / max,
-                showHandle: showHandle,
-              ),
+            // 曲线层与轨道同宽（两端各内缩半个柄宽，与 track 同一坐标系），
+            // 叠在轨道上方那条空带里。整层 IgnorePointer（在 HeatCurveBar
+            // 内部）→ 命中全部穿透给本 GestureDetector，拖动/点按语义不变。
+            child: Stack(
+              fit: StackFit.expand,
+              children: [
+                if (heat != null && heat!.isDrawable)
+                  Positioned(
+                    left: handleWidth / 2,
+                    right: handleWidth / 2,
+                    top: _kHeatBandTop,
+                    height: _kHeatBandHeight,
+                    child: HeatCurveBar(
+                      key: HeatCurveBar.widgetKey,
+                      curve: heat,
+                    ),
+                  ),
+                CustomPaint(
+                  size: Size(width, height),
+                  painter: _SeekBarPainter(
+                    progress: durationMs > 0 ? positionMs / max : 0,
+                    buffered: (bufferedMs == null || durationMs <= 0)
+                        ? 0
+                        : bufferedMs! / max,
+                    showHandle: showHandle,
+                  ),
+                ),
+              ],
             ),
           );
         },

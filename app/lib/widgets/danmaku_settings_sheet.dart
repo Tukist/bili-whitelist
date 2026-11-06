@@ -116,6 +116,19 @@ class _DanmakuSettingsSheetState extends State<DanmakuSettingsSheet> {
               value: !_s.blockBottom,
               onChanged: (v) => _set(_s.copyWith(blockBottom: !v)),
             ),
+            SwitchListTile(
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              activeTrackColor: kPlayerOn,
+              // 热度曲线（v2.61.0+）：画在进度条上方，数据 = 当前集的弹幕密度。
+              // 文案压到 12 个非空白字符（页面里的开关文案上限 42）。
+              title: const Text('热度曲线',
+                  style: TextStyle(color: kPlayerOn, fontSize: 15)),
+              subtitle: const Text('进度条上方显示弹幕密度高峰（默认开启）',
+                  style: TextStyle(color: kPlayerOff, fontSize: 12)),
+              value: _s.heatCurve,
+              onChanged: (v) => _set(_s.copyWith(heatCurve: v)),
+            ),
             const Divider(height: 12),
             // ---- 屏蔽关键词 ----
             const Text('屏蔽关键词', style: _kSectionTitleStyle),
