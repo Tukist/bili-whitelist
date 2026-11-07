@@ -15,6 +15,7 @@ import '../cache/playback_progress.dart';
 import '../config.dart';
 import '../models/danmaku.dart';
 import '../models/danmaku_settings.dart';
+import '../models/float_window_prefs.dart';
 import '../models/playlist_context.dart';
 import '../models/subtitle.dart';
 import '../models/upowner.dart';
@@ -24,6 +25,7 @@ import '../services/bili_history_reporter.dart';
 import '../services/bili_toview_api.dart';
 import '../services/danmaku_settings_store.dart';
 import '../services/device_media.dart';
+import '../services/float_window_store.dart';
 import '../services/history_store.dart';
 import '../services/heat_curve.dart';
 import '../services/keep_screen_on.dart';
@@ -50,6 +52,7 @@ import '../widgets/cover_image.dart';
 import '../widgets/danmaku_overlay.dart';
 import '../widgets/danmaku_settings_sheet.dart';
 import '../widgets/expandable_text.dart';
+import '../widgets/floating_player_window.dart';
 import '../widgets/heat_curve_bar.dart';
 import '../widgets/upowner_badge.dart';
 import 'comment_page.dart';
@@ -1144,6 +1147,12 @@ void debugResetToViewCacheForTest() {
 const double kPortraitVideoHeightRatio = 0.6;
 const double kLandscapeVideoHeightRatio = 0.55;
 
+/// 应用内浮动小窗态的视频区高度（v2.65.0）。
+///
+/// 画面搬进浮窗后，视频区只剩一条操作条（返回 / 播放暂停 / 更多 / 回到大屏）：
+/// 48dp = 一个标准触摸目标的高度。再高就白占评论区的空间，再矮按钮就不好点。
+const double kFloatBarHeight = 48;
+
 /// 底栏按钮行高度（竖屏 5 格：倍速 / 清晰度 / 弹幕 / 评论 / 更多；
 /// 全屏 8 格：多出听视频 / 字幕 / 下载 —— **同一行高**，不做两套视觉）。
 ///
@@ -1438,6 +1447,9 @@ enum _MoreAction {
   /// 调起系统分享面板。
   share,
 
+  /// 进应用内浮动小窗（v2.65.0）：画面缩成可拖动/缩放/锁定的窗口浮在本页上层。
+  floatWindow,
+
   /// 进系统小窗（画中画，v2.63.0）。
   pip,
 }
@@ -1640,6 +1652,20 @@ class _PlayerPageState extends State<PlayerPage>
 
   /// 小窗状态事件订阅（只在支持时才订阅，见 [_refreshPipSupport]）。
   StreamSubscription<PipEvent>? _pipSub;
+
+  // 应用内浮动小窗（v2.65.0）
+  // -------------------------------------------------------------------------
+  /// 当前是否处于**应用内**浮动小窗态。
+  ///
+  /// 与 [_inPip]（系统画中画）是两件互不替代的事：
+  /// - 应用内小窗：窗口浮在播放页上层，页面内容照常可见可滚，能拖动/缩放/锁定；
+  ///   但切到别的 App 就看不见了（它只是本页的一个层）；
+  /// - 系统 PiP：窗口归系统管，切到别的 App 还能继续看，但既不能拖角缩放、
+  ///   也没法加自定义按钮（Android 平台限制）。
+  bool _floatWindow = false;
+
+  /// 浮动小窗的大小/位置/锁定状态（唯一真相；持久化见 [FloatWindowStore]）。
+  FloatWindowPrefs _floatPrefs = const FloatWindowPrefs();
 
   /// 宽高比是否**真的**来自播放器（[_onPrepared] 的 width/height）。
   ///
@@ -2789,6 +2815,9 @@ class _PlayerPageState extends State<PlayerPage>
     _realtime.sentences.addListener(_onRealtimeSentencesChanged);
     _realtimeModelDirHint();
     _loadDanmakuSettings();
+    // 应用内小窗（v2.65.0）：读一次上次的窗口大小/位置/锁定。读失败/坏值 →
+    // store 内部回退默认（异步，进页面第一帧用的是默认窗口，读回来才校正）。
+    unawaited(_loadFloatPrefs());
     _checkLoginExpiry();
     // UP 主入口元数据（阶段 C）：拉 view 接口 owner 补齐 mid/face（异步，
     // 信息行先用 up_name 文本渲染，拉取成功后 setState 换头像+真名）。
@@ -2993,6 +3022,9 @@ class _PlayerPageState extends State<PlayerPage>
   /// 画面缩成系统小窗本身就是反馈。
   Future<void> _enterPip() async {
     if (!_pipSupported || _inPip) return;
+    // 已经在应用内小窗里：先把浮窗收起——两套小窗状态叠着会让"退出 PiP 后
+    // 浮窗又冒出来"，用户会以为界面错乱。
+    if (_floatWindow && mounted) setState(() => _floatWindow = false);
     final result = await PipService.instance.enter(
       width: _videoWidth,
       height: _videoHeight,
@@ -3056,6 +3088,172 @@ class _PlayerPageState extends State<PlayerPage>
                 child: BiliDashTexture(textureId: textureId),
               ),
             ),
+    );
+  }
+
+  // -------------------------------------------------------------------------
+  // 应用内浮动小窗（v2.65.0）
+  // -------------------------------------------------------------------------
+  //
+  // 用户原话：「小窗改成可以拖动角来缩放的，然后加个锁定按钮」。
+  //
+  // 系统画中画（上一节）的窗口大小/位置/装饰**全由系统管**：不能拖角、不能加
+  // 自定义按钮 —— 这是 Android 平台限制。所以这一节做的是另一种小窗：画面缩成
+  // 页面自己画的一层窗口浮在内容之上，信息块与评论区照常可见可滚；能拖动移动、
+  // 拖右下角缩放、一键锁定防误触。两者并存（「更多」里叫「应用内小窗」与
+  // 「小窗播放」），系统 PiP 的行为一个字没改。
+  //
+  // ## 为什么不重新取流
+  //
+  // 窗口里放的就是**同一个** BiliDashTexture（同一个 textureId）：只是把纹理
+  // 从视频区挪到浮窗里画。播放器、解码、tick、进度上报、历史写入全在原轨道上
+  // 跑 → 进出小窗位置天然连续，`setDataSource` 次数不变（测试有断言）。
+  //
+  // ## 小窗态的界面
+  //
+  // 视频区收成一条 48dp 操作条（[_buildFloatBar]：返回 / 播放暂停 / 更多 /
+  // 回到大屏）——播放控制不能因为画面搬走就消失；信息块与评论区照旧，还多出
+  // 视频区让出的高度。弹幕 / 字幕 / 热度曲线不画在小窗里（理由与系统 PiP 一致：
+  // 巴掌大的窗口里任何信息层都是噪点），状态位一个都不改，还原后按用户原来的
+  // 开关恢复。
+  //
+  // ## 亮屏
+  //
+  // **继续亮屏**。与系统 PiP 不同：那时用户已经切去别的 App，拦着息屏纯属耗电；
+  // 应用内小窗里用户还在看这一页的画面，屏幕当然不能黑。所以
+  // [_syncKeepScreenOn] 照旧只认 [_inPip]，这里一个字都不用改。
+
+  /// 读一次窗口状态（大小/位置/锁定）。坏值/读失败由 store 兜成默认。
+  Future<void> _loadFloatPrefs() async {
+    final prefs = await FloatWindowStore.instance.get();
+    if (!mounted) return;
+    setState(() => _floatPrefs = prefs);
+  }
+
+  /// 进应用内小窗（「更多 → 应用内小窗」）。
+  ///
+  /// 全屏时先退全屏：浮动小窗是"页面里的一块浮层"，与全屏那套（沉浸式系统栏 /
+  /// 方向锁）语义冲突；退出全屏顺带复位画面缩放/旋转（见 [_toggleFullscreen]）。
+  Future<void> _enterFloatWindow() async {
+    if (_floatWindow) return;
+    // 还没有纹理（取流失败 / 播放器还没建好）：进去只会得到一条操作条 + 一个
+    // 空窗口，等于"点了没反应"。直接说清楚，别让用户以为按钮坏了。
+    if (_textureId == null) {
+      _showSnack('画面还没准备好，稍后再试');
+      return;
+    }
+    if (_fullscreen) await _toggleFullscreen();
+    if (!mounted) return;
+    setState(() => _floatWindow = true);
+    debugPrint('[player_page] 进应用内小窗 $_floatPrefs');
+  }
+
+  /// 回到大屏。**只改界面**，播放器一个字不动 → 位置连续、不重新取流。
+  void _exitFloatWindow() {
+    if (!_floatWindow) return;
+    debugPrint('[player_page] 退出应用内小窗');
+    setState(() => _floatWindow = false);
+  }
+
+  /// 锁定 / 解锁（用户的一次明确选择，立即持久化）。
+  void _toggleFloatLock() {
+    final next = _floatPrefs.copyWith(locked: !_floatPrefs.locked);
+    debugPrint('[player_page] 小窗锁定 → ${next.locked}');
+    setState(() => _floatPrefs = next);
+    unawaited(FloatWindowStore.instance.save(next));
+  }
+
+  /// 拖动 / 缩放结束：矩形 → 比例 → 存盘。
+  ///
+  /// 只存比例（见 [FloatWindowPrefs]）：换机型、转屏、分屏之后窗口仍然落在
+  /// 合理位置，而不是卡在旧屏幕的像素坐标上。拖动过程中不写盘。
+  void _onFloatRectSettled(Rect rect, Size page, EdgeInsets safe) {
+    final ratios = floatWindowRatiosOf(rect, page, safe);
+    final next = _floatPrefs.copyWith(
+      widthRatio: ratios.widthRatio,
+      dxRatio: ratios.dxRatio,
+      dyRatio: ratios.dyRatio,
+    );
+    debugPrint('[player_page] 小窗 rect=$rect → $next');
+    setState(() => _floatPrefs = next);
+    unawaited(FloatWindowStore.instance.save(next));
+  }
+
+  /// 浮动小窗态的视频区：一条 48dp 操作条。
+  ///
+  /// 为什么不"照旧留一块大黑盒"：画面已经搬进浮窗，视频区还占满高度只会把
+  /// 评论区挤到看不见。收成一条，播放控制（播放/暂停、更多）与导航（返回、
+  /// 回到大屏）都还在。
+  Widget _buildFloatBar() {
+    final playing = _playing && !_completed;
+    return SizedBox(
+      key: const ValueKey('player-float-bar'),
+      height: kFloatBarHeight,
+      child: Row(
+        children: [
+          IconButton(
+            key: const ValueKey('player-float-bar-back'),
+            icon: const Icon(Icons.arrow_back, color: kPlayerOn),
+            tooltip: '返回',
+            constraints: const BoxConstraints(minWidth: 48, minHeight: 48),
+            onPressed: _handleBack,
+          ),
+          IconButton(
+            key: const ValueKey('player-float-bar-play'),
+            icon: Icon(playing ? Icons.pause : Icons.play_arrow,
+                color: kPlayerOn),
+            tooltip: playing ? '暂停' : '播放',
+            constraints: const BoxConstraints(minWidth: 48, minHeight: 48),
+            onPressed: () => unawaited(_togglePlay()),
+          ),
+          const Expanded(
+            child: Text(
+              '小窗播放中',
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(color: kPlayerOnDim, fontSize: 13),
+            ),
+          ),
+          IconButton(
+            key: const ValueKey('player-float-bar-more'),
+            icon: const Icon(Icons.more_horiz, color: kPlayerOn),
+            tooltip: '更多功能',
+            constraints: const BoxConstraints(minWidth: 48, minHeight: 48),
+            onPressed: () => unawaited(_showMoreSheet()),
+          ),
+          TextButton(
+            key: const ValueKey('player-float-bar-restore'),
+            onPressed: _exitFloatWindow,
+            child: const Text('回到大屏'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// 浮动小窗层（叠在页面 Column 之上；只有它自己那块矩形吃触摸）。
+  Widget _buildFloatOverlay(Size page, EdgeInsets safe) {
+    // 上边界再让出一条操作条：浮窗不许盖住那条 48dp 的「返回 / 播放暂停 /
+    // 更多 / 回到大屏」。默认贴顶时正好落在操作条下方，怎么拖也压不住按钮
+    // —— 否则默认位置就盖住"回到大屏"，用户想还原却点到窗口上（死路）。
+    final overlaySafe = safe.copyWith(top: math.max(safe.top, kFloatBarHeight));
+    return FloatingPlayerWindow(
+      rect: floatWindowRect(
+        page: page,
+        safe: overlaySafe,
+        aspectRatio: _aspectRatio,
+        widthRatio: _floatPrefs.widthRatio,
+        dxRatio: _floatPrefs.dxRatio,
+        dyRatio: _floatPrefs.dyRatio,
+      ),
+      pageSize: page,
+      safeInsets: overlaySafe,
+      aspectRatio: _aspectRatio,
+      locked: _floatPrefs.locked,
+      onSettled: (rect) => _onFloatRectSettled(rect, page, overlaySafe),
+      onToggleLock: _toggleFloatLock,
+      onRestore: _exitFloatWindow,
+      child: BiliDashTexture(textureId: _textureId!),
     );
   }
 
@@ -5856,6 +6054,8 @@ class _PlayerPageState extends State<PlayerPage>
         _onDownloadTap();
       case _MoreAction.share:
         await _shareCurrentVideo();
+      case _MoreAction.floatWindow:
+        await _enterFloatWindow();
       case _MoreAction.pip:
         await _enterPip();
     }
@@ -5946,6 +6146,20 @@ class _PlayerPageState extends State<PlayerPage>
       hint: '把标题和链接发给其他 App',
       key: const ValueKey('player-more-share'),
     );
+    // 应用内小窗（v2.65.0）：与系统小窗并列，但两者**不是同一件事**，名字必须
+    // 能区分：
+    // - 应用内小窗：能拖动/拖角缩放/锁定，页面内容照常可看；切到别的 App 就没了；
+    // - 小窗播放（系统 PiP，v2.63.0）：窗口归系统管，切到别的 App 也能继续看。
+    // 听视频 / 仅音频缓存态不给这两个入口：那时源里没有视频轨，窗口只会是黑屏。
+    if (!_listenMode && !_audioOnlyPlayback) {
+      add(
+        _MoreAction.floatWindow,
+        Icons.picture_in_picture_outlined,
+        '应用内小窗',
+        hint: '浮在本页上：可拖动、拖角缩放、可锁定',
+        key: const ValueKey('player-more-float'),
+      );
+    }
     // 小窗播放（v2.63.0）：**不支持就不显示**（旧系统 / ROM 没这个 feature），
     // 听视频态也不显示（那时连视频轨都没拉，小窗里只会是纯黑）。
     // 放在「分享」之后、列表最末：它会把界面整个缩走，是这一组的"离开"动作。
@@ -5954,7 +6168,7 @@ class _PlayerPageState extends State<PlayerPage>
         _MoreAction.pip,
         Icons.picture_in_picture_alt_outlined,
         '小窗播放',
-        hint: '缩成系统小窗，切到别的 App 也能继续看',
+        hint: '系统小窗：切到别的 App 也能继续看',
         key: const ValueKey('player-more-pip'),
       );
     }
@@ -8580,6 +8794,9 @@ class _PlayerPageState extends State<PlayerPage>
     final screen = MediaQuery.sizeOf(context);
     final videoAreaHeight =
         _fullscreen ? screen.height : _embeddedVideoHeight(screen);
+    // 应用内浮动小窗（v2.65.0）：画面搬进浮窗的条件是"确实有纹理"——换源的空档
+    // （_textureId 暂时为 null）仍按常规视频区走，避免出现一个全黑的窗口。
+    final floating = _floatWindow && _textureId != null;
     return PopScope(
       // 系统返回键：全屏中拦截为「先退出全屏」（canPop=false 拦截后由
       // onPopInvokedWithResult 兜底退全屏，回到当前方向的置顶+评论）；
@@ -8592,43 +8809,65 @@ class _PlayerPageState extends State<PlayerPage>
         backgroundColor: _fullscreen
             ? Colors.black
             : Theme.of(context).colorScheme.surface,
-        body: Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            // 1. 视频区（黑底）：非全屏 = 顶部置顶、按宽高比封顶的黑盒
-            //    （竖屏超高视频封顶屏高 60%；横屏 16:9 理想高度≈整屏高 →
-            //    封顶屏高 55%——盒内画面均按 AspectRatio 居中 + 黑边补齐）；
-            //    全屏 = 占满整屏。
-            SizedBox(
-              key: const ValueKey('player-video-area'),
-              height: videoAreaHeight,
-              child:
-                  ColoredBox(color: Colors.black, child: _buildVideoLayers()),
-            ),
-            // 2/3. 非全屏内容区（竖屏 / 横屏置顶共用）：视频信息块（标题/
-            //      时长 + UP 主入口：阶段 C 已从 UP 主名文本占位升级为头像
-            //      +名字可点进 UP 主页；横屏自动紧凑；块化见 [_buildInfoBlock]）
-            //      + 内嵌评论区（评论区底部避开系统手势导航条）。
-            //      全屏不渲染（下方内容区不占位）。
-            //      竖屏额外支持「滚评论收信息块」：收起/展开见
-            //      [_buildCollapsibleInfoBlock]（横屏置顶不参与，返回原块）。
-            if (!_fullscreen) ...[
-              // 竖屏：评论区滚动可把这块收起（见 _buildCollapsibleInfoBlock）
-              _buildCollapsibleInfoBlock(context),
-              Expanded(
-                key: const ValueKey('player-comments'),
-                // 评论滚动 → 信息块显隐的监听放在页面侧（评论区组件自己那个
-                // NotificationListener 返回 false 会继续冒泡上来，不必改组件）。
-                child: NotificationListener<ScrollNotification>(
-                  onNotification: _onCommentScrollNotification,
-                  child: SafeArea(
-                    top: false,
-                    child: _buildEmbeddedComments(),
-                  ),
+        // LayoutBuilder 拿到的是**页面实际可用矩形**（Scaffold body 的约束），
+        // 浮窗的夹取口径就用它：拿 MediaQuery 的屏幕尺寸会在将来加 AppBar /
+        // 底部栏时算偏。
+        body: LayoutBuilder(
+          builder: (context, constraints) {
+            final pageSize =
+                Size(constraints.maxWidth, constraints.maxHeight);
+            final safe = MediaQuery.paddingOf(context);
+            return Stack(
+              children: [
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    // 1. 视频区（黑底）：非全屏 = 顶部置顶、按宽高比封顶的黑盒
+                    //    （竖屏超高视频封顶屏高 60%；横屏 16:9 理想高度≈整屏高 →
+                    //    封顶屏高 55%——盒内画面均按 AspectRatio 居中 + 黑边补齐）；
+                    //    全屏 = 占满整屏。
+                    //    应用内小窗态：画面搬到浮窗里，这里只剩一条操作条
+                    //    （见 [_buildFloatBar]），把高度让给信息块与评论区。
+                    SizedBox(
+                      key: const ValueKey('player-video-area'),
+                      height: floating ? kFloatBarHeight : videoAreaHeight,
+                      child: ColoredBox(
+                        color: Colors.black,
+                        child: floating
+                            ? _buildFloatBar()
+                            : _buildVideoLayers(),
+                      ),
+                    ),
+                    // 2/3. 非全屏内容区（竖屏 / 横屏置顶共用）：视频信息块（标题/
+                    //      时长 + UP 主入口：阶段 C 已从 UP 主名文本占位升级为头像
+                    //      +名字可点进 UP 主页；横屏自动紧凑；块化见 [_buildInfoBlock]）
+                    //      + 内嵌评论区（评论区底部避开系统手势导航条）。
+                    //      全屏不渲染（下方内容区不占位）。
+                    //      竖屏额外支持「滚评论收信息块」：收起/展开见
+                    //      [_buildCollapsibleInfoBlock]（横屏置顶不参与，返回原块）。
+                    if (!_fullscreen) ...[
+                      // 竖屏：评论区滚动可把这块收起（见 _buildCollapsibleInfoBlock）
+                      _buildCollapsibleInfoBlock(context),
+                      Expanded(
+                        key: const ValueKey('player-comments'),
+                        // 评论滚动 → 信息块显隐的监听放在页面侧（评论区组件自己那个
+                        // NotificationListener 返回 false 会继续冒泡上来，不必改组件）。
+                        child: NotificationListener<ScrollNotification>(
+                          onNotification: _onCommentScrollNotification,
+                          child: SafeArea(
+                            top: false,
+                            child: _buildEmbeddedComments(),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ],
                 ),
-              ),
-            ],
-          ],
+                // 浮动小窗层：只占自己那块矩形，其余区域的触摸照常落到页面上
+                if (floating) _buildFloatOverlay(pageSize, safe),
+              ],
+            );
+          },
         ),
       ),
     );
