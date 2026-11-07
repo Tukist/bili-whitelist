@@ -85,6 +85,16 @@
 /// [InboxHandledStore] 过滤掉已处理的 bvid → 残留条目不显示、也不计入红点，
 /// 红点数与卡片数仍然一致（同一处实现）。
 ///
+/// ## ★ 热度榜排序在**页面层**（v2.64.0+）
+/// [getItems] / [checkAll] 返回的队列**仍然按发布时间倒序**（服务层口径不变：
+/// 红点数、可见性过滤、已处理过滤一个字节都没动）。「热度 / 最新」的排序、
+/// 名次与分数全部由 `pages/inbox_page.dart` + `services/inbox_heat.dart` 在
+/// 本地算 —— 不发请求、不改可见性，只是把同一批卡换个顺序摆。
+///
+/// 播放量（[InboxItem.view]）也在这里顺路带上：它本来就是 `arc/search` 响应里
+/// 的 `vlist[].play`（`BiliApi._videoFromVlist` 已解析进 [WhitelistVideo.view]），
+/// **不为热度补发任何请求**。
+///
 /// ## 风控策略
 /// - 串行遍历，每 UP 主间隔 ≥ 1.5s（被风控时自动降级到 3s，测试可注入更小的
 ///   [requestGap] 以便快速跑多轮轮转）
@@ -118,7 +128,18 @@ class InboxItem {
   final String title;
   final String cover;
   final int duration;
-  final int pubDate; // Unix 秒（用于排序：按时间倒序）
+  final int pubDate; // Unix 秒（发布时间；缺省 0 = 未知）
+
+  /// 播放量（v2.64.0+；`null` = 未知 / 旧缓存，**不是 0**）。
+  ///
+  /// 来源：UP 主页 `arc/search` 的 `vlist[].play` → [WhitelistVideo.view] →
+  /// 这里（见 `bilibili_api._videoFromVlist`）。热度榜（`services/inbox_heat.dart`）
+  /// 只用这个字段，**不为每张卡补发请求**。
+  ///
+  /// 语义与 [WhitelistVideo.view] 一致：非负整数才有值，0 是"真·零播放"
+  /// （照常参与打分 = 0 分），缺失 / 脏类型 = null（不参与打分、卡片显示「—」）。
+  /// `toJson` **仅在非空时输出**：旧缓存读进来再写回去一个字节都不变。
+  final int? view;
 
   const InboxItem({
     required this.upMid,
@@ -129,6 +150,7 @@ class InboxItem {
     required this.cover,
     required this.duration,
     required this.pubDate,
+    this.view,
   });
 
   /// 构造 WhitelistVideo 给 PlayerPage 用：cid 缺省 0（PlayerPage 会调
@@ -157,6 +179,9 @@ class InboxItem {
         'cover': cover,
         'duration': duration,
         'pub_date': pubDate,
+        // 只在有值时才写（v2.64.0+）：旧缓存 / 未知播放量不产生多余键，
+        // 老版本读新数据也只会忽略它
+        if (view != null) 'view': view,
       };
 
   factory InboxItem.fromJson(Map<String, dynamic> j) => InboxItem(
@@ -168,6 +193,10 @@ class InboxItem {
         cover: j['cover'] as String? ?? '',
         duration: (j['duration'] as num?)?.toInt() ?? 0,
         pubDate: (j['pub_date'] as num?)?.toInt() ?? 0,
+        // 缺字段 / 脏类型 / 负数 → null（不参与热度打分，卡片显示「—」）
+        view: j['view'] is num && (j['view'] as num) >= 0
+            ? (j['view'] as num).toInt()
+            : null,
       );
 }
 
@@ -622,6 +651,8 @@ class InboxService {
         cover: v.cover,
         duration: v.duration,
         pubDate: _parsePubDate(v.addedAt),
+        // v2.64.0+：热度榜要的播放量，同一次响应里就有（vlist.play）——不补请求
+        view: v.view,
       ),
     ];
   }
@@ -648,6 +679,8 @@ class InboxService {
         cover: v.cover,
         duration: v.duration,
         pubDate: _parsePubDate(v.addedAt),
+        // v2.64.0+：同一次响应里的播放量（热度榜打分用；拿不到就是 null）
+        view: v.view,
       ));
     }
     return items;

@@ -629,7 +629,7 @@ GH_REPO_TOKEN='<你的 GitHub Token>' bash build_release.sh
 | **UP 主详情页** | 搜索 UP 结果 / 播放页 UP 入口 / 评论 UP 链接点 UP 主 | 头部信息卡（头像 + 名字 + 粉丝 + 简介）+ 视频列表（最新发布 / 最多播放 / 最多收藏 三种排序，分页 20 条/页），点视频直接播放（不写 Gist）；顶部可关注 / 取关 |
 | **导入我关注的 UP（v2.17.12+）** | UP 主管理页（底部导航「UP 主」页）顶部「导入我关注的 UP」 | 登录 B 站后拉自己账号关注列表（`x/relation/followings`，需 SESSDATA），分页「加载更多」最多前 200 位；勾选/全选 → 批量加入白名单（一次拉 Gist → mid 查重 → 一次写回），已在白名单的关注项标「已关注」自动跳过，汇总「已添加 X，跳过 Y」 |
 | **启动自动同步关注（v2.17.13+）** | 无入口（自动） | 每次进入 App（启动 ~4s 后 / 登录成功后）**静默**拉一次 B 站关注（前 200，10 分钟节流），把**不在白名单的新关注自动批量加入**（增量、只加不删）；未登录 / 未配 GitHub 静默跳过；手动移除过的 UP（即便仍在关注）不会再被自动加回 |
-| **信箱** | 首页 AppBar 最左侧图标 | 启动 5s 后自动检查所有白名单 UP 主的新视频（带 30min 节流 + 1.5s 间隔），未读数 ≥ 1 时显示小红点；下拉刷新强制重检；顶部「全部标记已读」一键清空 |
+| **信箱** | 首页 AppBar 最左侧图标 | 启动 5s 后自动检查所有白名单 UP 主的新视频（带 30min 节流 + 1.5s 间隔），未读数 ≥ 1 时显示小红点；下拉刷新强制重检；顶部「全部标记已读」一键清空。卡片默认按**热度**排（v2.64.0+），AppBar 上可切「热度榜 / 最新」并记住选择，见下方「信箱热度榜」 |
 
 ### 设计取舍
 
@@ -638,6 +638,29 @@ GH_REPO_TOKEN='<你的 GitHub Token>' bash build_release.sh
 - **本地优先**：未读列表写 SharedPreferences（每 UP 主一份 unseen），`lastSeenBvid` 写 Gist（批量 `updateLastSeenBatch`）；检查期间断网/失败不影响下次重试
 - **信箱卡片四向手势**：**右滑 = 加入白名单 / 左滑 = 跳过**（两者都算「处理掉」并写 Gist）、**下滑 = 暂缓**（先看后面的卡片、暂不判断）、**上滑 = 取回**最近一次暂缓的那张（LIFO）。**一次「暂缓」只欠一次取回**——反复上滑不会再让之前处理掉的卡片冒出来（v2.50.0 修掉的「卡片循环」）；没有可取回的卡片时上滑只弹一句「暂无可取回的卡片」，**不再静默**（该提示属「界面提示」，受设置里的总开关约束）
 - **风控降级**：任何 UP 主遇 -412/-352 → 间隔从 1.5s 自动升级到 3s，跳过该 UP 主不抛错；最多检查 100 个 UP 主（超出按前 100）
+- **信箱按热度排，不打乱手上的卡（v2.64.0+）**：卡片顺序默认按热度（`app/lib/services/inbox_heat.dart` 纯函数本地算），只用 `arc/search` 同一次响应里已有的 `play` / `created`，**不为排序多发一个请求**；回读 / 检查带回来的新条目只从索引 1 起找位置、切换排序也只重排队首之后的尾巴 → 用户正在看（甚至正在拖）的那张永远不换人。详情见下方「信箱热度榜」
+
+### 信箱热度榜（v2.64.0+）
+
+信箱卡片从「按发布时间」改成「按热度」，AppBar 上「热度榜 / 最新」一键切换，选择落盘在 `ui:inbox_sort_mode`（默认热度，重启保持）。
+
+- **打分公式**（`app/lib/services/inbox_heat.dart`，纯函数、时间由参数传入，便于钉死）：
+  - `E = view + 20 × danmaku + 50 × comment`（互动折算成"等效播放"）
+  - `hours` = 发布至今小时数（时间未知 / 未来时间按 0 算）
+  - `E_eff = E ÷ (hours + 2)^1.5`（时间衰减，2 小时缓冲既避免除零，也避免"刚发 1 分钟的 3 播放"被放大成榜首）
+  - `score = 100 × log10(1 + E_eff) ÷ log10(1 + 1000000)`，再夹到 0~100（100 万等效播放 = 满分）
+  - 效果：衰减很凶（相对刚发布，2 小时前约剩 35%、6 小时前约 12.5%、1 天前约 1/47、3 天前约 1/225），叠上 log 压缩之后「3 小时前 12 万播放」能压过「1 天前 80 万播放」——榜会换血，不会长期被大 UP 的旧爆款占满
+- **`null` 与 `0` 必须分开**：`view == null`（接口没给 `play` / 升级前的老缓存）= **未知**，分也是 `null`，角标显示 `#1 · —`；`view == 0` 是**真·零播放**，照常算分 = 0，角标显示 `#1 · 0`（**不显示假的 0**）
+- **榜单角标**：只有顶层卡片画，左上角一枚 `#3 · 87`（队列内名次 + 0~100 分），与右上角时长角标同一套配色 token；「正在直播」角标也占着左上角时自动下移，两个不叠
+- **不换掉手上的卡**：新条目从索引 1 起找插入位置（前插下限是第二张），已在队列里的卡片不重排；切换排序只重排**队首之后**的尾巴。代价是「新模式晚一张生效」——划走手上这张之后，后面完全按新模式排
+- **零额外请求**：播放量来自 `x/space/wbi/arc/search` 的 `vlist[].play`（v2.37.0+ 已解析进 `WhitelistVideo.view`），发布时间来自 `vlist[].created`，本批只是顺路带进 `InboxItem.view`；排序 / 切换 / 名次全在本地算，`InboxService.getItems` / `checkAll` 的返回口径（红点数、可见性过滤、已处理过滤）一个字节没动
+- **名次是队列内的相对名次**：只算队首这一张（O(n) 计数），同分并列（都可能是 `#1`）；「最新」模式下角标仍显示**热度名次**（它描述这条视频在榜上的位置，与当前按什么排是两件事）
+
+**已知限制**
+
+- 弹幕数 / 评论数目前**拿不到**（`vlist` 里的互动字段没进模型），所以实际只靠播放量 + 时间衰减；`kInboxHeatDanmakuWeight`（20）/ `kInboxHeatCommentWeight`（50）两个权重口子已留好，上游哪天解析进来传值即生效，公式不用改
+- **升级前已在缓存里的老条目没有播放量** → 显示 `—` 并排在有分的条目之后（彼此按发布时间倒序，等于退回老行为）。这类条目**不会因为再次检查而回填**播放量（写盘前的合并里缓存值优先），消费掉之后就没有了；升级后新抓到的条目一律带播放量
+- 时间衰减按设备时钟算：时钟偏快会让分整体偏低（不会算出 NaN / 溢出，超大播放量封顶 100）
 
 ### 数据模型 v4
 
@@ -682,6 +705,7 @@ GH_REPO_TOKEN='<你的 GitHub Token>' bash build_release.sh
 - 模型：`app/lib/models/upowner.dart`（`Upowner` / `addUpowner` / `removeUpowner` / `UpownerException`）
 - 写入：`app/lib/services/upowner_writer.dart`（`UpownerWriter.add` / `removeByMid` / `updateLastSeenBatch`）
 - 信箱：`app/lib/services/inbox_service.dart`（`InboxService.checkAll` / `markAllRead` / `getUnseenCount` / `getItems`）
+- 热度榜：`app/lib/services/inbox_heat.dart`（`inboxHeatScore` / `inboxSortItems` / `inboxCompareForInsert` / `inboxTopHeatRank`）/ `app/lib/services/inbox_sort_store.dart`（`InboxSortStore`，key `ui:inbox_sort_mode`）
 - 页面：`app/lib/pages/upowner_page.dart`（详情页）/ `app/lib/pages/inbox_page.dart`（信箱页）
 - 入口：`app/lib/widgets/upowner_tile.dart`（搜索结果列表项）
 - B 站接口：`app/lib/api/bilibili_api.dart` 的 `searchUpowner` / `fetchUpownerVideos` / `fetchUpownerInfo`

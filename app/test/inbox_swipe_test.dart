@@ -43,9 +43,12 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:bili_whitelist_app/api/bilibili_api.dart';
 import 'package:bili_whitelist_app/api/github_api.dart';
+import 'package:bili_whitelist_app/models/live_status.dart';
 import 'package:bili_whitelist_app/models/whitelist_video.dart';
 import 'package:bili_whitelist_app/pages/inbox_page.dart';
+import 'package:bili_whitelist_app/services/inbox_heat.dart';
 import 'package:bili_whitelist_app/services/inbox_service.dart';
+import 'package:bili_whitelist_app/services/inbox_sort_store.dart';
 import 'package:bili_whitelist_app/services/service_locator.dart';
 import 'package:bili_whitelist_app/services/ui_prefs_store.dart';
 import 'package:bili_whitelist_app/services/whitelist_writer.dart';
@@ -119,6 +122,35 @@ class _FakeBiliApi extends BiliApi {
       'duration': 245,
       'owner': {'name': 'UP'},
     };
+  }
+}
+
+/// 只数**请求次数**的假接口（v2.64.0：证明热度排序 / 切换零额外请求）。
+///
+/// 两个入口都覆盖成"不发网络、只计数"：
+/// - [fetchVideoMeta]：点卡片开播放页；
+/// - [fetchLiveStatusByMid]：队首开播角标（既有逻辑，每张顶卡一次）。
+class _CountingBiliApi extends BiliApi {
+  int metaCalls = 0;
+  int liveCalls = 0;
+
+  @override
+  Future<Map<String, dynamic>> fetchVideoMeta(String bvid) async {
+    metaCalls++;
+    return {
+      'bvid': bvid,
+      'cid': 1,
+      'title': '标题 $bvid',
+      'pic': '',
+      'duration': 245,
+      'owner': {'name': 'UP'},
+    };
+  }
+
+  @override
+  Future<LiveStatus?> fetchLiveStatusByMid(int mid) async {
+    liveCalls++;
+    return null;
   }
 }
 
@@ -299,9 +331,16 @@ void _usePortraitPhone(WidgetTester tester) {
   addTearDown(tester.view.reset);
 }
 
-InboxItem _item(int i, {int duration = 245, int? pubDate}) => InboxItem(
-      upMid: i,
-      upName: 'UP$i',
+InboxItem _item(
+  int i, {
+  int duration = 245,
+  int? pubDate,
+  int? view,
+  int? upMid,
+}) =>
+    InboxItem(
+      upMid: upMid ?? i,
+      upName: 'UP${upMid ?? i}',
       upFace: '',
       bvid: 'BV$i',
       title: '新视频 $i',
@@ -310,6 +349,8 @@ InboxItem _item(int i, {int duration = 245, int? pubDate}) => InboxItem(
       // 默认 3 小时前（相对时间可断言且不受当天时间影响）
       pubDate: pubDate ??
           DateTime.now().millisecondsSinceEpoch ~/ 1000 - 3 * 3600,
+      // v2.64.0+：热度榜的播放量（不传 = 未知，与旧缓存同一形状）
+      view: view,
     );
 
 /// [hours] 小时前的 Unix 秒（构造"发布时间有序"的队列用）。
@@ -372,6 +413,32 @@ InboxItem _titled(int i, String title) => InboxItem(
       duration: 245,
       pubDate: DateTime.now().millisecondsSinceEpoch ~/ 1000 - 3 * 3600,
     );
+
+/// 热度榜用例的脚手架（v2.64.0）：与 [_pumpInbox] 同形，但 B 站接口换成
+/// [_CountingBiliApi]（数请求次数），且不注入白名单写入器（这些用例不右滑）。
+class _HeatHarness {
+  _HeatHarness({required this.service, required this.api});
+
+  final _FakeInboxService service;
+  final _CountingBiliApi api;
+}
+
+Future<_HeatHarness> _pumpHeat(
+  WidgetTester tester,
+  List<InboxItem> items, {
+  Completer<void>? checkGate,
+  _CountingBiliApi? api,
+}) async {
+  _usePortraitPhone(tester);
+  final service = _FakeInboxService(items);
+  if (checkGate != null) service.checkGate = checkGate;
+  final counting = api ?? _CountingBiliApi();
+  ServiceLocator.overrideInboxService(service);
+  ServiceLocator.overrideSyncService(_FakeSyncService());
+  await tester.pumpWidget(MaterialApp(home: InboxPage(api: counting)));
+  await tester.pumpAndSettle();
+  return _HeatHarness(service: service, api: counting);
+}
 
 /// 冲掉一串 `await`（假接口都是立刻完成的 Future）+ 收敛动画。
 Future<void> _flush(WidgetTester tester) async {
@@ -2431,6 +2498,245 @@ void main() {
           reason: '两次加入都要落进白名单（不丢更新）');
       expect(service.handled, ['BV1', 'BV2']);
       expect(_deckOrder(tester), ['BV3']);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // 热度榜（v2.64.0）：默认热度序 / 切换「最新」并落盘 / 名次角标 /
+  // 队首不换人 / 已消费不复活 / 暂缓取回语义不变 / 零额外请求
+  // -------------------------------------------------------------------------
+  group('热度榜', () {
+    setUp(() {
+      InboxSortStore.instance.resetForTest();
+      // 开播查询是会话级单例（缓存 + 串行队列）：上一个用例留下的未决请求会
+      // 把队列堵死，让本组"请求数"断言的基线不稳定 → 每个用例重置一次
+      LiveStatusHub.instance.clear();
+    });
+    tearDown(() {
+      InboxSortStore.instance.resetForTest();
+      LiveStatusHub.instance.clear();
+    });
+
+    testWidgets('默认按热度降序：队首 = 最热，角标 #1 + 分数与算法一致', (tester) async {
+      final h = await _pumpHeat(tester, [
+        // 1000 播放 / 2 小时前 = 35
+        _item(1, view: 1000, pubDate: _agoHours(2)),
+        // 200 万播放 / 5 小时前 = 84
+        _item(2, view: 2000000, pubDate: _agoHours(5)),
+        // 10 万播放 / 2 小时前 = 68
+        _item(3, view: 100000, pubDate: _agoHours(2)),
+      ]);
+      final s = _inboxState(tester);
+      expect(s.debugSortMode, InboxSortMode.heat, reason: '默认就是热度榜');
+      expect(s.debugItemBvids, ['BV2', 'BV3', 'BV1']);
+      expect(_topBvid(tester), 'BV2');
+
+      // 角标只在顶层卡片上（后层只露底边，画在顶部也看不见）
+      expect(find.text('#1 · 84'), findsOneWidget);
+      expect(find.textContaining('#1 · '), findsOneWidget);
+      expect(h.api.metaCalls, 0, reason: '排序不发请求');
+    });
+
+    testWidgets('切换「最新」：只重排队尾、队首不换人、落盘且重启后保持', (tester) async {
+      final items = [
+        _item(1, view: 1000, pubDate: _agoHours(1)), // 最新、但最不热
+        _item(2, view: 2000000, pubDate: _agoHours(5)), // 最热
+        _item(3, view: 100000, pubDate: _agoHours(2)),
+      ];
+      await _pumpHeat(tester, items);
+      var s = _inboxState(tester);
+      expect(s.debugItemBvids, ['BV2', 'BV3', 'BV1']);
+
+      await tester.tap(find.byKey(const ValueKey('inbox.sort.toggle')));
+      await _flush(tester);
+      s = _inboxState(tester);
+      expect(s.debugSortMode, InboxSortMode.latest);
+      expect(s.debugItemBvids, ['BV2', 'BV1', 'BV3'],
+          reason: '队首不动；队尾按发布时间倒序（1h 前 > 2h 前 > 5h 前）');
+      expect(_topBvid(tester), 'BV2', reason: '★ 切换排序也不换掉正在看的这张');
+
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getString(InboxSortStore.storageKey), 'latest',
+          reason: '选择要落盘');
+
+      // 模拟杀进程重开：新 State 从盘里读回「最新」→ 整队按时间排
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pumpAndSettle();
+      await _pumpHeat(tester, items);
+      s = _inboxState(tester);
+      expect(s.debugSortMode, InboxSortMode.latest);
+      expect(s.debugItemBvids, ['BV1', 'BV3', 'BV2'],
+          reason: '重启后仍是「最新」：整队发布时间倒序（1h > 2h > 5h）');
+
+      // 收尾：第二次进页触发的开播查询要等串行队列的 ≥1.5s 间隔，让它真的跑掉
+      // ——否则用例结束时留下 pending timer，flutter_test 会判定失败
+      await tester.pump(const Duration(seconds: 2));
+      await tester.pump();
+    });
+
+    testWidgets('回读到更热的新视频：插到队尾该在的位置、队首不换人、名次如实变化',
+        (tester) async {
+      final gate = Completer<void>();
+      final items = [
+        // 200 万 / 2 小时前 = 90
+        _item(1, view: 2000000, pubDate: _agoHours(2)),
+        // 1000 / 2 小时前 = 35
+        _item(2, view: 1000, pubDate: _agoHours(2)),
+      ];
+      final h = await _pumpHeat(tester, items, checkGate: gate);
+      final s = _inboxState(tester);
+      expect(s.debugItemBvids, ['BV1', 'BV2']);
+      expect(find.text('#1 · 90'), findsOneWidget);
+
+      // 检查还在跑：又落盘了一条更热的（400 万 / 2 小时前 = 95）
+      items.add(_item(3, view: 4000000, pubDate: _agoHours(2)));
+      await tester.pump(const Duration(seconds: 3)); // _kProgressPoll
+      await _flush(tester);
+
+      expect(s.debugItemBvids, ['BV1', 'BV3', 'BV2'],
+          reason: '新条目按热度插入队尾（95 > 35 → 在 BV2 之前）');
+      expect(_topBvid(tester), 'BV1', reason: '★ 队首不换人：正在看的那张不动');
+      expect(find.text('#2 · 90'), findsOneWidget,
+          reason: '队首还是那张，但榜单名次如实变成 #2（不是假的 #1）');
+
+      gate.complete();
+      await _flush(tester);
+      expect(h.service.checkCalls, 1);
+    });
+
+    testWidgets('热度排序不会让已消费的卡复活', (tester) async {
+      final gate = Completer<void>();
+      final items = [
+        _item(1, view: 2000000, pubDate: _agoHours(2)),
+        _item(2, view: 1000, pubDate: _agoHours(2)),
+      ];
+      await _pumpHeat(tester, items, checkGate: gate);
+      final s = _inboxState(tester);
+
+      await tester.drag(_cardByBvid('BV1'), const Offset(-300, 0)); // 跳过
+      await _flush(tester);
+      expect(s.debugItemBvids, ['BV2']);
+
+      // 服务层这一轮仍把 BV1 当"未读"（替身不删 items）→ 回读一定会带上它
+      items.add(_item(3, view: 3000, pubDate: _agoHours(2)));
+      await tester.pump(const Duration(seconds: 3));
+      await _flush(tester);
+
+      expect(s.debugItemBvids, isNot(contains('BV1')),
+          reason: '★ 已消费的条目不能因为重排 / 回读复活');
+      expect(_cardByBvid('BV1'), findsNothing);
+      expect(s.debugItemBvids, ['BV2', 'BV3'],
+          reason: '新条目按热度插到 BV2 之前（3000 > 1000）');
+
+      gate.complete();
+      await _flush(tester);
+    });
+
+    testWidgets('热度序下「暂缓 / 取回」语义不变：推后到队尾、一次暂缓一次取回',
+        (tester) async {
+      final items = [
+        _item(1, view: 2000000, pubDate: _agoHours(2)), // 90
+        _item(2, view: 1000, pubDate: _agoHours(2)), // 35
+        _item(3, view: 100000, pubDate: _agoHours(2)), // 68
+      ];
+      final h = await _pumpHeat(tester, items);
+      final s = _inboxState(tester);
+      expect(s.debugItemBvids, ['BV1', 'BV3', 'BV2']);
+
+      await tester.drag(_cardByBvid('BV1'), const Offset(0, 300)); // 稍后
+      await _flush(tester);
+      expect(s.debugItemBvids, ['BV3', 'BV2', 'BV1'],
+          reason: '暂缓 = 这张推到队尾（不重排、不做判断）');
+      expect(s.debugDeferredBvids, ['BV1']);
+
+      await tester.drag(_cardByBvid('BV3'), const Offset(0, -300)); // 取回
+      await _flush(tester);
+      expect(s.debugItemBvids, ['BV1', 'BV3', 'BV2'], reason: '取回 = 回到队首');
+      expect(s.debugDeferredBvids, isEmpty, reason: '一次暂缓只欠一次取回（票已排空）');
+      expect(s.debugRestoreCount, 1);
+      expect(s.debugItemBvids.length, h.service.items.length,
+          reason: '红点口径 = 可见队列条数（排序不改长度）');
+      expect(s.debugItemBvids.toSet().length, s.debugItemBvids.length,
+          reason: '队列里没有重复 bvid');
+    });
+
+    testWidgets('播放量未知：角标显示「—」而不是假的 0 分', (tester) async {
+      await _pumpHeat(tester, [_item(1), _item(2)]);
+      expect(find.text('#1 · —'), findsOneWidget);
+      expect(find.text('#1 · 0'), findsNothing,
+          reason: '0 分是"真·零播放"的合法值，未知必须显示「—」');
+    });
+
+    testWidgets('角标组件契约：有分数显示分数、无数据显示「—」、不给名次就不画',
+        (tester) async {
+      Future<void> pumpCard({int? rank, int? heat}) async {
+        await tester.pumpWidget(MaterialApp(
+          home: Scaffold(
+            body: Center(
+              child: InboxSwipeCard(
+                item: _item(1, view: 1000),
+                width: 320,
+                rank: rank,
+                heat: heat,
+              ),
+            ),
+          ),
+        ));
+        await tester.pumpAndSettle();
+      }
+
+      await pumpCard(rank: 3, heat: 87);
+      expect(find.text('#3 · 87'), findsOneWidget);
+
+      await pumpCard(rank: 1, heat: null);
+      expect(find.text('#1 · —'), findsOneWidget);
+      expect(find.text('#1 · 0'), findsNothing);
+
+      await pumpCard();
+      expect(find.textContaining('#'), findsNothing,
+          reason: '宿主不给名次（例如后层卡片 / 幽灵卡）→ 不画角标');
+    });
+
+    testWidgets('排序 / 切换排序 / 新条目入队：零额外网络请求、不触发 checkAll',
+        (tester) async {
+      final gate = Completer<void>();
+      final api = _CountingBiliApi();
+      // 用没人用过的 upMid：`LiveStatusHub` 是会话级缓存，别的用例查过 1/2 号
+      // UP 之后这里就不会真的发查询了（那样"基线 ≥1"就成了空断言）
+      final h = await _pumpHeat(tester, [
+        _item(1, view: 2000000, pubDate: _agoHours(2), upMid: 90001),
+        _item(2, view: 1000, pubDate: _agoHours(2), upMid: 90002),
+      ], checkGate: gate, api: api);
+
+      // 让开播查询真的发出去（LiveStatusHub 串行 + 相邻间隔 1.5s）：这样下面
+      // "请求数没涨"的断言才有真实基线，而不是拿 0 跟 0 比
+      await tester.pump(const Duration(seconds: 2));
+      await tester.pump();
+
+      final metaBefore = api.metaCalls;
+      final liveBefore = api.liveCalls;
+      final checkBefore = h.service.checkCalls;
+      expect(liveBefore, greaterThanOrEqualTo(1),
+          reason: '开播角标查询是既有逻辑（每张顶卡一次，这里只当作基线）');
+
+      await tester.tap(find.byKey(const ValueKey('inbox.sort.toggle')));
+      await _flush(tester);
+      await tester.tap(find.byKey(const ValueKey('inbox.sort.toggle')));
+      await _flush(tester);
+
+      // 再从回读路径进来一条（需要打分 + 落位）
+      h.service.items.add(_item(3, view: 500000, pubDate: _agoHours(2)));
+      await tester.pump(const Duration(seconds: 3));
+      await _flush(tester);
+
+      expect(api.metaCalls, metaBefore, reason: '★ 排序 / 打分绝不能发请求');
+      expect(api.liveCalls, liveBefore,
+          reason: '★ 切换排序 / 回读不触发任何额外请求（含开播查询）');
+      expect(h.service.checkCalls, checkBefore,
+          reason: '切排序不等于检查：不会重跑 checkAll');
+
+      gate.complete();
+      await _flush(tester);
     });
   });
 }

@@ -98,6 +98,9 @@ class InboxSwipeCard extends StatelessWidget {
     this.action,
     this.actionProgress = 0,
     this.reactionVertical = false,
+    this.rank,
+    this.heat,
+    this.badgeTop = kSpace12,
   });
 
   /// 卡片数据。
@@ -126,10 +129,28 @@ class InboxSwipeCard extends StatelessWidget {
   /// "往哪边划"的信息在竖直方向上，贴着左右边缘反而看不出反馈跟手。
   final bool reactionVertical;
 
+  /// 这张卡在**热度榜**里的名次（1 起；null = 不显示角标）。
+  ///
+  /// v2.64.0+：只有页面传给**顶层卡片**时才画（后层只露出底边，角标在顶部
+  /// 本来也看不见）。名次与分数都来自 `services/inbox_heat.dart`，本组件只负责
+  /// 画，不算分。
+  final int? rank;
+
+  /// 热度分（0~100）；`null` = 数据不足（榜单角标显示「—」，**不显示假的 0**）。
+  final int? heat;
+
+  /// 榜单角标距卡片顶部的距离（dp）。
+  ///
+  /// 默认 [kSpace12]（与各版式自己的右上角时长角标同一档）。宿主在「正在直播」
+  /// 角标也占着左上角时把它下移（见 `inbox_page.dart` 的 `_buildTopCard`）→
+  /// 两个角标不叠在一起。
+  final double badgeTop;
+
   @override
   Widget build(BuildContext context) {
     final act = action;
     final mark = act == null ? null : _markFor(context, act);
+    final r = rank;
     return SizedBox(
       width: width,
       height: inboxCardHeight(width),
@@ -137,6 +158,15 @@ class InboxSwipeCard extends StatelessWidget {
         fit: StackFit.expand,
         children: [
           InboxCardStyleView(item: item, style: style, width: width),
+          // 榜单角标（v2.64.0+）：左上角一枚实心小胶囊「#3 · 87」。
+          // 底色 / 字色与右上角时长角标同一对（palette.inkFill + onInk，
+          // 已过对比度护栏）→ 任何版式、任何封面、夜间都读得清。
+          if (r != null)
+            Positioned(
+              left: kSpace12,
+              top: badgeTop,
+              child: _HeatBadge(rank: r, heat: heat),
+            ),
           if (mark != null && actionProgress > 0)
             _ReactionMark(
               label: mark.label,
@@ -150,6 +180,46 @@ class InboxSwipeCard extends StatelessWidget {
               tilt: reactionVertical ? 0 : mark.tilt,
             ),
         ],
+      ),
+    );
+  }
+}
+
+/// 热度榜角标（v2.64.0+）：`#3 · 87`。
+///
+/// 样式**刻意克制**（与右上角时长角标同一套 token，见文件头「浮层标记的颜色」
+/// 那段硬约束）：实心 [AppPalette.inkFill] 底 + [AppPalette.onInk] 字、圆角
+/// [kRadiusXs]、字阶 [kTypeNum]（等宽数字，名次跳动时宽度不抖）。没有任何
+/// 阴影 / 渐变 —— 它只是一个"名次 + 分数"的小标签，不该抢卡片内容。
+///
+/// 分数为 null（播放量未知）时显示「—」：**不显示假的 0 分**（0 分是"真·零
+/// 播放"的合法值，两者在数据上必须分得开）。
+class _HeatBadge extends StatelessWidget {
+  const _HeatBadge({required this.rank, required this.heat});
+
+  final int rank;
+  final int? heat;
+
+  @override
+  Widget build(BuildContext context) {
+    final palette = context.palette;
+    final score = heat == null ? '—' : '$heat';
+    return Semantics(
+      label: '热度榜第 $rank 名，热度 ${heat ?? '未知'}',
+      excludeSemantics: true,
+      child: Container(
+        padding: const EdgeInsets.symmetric(
+          horizontal: kSpace8,
+          vertical: kSpace2,
+        ),
+        decoration: BoxDecoration(
+          color: palette.inkFill,
+          borderRadius: BorderRadius.circular(kRadiusXs),
+        ),
+        child: Text(
+          '#$rank · $score',
+          style: kTypeNum.copyWith(color: palette.onInk, letterSpacing: 0.5),
+        ),
       ),
     );
   }

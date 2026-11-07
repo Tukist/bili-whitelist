@@ -40,6 +40,25 @@
 ///   位移超过 touch slop 只能有一条胜出，所以「点」不会误触发拖动，
 ///   「拖」也不会误触发打开）。
 ///
+/// ## ★ 热度榜（v2.64.0+）
+/// 队列默认按**热度**排（用户原话：「把推荐卡牌做成热度榜」），AppBar 上有
+/// 「热度榜 / 最新」切换，选择落盘在 [InboxSortStore]（默认热度，重启保持）。
+///
+/// - **打分**：`services/inbox_heat.dart` 的纯函数，只用条目上已有的
+///   [InboxItem.view]（播放量）+ [InboxItem.pubDate]（时间衰减），**零额外请求**；
+/// - **卡片角标**：顶层卡片左上角一枚「#3 · 87」（名次 + 0~100 分），样式与
+///   右上角时长角标同一套 token；播放量未知时显示「—」而不是假的 0。
+///   「最新」模式里角标仍然显示**热度榜名次**（它描述的是这条视频在榜上的位置，
+///   跟队列当前按什么排是两件事）；
+/// - **队首不换人**（硬契约，沿用 [_mergeChecked] 的既有约定）：回读 / 整轮
+///   checkAll 带回来的新条目**只往队列尾部插**（插入位置下限 = 索引 1），
+///   按热度定它该在的位置；已经在队列里的卡片**不会**被重排 → 用户手上正在看
+///   的那张、和后面已排好的顺序都不会跳；
+/// - **切换排序**：也只重排**队首之后**的尾巴（同样是为了不把正在看的那张换掉），
+///   队首那张被划走之后，后面的卡片才开始严格按新模式排。
+///   取舍：切换的"新顺序"晚一张卡生效；换来的是"任何重排都不会换掉手上的卡"，
+///   与既有「回读不换人」是同一条契约。
+///
 /// ## 卡片比例与版式（v2.21.0+）
 /// - 卡片固定为**扑克牌比例**（宽 : 高 = 1 : [kInboxCardAspect] = 1 : 1.39，
 ///   63:88）：宽度仍取「屏宽 × 0.88 封顶 420」，高度由比例算出；
@@ -140,7 +159,9 @@ import '../api/bilibili_api.dart';
 import '../api/github_api.dart';
 import '../models/live_status.dart';
 import '../services/inbox_card_style_store.dart';
+import '../services/inbox_heat.dart';
 import '../services/inbox_service.dart';
+import '../services/inbox_sort_store.dart';
 import '../services/service_locator.dart';
 import '../services/whitelist_writer.dart';
 import '../sync/whitelist_freshness.dart';
@@ -362,8 +383,18 @@ class InboxPageState extends State<InboxPage>
   late final BiliApi _api = widget.api ?? BiliApi();
   late final WhitelistWriter _writer = widget.writer ?? WhitelistWriter();
 
-  /// 待处理队列（未读，按发布时间倒序；队首 = 顶层卡片）。
+  /// 待处理队列（队首 = 顶层卡片）。
+  ///
+  /// 顺序由 [_sortMode] 决定（v2.64.0+）：热度榜 → 热度降序，最新 → 发布时间
+  /// 倒序；两种模式下**队首都是用户此刻正在看的那张**，任何重排都不换人
+  /// （见 [_mergeChecked] / [_resortKeepingHead]）。
   List<InboxItem> _items = [];
+
+  /// 当前排序模式（v2.64.0+；落盘在 [InboxSortStore]，默认热度）。
+  ///
+  /// 页面存一份内存副本是为了 `build` 里同步读（不能 await 存储）；写入口只有
+  /// [_toggleSortMode] 一处，改完立刻与 store 对齐。
+  InboxSortMode _sortMode = InboxSortMode.heat;
 
   /// 后台任务提示文案（null = 没有任务在跑）。
   ///
@@ -595,14 +626,30 @@ class InboxPageState extends State<InboxPage>
   // ---------------------------------------------------------------------------
 
   /// 只刷新缓存条目（不触网）。
+  ///
+  /// ★ v2.64.0+：**先**把排序偏好从盘里读回来（[InboxSortStore.ensureLoaded]，
+  /// 幂等），再铺队列 —— 否则重启后会先用默认（热度）排一遍，再切成用户上次
+  /// 选的「最新」，肉眼能看到一次跳序。
   Future<void> _refreshItems() async {
+    final modeBefore = _sortMode;
+    await InboxSortStore.instance.ensureLoaded();
     final items = await ServiceLocator.inboxService.getItems();
     if (!mounted) return;
     setState(() {
+      final loaded = InboxSortStore.instance.mode;
+      _sortMode = loaded;
       // 本地缓存里已经有卡片 → 记「拿到过队列结果」：此后队列被划空时显示
       // 空态，而不是转圈等 checkAll
       if (items.isNotEmpty) _loadedOnce = true;
-      _items = _mergeChecked(items);
+      final merged = _mergeChecked(items);
+      // ★ 首屏这一次：从盘里读回来的偏好若与"刚才用的默认值"不同（例如上次
+      //   选的是「最新」），**整队**按真实偏好重排一次。理由：initState 里
+      //   `_refreshItems` 与 `_checkNow` 是并行的，检查回来的条目可能已经先用
+      //   默认（热度）铺过一遍；不重排的话首屏就是错的顺序。这里不受"队首不换人"
+      //   约束 —— 页面刚打开，用户还没看过/碰过任何一张。
+      _items = loaded != modeBefore
+          ? inboxSortItems(merged, mode: loaded, nowSec: _nowSec())
+          : merged;
     });
     unawaited(_loadTopLive());
   }
@@ -658,21 +705,31 @@ class InboxPageState extends State<InboxPage>
   /// 把一份「服务端 / 缓存的队列」并进当前队列。
   ///
   /// ★ 只增不改（并发要求）：已经在队列里的、以及本次会话里被用户消费掉的
-  /// （[_consumedBvids]）一律跳过；新出现的条目**按发布时间倒序插到它该在的
+  /// （[_consumedBvids]）一律跳过；新出现的条目**按当前排序模式插到它该在的
   /// 位置**。刻意不覆盖：一轮 [InboxService.checkAll] 可能跑几分钟，期间用户
   /// 已经划走了几张，覆盖会让划过的不复活。
   ///
+  /// 落位规则（[inboxCompareForInsert]）：
+  /// - 热度榜（默认）：热度分高的在前；没有播放量数据的条目排在最后，彼此
+  ///   之间**退回发布时间倒序**（这就是 v2.64.0 之前的唯一行为 ——
+  ///   [InboxService.getItems] / checkAll 的返回值都是时间倒序，所以"缺字段
+  ///   就按原序"= 不打乱）；
+  /// - 最新：按发布时间倒序；
+  /// - 两者同分 / 同时间 → 排在等位条目之后（"先到先得"，与老实现一致）。
+  ///
   /// 为什么不再是"一律追加到队尾"（v2.50.0 改）：服务返回的列表是按发布时间
-  /// **倒序**的（[InboxService.getItems] / checkAll 的返回值都走同一口径），
-  /// 追加会把**更新的视频压到队尾** → 卡片顺序与发布时间序脱钩，用户报的
-  /// 「顺序很乱」有一半来自这里。现在插到第一张比它旧的卡之前；pubDate 相同的
-  /// 排在后面（服务返回的顺序即"先到先得"）→ 既有的"同批条目顺序不变"照样成立。
+  /// **倒序**的，追加会把**更新的视频压到队尾** → 卡片顺序与发布时间序脱钩，
+  /// 用户报的「顺序很乱」有一半来自这里。
   ///
   /// ★ 但**绝不插到当前这张之前**（插入位置下限 = 索引 1）：用户手上正在看的
   /// 那张不许因为一次后台回读换人 —— 这是既有硬契约，被
   /// `test/inbox_swipe_test.dart` 的「检查进行中…当前正在看的那张不能换人」
   /// 锁着（回读每 3s 一次、正跑在拖动中间，换人会把这一次手势判到另一张视频
-  /// 头上）。当前那张被划走之后，队列就完全按发布时间序了。
+  /// 头上）。当前那张被划走之后，队列就完全按当前模式排了。
+  ///
+  /// ★ v2.64.0+：**已经在队列里的卡片不会被重排**（只在空队列时整队铺开）。
+  /// 热度衰减会让名次慢慢变化，若每次回读都重排一次尾巴，用户刚看过的顺序会
+  /// 在眼皮底下跳 —— "新条目参与排序"靠插入位置实现，不靠打乱旧顺序。
   ///
   /// [_deferredBvids] 的取回顺序不受影响：它是按"推后的先后"入栈的，与卡在队列
   /// 里的位置无关（「稍后」永远是把卡送到队尾，见 [_reinsertDeferred]）。
@@ -697,12 +754,23 @@ class InboxPageState extends State<InboxPage>
       fresh.add(it);
     }
     if (fresh.isEmpty) return _items;
+    final nowSec = _nowSec();
+    // 空队列（首次铺开 / 用户刚划完）→ 整队按当前模式排序，队首就是榜首
+    if (_items.isEmpty) {
+      return inboxSortItems(fresh, mode: _sortMode, nowSec: nowSec);
+    }
     final merged = List<InboxItem>.of(_items);
     for (final it in fresh) {
-      // 从索引 1 起找第一张比它旧的 → 插在它前面（没有比它旧的 → 追加到队尾）
+      // 从索引 1 起找第一张"排在它后面"的卡 → 插在它前面；没有 → 追加队尾
       var at = merged.length;
       for (var i = 1; i < merged.length; i++) {
-        if (merged[i].pubDate < it.pubDate) {
+        final cmp = inboxCompareForInsert(
+          it,
+          merged[i],
+          mode: _sortMode,
+          nowSec: nowSec,
+        );
+        if (cmp < 0) {
           at = i;
           break;
         }
@@ -710,6 +778,44 @@ class InboxPageState extends State<InboxPage>
       merged.insert(at, it);
     }
     return merged;
+  }
+
+  /// 当前 Unix 秒（热度打分 / 排序的时间基准）。
+  ///
+  /// 一次合并 / 一次重排里**只取一次**，同一批条目用同一个"现在" → 分数之间
+  /// 可比（各自取一次时间会让同一批的分差带上微秒级抖动）。
+  int _nowSec() => DateTime.now().millisecondsSinceEpoch ~/ 1000;
+
+  /// 切换「热度 / 最新」：落盘 + 重排**队首之后**的尾巴。
+  ///
+  /// ★ 为什么不整队重排：队首是用户正在看的（甚至正在拖的）那张，换掉它就是
+  /// 把这次手势判到另一条视频头上 —— 与 [_mergeChecked] 的"插入位置下限 =
+  /// 索引 1"是同一条契约。代价是"新模式晚一张卡生效"，用户划走手上这张之后
+  /// 就完全按新模式排（切换时已经把这之后的尾巴排好了）。
+  Future<void> _toggleSortMode() async {
+    final next = _sortMode == InboxSortMode.heat
+        ? InboxSortMode.latest
+        : InboxSortMode.heat;
+    await InboxSortStore.instance.select(next);
+    if (!mounted) return;
+    setState(() {
+      _sortMode = next;
+      _items = _resortKeepingHead();
+    });
+    _showSnack(next == InboxSortMode.heat ? '已切到「热度」：按热度榜排序' : '已切到「最新」：按发布时间排序');
+  }
+
+  /// 只重排队首之后的尾巴（队首那张原封不动）；队列 ≤ 1 张时原样返回。
+  List<InboxItem> _resortKeepingHead() {
+    if (_items.length < 2) return _items;
+    return [
+      _items.first,
+      ...inboxSortItems(
+        _items.sublist(1),
+        mode: _sortMode,
+        nowSec: _nowSec(),
+      ),
+    ];
   }
 
   /// 触发 checkAll(force=true) 并刷新本地列表。
@@ -841,7 +947,11 @@ class InboxPageState extends State<InboxPage>
       final items = await ServiceLocator.inboxService.getItems();
       if (!mounted) return;
       setState(() {
-        _items = items;
+        _items = inboxSortItems(
+          items,
+          mode: _sortMode,
+          nowSec: _nowSec(),
+        );
         // 全部标记已读 = 用户明说"这些都看过了" → 「待取回」的也一并作废
         // （否则上滑还会把一张已经标记已读的卡搬回栈顶）
         _deferredBvids.clear();
@@ -1657,6 +1767,27 @@ class InboxPageState extends State<InboxPage>
                 style: kTypeBodyS.copyWith(color: kInkGray70),
               ),
             ),
+          // 排序切换（v2.64.0+）：热度榜（默认）/ 最新。落盘在 InboxSortStore，
+          // 重启保持；切换只重排队首之后的尾巴（见 [_toggleSortMode]）。
+          // 用「图标 + 当前模式名」而不是纯图标：一眼看得出现在按什么排；
+          // 文案压成两个字是为了给「全部标记已读」留出 AppBar 宽度。
+          Tooltip(
+            message: _sortMode == InboxSortMode.heat
+                ? '排序：热度榜（点击切到最新）'
+                : '排序：最新（点击切到热度榜）',
+            child: TextButton(
+              key: const ValueKey('inbox.sort.toggle'),
+              // 纯文字 + 收紧内边距：AppBar 里还要放「检查中…」与「全部标记已读」，
+              // 360dp 窄屏也不能挤爆（test/inbox_swipe_test.dart 有 360dp 用例）。
+              // 带图标会多占 ~26dp，正好在 360dp 上溢出 4px（实测）。
+              style: TextButton.styleFrom(
+                padding: const EdgeInsets.symmetric(horizontal: kSpace8),
+                visualDensity: VisualDensity.compact,
+              ),
+              onPressed: () => unawaited(_toggleSortMode()),
+              child: Text(_sortMode.label),
+            ),
+          ),
           TextButton.icon(
             icon: const Icon(Icons.done_all),
             label: const Text('全部标记已读'),
@@ -1745,6 +1876,12 @@ class InboxPageState extends State<InboxPage>
     // 当前卡片版式（设置页可切）：本方法在 ListenableBuilder 里被重建，
     // 换风格 → 整叠卡片同时换版式（尺寸固定，卡片栈不跳动）
     final style = InboxCardStyleStore.instance.style;
+    // 热度榜角标（v2.64.0+）：只算**队首这一张** —— 后层只露出底边，角标在顶部
+    // 本来也看不见；拖动期间每帧也只多这一次 O(n) 计数（不排序整队）。
+    final top = _items.first;
+    final nowSec = _nowSec();
+    final topRank = inboxTopHeatRank(top, _items, nowSec: nowSec);
+    final topHeat = inboxHeatDisplay(top, nowSec: nowSec);
     return StaggeredListScope(
       generation: 'inbox',
       ledger: _entranceLedger,
@@ -1794,7 +1931,13 @@ class InboxPageState extends State<InboxPage>
                             advancing: _anim == _SwipeAnim.exit,
                             // 上滑取回一次 → 后层退回原位（见该字段的说明）
                             restoreTick: _restoreTick,
-                            topCard: _buildTopCard(_items.first, cardW, style),
+                            topCard: _buildTopCard(
+                              _items.first,
+                              cardW,
+                              style,
+                              rank: topRank,
+                              heat: topHeat,
+                            ),
                             // 幽灵卡：已经交接出去、还在飞的那张（画在最上面、
                             // 不吃手势）—— 新手势因此落到下面新顶卡上
                             overlay: _buildGhost(cardW, style),
@@ -1813,8 +1956,18 @@ class InboxPageState extends State<InboxPage>
     );
   }
 
-  /// 顶层卡片：手势 + 跟随/旋转 + 浮层标记（+ 在播角标）。
-  Widget _buildTopCard(InboxItem item, double cardW, InboxCardStyle style) {
+  /// 顶层卡片：手势 + 跟随/旋转 + 浮层标记（+ 在播角标 + 热度榜角标）。
+  ///
+  /// [rank] / [heat]：这张卡在热度榜里的名次与 0~100 热度分（v2.64.0+，由
+  /// [_buildDeck] 算好传进来）。只有顶层卡片画它 —— 后层只露出底边。
+  Widget _buildTopCard(
+    InboxItem item,
+    double cardW,
+    InboxCardStyle style, {
+    required int rank,
+    required int? heat,
+  }) {
+    final live = _live;
     final card = InboxSwipeCard(
       item: item,
       width: cardW,
@@ -1825,6 +1978,12 @@ class InboxPageState extends State<InboxPage>
       actionProgress: _reactionProgress,
       // 竖直主导的拖动/飞出 → 徽标居中显示（见 _vertical 的说明）
       reactionVertical: _vertical,
+      // 榜单角标：`#3 · 87`（左上角）
+      rank: rank,
+      heat: heat,
+      // 「正在直播」角标也占着左上角（48dp 高）→ 有直播时把榜单角标让到它下面，
+      // 两个角标不叠在一起
+      badgeTop: (live != null && live.isLive) ? kSpace8 + 48 : kSpace12,
     );
     final gesture = GestureDetector(
       behavior: HitTestBehavior.opaque,
@@ -1849,7 +2008,6 @@ class InboxPageState extends State<InboxPage>
     // 只是 Stack 里的一层，卡片的自然高度仍是 Stack 的高度，卡片栈的几何
     // 一点没动）。点它是自己的手势（内层 InkWell 在手势竞技场里胜出），
     // → 进站内直播播放页（v2.27.0+）；点卡片其它地方照旧开播放页。
-    final live = _live;
     final body = (live != null && live.isLive)
         ? Stack(
             children: [
@@ -2036,4 +2194,8 @@ class InboxPageState extends State<InboxPage>
   /// 重复取回（循环）。
   @visibleForTesting
   int get debugRestoreCount => _restoreTick;
+
+  /// 当前排序模式（v2.64.0+：热度榜 / 最新）。
+  @visibleForTesting
+  InboxSortMode get debugSortMode => _sortMode;
 }
