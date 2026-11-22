@@ -47,6 +47,7 @@ import 'history_page.dart';
 import 'inbox_page.dart';
 import 'login_page.dart';
 import 'player_page.dart';
+import 'recommend_page.dart';
 import 'schedule_page.dart';
 import 'search_page.dart';
 import 'update_dialog.dart';
@@ -57,6 +58,8 @@ import 'watch_stats_page.dart';
 // ==================== 底部导航目的地下标（唯一真相） ====================
 //
 // v2.33.0 在「UP 主」与「历史」之间插入了「日程」，历史与个人各 +1。
+// v2.68.0 又把「UP 主」换成了「推荐」（下标不变，仍是 1；UP 主管理迁到
+// 「个人 → 设置 → UP 主管理」全屏页）。
 // 之所以把这些下标提升成具名常量：本页里有 [PlaylistPage] 的 PageView 顺序、
 // [_PlaylistPageState._tab] 初值、[_PlaylistPageState._reloadTab] 的分支、
 // NavigationBar 的 destinations 顺序**四处**必须完全对齐，任何一处漏改都是
@@ -66,10 +69,10 @@ import 'watch_stats_page.dart';
 /// 合集（白名单视频）：PageView 第 1 页。
 const int kTabCollections = 0;
 
-/// UP 主管理：PageView 第 2 页。
-const int kTabUpowners = 1;
+/// 推荐（按兴趣标签推送，v2.68.0 取代原「UP 主」页签）：PageView 第 2 页。
+const int kTabRecommend = 1;
 
-/// 日程（v2.33.0 新增）：PageView 第 3 页，夹在 UP 主与历史之间。
+/// 日程（v2.33.0 新增）：PageView 第 3 页，夹在推荐与历史之间。
 const int kTabSchedule = 2;
 
 /// 历史记录：PageView 第 4 页（v2.33.0 起由 2 → 3）。
@@ -118,14 +121,17 @@ const int kTabPersonal = 4;
 ///   去登录解锁 1080P」提示入口（v2.16.21，不默认静默降级）
 /// - **底部导航 5 个目的地**（v2.19.0 起把原「统计」+「设置」合并为
 ///   **「个人」**；v2.33.0 在「UP 主」与「历史」之间插入 **「日程」**；
-///   取代更早的 AppBar 历史/统计/管理三个图标；同时保留
-///   PageView 左右滑动）：
-///   合集(0) → UP 主管理(1) → **日程**(2，v2.33.0 新增，本地可编辑网格) →
+///   v2.68.0 把「UP 主」换成 **「推荐」**；取代更早的 AppBar 历史/统计/管理
+///   三个图标；同时保留 PageView 左右滑动）：
+///   合集(0) → **推荐**(1，v2.68.0：按最近观看的标签推热门/新片，已看不推) →
+///   **日程**(2，v2.33.0 新增，本地可编辑网格) →
 ///   **历史记录**(3，播放历史，点击续播) →
 ///   **个人**(4)：**观看统计在上**（v2.17.9+ 每日真实观看时长；v2.17.10+
 ///   克莱因蓝 GitHub 式热力单张大图 + 总览在热力下方 + 点日期格看当天历史）、
 ///   **设置在下**（与旧齿轮弹层共用 [ManagePanel]，内联嵌入不 pop 路由，
 ///   见 watch_stats_page.dart / widgets/manage_panel.dart）。
+///   原「UP 主」页上的两个管理动作（移除白名单 UP 主、导入我的 UP）没丢：
+///   迁到设置区的「UP 主管理」全屏页（见 [_openUpownerManage]）。
 ///   下标唯一真相 = 本文件顶部的 [kTabCollections] 一组常量。
 ///   切换目的地 = animateToPage(kDurBase) + 显式幂等刷新目标页数据
 ///   （见 [_goToPage]/[_reloadTab]）；图标 + 文字标签常显（Material 3
@@ -232,8 +238,9 @@ class _PlaylistPageState extends State<PlaylistPage> {
 
   bool get _hasData => _data.videos.isNotEmpty;
 
-  /// 主页 PageView（v2.33.0 起 5 页：合集主页 / UP 主管理 / **日程** /
-  /// 历史记录 / 个人），初始停在合集主页（index 0，与底部导航首项一致）。
+  /// 主页 PageView（v2.33.0 起 5 页：合集主页 / **推荐**（v2.68.0 取代
+  /// UP 主管理）/ **日程** / 历史记录 / 个人），初始停在合集主页
+  /// （index 0，与底部导航首项一致）。
   final PageController _pageController = PageController(initialPage: 0);
 
   /// 当前选中的底部导航目的地（= PageView 当前页；点导航与滑动都会同步它，
@@ -243,6 +250,11 @@ class _PlaylistPageState extends State<PlaylistPage> {
   /// 历史页 State 的全局 key：切到历史页时刷新数据（PageView 相邻页存活，
   /// 用户可能刚从别处播放回来，需要重新读表）。
   final GlobalKey<HistoryPageState> _historyKey = GlobalKey<HistoryPageState>();
+
+  /// 推荐页 State 的全局 key：切到推荐页时刷新（非 force → 走服务里的
+  /// 30 分钟 TTL，切页不会每次重打 10 个请求）。
+  final GlobalKey<RecommendPageState> _recommendKey =
+      GlobalKey<RecommendPageState>();
 
   /// 「个人」页（内含观看统计）State 的全局 key：切到该页时刷新（播放返回/
   /// 跨日后数据可能已变；PageView 页存活时也以切页为准重读，约定同历史页）。
@@ -263,12 +275,14 @@ class _PlaylistPageState extends State<PlaylistPage> {
 
   /// 目标页数据刷新（幂等）：[kTabHistory] / [kTabPersonal]（观看统计）页重读
   /// 本地表；[kTabCollections] 重算合集统计（切回来时把「已看 X/Y」对齐刚看完
-  /// 的那几集）。
+  /// 的那几集）；[kTabRecommend] 让推荐页按 TTL 重算（刚看完的视频会从池子里
+  /// 消失，但 30 分钟内不重复打请求）。
   ///
   /// [kTabSchedule]（日程）**故意不在这里刷新**：日程表全在内存里、每次改动
   /// 即刻落库，切回来不需要重读；反而重读会把用户正在编辑的态打断。
   void _reloadTab(int i) {
     if (i == kTabCollections) unawaited(_refreshCollectionStats());
+    if (i == kTabRecommend) unawaited(_recommendKey.currentState?.reload());
     if (i == kTabHistory) _historyKey.currentState?.reload();
     if (i == kTabPersonal) _statsKey.currentState?.reload();
   }
@@ -1239,6 +1253,9 @@ class _PlaylistPageState extends State<PlaylistPage> {
       headingTitle: headingTitle,
       headingSubtitle: headingSubtitle,
       onManageCollections: _openCollectionManage,
+      // 原底部导航「UP 主」页的两个管理动作（移除 / 导入我的 UP）的唯一入口
+      // （v2.68.0：该页签已换成「推荐」）
+      onOpenUpowners: _openUpownerManage,
       onCheckUpdate: _manualCheckUpdate,
       // 次级「登录 / 重新登录」入口：推登录页（测试可注入替身）
       onLogin: () {
@@ -1587,6 +1604,30 @@ class _PlaylistPageState extends State<PlaylistPage> {
     if (changed == true && mounted) _load();
   }
 
+  /// 打开「UP 主管理」全屏页（v2.68.0：原底部导航「UP 主」页签被「推荐」
+  /// 取代，这一页连同它的三个动作整体搬到设置区入口后面）。
+  ///
+  /// 为什么是**全屏页**而不是弹层：这一页有列表 + 下拉刷新 + 批量导入流程，
+  /// 弹层里塞列表滚动会与「导入我的 UP」的勾选页打架；全屏路由与原来在
+  /// PageView 里的观感最接近（顶部补一个 AppBar 就够）。
+  Future<void> _openUpownerManage() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => _UpownerManageScreen(
+          readUpowners: () => _data.upowners,
+          syncing: () => _syncing,
+          onRefresh: _load,
+          onSearch: () => _openSearch(initialTab: 2),
+          onOpen: _openUpowner,
+          onRemove: _removeUpowner,
+          onImportFollowings: _importFollowings,
+        ),
+      ),
+    );
+    // 返回首页时数据可能已变（移除 / 导入都写 Gist 并刷新过），这里兜一次
+    if (mounted) unawaited(_load());
+  }
+
   /// 从首页 UP 管理页移除白名单 UP 主。
   Future<void> _removeUpowner(Upowner up) async {
     final ok = await showDialog<bool>(
@@ -1729,20 +1770,17 @@ class _PlaylistPageState extends State<PlaylistPage> {
           // 无 key 时只能按 index 匹配 Element，State 可能错配/被重置
           // （「个人」页的 ManagePanel 持有输入框与账号状态）。
           //
-          // ★ 顺序必须与 [kTabCollections] / [kTabUpowners] / [kTabSchedule] /
+          // ★ 顺序必须与 [kTabCollections] / [kTabRecommend] / [kTabSchedule] /
           //   [kTabHistory] / [kTabPersonal] 及下面 NavigationBar 的
-          //   destinations **逐项对齐**（v2.33.0 在中间插了「日程」）。
+          //   destinations **逐项对齐**（v2.33.0 在中间插了「日程」，
+          //   v2.68.0 把第 2 项从 UP 主管理换成了推荐）。
           _buildCollectionHome(theme, cards),
-          _UpownerManagePage(
-            key: const ValueKey('upowner'),
-            upowners: _data.upowners,
-            syncing: _syncing,
-            onRefresh: _load,
-            onSearch: () => _openSearch(initialTab: 2),
-            onOpen: _openUpowner,
-            onRemove: _removeUpowner,
-            onImportFollowings: _importFollowings,
-          ),
+          // 「推荐」（kTabRecommend，v2.68.0）：按最近观看的标签推热门/新片，
+          // 已看过的不出现。同样**不是**路由、是本 PageView 的一页。
+          //
+          // 不给 api：PlaylistPage 没有注入点，让 [RecommendPage] 用默认
+          // [BiliApi]（点卡片取元数据时才真正发请求）。
+          RecommendPage(key: _recommendKey),
           // 「日程」（kTabSchedule，v2.33.0 新增）：本地可编辑网格，数据只在
           // 本机（ScheduleStore → SharedPreferences，不进 Gist，理由见该类注释）。
           // 页面**不是**路由、是本 PageView 的一页（同历史/个人），因此没有
@@ -1766,7 +1804,8 @@ class _PlaylistPageState extends State<PlaylistPage> {
         ],
       ),
       // 底部导航（v2.18.0+，v2.19.0 起 4 个目的地；**v2.33.0 起 5 个**——
-      // 在「UP 主」与「历史」之间插入「日程」，Material 3）：
+      // 在「UP 主」与「历史」之间插入「日程」；v2.68.0 第 2 项由「UP 主」
+      // 换成「推荐」，Material 3）：
       // 图标 + 文字标签常显（触摸目标 ≥ 48dp 由 NavigationBar +
       // materialTapTargetSize 保证）。
       // 选中态墨色与指示器底由 app_theme 的 navigationBarTheme 统一配置，
@@ -1794,14 +1833,17 @@ class _PlaylistPageState extends State<PlaylistPage> {
                 label: '合集',
                 tooltip: '合集（白名单视频）',
               ),
+              // 「推荐」（v2.68.0 取代原「UP 主」）：explore 图标 = 发现/推荐，
+              // 与 video_library / calendar_month / history / account_circle
+              // 互不撞脸。
               NavigationDestination(
-                icon: Icon(Icons.person_outline),
-                label: 'UP 主',
-                tooltip: '白名单 UP 主',
+                icon: Icon(Icons.explore_outlined),
+                label: '推荐',
+                tooltip: '推荐（按你的兴趣标签）',
               ),
               // 「日程」（v2.33.0 新增）：图标用 calendar_month_outlined 而不是
               // event_note——日历格形状与页面里那张网格表最贴，且与
-              // video_library / person / history / account_circle 互不撞脸。
+              // video_library / explore / history / account_circle 互不撞脸。
               NavigationDestination(
                 icon: Icon(Icons.calendar_month_outlined),
                 label: '日程',
@@ -1812,7 +1854,8 @@ class _PlaylistPageState extends State<PlaylistPage> {
                 label: '历史',
                 tooltip: '历史记录',
               ),
-              // 图标不用 person_outline（已被「UP 主」占用，避免两项混淆）
+              // 图标不用 person / explore（已被「UP 主管理」入口与「推荐」占用，
+              // 避免混淆）
               NavigationDestination(
                 icon: Icon(Icons.account_circle_outlined),
                 label: '个人',
@@ -1992,8 +2035,9 @@ class _PlaylistPageState extends State<PlaylistPage> {
           padding: const EdgeInsets.symmetric(vertical: 4),
           child: Text(
             // 底部导航项列表写在这里也是"硬编码的 tab 清单"之一（虽然只是文案，
-            // 但页脚列错项同样是 bug）——v2.33.0 插入「日程」后同步补上。
-            'v$_version · 底部导航切换：合集 / UP 主 / 日程 / 历史 / 个人',
+            // 但页脚列错项同样是 bug）——v2.33.0 插入「日程」、v2.68.0 把
+            // 「UP 主」换成「推荐」后都同步改过这里。
+            'v$_version · 底部导航切换：合集 / 推荐 / 日程 / 历史 / 个人',
             style: theme.textTheme.labelSmall?.copyWith(
               color: theme.colorScheme.outline,
             ),
@@ -2040,20 +2084,121 @@ class _PlaylistPageState extends State<PlaylistPage> {
   }
 }
 
-/// 底部导航「UP 主」页（index 1）：白名单 UP 主管理。
+/// 「UP 主管理」全屏页（v2.68.0）：原底部导航「UP 主」页签（index 1）的内容，
+/// 现在由设置区「UP 主管理」入口 push 出来。
+///
+/// 为什么要再包一层 Stateful：内容页 [_UpownerManagePage] 吃的是**一份**
+/// `upowners` 列表快照。原来在 PageView 里，父页面 setState 会顺带重建它；
+/// 换成独立路由后父页面重建不会传到这里——移除一个 UP 主之后列表就停在旧值。
+/// 这层包装在每次动作结束后重新向父页面取一次快照（[readUpowners]）。
+class _UpownerManageScreen extends StatefulWidget {
+  /// 每次需要时向父页面取**当前**的 UP 主列表（返回的是不可变数据，安全）。
+  final List<Upowner> Function() readUpowners;
+  final bool Function() syncing;
+  final Future<void> Function() onRefresh;
+
+  /// 两个动作都是 `Future`：跑完（搜索页/勾选页 pop 且父页已刷新）之后，
+  /// 本页要再取一次快照，否则独立路由不会随父页面重建。
+  final Future<void> Function() onSearch;
+  final Future<void> Function(Upowner upowner) onOpen;
+  final Future<void> Function(Upowner upowner) onRemove;
+  final Future<void> Function() onImportFollowings;
+
+  const _UpownerManageScreen({
+    required this.readUpowners,
+    required this.syncing,
+    required this.onRefresh,
+    required this.onSearch,
+    required this.onOpen,
+    required this.onRemove,
+    required this.onImportFollowings,
+  });
+
+  @override
+  State<_UpownerManageScreen> createState() => _UpownerManageScreenState();
+}
+
+class _UpownerManageScreenState extends State<_UpownerManageScreen> {
+  late List<Upowner> _items = widget.readUpowners();
+
+  /// 本页自己的"同步中"标记：父页面的 [_syncing] 变化不会重建这条独立路由，
+  /// 所以下拉刷新这段时间得自己记，空态文案才会显示「正在同步白名单…」。
+  bool _busy = false;
+
+  /// 动作结束后重取快照（移除 / 导入 / 详情页里改了白名单都会落到父页面）。
+  void _resync() {
+    if (!mounted) return;
+    setState(() => _items = widget.readUpowners());
+  }
+
+  Future<void> _refresh() async {
+    setState(() => _busy = true);
+    await widget.onRefresh();
+    if (!mounted) return;
+    setState(() => _busy = false);
+    _resync();
+  }
+
+  Future<void> _remove(Upowner up) async {
+    await widget.onRemove(up);
+    _resync();
+  }
+
+  Future<void> _open(Upowner up) async {
+    // 详情页返回后父数据可能已刷新（那里可移出白名单）→ 回来再取一次快照
+    await widget.onOpen(up);
+    _resync();
+  }
+
+  /// 「搜索 UP 主」：搜索页 pop 且父页重新同步完成后，再重取快照
+  /// （独立路由不随父页 setState 重建，不重取就只能看到旧列表）。
+  Future<void> _search() async {
+    await widget.onSearch();
+    _resync();
+  }
+
+  /// 「导入我的 UP」：同上——导入页 pop 且父页刷新完成后重取快照。
+  Future<void> _importFollowings() async {
+    await widget.onImportFollowings();
+    _resync();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('UP 主管理')),
+      body: _UpownerManagePage(
+        upowners: _items,
+        syncing: _busy || widget.syncing(),
+        onRefresh: _refresh,
+        onSearch: _search,
+        onOpen: _open,
+        onRemove: _remove,
+        onImportFollowings: _importFollowings,
+      ),
+    );
+  }
+}
+
+/// 白名单 UP 主管理内容（列表 + 移除 + 导入我的 UP + 搜索 UP 主）。
+///
+/// v2.68.0 起不再直接挂在底部导航上，由 [_UpownerManageScreen] 包一层
+/// Scaffold 承载；内部仍是「固定头 + Expanded(RefreshIndicator(ListView))」，
+/// 放在 Scaffold body 里有界高度，滚动与下拉刷新都照旧。
 class _UpownerManagePage extends StatelessWidget {
   final List<Upowner> upowners;
   final bool syncing;
   final Future<void> Function() onRefresh;
-  final VoidCallback onSearch;
+
+  /// 两者都是 `Future`：调用方（[_UpownerManageScreen]）要 await 完再重取快照。
+  final Future<void> Function() onSearch;
 
   /// 「导入我的 UP」（v2.17.12+）：把 B 站关注列表批量加入白名单。
-  final VoidCallback onImportFollowings;
+  final Future<void> Function() onImportFollowings;
   final void Function(Upowner upowner) onOpen;
   final void Function(Upowner upowner) onRemove;
 
   const _UpownerManagePage({
-    super.key,
     required this.upowners,
     required this.syncing,
     required this.onRefresh,
@@ -2080,7 +2225,7 @@ class _UpownerManagePage extends StatelessWidget {
               Text('白名单 UP 主', style: theme.textTheme.titleSmall),
               const SizedBox(height: 2),
               Text(
-                '关注 UP 主 = 加入白名单；底部导航「UP 主」可管理，可移除或从 B 站关注列表批量导入',
+                '关注 UP 主 = 加入白名单；可移除，或从 B 站关注列表批量导入',
                 style: theme.textTheme.bodySmall?.copyWith(
                   color: theme.colorScheme.onSurfaceVariant,
                 ),
@@ -2090,7 +2235,7 @@ class _UpownerManagePage extends StatelessWidget {
                 children: [
                   Expanded(
                     child: OutlinedButton.icon(
-                      onPressed: onImportFollowings,
+                      onPressed: () => unawaited(onImportFollowings()),
                       icon: const Icon(Icons.download_outlined, size: 18),
                       label: const Text('导入我的 UP'),
                     ),
@@ -2098,7 +2243,7 @@ class _UpownerManagePage extends StatelessWidget {
                   const SizedBox(width: 8),
                   Expanded(
                     child: FilledButton.icon(
-                      onPressed: onSearch,
+                      onPressed: () => unawaited(onSearch()),
                       icon: const Icon(Icons.person_search, size: 18),
                       label: const Text('搜索 UP 主'),
                     ),
@@ -2136,7 +2281,7 @@ class _UpownerManagePage extends StatelessWidget {
 
 class _EmptyUpownerList extends StatelessWidget {
   final bool syncing;
-  final VoidCallback onSearch;
+  final Future<void> Function() onSearch;
 
   const _EmptyUpownerList({required this.syncing, required this.onSearch});
 
@@ -2156,7 +2301,7 @@ class _EmptyUpownerList extends StatelessWidget {
         const SizedBox(height: 16),
         Center(
           child: FilledButton.icon(
-            onPressed: onSearch,
+            onPressed: () => unawaited(onSearch()),
             icon: const Icon(Icons.person_add_alt_1),
             label: const Text('搜索并加入 UP 主'),
           ),

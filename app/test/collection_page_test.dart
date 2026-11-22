@@ -292,8 +292,14 @@ void main() {
       expect(find.text('0 个视频'), findsOneWidget);
     });
 
-    testWidgets('右滑进入白名单 UP 主管理页，显示已加入 UP 和搜索入口', (tester) async {
-      await _pumpHome(
+    testWidgets('「UP 主管理」入口在设置区，进去能看到已加入 UP 和搜索入口',
+        (tester) async {
+      // 本文件没有全局 setUp：先铺 prefs 假存储（统计页的 loading 依赖它，
+      // 不铺的话「个人」页会一直停在加载态）
+      SharedPreferences.setMockInitialValues({});
+      // 用 _pumpHomeWithGithub：它注册了 secure storage 内存通道 + 有效会话，
+      // 不会在启动时被引导到登录页（本用例要一路点进设置区）
+      await _pumpHomeWithGithub(
         tester,
         _dataWith(
           [_video('BV1', '视频A')],
@@ -309,7 +315,27 @@ void main() {
         ),
       );
 
-      await tester.drag(find.byType(PageView), const Offset(-500, 0));
+      // v2.68.0：第 2 个页签换成「推荐」，UP 主管理迁到
+      // 「个人 → 设置 → UP 主管理」的全屏页 —— 入口换了，内容一条没少。
+      await tester.tap(find.byTooltip('个人（观看统计 / 设置）'));
+      await tester.pumpAndSettle();
+      // 设置区在同一页的滚动流底部：往下拖到「UP 主管理」露出来
+      for (var i = 0; i < 10 && find.text('UP 主管理').evaluate().isEmpty; i++) {
+        await tester.drag(find.byType(ListView).first, const Offset(0, -400));
+        await tester.pumpAndSettle();
+      }
+      // 面板分区标题 + 入口按钮同名（两处都能看到这个入口）
+      expect(find.text('UP 主管理'), findsWidgets);
+      final entry = find.ancestor(
+        of: find.text('UP 主管理'),
+        // OutlinedButton.icon 返回私有子类，find.byType 精确匹配不到
+        matching: find.byWidgetPredicate((w) => w is OutlinedButton),
+      );
+      expect(entry, findsOneWidget);
+      // ListView 的 cacheExtent 会把视口外一点的项也建出来 → 先滚到可见再点
+      await tester.ensureVisible(entry);
+      await tester.pumpAndSettle();
+      await tester.tap(entry);
       await tester.pumpAndSettle();
 
       expect(find.text('白名单 UP 主'), findsOneWidget);
@@ -702,15 +728,16 @@ void main() {
       SharedPreferences.setMockInitialValues({});
       await _pumpHomeWithGithub(tester, WhitelistData.empty());
 
-      // 目的地 = 合集 / UP 主 / **日程**（v2.33.0 新增）/ 历史 / 个人
+      // 目的地 = 合集 / **推荐**（v2.68.0 取代原「UP 主」）/ **日程**
+      // （v2.33.0 新增）/ 历史 / 个人
       // （原「统计」「设置」两项在 v2.19.0 已合并）
       final nav = tester.widget<NavigationBar>(find.byType(NavigationBar));
       final labels = [
         for (final d in nav.destinations) (d as NavigationDestination).label,
       ];
-      expect(labels, ['合集', 'UP 主', '日程', '历史', '个人']);
+      expect(labels, ['合集', '推荐', '日程', '历史', '个人']);
       // 5 个标签都实际渲染（单行不截断；M3 NavigationBar + 11sp label +
-      // 5 等分宽度下最长的「UP 主」也只有 ~30dp，不会挤爆）
+      // 5 等分宽度下最长的「日程」也只有 ~30dp，不会挤爆）
       for (final label in labels) {
         expect(find.text(label), findsOneWidget, reason: '标签 $label 未渲染');
       }

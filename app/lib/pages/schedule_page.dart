@@ -28,7 +28,8 @@ const double kScheduleRowHeadW = 44;
 /// 日程页（v2.33.0 新增）：「像 Excel 一样可编辑的网格」。
 ///
 /// 作为主页 PageView 的一页（与主页共享 AppBar，**不带自己的 Scaffold**，
-/// 同 [HistoryPage] / [WatchStatsPage]）；底部导航第 3 项进入。
+/// 同 [HistoryPage] / [WatchStatsPage]）；从底部导航「日程」项（下标 2）
+/// 进入。
 ///
 /// 交互五件套（对应需求原话）：
 /// 1. **点格子 → 编辑面板**（底部弹层）：改文字 / 选颜色 / 清除此格

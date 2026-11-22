@@ -1394,6 +1394,68 @@ class BiliApi {
     throw StateError('view 接口重试后仍失败（$bvid）');
   }
 
+  /// 视频标签上限（推荐页只用前 20 个：B 站最多给 12 个左右，20 是防御上限）。
+  static const int kMaxVideoTags = 20;
+
+  /// 视频标签（`x/tag/archive/tags`）：`data[].tag_name` 列表。
+  ///
+  /// **为什么不用 WBI**：实测该接口匿名 + 完整浏览器头即可（与
+  /// [fetchVideoShot] 同档），签名只会多一次 nav 往返。请求头沿用
+  /// `BiliApi` 构造时塞进 `BaseOptions.headers` 的那份 [biliHeaders]，
+  /// 这里一个字节都不改（红线：图片/弹幕/登录各自有独立头，不动）。
+  ///
+  /// 失败分类（调用方据此退避）：
+  /// - `-412` / `-352`：先刷一次 WBI key 重试（与 [fetchVideoMeta] 同一套
+  ///   兜底模板——风控时换 key 重发对**带登录态**的请求确实常能过），
+  ///   仍失败则抛 [BiliApiException]，让上层退避；
+  /// - 其它业务码 → [BiliApiException]（带服务端 message）；
+  /// - 网络异常 → [DioException] 原样上抛（上层按网络失败处理）。
+  ///
+  /// 解析容错：`data` 不是 List（含 null / 空数组）→ 返回空列表；条目里
+  /// `tag_name` 非字符串 / 空白 → 跳过；同名标签去重（B 站偶尔重复）。
+  Future<List<String>> fetchVideoTags(String bvid) async {
+    await _injectAuth();
+    const path = '/x/tag/archive/tags';
+    for (var attempt = 0; attempt < 2; attempt++) {
+      final resp = await _dio.get<Map<String, dynamic>>(
+        path,
+        queryParameters: {'bvid': bvid},
+      );
+      final data = resp.data;
+      final code = data?['code'] as int?;
+      if ((code == -412 || code == -352) && attempt == 0) {
+        // 与 fetchVideoMeta 同模板：只刷一次 key 重试一次，不再往上堆
+        debugPrint('[bili_api] $path code=$code（$bvid）→ 刷新 WBI key 重试一次');
+        await _refreshWbiKeys();
+        continue;
+      }
+      if (code != 0) {
+        throw BiliApiException(
+          code: code ?? -1,
+          message: (code == -412 || code == -352)
+              ? '标签接口被风控限流（$code）'
+              : '${data?['message']}（$bvid）',
+          path: path,
+        );
+      }
+      final raw = data?['data'];
+      if (raw is! List) return const [];
+      final out = <String>[];
+      final seen = <String>{};
+      for (final item in raw.whereType<Map<String, dynamic>>()) {
+        final name = item['tag_name'];
+        if (name is! String) continue;
+        final tag = name.trim();
+        if (tag.isEmpty || !seen.add(tag)) continue;
+        out.add(tag);
+        if (out.length >= kMaxVideoTags) break;
+      }
+      return out;
+    }
+    // 理论不可达：循环内要么 return，要么在第二次尝试时 return
+    throw StateError('$path 风控重试后仍未返回响应（$bvid）');
+  }
+
   /// 拉取视频进度预览图（雪碧图）信息。
   ///
   /// [index] = 分P序号（**1-based；必传**——不传时 `data.index` 返回空数组）。

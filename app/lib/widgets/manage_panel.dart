@@ -36,7 +36,9 @@ import 'traffic_panel.dart';
 /// 内容分区：B 站账号（登录/重新登录）→ 配色主题（P1.5 双墨配方切换）→
 /// **外观（v2.57.0：浅色 / 深色 / 跟随系统三选一，选中立即生效）** →
 /// 信箱卡片样式（v2.21.0+ 多版式切换）→
-/// GitHub 配置（token/gist）→ 合集管理（重命名/删除）→ 离线缓存管理 →
+/// GitHub 配置（token/gist）→ 合集管理（重命名/删除）→
+/// **UP 主管理（v2.68.0+：「UP 主」页签被「推荐」取代后，移除 / 导入我的
+/// UP 的入口迁到这里）** → 离线缓存管理 →
 /// **网络与播放（v2.51.0+：「免流兼容（实验）」开关，只改视频/音频流请求的
 /// User-Agent，默认关；v2.53.0 补「取流状态」三态 + 最近一次取流实测信息；
 /// v2.60.0 补「播放时保持亮屏」开关，默认开）** →
@@ -61,6 +63,13 @@ class ManagePanel extends StatefulWidget {
 
   /// 打开合集管理面板（重命名 / 删除；宿主维护合集数据）。
   final VoidCallback onManageCollections;
+
+  /// 打开「UP 主管理」（v2.68.0+）：白名单 UP 主的查看 / 移除 / 导入我的 UP。
+  ///
+  /// 为什么要有这个入口：底部导航原来的「UP 主」页签被「推荐」取代，那两个
+  /// 管理动作（移除、导入我的 UP）就只剩设置区这一处入口。为空则不渲染
+  /// 这一行（弹层宿主/旧调用方不受影响）。
+  final VoidCallback? onOpenUpowners;
 
   /// 检查更新入口（宿主弹更新对话框）。
   final VoidCallback onCheckUpdate;
@@ -92,6 +101,7 @@ class ManagePanel extends StatefulWidget {
     required this.github,
     this.bili,
     required this.onManageCollections,
+    this.onOpenUpowners,
     required this.onCheckUpdate,
     required this.onLogin,
     this.onSessionChanged,
@@ -595,6 +605,30 @@ class _ManagePanelState extends State<ManagePanel> {
         const SizedBox(height: 16),
         const Divider(height: 1),
         const SizedBox(height: 16),
+        // ---- UP 主管理（v2.68.0：底部导航「UP 主」页签换成「推荐」后，
+        //      移除 / 导入我的 UP 这两个动作只剩这里一个入口）----
+        if (widget.onOpenUpowners != null) ...[
+          Text('UP 主管理', style: theme.textTheme.titleMedium),
+          const SizedBox(height: 4),
+          Text(
+            '查看 / 移除白名单 UP 主、导入我关注的 UP。',
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+          const SizedBox(height: 8),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: widget.onOpenUpowners,
+              icon: const Icon(Icons.person_outline, size: 18),
+              label: const Text('UP 主管理'),
+            ),
+          ),
+          const SizedBox(height: 16),
+          const Divider(height: 1),
+          const SizedBox(height: 16),
+        ],
         // ---- 离线缓存（v2.29.0：弹层升级成独立页，见 offline_page.dart）----
         Text('离线缓存', style: theme.textTheme.titleMedium),
         const SizedBox(height: 4),

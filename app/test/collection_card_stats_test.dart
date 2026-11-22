@@ -282,7 +282,9 @@ void main() {
 
       // 模拟「刚看完 P1」：历史表多一条，然后切走 → 切回首页
       await HistoryStore.instance.addOrUpdate(_watched('BV1', 0));
-      await tester.tap(find.text('UP 主'));
+      // v2.68.0：第 2 个页签由「UP 主」换成「推荐」——本用例只要求"切走再
+      // 切回"，换哪个页签都行，跟着导航标签一起改。
+      await tester.tap(find.text('推荐'));
       await tester.pumpAndSettle();
       await tester.tap(find.text('合集'));
       await tester.pumpAndSettle();

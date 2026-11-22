@@ -1,13 +1,16 @@
 // 底部导航「日程」入口 + 下标错位回归测试（v2.33.0）。
 //
 // 本轮改动最容易翻车的地方 = **在中间插一页导致的下标错位**：日程插在
-// 「UP 主」与「历史」之间，历史与个人各 +1。这里把 5 个目的地**逐个点一遍**
+// 「推荐」与「历史」之间，历史与个人各 +1。这里把 5 个目的地**逐个点一遍**
 // 并断言落到了各自该落的页面，任何漏改（NavigationBar 顺序 / PageView 顺序 /
 // _reloadTab 分支）都会在这里炸出来。
 //
+// v2.68.0：第 2 项由「UP 主」换成「推荐」（原 UP 主管理迁到
+// 「个人 → 设置 → UP 主管理」全屏页），下标不变。
+//
 // 页面的身份锚点（各自独有、不在别处出现的文案）：
 // - 合集首页：合集卡 / 「未分类」
-// - UP 主管理：页内标题「UP 主」
+// - 推荐：页内标题「推荐」+ 空历史文案「先看几个视频，这里会生成你的兴趣标签」
 // - 日程：页内标题「日程」+ 副标题「点格子改文字与底色…」+ 默认 3 列 × 8 行网格
 // - 历史：「暂无历史记录」空态
 // - 个人：「底部导航「个人」· …」标题条
@@ -74,7 +77,8 @@ Future<void> _pumpHome(WidgetTester tester, WhitelistData data) async {
 /// 「日程」「历史」这些词在页面内容里也会出现，按文字点会撞到两个匹配）。
 const Map<String, String> kTabTooltip = {
   '合集': '合集（白名单视频）',
-  'UP 主': '白名单 UP 主',
+  // v2.68.0：第 2 项由「UP 主」换成「推荐」（UP 主管理迁到设置区）
+  '推荐': '推荐（按你的兴趣标签）',
   '日程': '日程（可编辑表格）',
   '历史': '历史记录',
   '个人': '个人（观看统计 / 设置）',
@@ -93,7 +97,7 @@ void main() {
   setUp(() => SharedPreferences.setMockInitialValues({}));
 
   group('底部导航结构', () {
-    testWidgets('5 个目的地，「日程」在「UP 主」与「历史」之间（第 3 位）',
+    testWidgets('5 个目的地，「日程」在「推荐」与「历史」之间（第 3 位）',
         (tester) async {
       await _pumpHome(tester, WhitelistData.empty());
 
@@ -101,9 +105,9 @@ void main() {
       final labels = [
         for (final d in nav.destinations) (d as NavigationDestination).label,
       ];
-      expect(labels, ['合集', 'UP 主', '日程', '历史', '个人']);
+      expect(labels, ['合集', '推荐', '日程', '历史', '个人']);
       expect(labels.indexOf('日程'), 2);
-      expect(labels.indexOf('日程'), greaterThan(labels.indexOf('UP 主')));
+      expect(labels.indexOf('日程'), greaterThan(labels.indexOf('推荐')));
       expect(labels.indexOf('日程'), lessThan(labels.indexOf('历史')));
 
       // 图标与选中态：日程用日历格图标，不与既有 4 个撞脸
@@ -126,7 +130,7 @@ void main() {
   });
 
   group('★ 下标错位回归：每个目的地都落到该落的页面', () {
-    testWidgets('点「日程」→ 进日程页（不是历史、不是 UP 主）', (tester) async {
+    testWidgets('点「日程」→ 进日程页（不是历史、不是推荐）', (tester) async {
       await _pumpHome(tester, WhitelistData.empty());
 
       await _tapTab(tester, '日程');
@@ -138,9 +142,9 @@ void main() {
       expect(state.debugData.columns.length, 3);
       expect(state.debugData.rows.length, 8);
       expect(find.byKey(const ValueKey('schedule-cell-7-2')), findsOneWidget);
-      // 没有被历史页 / UP 主页的空态串台
+      // 没有被历史页 / 推荐页的空态串台
       expect(find.text('暂无历史记录'), findsNothing);
-      expect(find.text('还没有白名单 UP 主'), findsNothing);
+      expect(find.text('先看几个视频，这里会生成你的兴趣标签'), findsNothing);
       expect(_selectedIndex(tester), 2);
     });
 
@@ -170,14 +174,17 @@ void main() {
       expect(find.text('暂无历史记录'), findsNothing);
     });
 
-    testWidgets('点「UP 主」→ 仍是 UP 主页（下标不变 = 1）', (tester) async {
+    testWidgets('点「推荐」→ 进推荐页（下标不变 = 1）', (tester) async {
       await _pumpHome(tester, WhitelistData.empty());
 
-      await _tapTab(tester, 'UP 主');
+      await _tapTab(tester, '推荐');
 
       expect(_selectedIndex(tester), 1);
-      expect(find.text('导入我的 UP'), findsOneWidget);
-      expect(find.text('还没有白名单 UP 主'), findsOneWidget);
+      // 本机没有观看历史 → 推荐页给「先看几个视频」那一种空态（不触网）
+      expect(find.text('先看几个视频，这里会生成你的兴趣标签'), findsOneWidget);
+      // 原「UP 主」页的内容不再挂在这一页上（迁到设置区的全屏页）
+      expect(find.text('导入我的 UP'), findsNothing);
+      expect(find.text('还没有白名单 UP 主'), findsNothing);
     });
 
     testWidgets('点「合集」→ 回首页（下标 0 不变）', (tester) async {
@@ -199,7 +206,7 @@ void main() {
       // (label, 期望 selectedIndex)
       const order = [
         ('合集', 0),
-        ('UP 主', 1),
+        ('推荐', 1),
         ('日程', 2),
         ('历史', 3),
         ('个人', 4),
