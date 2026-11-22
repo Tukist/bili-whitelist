@@ -1,11 +1,17 @@
 import 'package:flutter/material.dart';
 
+import '../services/remote_watch_stats.dart';
 import '../services/watch_stats.dart';
 import '../theme/app_palette.dart';
 import '../theme/app_tokens.dart';
 import '../widgets/app_state_view.dart';
 import '../widgets/dot_illustration.dart';
 import 'daily_history_page.dart';
+
+// v2.66.0：formatWatchDuration 搬到了 services/watch_stats.dart（每日详情页
+// 也要用，页面之间互相 import 会成环）。这里 re-export，既有调用点（含测试）
+// 不用改 import。
+export '../services/watch_stats.dart' show formatWatchDuration;
 
 /// 观看统计页（v2.17.10+ 重做：GitHub 官方样式热力 + 总览下移
 /// + 点日进历史 + 底部内联设置区；v2.17.16 热力改**相对制**配色；
@@ -16,6 +22,12 @@ import 'daily_history_page.dart';
 /// 「个人」＝本页统计在上 + 设置在下；v2.33.0 起由 3 → 4，因为中间插入了
 /// 「日程」）。数据源 [WatchStats]
 /// （shared_preferences，播放页 playing 时按位置增量累计，见 player_page）。
+///
+/// **v2.66.0：热力图/概览的每日值 = 本机实测 + 电脑端（估算）**。电脑端部分来自
+/// B 站账号历史（[RemoteWatchStats] 存每日估算秒 + 幂等键；由
+/// `BiliHistorySyncService.sync` 在同步成功时写入）。两个数分别落盘，画图时才
+/// 相加（[mergeDailySeconds]）：本机是真测，电脑端是按 `progress` 推算的
+/// **估算**（拖动进度条会偏大、只覆盖最近 90 条、重复观看只算最近一次）。
 ///
 /// 页内纵向滚动，布局（v2.17.10）：
 /// - 顶部淡色标题条「观看统计」
@@ -176,19 +188,6 @@ List<HeatMonthLabel> buildHeatMonthLabels(
   return labels;
 }
 
-/// 秒 → 「N 分钟 / N 小时 M 分 / N 天 M 小时」阅读文案（详情行用）。
-String formatWatchDuration(int seconds) {
-  if (seconds < 60) return '$seconds 秒';
-  final min = seconds ~/ 60;
-  if (min < 60) return '$min 分钟';
-  final h = min ~/ 60;
-  final m = min % 60;
-  if (h < 24) return m == 0 ? '$h 小时' : '$h 小时 $m 分';
-  final d = h ~/ 24;
-  final rh = h % 24;
-  return d == 0 ? '$h 小时' : (rh == 0 ? '$d 天' : '$d 天 $rh 小时');
-}
-
 /// 总览卡大数字：返回 (数字文本, 单位文本)。
 (String, String) _splitStatText(int seconds) {
   if (seconds < 60) return ('$seconds', '秒');
@@ -215,7 +214,16 @@ class WatchStatsPage extends StatefulWidget {
   /// 滚动流（[settingsSection] 追加在统计内容之后，见 [_buildBody]）。
   final Widget? settingsSection;
 
-  const WatchStatsPage({super.key, this.stats, this.settingsSection});
+  /// 测试注入：电脑端（估算）观看时长数据源（默认全局
+  /// [RemoteWatchStats.instance]）。v2.66.0 起热力图总值 = 本机实测 + 电脑端估算。
+  final RemoteWatchStats? remote;
+
+  const WatchStatsPage({
+    super.key,
+    this.stats,
+    this.remote,
+    this.settingsSection,
+  });
 
   @override
   WatchStatsPageState createState() => WatchStatsPageState();
@@ -223,6 +231,10 @@ class WatchStatsPage extends StatefulWidget {
 
 class WatchStatsPageState extends State<WatchStatsPage> {
   late final WatchStats _stats = widget.stats ?? WatchStats.instance;
+
+  /// 电脑端估算时长（v2.66.0）：与本机实测**分开存**，画热力图时才相加。
+  late final RemoteWatchStats _remote =
+      widget.remote ?? RemoteWatchStats.instance;
 
   /// 初始时 stats 已加载过（首次 record/读页时惰性 load）。
   bool _ready = false;
@@ -235,19 +247,40 @@ class WatchStatsPageState extends State<WatchStatsPage> {
   @override
   void initState() {
     super.initState();
+    // 历史同步（另一个页签）写入电脑端时长后，本页若正活着也立刻跟着刷新
+    _remote.addListener(_onRemoteWatchChanged);
     reload();
   }
 
   @override
   void dispose() {
+    _remote.removeListener(_onRemoteWatchChanged);
     _heatHScroll.dispose();
     super.dispose();
+  }
+
+  void _onRemoteWatchChanged() {
+    if (mounted && _ready) setState(() {});
   }
 
   /// 重新读取最新统计（主页切到本页时由 GlobalKey 调用）。
   Future<void> reload() async {
     await _stats.ensureLoaded();
+    await _remote.ensureLoaded();
     if (mounted && !_ready) setState(() => _ready = true);
+  }
+
+  /// 热力图/概览用的每日总和（本机实测 + 电脑端估算，v2.66.0）。
+  Map<String, int> get _mergedDays =>
+      mergeDailySeconds(_stats.days, _remote.days);
+
+  /// 合并后的累计秒数（只用于判断"有没有任何数据"和平均值的分母）。
+  static int _sumOf(Map<String, int> days) {
+    var sum = 0;
+    for (final v in days.values) {
+      sum += v;
+    }
+    return sum;
   }
 
   @override
@@ -290,16 +323,17 @@ class WatchStatsPageState extends State<WatchStatsPage> {
   }
 
   Widget _buildBody(ThemeData theme) {
-    final total = _stats.totalSeconds;
+    final merged = _mergedDays;
+    final total = _sumOf(merged);
     return ListView(
       padding: const EdgeInsets.all(12),
       physics: const AlwaysScrollableScrollPhysics(),
       children: [
         // 1) 单张大热力图（GitHub 官方样式，当前配方主墨阶）——放最上
-        _heatCard(theme, total),
+        _heatCard(theme, merged, total),
         // 2) 总览统计移到热力下方（v2.17.10）
         const SizedBox(height: 12),
-        _overviewSection(theme, total),
+        _overviewSection(theme, merged, total),
         // 3) 设置区内联页底（v2.19.0 起「个人」页在此挂 ManagePanel）：
         //    统计在上、设置在下，同一 ListView 滚动流——长内容自然可滚到底，
         //    不溢出（面板自身无滚动/无内边距，由此处提供 padding）。
@@ -314,19 +348,26 @@ class WatchStatsPageState extends State<WatchStatsPage> {
   }
 
   /// 总览区：小标题 + 2×2 卡 + 活跃天数/平均每日副信息。
-  Widget _overviewSection(ThemeData theme, int total) {
+  ///
+  /// v2.66.0：数字口径改为**合并后**（本机实测 + 电脑端估算），与热力图一致——
+  /// 否则会出现"热力最深的那天，今日/本周却是 0"。
+  Widget _overviewSection(
+    ThemeData theme,
+    Map<String, int> merged,
+    int total,
+  ) {
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Text('观看总览', style: theme.textTheme.titleSmall),
         const SizedBox(height: 8),
-        _overviewGrid(theme),
+        _overviewGrid(theme, merged, total),
         if (total > 0) ...[
           const SizedBox(height: 8),
           Center(
             child: Text(
-              '${_stats.activeDays} 天有观看记录'
-              '${total > 0 ? ' · 平均每天 ${(total ~/ 60 / _stats.activeDays).toStringAsFixed(1)} 分钟' : ''}',
+              '${merged.length} 天有观看记录'
+              ' · 平均每天 ${(total ~/ 60 / merged.length).toStringAsFixed(1)} 分钟',
               style: theme.textTheme.bodySmall?.copyWith(
                 color: theme.colorScheme.onSurfaceVariant,
               ),
@@ -337,12 +378,26 @@ class WatchStatsPageState extends State<WatchStatsPage> {
     );
   }
 
-  Widget _overviewGrid(ThemeData theme) {
+  Widget _overviewGrid(
+    ThemeData theme,
+    Map<String, int> merged,
+    int totalSeconds,
+  ) {
     (String, String) split(int s) => _splitStatText(s);
-    final today = split(_stats.todaySeconds);
-    final week = split(_stats.weekSeconds);
-    final total = split(_stats.totalSeconds);
-    final streak = ('${_stats.longestStreakDays}', '天');
+    final now = _stats.clock();
+    final todayKey = WatchStats.dateKey(now);
+    final today = split(merged[todayKey] ?? 0);
+    // 本周 = 周一起到今天（与 [WatchStats.weekSeconds] 同口径，只是数据换成合并表）
+    final day0 = DateTime(now.year, now.month, now.day);
+    var weekSeconds = 0;
+    for (var d = day0.subtract(Duration(days: day0.weekday - 1));
+        !d.isAfter(day0);
+        d = d.add(const Duration(days: 1))) {
+      weekSeconds += merged[WatchStats.dateKey(d)] ?? 0;
+    }
+    final week = split(weekSeconds);
+    final total = split(totalSeconds);
+    final streak = ('${WatchStats.countStreak(merged)}', '天');
     // 总览卡图标坐在浅底上 → 用「纸上的可读墨」（默认配方下 = 原墨，观感不变）
     final ink = context.palette.inkText;
     return Column(
@@ -398,12 +453,18 @@ class WatchStatsPageState extends State<WatchStatsPage> {
     );
   }
 
-  Widget _heatCard(ThemeData theme, int totalSeconds) {
-    final now = DateTime.now();
-    final grid = buildHeatmapGrid(_stats.days, now);
+  /// 热力卡（v2.66.0：`days` 是**合并后**的每日总值 = 本机实测 + 电脑端估算）。
+  ///
+  /// 颜色仍按合并后的秒数走既有相对色阶（[maxDaySecondsOfGrid] +
+  /// [WatchStats.relativeIntensity] + [heatColorForIntensity]），没有第二套配色：
+  /// "电脑上看的那天"与"手机上看的那天"用同一个刻度，才读得出轻重。
+  Widget _heatCard(ThemeData theme, Map<String, int> days, int totalSeconds) {
+    final now = _stats.clock();
+    final grid = buildHeatmapGrid(days, now);
     final labels = buildHeatMonthLabels(heatGridStart(now), now);
     // 相对配色基准：窗口（53 周）内最长单日观看秒 —— 该日格子最深（主墨）
     final maxSeconds = maxDaySecondsOfGrid(grid);
+    final hasRemote = _remote.totalSeconds > 0;
     return Container(
       padding: const EdgeInsets.fromLTRB(12, 12, 12, 10),
       decoration: BoxDecoration(
@@ -444,6 +505,18 @@ class WatchStatsPageState extends State<WatchStatsPage> {
                 ),
               ),
             ),
+            if (hasRemote) ...[
+              const SizedBox(height: 2),
+              Center(
+                child: Text(
+                  '含电脑端观看：按 B 站历史进度估算，可能偏大（拖动进度条会让进度虚高）',
+                  textAlign: TextAlign.center,
+                  style: theme.textTheme.labelSmall?.copyWith(
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ),
+            ],
           ],
         ],
       ),
@@ -638,11 +711,18 @@ class WatchStatsPageState extends State<WatchStatsPage> {
   }
 
   /// 点日期格 → 进入该日历史页（当天观看视频列表，可续播）。
+  ///
+  /// v2.66.0：把本页用的两个数据源传下去，详情页才能显示"本机 / 电脑端"拆分，
+  /// 且不会因为注入的测试实例与全局单例不同而显示成两套数。
   void _openDay(DateTime day) {
     Navigator.of(context).push(
       MaterialPageRoute<void>(
         settings: const RouteSettings(name: 'daily-history'),
-        builder: (_) => DailyHistoryPage(date: day),
+        builder: (_) => DailyHistoryPage(
+          date: day,
+          stats: _stats,
+          remote: _remote,
+        ),
       ),
     );
   }
@@ -668,8 +748,11 @@ class WatchStatsPageState extends State<WatchStatsPage> {
     final palette = context.palette;
     final dateKey = WatchStats.dateKey(cell.date);
     final isToday = dateKey == WatchStats.dateKey(today);
+    // v2.66.0：格子里是"本机实测 + 电脑端估算"的和，说清楚其中有多少是估算
+    final remoteSec = _remote.secondsOfKey(dateKey);
     final desc = cell.seconds > 0
         ? '$dateKey 观看 ${formatWatchDuration(cell.seconds)}'
+            '${remoteSec > 0 ? '（含电脑端估算 ${formatWatchDuration(remoteSec)}）' : ''}'
         : '$dateKey 无观看记录';
     final intensity = WatchStats.relativeIntensity(cell.seconds, maxSeconds);
     return Semantics(

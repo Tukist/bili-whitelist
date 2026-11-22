@@ -5,7 +5,9 @@ import '../api/bilibili_api.dart';
 import '../cache/playback_progress.dart';
 import '../models/whitelist_video.dart';
 import 'history_store.dart';
+import 'remote_watch_stats.dart';
 import 'service_locator.dart';
+import 'watch_stats.dart';
 
 /// B 站观看历史同步（v2.57.0+）：读 `x/web-interface/history/cursor`，
 /// 解析成 [RemoteHistoryItem]，映射成 [HistoryEntry] 并入本机历史。
@@ -310,6 +312,10 @@ class HistorySyncOutcome {
   /// 只用于日志与测试；界面文案不显示它（用户不关心这个数字）。
   final int adoptedProgress;
 
+  /// 本次**新计入**的电脑端（估算）观看秒数（v2.66.0，幂等：同一条历史只算
+  /// 第一次）。同样只用于日志与测试，不进 [summary] 文案。
+  final int pcWatchSeconds;
+
   /// 本次同步的完成时间（失败 = null）。
   final DateTime? lastSyncAt;
 
@@ -325,6 +331,7 @@ class HistorySyncOutcome {
     required this.updated,
     this.notInWhitelist = 0,
     this.adoptedProgress = 0,
+    this.pcWatchSeconds = 0,
     this.lastSyncAt,
     this.error,
   });
@@ -338,6 +345,7 @@ class HistorySyncOutcome {
         added = 0,
         updated = 0,
         adoptedProgress = 0,
+        pcWatchSeconds = 0,
         lastSyncAt = null,
         error = message;
 
@@ -396,6 +404,9 @@ class BiliHistorySyncService {
   final HistoryStore store;
   final DateTime Function() now;
 
+  /// 电脑端（估算）观看时长的存储（v2.66.0；同步成功后写入，热力图读）。
+  final RemoteWatchStats remoteWatch;
+
   BiliHistorySyncService({
     BiliApi? api,
     Future<Map<String, dynamic>> Function({
@@ -406,12 +417,14 @@ class BiliHistorySyncService {
     })? fetchPage,
     Future<WhitelistData> Function()? whitelist,
     HistoryStore? store,
+    RemoteWatchStats? remoteWatch,
     DateTime Function()? now,
   })  : fetchPage = fetchPage ??
             ((api ?? BiliApi()).fetchHistoryCursor),
         whitelist = whitelist ??
             (() async => (await ServiceLocator.syncService.sync()).data),
         store = store ?? HistoryStore.instance,
+        remoteWatch = remoteWatch ?? RemoteWatchStats.instance,
         now = now ?? DateTime.now;
 
   /// 执行一次同步。**永不抛**：所有失败都折成 [HistorySyncOutcome.failure]。
@@ -466,7 +479,17 @@ class BiliHistorySyncService {
       }
       final dropped =
           dropOtherBusiness + dropNoBvid + dropNoViewAt + dropNoCid;
+      // v2.66.0：把这次同步到的远程历史折算成"电脑端（估算）"观看时长。
+      // 必须在 [HistoryStore.mergeRemote] **之前**读本机历史：合并会把远程条目
+      // 写进本机表（source=bilibili），之后再读就分不清"哪条是本机真看过"了。
+      final localBefore = await store.getAll();
+      final samples = buildRemoteWatchSamples(
+        items: pages,
+        whitelistByBvid: byBvid,
+        localHistory: localBefore,
+      );
       final merged = await store.mergeRemote(mapped);
+      final pcSeconds = await _accumulateRemoteWatch(samples);
       final adopted = await _adoptRemoteProgress(merged.remoteProgressWinners);
       final at = now();
       await store.saveLastSyncAt(at);
@@ -474,7 +497,8 @@ class BiliHistorySyncService {
           '保留=${mapped.length}（不在白名单=$notInWhitelist） '
           '丢弃=$dropped［其它业务=$dropOtherBusiness 空bvid=$dropNoBvid '
           '无观看时间=$dropNoViewAt 无cid=$dropNoCid］ '
-          '新增=${merged.added} 更新=${merged.updated} 进度落本机=$adopted');
+          '新增=${merged.added} 更新=${merged.updated} 进度落本机=$adopted '
+          '电脑端估算+${pcSeconds}s');
       return HistorySyncOutcome(
         ok: true,
         scanned: pages.length,
@@ -484,6 +508,7 @@ class BiliHistorySyncService {
         added: merged.added,
         updated: merged.updated,
         adoptedProgress: adopted,
+        pcWatchSeconds: pcSeconds,
         lastSyncAt: at,
       );
     } on BiliApiException catch (e) {
@@ -518,6 +543,23 @@ class BiliHistorySyncService {
     } catch (e) {
       // 写进度失败：只影响"续播位置"，不影响历史表本身
       debugPrint('[bili_history] 远程进度落本机失败（静默）: $e');
+      return 0;
+    }
+  }
+
+  /// 把本次可计入的远程样本写进 [RemoteWatchStats]（v2.66.0）。
+  ///
+  /// **失败静默**：电脑端时长是热力图的补充信息，写盘抽风不该让"历史同步成功"
+  /// 变成失败；返回 0 即可（下次同步会再算一遍，幂等保证不会重复累加）。
+  Future<int> _accumulateRemoteWatch(List<RemoteWatchSample> samples) async {
+    if (samples.isEmpty) return 0;
+    try {
+      final added = await remoteWatch.recordAll(samples);
+      debugPrint('[bili_history] 电脑端观看估算 候选=${samples.length} '
+          '新增计入=${added}s');
+      return added;
+    } catch (e) {
+      debugPrint('[bili_history] 电脑端观看估算写入失败（静默）: $e');
       return 0;
     }
   }
@@ -581,11 +623,7 @@ HistoryEntry entryFromRemote({
   required RemoteHistoryItem item,
   WhitelistVideo? video,
 }) {
-  final pageIndex = video != null
-      ? resolvePageIndex(item: item, video: video)
-      // 没有白名单分 P 列表可对：page 是"分 P 序号"（推断 1 基），
-      // 0/负数按第 0 集处理
-      : (item.page > 0 ? item.page - 1 : 0);
+  final pageIndex = remotePageIndexOf(item: item, video: video);
   final pages = video?.pages;
   final localDurationMs = (pages != null &&
           pageIndex < pages.length &&
@@ -613,4 +651,70 @@ HistoryEntry entryFromRemote({
     // 标记影响 UI（历史页「未在白名单」），也是合并时"以远程为准"的字段
     inWhitelist: video != null,
   );
+}
+
+/// 远程条目 → 分 P 下标（与 [entryFromRemote] 完全同口径，纯函数）。
+///
+/// 抽出来是为了让"历史条目"和"电脑端时长归日/去重"用同一个 pageIndex——
+/// 两边算法一旦分叉，同一条历史会在两个概念里落到不同的分 P 上。
+int remotePageIndexOf({
+  required RemoteHistoryItem item,
+  WhitelistVideo? video,
+}) {
+  if (video != null) return resolvePageIndex(item: item, video: video);
+  // 没有白名单分 P 列表可对：page 是"分 P 序号"（推断 1 基），0/负数按第 0 集
+  return item.page > 0 ? item.page - 1 : 0;
+}
+
+/// 从一次同步的远程历史里算出可计入"电脑端（估算）时长"的样本（v2.66.0）。
+///
+/// 规则（顺序即语义）：
+/// 1. 只收能进历史的普通稿件（[RemoteHistoryItem.isUsable]）+ 有进度可估的；
+/// 2. `seconds = clamp(progress, 0, duration)`，`<= 0` 跳过（不编数）；
+/// 3. **排除本机看的那部分**：本机历史里同一 `(bvid, pageIndex)` 且**同一自然日**
+///    有记录、且该记录来源包含本机（[HistorySource.local] / [HistorySource.both]）
+///    → 跳过这条远程，避免"本机实测 + 电脑端回读"双计。
+///    纯 [HistorySource.bilibili] 的旧记录不算"本机看过"（那是上一次同步写进来的）。
+///
+/// ⚠️ 这条排除是**启发式**：同一天既在手机又在电脑看同一个视频，会被判成
+/// "手机看过"而整条跳过（少算），但绝不会双计。
+List<RemoteWatchSample> buildRemoteWatchSamples({
+  required Iterable<RemoteHistoryItem> items,
+  required Map<String, WhitelistVideo> whitelistByBvid,
+  required Iterable<HistoryEntry> localHistory,
+}) {
+  // (bvid, pageIndex) → 本机看过这集的自然日集合
+  final localDays = <String, Set<String>>{};
+  for (final e in localHistory) {
+    if (e.source == HistorySource.bilibili) continue; // 纯远程记录不是"本机看过"
+    if (e.bvid.isEmpty) continue;
+    localDays
+        .putIfAbsent('${e.bvid}#${e.pageIndex}', () => <String>{})
+        .add(WatchStats.dateKey(e.watchedAt));
+  }
+  final out = <RemoteWatchSample>[];
+  for (final item in items) {
+    if (!item.isUsable) continue;
+    final seconds = estimateRemoteWatchSeconds(
+      progressSec: item.progressSec,
+      durationSec: item.durationSec,
+    );
+    if (seconds <= 0) continue;
+    final pageIndex = remotePageIndexOf(
+      item: item,
+      video: whitelistByBvid[item.bvid],
+    );
+    final viewedAt = DateTime.fromMillisecondsSinceEpoch(item.viewAtSec * 1000);
+    final dayKey = WatchStats.dateKey(viewedAt);
+    if (localDays['${item.bvid}#$pageIndex']?.contains(dayKey) ?? false) {
+      continue; // 同一天本机也看过这集 → 回读会双计，交给本机实测
+    }
+    out.add(RemoteWatchSample(
+      bvid: item.bvid,
+      pageIndex: pageIndex,
+      viewAtSec: item.viewAtSec,
+      seconds: seconds,
+    ));
+  }
+  return out;
 }

@@ -3,6 +3,21 @@ import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+/// 秒 → 「N 分钟 / N 小时 M 分 / N 天 M 小时」阅读文案（热力格无障碍标签、
+/// 每日详情行用）。v2.66.0 从 `pages/watch_stats_page.dart` 搬到这里：每日
+/// 详情页也要用同一套口径，页面之间互相 import 会成环。
+String formatWatchDuration(int seconds) {
+  if (seconds < 60) return '$seconds 秒';
+  final min = seconds ~/ 60;
+  if (min < 60) return '$min 分钟';
+  final h = min ~/ 60;
+  final m = min % 60;
+  if (h < 24) return m == 0 ? '$h 小时' : '$h 小时 $m 分';
+  final d = h ~/ 24;
+  final rh = h % 24;
+  return d == 0 ? '$h 小时' : (rh == 0 ? '$d 天' : '$d 天 $rh 小时');
+}
+
 /// 每日观看时长记录（本地，不入 Gist、不跨设备，同 [HistoryStore] 介质）。
 ///
 /// - 键格式：**本地日期** `yyyy-MM-dd`（如 `2026-09-08`），一天一个值（秒）。
@@ -79,8 +94,7 @@ class WatchStats extends ChangeNotifier {
     return dt;
   }
 
-  /// 相对强度（纯函数，v2.17.16 相对配色用）：某日观看秒 / 窗口内最长单日
-  /// 秒，截断到 [0,1]——0 = 无观看（或窗口内没有任何观看，[maxSeconds]<=0
+  /// 相对强度（纯函数，v2.17.16 相对配色用）：某日观看秒 / 窗口内最长单日  /// 秒，截断到 [0,1]——0 = 无观看（或窗口内没有任何观看，[maxSeconds]<=0
   /// 视为 0，避免除零）；1 = 当天就是窗口内最长的一天。热力格按此连续
   /// 渐变着色（不再固定时间分档），图例/单测共用。
   static double relativeIntensity(int daySeconds, int maxSeconds) {
