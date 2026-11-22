@@ -63,6 +63,7 @@ import 'package:package_info_plus/package_info_plus.dart';
 import 'package:path_provider/path_provider.dart';
 
 import '../models/update_info.dart';
+import '../utils/log_redact.dart' as redact;
 import 'update_storage.dart';
 
 class UpdateService {
@@ -776,19 +777,13 @@ class UpdateService {
 
   /// 日志用 URL 脱敏：**只留 host + path**。
   ///
-  /// 为什么必须脱敏：私有仓库的下载地址是 GitHub 302 到签名 CDN，
-  /// `?X-Amz-Signature=…` 这类下载凭据就在 query 里 —— 完整 URL 落日志等于把
-  /// 下载凭据写进 logcat。公开给 UI 层（`update_dialog.dart`）与单测复用。
-  static String maskUrlForLog(String url) {
-    final raw = url.trim();
-    if (raw.isEmpty) return '(空 URL)';
-    final uri = Uri.tryParse(raw);
-    if (uri == null || uri.host.isEmpty) return '<非绝对 URL，已省略>';
-    return '${uri.host}${uri.path}';
-  }
+  /// v2.67.0 起实现搬到 `utils/log_redact.dart`（日志全量落盘后，脱敏是所有
+  /// 日志的公共前置步骤，不再只服务更新业务）；这里保留同名静态方法做
+  /// delegate，`update_dialog.dart` 与老单测的调用点零改动、行为逐字不变。
+  static String maskUrlForLog(String url) => redact.maskUrlForLog(url);
 
   /// 日志文本脱敏：文本里出现的 URL 一律截成 host + path，并把 token 形态的串
-  /// 换成占位符。
+  /// 换成占位符（v2.67.0 起实现搬去 `utils/log_redact.dart`，这里只转一手）。
   ///
   /// 为什么这里是**防御性**的（而不是"dio 一定会带 URL"）：dio 5.x 默认的
   /// `defaultDioExceptionReadableStringBuilder` 只在少数分支（`type: message`
@@ -799,18 +794,5 @@ class UpdateService {
   /// `?X-Amz-Signature=…` 就在 query 里：一旦漏进 logcat，下载凭据是**收不回
   /// 来**的。这种"发生一次就不可挽回"的事，按防御性处理，比按当前版本的实现
   /// 细节处理划算。
-  static String sanitizeLogText(Object? raw) {
-    if (raw == null) return '—';
-    var text = raw.toString();
-    text = text.replaceAllMapped(
-      RegExp(r'''https?://[^\s"'<>]+'''),
-      (m) => maskUrlForLog(m[0]!),
-    );
-    text = text.replaceAll(RegExp(r'Bearer\s+\S+'), 'Bearer <已脱敏>');
-    text = text.replaceAll(
-      RegExp(r'gh[a-z]*_[A-Za-z0-9_]{20,}'),
-      '<token 已脱敏>',
-    );
-    return text;
-  }
+  static String sanitizeLogText(Object? raw) => redact.sanitizeLogText(raw);
 }

@@ -8,6 +8,35 @@
 
 ---
 
+## v2.67.0 (2026-11-23)
+
+这个版本补的是排查问题的基础设施：以前出问题，日志只打在 logcat 里，得连 USB 抓，现在日志自己落盘，闪退也留证据，一键打包发出来就行。
+
+### 新增
+
+- **诊断日志自动落盘**。`main()` 接管全局 `debugPrint`，全库 556 处既有调用点零改动，日志写到应用支持目录下的 `logs/diag-YYYYMMDD.log`。环形缓冲：单文件 512KB × 4 份轮转、整个目录上限 5MB；攒批 64 条或 2 秒写一次；单行超 8000 字符截断（stack trace 不会一口吃掉整个文件）；同 `(tag, 前 80 字)` 1 秒内只写一条并计数，播放 / 信箱这类刷屏模块不会几秒滚完一个文件。
+- **崩溃四入口全接上**。`runZonedGuarded`、`FlutterError.onError`、`PlatformDispatcher.onError`、`ErrorWidget.builder` 四条路径统一走 `recordError` → **`flushSync()` 同步写盘**（崩溃后进程就没了，攒批等于丢日志）。`ErrorWidget` 的错误摘要按 120 字去重，不会因为反复 build 报错糊满磁盘。
+- **原生崩溃也留证据**。`NativeCrashRecorder.install(this)` 在 `MainActivity.onCreate` 接 JVM 默认 `UncaughtExceptionHandler`，写 `native-crash-<毫秒>.txt`（最多 10 个碎片），下次启动合入主日志后删原文件，异常照常交回原 handler；没有原 handler 时自杀进程，不把崩溃静默吞成"卡死"。
+- **一键导出**。个人页 →「诊断日志」→「导出日志」，把全部日志 + `meta.txt`（App 版本 / 机型 + Android 版本 / 导出时间 / 文件数 / 非空行数 / 总大小 / 最早·最后写入）打成 zip，走系统分享面板直接发微信 / 邮件。zip 落 `<support>/logs/export/`，只保留最近 3 个包。
+
+### 隐私
+
+- 落盘**之前**就脱敏，不是导出时才脱。覆盖 `SESSDATA` / `bili_jct` / `csrf` / `access_key` / `access_token` / `refresh_token` / `bili_ticket` / `deadline` / `sign` / `X-Amz-Signature` / `Authorization` / GitHub PAT / 手机号，以及**搜索关键词**；`键=值`、`键: 值`、JSON 三种形态都认，打码后保留键名与引号（JSON 仍是合法 JSON）。URL 只留 host + path。
+- 零新增权限：清单里只加了一条 `<queries>` 的分享可见性声明，没有任何 `uses-permission`。
+
+### 顺手修的
+
+- 字幕下载日志里的完整 URL 改为按 `maskUrlForLog` 打码（签名参数不再进日志）。
+- `exportBundle` 补 2s 超时：存储通道异常时，导出按钮不会永久卡在「正在打包…」。
+
+### 已知限制
+
+- 国产 ROM 的分享面板对 `application/zip` 的接收行为只能真机实测，AOSP 上必然可用。
+- 512KB × 4 轮转在常驻播放一天后的实际表现，单测用临时目录验证了逻辑，真机还没长跑过。
+- 日志里保留脱敏后的搜索关键词结构（值已打码），排查搜索类问题时仍能看出"搜过几次"。
+
+---
+
 ## v2.66.0 (2026-11-22)
 
 ### 电脑端看的时长也计入热力图了

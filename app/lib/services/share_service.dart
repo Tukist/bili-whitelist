@@ -21,20 +21,22 @@ class ShareResult {
         message = '';
 }
 
-/// 系统分享面板的通道封装（v2.62.0）。
+/// 系统分享面板的通道封装（v2.62.0；v2.67.0 加 [ShareService.shareFile]）。
 ///
-/// 对应原生 `SharePlugin.kt`：`Intent.ACTION_SEND` + `type=text/plain` +
-/// `FLAG_ACTIVITY_NEW_TASK` + `Intent.createChooser`。**不需要任何权限**，
-/// 也不联网 —— 分享只是把一段文本交给别的 App（所以未登录 / 离线都能分享）。
+/// 对应原生 `SharePlugin.kt`：`Intent.ACTION_SEND` + `type=text/plain`（文本）
+/// 或 `EXTRA_STREAM` + `FileProvider` URI（文件）+ `FLAG_ACTIVITY_NEW_TASK`
+/// + `Intent.createChooser`。**不需要任何权限**，也不联网 —— 分享只是把一段
+/// 文本 / 一个文件交给别的 App（所以未登录 / 离线都能分享）。
 ///
 /// ## 失败约定
 ///
 /// 三条失败路径都给**可读中文**，绝不抛到界面：
-/// - 原生回 `false`（系统里没有任何 App 能收 `text/plain`）；
+/// - 原生回 `false`（系统里没有任何 App 能接收这个类型）；
 /// - 原生抛 `PlatformException`（调起过程中 Activity 异常）；
 /// - 通道不存在（`MissingPluginException`：非 Android 平台 / 旧包）。
 ///
-/// 返回 [ShareResult]，由调用点决定怎么提示（播放页是一条 SnackBar）。
+/// 返回 [ShareResult]，由调用点决定怎么提示（播放页 / 诊断日志入口各是一条
+/// SnackBar）。
 class ShareService {
   static const MethodChannel _channel = MethodChannel(kShareChannel);
 
@@ -54,6 +56,44 @@ class ShareService {
       return const ShareResult(
         ok: false,
         message: '分享失败：系统里没有能接收文字的 App',
+      );
+    } on PlatformException catch (e) {
+      return ShareResult(
+        ok: false,
+        message: '分享失败：${e.message ?? e.code}',
+      );
+    } on MissingPluginException {
+      return const ShareResult(ok: false, message: '当前环境不支持系统分享');
+    } catch (e) {
+      return ShareResult(ok: false, message: '分享失败：$e');
+    }
+  }
+
+  /// 分享一个**文件**（v2.67.0：诊断日志 zip）。
+  ///
+  /// [path] 必须是应用私有目录下的真实文件（原生用 `FileProvider` 换 URI，
+  /// 白名单见 `android/app/src/main/res/xml/file_paths.xml`：整个
+  /// `getFilesDir()` 都映射成 `content://<pkg>.fileprovider/support/...`，
+  /// 所以日志放在 `<support>/logs/` 下天然可分享）。[mimeType] 决定系统给哪些
+  /// App 出现在面板里（诊断包是 `application/zip`）。
+  static Future<ShareResult> shareFile({
+    required String path,
+    required String mimeType,
+    required String subject,
+  }) async {
+    if (path.trim().isEmpty) {
+      return const ShareResult(ok: false, message: '没有可分享的文件');
+    }
+    try {
+      final ok = await _channel.invokeMethod<bool>('shareFile', {
+        'path': path,
+        'mimeType': mimeType,
+        'subject': subject,
+      });
+      if (ok == true) return const ShareResult.ok();
+      return const ShareResult(
+        ok: false,
+        message: '分享失败：系统里没有能接收该文件的 App',
       );
     } on PlatformException catch (e) {
       return ShareResult(

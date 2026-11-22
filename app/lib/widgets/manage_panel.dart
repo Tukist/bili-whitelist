@@ -8,7 +8,9 @@ import '../api/translate_api.dart';
 import '../cache/download_manager.dart';
 import '../pages/offline_page.dart';
 import '../services/clipboard_link_store.dart';
+import '../services/diag_log.dart';
 import '../services/inbox_card_style_store.dart';
+import '../services/share_service.dart';
 import '../services/theme_store.dart';
 import '../services/ui_copy_store.dart';
 import '../services/ui_prefs_store.dart';
@@ -41,7 +43,9 @@ import 'traffic_panel.dart';
 /// **流量计量（v2.53.0+：系统口径移动流量 + 运营商数值快照相减）** →
 /// 翻译服务 → 界面文案（空态/加载/错误/页脚，可改可恢复，v2.19.0 补）→
 /// 启动行为 → 界面提示 → **写操作（v2.40.0+，点赞/投币/收藏总开关，
-/// v2.42.0+ 加入评论，默认关）** → 版本更新（检查更新）。面板只含内容本身（无自己的滚动/
+/// v2.42.0+ 加入评论，默认关）** → 版本更新（检查更新）→
+/// **诊断日志（v2.67.0：导出最近运行日志 zip → 系统分享，已自动脱敏）**。
+/// 面板只含内容本身（无自己的滚动/
 /// 内边距），外层（弹层 or 页面滚动流）负责滚动与留白。
 /// **新建合集已移到合集页**（v2.19.0），面板不再提供该分区。
 ///
@@ -175,12 +179,26 @@ const Key kPasteCookieButtonKey = Key('paste-cookie-login');
 /// 「退出登录」入口按钮的 key（测试锚点；v2.49.1+）。
 const Key kLogoutButtonKey = Key('bili-logout');
 
+/// 「导出日志」入口按钮的 key（测试锚点；v2.67.0）。
+const Key kDiagExportButtonKey = Key('diag-export');
+
+/// 诊断日志小节的小字（v2.67.0）。
+///
+/// 两件事都不能省：**已脱敏**（让用户敢发）、**发之前自己看一眼**（脱敏是按
+/// 已知形态做的，文档里贴了自己的隐私内容那种情况它管不了）。
+/// 非空白字符 ≤ 42 —— 与 `kStreamCompatHint` 同一条既有约束（两行以内）。
+const String kDiagExportHint =
+    '已自动脱敏（URL 只留域名+路径、token/手机号打码），发之前建议自己先看一眼。';
+
 class _ManagePanelState extends State<ManagePanel> {
   final _tokenCtrl = TextEditingController();
   final _gistCtrl = TextEditingController();
   bool _loadingConfig = true;
   bool _savingConfig = false;
   bool _obscureToken = true;
+
+  /// 「导出日志」正在打包中（v2.67.0）：连点两次会打包出两个 zip。
+  bool _exportingDiag = false;
 
   /// B 站账号状态（读取 secure storage 的 SESSDATA 剩余有效期判断）。
   _AccountState _account = _AccountState.loading;
@@ -902,8 +920,63 @@ class _ManagePanelState extends State<ManagePanel> {
             label: const Text('检查更新'),
           ),
         ),
+        const SizedBox(height: 16),
+        const Divider(height: 1),
+        const SizedBox(height: 16),
+        // ---- 诊断日志（v2.67.0）----
+        // 报障从"连 USB 抓 logcat"变成"点一下导出、系统分享发出去"。
+        // 日志由 main() 里的 DiagLog 接管 debugPrint 自动落盘，这里只是入口。
+        Text('诊断日志', style: theme.textTheme.titleMedium),
+        const SizedBox(height: 4),
+        Text(
+          '出问题时把最近几天的运行日志打包发出来，比截图好查得多。',
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          kDiagExportHint,
+          style: theme.textTheme.bodySmall?.copyWith(
+            color: theme.colorScheme.onSurfaceVariant,
+          ),
+        ),
+        const SizedBox(height: 8),
+        SizedBox(
+          width: double.infinity,
+          child: OutlinedButton.icon(
+            key: kDiagExportButtonKey,
+            onPressed: _exportingDiag ? null : _exportDiagLogs,
+            icon: const Icon(Icons.bug_report_outlined, size: 18),
+            label: Text(_exportingDiag ? '正在打包…' : '导出日志'),
+          ),
+        ),
       ],
     );
+  }
+
+  /// 导出诊断日志 → 系统分享（v2.67.0）。
+  ///
+  /// 两段都可能失败（打包 / 调起分享），各自给一句人话；成功**不弹提示**
+  /// —— 系统分享面板本身就是"已经发出去了"的反馈，再叠一条 SnackBar 是噪音。
+  Future<void> _exportDiagLogs() async {
+    if (_exportingDiag) return;
+    setState(() => _exportingDiag = true);
+    try {
+      final path = await DiagLog.exportBundle();
+      if (path == null) {
+        _showSnack('导出失败：暂时没有可导出的日志', kind: SnackKind.error);
+        return;
+      }
+      final result = await ShareService.shareFile(
+        path: path,
+        mimeType: 'application/zip',
+        subject: 'amoTV 诊断日志',
+      );
+      if (!result.ok) _showSnack(result.message, kind: SnackKind.error);
+    } finally {
+      if (mounted) setState(() => _exportingDiag = false);
+    }
   }
 
   /// 打开配色主题选择器（P1.5）：列出全部双墨配方，选中立即生效并关闭弹层。

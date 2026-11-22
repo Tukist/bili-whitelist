@@ -121,5 +121,14 @@
             <action android:name="android.intent.action.SEND"/>
             <data android:mimeType="text/plain"/>
         </intent>
+        <!-- 导出诊断日志（v2.67.0）：SharePlugin.shareFile 分享 `application/zip`
+             时同样用 queryIntentActivities 先判断有没有接收方。没有这条 query，
+             分享文件在 API 30+ 会被包可见性挡成"没有 App 能接收"。
+             `*/*` 是 SEND 的通用 MIME（各家文件管理器 / 网盘 / 邮件客户端声明的
+             type 各不相同），只声明 zip 会漏掉一部分接收方。 -->
+        <intent>
+            <action android:name="android.intent.action.SEND"/>
+            <data android:mimeType="*/*"/>
+        </intent>
     </queries>
 </manifest>

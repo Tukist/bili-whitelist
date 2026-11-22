@@ -1,13 +1,16 @@
 package com.biliwhitelist.bili_whitelist_app
 
 import android.app.Activity
+import android.content.ClipData
 import android.content.Intent
 import android.util.Log
+import androidx.core.content.FileProvider
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.MethodChannel
+import java.io.File
 
 /**
- * 系统分享面板（v2.62.0）。
+ * 系统分享面板（v2.62.0 文本；v2.67.0 加文件）。
  *
  * 通道：`bili_whitelist/share`，方法与 Dart 侧封装见
  * lib/services/share_service.dart（[ShareService]）。
@@ -16,6 +19,11 @@ import io.flutter.plugin.common.MethodChannel
  *  - shareText(subject: String, text: String) -> Boolean
  *    调起系统选择器；`true` = 已调起，`false` = 系统里没有任何 App 能接收
  *    `text/plain`（Dart 侧据此给一句可读提示）。
+ *  - shareFile(path: String, mimeType: String, subject: String) -> Boolean
+ *    v2.67.0：「个人 → 诊断日志 → 导出日志」用。把应用私有目录下的文件用
+ *    `FileProvider` 换成 `content://` URI 再 `ACTION_SEND` + `EXTRA_STREAM`。
+ *    不需要任何权限（`file_paths.xml` 已经把 `getFilesDir()` 根映射成
+ *    `support`，日志在 `<filesDir>/logs/` 下天然在白名单里）。
  *
  * ## 为什么是 ACTION_SEND + createChooser
  *
@@ -63,6 +71,17 @@ class SharePlugin(private val activity: Activity) {
                         }
                         shareText(subject, text, result)
                     }
+                    "shareFile" -> {
+                        val subject = call.argument<String>("subject") ?: ""
+                        val mime = call.argument<String>("mimeType")
+                            ?: "application/octet-stream"
+                        val path = call.argument<String>("path")
+                        if (path.isNullOrBlank()) {
+                            result.error("BAD_ARGS", "缺少 path 参数", null)
+                            return@setMethodCallHandler
+                        }
+                        shareFile(path, mime, subject, result)
+                    }
                     else -> result.notImplemented()
                 }
             }
@@ -102,6 +121,82 @@ class SharePlugin(private val activity: Activity) {
                 // 调起。都属于"分享没成功"，给 Dart 侧一句可读原因即可。
                 Log.w(TAG, "分享失败：${e.javaClass.simpleName} ${e.message}")
                 result.error("SHARE_FAILED", e.message ?: "调起分享面板失败", null)
+            }
+        }
+    }
+
+    /**
+     * 分享一个应用私有目录下的文件（v2.67.0：诊断日志 zip）。
+     *
+     * ## 为什么要 FileProvider
+     *
+     * API 24+ 直接传 `file://` URI 会抛 `FileUriExposedException`；清单里已经
+     * 有 `${applicationId}.fileprovider`（M1.3 给安装器用的），
+     * `res/xml/file_paths.xml` 把 `getFilesDir()` 根映射成 `support`，所以
+     * `<filesDir>/logs/xxx.zip` 换成 `content://<pkg>.fileprovider/support/logs/xxx.zip`
+     * —— **清单与路径白名单零改动**。
+     *
+     * ## 国产 ROM 的权限传递
+     *
+     * 只有 `FLAG_GRANT_READ_URI_PERMISSION` 时，个别 ROM（把分享面板做成
+     * 独立任务栈 / 二次转发的 ROM）会丢掉 grant，接收方打开时
+     * `SecurityException: Permission Denial`。做法同 `ApkInstaller.kt`：
+     * 把 URI 同时塞进 `clipData` —— 系统会按 clipData 里的 URI 一并授权，
+     * 这是官方 issue 里给出的兼容写法，不带也不影响 AOSP。
+     */
+    private fun shareFile(
+        path: String,
+        mimeType: String,
+        subject: String,
+        result: MethodChannel.Result,
+    ) {
+        activity.runOnUiThread {
+            try {
+                val file = File(path)
+                if (!file.exists()) {
+                    Log.w(TAG, "分享失败：文件不存在 $path")
+                    result.error("NOT_FOUND", "文件不存在：$path", null)
+                    return@runOnUiThread
+                }
+                val authority = "${activity.packageName}.fileprovider"
+                val uri = FileProvider.getUriForFile(activity, authority, file)
+                val send = Intent(Intent.ACTION_SEND).apply {
+                    type = mimeType
+                    putExtra(Intent.EXTRA_STREAM, uri)
+                    putExtra(Intent.EXTRA_SUBJECT, subject)
+                    addFlags(
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                            Intent.FLAG_ACTIVITY_NEW_TASK,
+                    )
+                    // 包可见性（API 30+）：给国产 ROM 留的第二条授权通道
+                    clipData = ClipData.newRawUri(subject.ifBlank { file.name }, uri)
+                }
+                val handlers = activity.packageManager
+                    .queryIntentActivities(send, 0)
+                if (handlers.isEmpty()) {
+                    Log.w(TAG, "分享失败：没有 App 能接收 $mimeType")
+                    result.success(false)
+                    return@runOnUiThread
+                }
+                val title = subject.ifBlank { DEFAULT_CHOOSER_TITLE }
+                val chooser = Intent.createChooser(send, title).apply {
+                    // 读权限也挂在 chooser 上：部分 ROM 是"先起 chooser 再转发"，
+                    // 只在内层 Intent 上带 grant 会被中间那一层吃掉。
+                    addFlags(
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                            Intent.FLAG_ACTIVITY_NEW_TASK,
+                    )
+                }
+                activity.startActivity(chooser)
+                result.success(true)
+            } catch (e: Exception) {
+                // FileProvider 未配置 / 路径不在白名单 / ROM 拦截都会落这里
+                Log.w(TAG, "分享文件失败：${e.javaClass.simpleName} ${e.message}")
+                result.error(
+                    "SHARE_FAILED",
+                    "${e.javaClass.simpleName}: ${e.message ?: "调起分享面板失败"}",
+                    null,
+                )
             }
         }
     }

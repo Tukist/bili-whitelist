@@ -24,6 +24,7 @@ import '../models/video_shot.dart';
 import '../models/whitelist_video.dart';
 import '../services/secure_store.dart';
 import '../services/web_login_cookies.dart';
+import '../utils/log_redact.dart' as redact;
 import '../wbi/wbi_signer.dart';
 
 /// 评论正文的字数上限（B 站网页端的「0/1000」就是它）。
@@ -2541,7 +2542,12 @@ class BiliApi {
     }
     var url = track.subtitleUrl;
     if (url.startsWith('//')) url = 'https:$url';
-    debugPrint('[bili_api] downloadSubtitle lan=${track.lan} url=$url');
+    // v2.67.0：字幕地址带签名 / 时效参数（`deadline` / `sign` 等），落盘日志
+    // 只留 host + path —— 与更新下载地址同一条规矩（见 utils/log_redact.dart）。
+    debugPrint(
+      '[bili_api] downloadSubtitle lan=${track.lan} '
+      'url=${redact.maskUrlForLog(url)}',
+    );
     final resp = await _dio.get<String>(
       url,
       options: Options(

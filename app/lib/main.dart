@@ -5,6 +5,8 @@ import 'package:flutter/material.dart';
 import 'cache/download_manager.dart';
 import 'pages/playlist_page.dart';
 import 'services/clipboard_link_store.dart';
+import 'services/crash_guard.dart';
+import 'services/diag_log.dart';
 import 'services/inbox_card_style_store.dart';
 import 'services/theme_store.dart';
 import 'services/ui_prefs_store.dart';
@@ -22,29 +24,49 @@ final RouteObserver<ModalRoute<void>> routeObserver =
     RouteObserver<ModalRoute<void>>();
 
 void main() {
-  // 读已保存的配色配方（P1.5）：必须在 runApp 前确保 binding 就绪
-  // （SharedPreferences 走平台通道）。读到非默认配方时会 notifyListeners，
-  // 首帧即用用户选的墨色，不闪默认色。
-  WidgetsFlutterBinding.ensureInitialized();
-  unawaited(ThemeStore.instance.ensureLoaded());
-  // 读已保存的**信箱卡片样式**（v2.21.0+）：同上，首帧即用用户选的版式，
-  // 不先闪一下默认版式。store 内部读失败静默（回退默认）。
-  unawaited(InboxCardStyleStore.instance.ensureLoaded());
-  // 读「冷启动读剪贴板开播」的开关与上次处理记录（v2.35.0）：开关默认开，
-  // 但用户可能关过——启动时先读进来，免得关掉之后第一次冷启动仍然去读剪贴板
-  // （store 内部幂等 + 读失败静默回默认）。
-  unawaited(ClipboardLinkStore.instance.ensureLoaded());
-  // 读「界面提示」开关（v2.36.0）：默认开，但用户可能关过——启动时先读进来，
-  // 免得关掉之后第一次冷启动仍然弹一堆提示（store 内部幂等 + 读失败静默回默认）。
-  unawaited(UiPrefsStore.instance.ensureLoaded());
-  // 预热离线缓存索引（v2.29.0 修复「冷启动入口缺计数」）：索引是**懒加载**的（[DownloadManager.init]
-  // 原先只由合集页 / 离线缓存页 / 播放页触发），而「个人」页设置区的
-  // 「缓存管理」入口文案直接读 [DownloadManager.cached]
-  // （`缓存管理（N 个视频 · X）`）——冷启动直奔「个人」页时索引还没进内存，
-  // 入口只剩「缓存管理」四个字，得先绕去别的页面才补上。启动预热一次就
-  // 没这个空窗（幂等 + 失败静默 + 不阻塞首帧，见 [preheatCacheIndex]）。
-  unawaited(preheatCacheIndex());
-  runApp(const BiliWhitelistApp());
+  // 整个 App 跑在一个守护 zone 里（v2.67.0）：Dart **异步**未处理异常
+  // （`unawaited` 的 future 抛了没人接、`Future.microtask` 里炸了）不经过
+  // Flutter 的任何回调，只有 zone 能拦。拦到就同步落进诊断日志。
+  runZonedGuarded(
+    () async {
+      // 读已保存的配色配方（P1.5）：必须在 runApp 前确保 binding 就绪
+      // （SharedPreferences 走平台通道）。读到非默认配方时会 notifyListeners，
+      // 首帧即用用户选的墨色，不闪默认色。
+      WidgetsFlutterBinding.ensureInitialized();
+      // 全局异常入口（v2.67.0）：Flutter 框架异常 / 引擎回调异常 / build
+      // 出错时的那块错误卡。先装它（同步、无依赖），再装日志落盘 ——
+      // 中间这一小段如果真崩了，至少控制台还是照旧打印。
+      CrashGuard.install();
+      // 接管 debugPrint（v2.67.0）：556 处调用点**一个字都不用改**，旧实现
+      // 照常回调（logcat / IDE 控制台不变），只是顺手多落一份盘。
+      // ⚠️ 必须在 main() 里装、不能做成库加载期副作用：多个测试会临时替换
+      // debugPrint 抓日志断言内容（见 DiagLog 类注释）。
+      await DiagLog.install();
+      // 上次进程原生崩溃留下的碎片文件，合入今天的 diag 日志（异步、失败静默）。
+      unawaited(DiagLog.mergeNativeCrashes());
+      unawaited(ThemeStore.instance.ensureLoaded());
+      // 读已保存的**信箱卡片样式**（v2.21.0+）：同上，首帧即用用户选的版式，
+      // 不先闪一下默认版式。store 内部读失败静默（回退默认）。
+      unawaited(InboxCardStyleStore.instance.ensureLoaded());
+      // 读「冷启动读剪贴板开播」的开关与上次处理记录（v2.35.0）：开关默认开，
+      // 但用户可能关过——启动时先读进来，免得关掉之后第一次冷启动仍然去读剪贴板
+      // （store 内部幂等 + 读失败静默回默认）。
+      unawaited(ClipboardLinkStore.instance.ensureLoaded());
+      // 读「界面提示」开关（v2.36.0）：默认开，但用户可能关过——启动时先读进来，
+      // 免得关掉之后第一次冷启动仍然弹一堆提示（store 内部幂等 + 读失败静默回默认）。
+      unawaited(UiPrefsStore.instance.ensureLoaded());
+      // 预热离线缓存索引（v2.29.0 修复「冷启动入口缺计数」）：索引是**懒加载**的（[DownloadManager.init]
+      // 原先只由合集页 / 离线缓存页 / 播放页触发），而「个人」页设置区的
+      // 「缓存管理」入口文案直接读 [DownloadManager.cached]
+      // （`缓存管理（N 个视频 · X）`）——冷启动直奔「个人」页时索引还没进内存，
+      // 入口只剩「缓存管理」四个字，得先绕去别的页面才补上。启动预热一次就
+      // 没这个空窗（幂等 + 失败静默 + 不阻塞首帧，见 [preheatCacheIndex]）。
+      unawaited(preheatCacheIndex());
+      runApp(const BiliWhitelistApp());
+    },
+    // 守护 zone 兜住的异步异常：同步落盘（崩溃路径不能指望异步 flush 排队）。
+    (error, stack) => DiagLog.recordError('zone', error, stack: stack),
+  );
 }
 
 /// 冷启动预热：把离线缓存索引（`cache_index.json`）读进 [DownloadManager]。

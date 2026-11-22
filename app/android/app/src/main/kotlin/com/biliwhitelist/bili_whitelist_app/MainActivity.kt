@@ -2,6 +2,7 @@ package com.biliwhitelist.bili_whitelist_app
 
 import android.content.Intent
 import android.content.res.Configuration
+import android.os.Bundle
 import android.util.Log
 import android.webkit.CookieManager
 import android.webkit.WebStorage
@@ -13,6 +14,20 @@ class MainActivity : FlutterActivity() {
     companion object {
         private const val COOKIE_CHANNEL = "bili_whitelist/cookie"
         private const val TAG = "bili_whitelist"
+    }
+
+    /**
+     * 原生崩溃落盘（v2.67.0）：播放器 / WebView / Keystore 这些纯 Java 层抛的
+     * 异常 Dart 侧一无所知，用户看到的就是"闪退且没有任何日志"。这里接
+     * JVM 的默认 handler，先写 `<filesDir>/logs/native-crash-*.txt`，再把异常
+     * 交给原 handler（系统照常处理，我们不吞崩溃）。
+     *
+     * 放在 onCreate 而不是 configureFlutterEngine：越早接上，启动早期（引擎还没
+     * 起来）的崩溃也能留下证据。install 内部幂等（Activity 重建不会叠套）。
+     */
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        NativeCrashRecorder.install(this)
     }
 
     // 评论图片保存相册（v2.16.19+）：授权结果（API 26~28 的
@@ -68,6 +83,9 @@ class MainActivity : FlutterActivity() {
         // 播放页「更多 → 分享」（v2.62.0）：Intent.ACTION_SEND + createChooser。
         // 不需要权限、不联网（理由见 SharePlugin 文件头）。
         SharePlugin(this).register(flutterEngine)
+        // 诊断信息（v2.67.0）：导出日志的 meta.txt 要机型 + Android 版本。
+        // 只读 android.os.Build 的公开字段，不需要权限。
+        DiagInfoPlugin().register(flutterEngine)
         // 播放页「更多 → 小窗播放」（v2.63.0）：系统画中画 + 状态回推。
         // 不需要权限（清单里只有 supportsPictureInPicture），理由见 PipPlugin 文件头。
         pip = PipPlugin(this)
