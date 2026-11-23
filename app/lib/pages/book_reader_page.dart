@@ -438,13 +438,19 @@ class _BookReaderPageState extends State<BookReaderPage> {
   }
 
   Widget _contentArea(BuildContext context, Color foreground) {
+    // 系统栏让位由 SafeArea 负责（它吃的是 `padding`）；这里额外按
+    // `viewPadding` 再留一份，是因为键盘弹出时 `padding.bottom` 会变成 0、
+    // 而 `viewPadding.bottom` 仍记着导航栏高度 —— 控制条本身的内边距就是按
+    // viewPadding 算的（见 [_bottomBar]），正文的让位必须跟着同一套口径走，
+    // 否则「刚收起键盘那一帧」最后一行会被控制条压住。
+    final insets = MediaQuery.viewPaddingOf(context);
     return SafeArea(
       child: AnimatedPadding(
         duration: kDurBase,
         curve: kCurveOut,
         padding: EdgeInsets.only(
           top: _controlsVisible ? 52 : 0,
-          bottom: _controlsVisible ? 96 : 0,
+          bottom: _controlsVisible ? 96 + insets.bottom : 0,
         ),
         child: _contentBody(context, foreground),
       ),
@@ -521,9 +527,19 @@ class _BookReaderPageState extends State<BookReaderPage> {
 
   Widget _topBar(BuildContext context, Color background, Color foreground) {
     final chapterName = _currentChapter?.name ?? '';
+    // 顶栏是「浮在正文上的」一块底色：背景必须一直铺到屏幕最上沿（状态栏 /
+    // 刘海下面），否则最上面会露出一条与纸色不同的硬边。做法是背景铺满整块
+    // Container，只把**内容**用 padding 往下推（padding 加在内容上，不是把
+    // 容器缩短）。kSpace4 是内容与状态栏之间的一点呼吸。
+    //
+    // 顺带一个巧合但必须保持的关系：这里的高度 = viewPadding.top + kSpace4 +
+    // IconButton(48) = viewPadding.top + 52，正好等于 [_contentArea] 的
+    // `top: 52` 加上 SafeArea 已经让出的状态栏高度 → 正文第一行永远刚好在
+    // 顶栏下沿，不会「钻到」半透明顶栏底下。
+    final topInset = MediaQuery.viewPaddingOf(context).top;
     return Container(
       color: background.withValues(alpha: .94),
-      padding: const EdgeInsets.only(top: kSpace32),
+      padding: EdgeInsets.only(top: topInset + kSpace4),
       child: Row(
         children: [
           IconButton(
@@ -555,9 +571,17 @@ class _BookReaderPageState extends State<BookReaderPage> {
     final hasPrev = _index > 0;
     final hasNext = _index < _chapters.length - 1;
     final disabled = foreground.withValues(alpha: .35);
+    // 目标 API 35 起系统强制 edge-to-edge：页面会一直画到三键导航栏下面。
+    // 这里**不能**用 SafeArea 包一层（那会把 Container 缩短，导航栏位置露出
+    // Scaffold 底色，底部出现一条硬边）；正确做法是背景铺满整条底部（包括
+    // 导航栏区域），只把内容按 `viewPadding.bottom` 往上顶。
+    //
+    // 用 viewPadding 而不是 padding：键盘弹出时 `padding.bottom` 会归零，
+    // 用 padding 会让内容重新滑到导航栏下面。
+    final bottomInset = MediaQuery.viewPaddingOf(context).bottom;
     return Container(
       color: background.withValues(alpha: .94),
-      padding: const EdgeInsets.only(bottom: kSpace16, top: kSpace4),
+      padding: EdgeInsets.only(bottom: kSpace16 + bottomInset, top: kSpace4),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [

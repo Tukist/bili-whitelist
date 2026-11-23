@@ -42,6 +42,10 @@ class MainActivity : FlutterActivity() {
     // ImagePickPlugin（requestCode 与上面那条通道错开）。
     private lateinit var imagePick: ImagePickPlugin
 
+    // 从手机里挑文本文件导入书源（v2.70.0）：同样走 SAF（ACTION_OPEN_DOCUMENT），
+    // 结果在这里转发给 FilePickerPlugin（requestCode 9050，与上面两条错开）。
+    private lateinit var filePicker: FilePickerPlugin
+
     // 画中画（小窗播放，v2.63.0）：通道 + 事件由 PipPlugin 负责，
     // 生命周期回调（onPictureInPictureModeChanged / onStop）只能在这里接。
     private lateinit var pip: PipPlugin
@@ -72,6 +76,10 @@ class MainActivity : FlutterActivity() {
         // 从相册选图（v2.50.0）：系统图片选择器 MethodChannel
         imagePick = ImagePickPlugin(this)
         imagePick.register(flutterEngine)
+        // 从手机里挑文本文件导入书源（v2.70.0）：系统文件选择器 MethodChannel，
+        // 读成 UTF-8 字符串回传。不需要任何权限（SAF 就是为这个设计的）。
+        filePicker = FilePickerPlugin(this)
+        filePicker.register(flutterEngine)
         // 流量计量（v2.53.0）：NetworkStatsManager + 「使用情况访问」引导。
         // 不需要持有实例（跳设置页不靠 onActivityResult 回传，Dart 侧在回到前台时
         // 自己重查权限）→ 与 ApkInstaller / MediaController 一样直接注册即走；
@@ -158,6 +166,9 @@ class MainActivity : FlutterActivity() {
         if (::imagePick.isInitialized) {
             imagePick.onActivityResult(requestCode, resultCode, data)
         }
+        if (::filePicker.isInitialized) {
+            filePicker.onActivityResult(requestCode, resultCode, data)
+        }
     }
 
     // 选文件期间 Activity 被销毁 → 收尾挂起的 Dart 调用（否则那条 await 永远不返回）
@@ -167,6 +178,9 @@ class MainActivity : FlutterActivity() {
         }
         if (::imagePick.isInitialized) {
             imagePick.onActivityDestroyed()
+        }
+        if (::filePicker.isInitialized) {
+            filePicker.onActivityDestroyed()
         }
         super.onDestroy()
     }

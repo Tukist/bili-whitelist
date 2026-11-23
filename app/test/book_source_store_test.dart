@@ -150,6 +150,22 @@ void main() {
       expect(list.single.toc.maxPages, 1);
     });
 
+    test('旧数据里的换行 / 零宽名字读出来就是干净单行（读路径也清洗）', () async {
+      SharedPreferences.setMockInitialValues({
+        BookSourceStore.storageKey: jsonEncode([
+          {
+            'name': '缩书文学\u200B网\n',
+            'author': '作者\t甲',
+            'baseUrl': ' https://s.example\uFEFF ',
+          },
+        ]),
+      });
+      final src = (await BookSourceStore().getAll()).single;
+      expect(src.name, '缩书文学网');
+      expect(src.author, '作者 甲');
+      expect(src.baseUrl, 'https://s.example');
+    });
+
     test('脏数据不会在下次写入时被打包丢掉 —— 写回后仍是合法 JSON', () async {
       SharedPreferences.setMockInitialValues({
         BookSourceStore.storageKey: jsonEncode([
@@ -218,6 +234,37 @@ void main() {
       expect(await store.saveIndexUrls(const []), isTrue);
       final prefs = await SharedPreferences.getInstance();
       expect(prefs.getStringList(BookSourceStore.indexUrlsKey), isNull);
+    });
+
+    test('replace: true 整份替换（选择页里删掉的行不该再冒出来）', () async {
+      final store = BookSourceStore();
+      await store.saveIndexUrls(['https://e.com/a.json', 'https://e.com/b.json']);
+      await store.saveIndexUrls(['https://e.com/c.json'], replace: true);
+      expect(await store.getIndexUrls(), ['https://e.com/c.json']);
+
+      // 清空链接框：key 直接删掉，不留空数组
+      await store.saveIndexUrls(const [], replace: true);
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getStringList(BookSourceStore.indexUrlsKey), isNull);
+    });
+  });
+
+  group('清空（clear）', () {
+    test('清空后读回空列表，存储 key 被整条删掉', () async {
+      final store = BookSourceStore();
+      await store.upsertAll([_src('甲'), _src('乙')]);
+      expect(await store.clear(), isTrue);
+
+      expect(await store.getAll(), isEmpty);
+      final prefs = await SharedPreferences.getInstance();
+      expect(prefs.getString(BookSourceStore.storageKey), isNull,
+          reason: '删的是整个 key，不留一个 "[]" 空壳');
+    });
+
+    test('本来就没有书源时 clear 也算成功（幂等）', () async {
+      final store = BookSourceStore();
+      expect(await store.clear(), isTrue);
+      expect(await store.getAll(), isEmpty);
     });
   });
 

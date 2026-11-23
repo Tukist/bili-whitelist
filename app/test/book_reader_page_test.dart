@@ -249,4 +249,32 @@ void main() {
     expect(detail.calls, 2);
     expect(find.textContaining('正文：第1章'), findsOneWidget);
   });
+
+  testWidgets('三键导航栏（viewPadding.bottom = 48）下：底栏背景铺到屏幕最底、内容内缩',
+      (tester) async {
+    // 复现真机现场：Android 15 强制 edge-to-edge，页面画到导航栏下面。
+    tester.view.physicalSize = const Size(400, 800);
+    tester.view.devicePixelRatio = 1.0;
+    tester.view.padding = const FakeViewPadding(bottom: 48);
+    tester.view.viewPadding = const FakeViewPadding(bottom: 48);
+    addTearDown(tester.view.reset);
+
+    await _pump(tester, content: _FakeContentService(), store: _RecordingStore());
+
+    final barFinder = find
+        .ancestor(of: find.text('下一章'), matching: find.byType(Container))
+        .first;
+    // ① 背景铺满：Container 的底边就是屏幕底边（不是被 SafeArea 缩短到 752）
+    expect(tester.getRect(barFinder).bottom, 800);
+    // ② 内容内缩：kSpace16 + 导航栏 48
+    expect(
+      tester.widget<Container>(barFinder).padding,
+      const EdgeInsets.only(top: 4, bottom: 16 + 48),
+    );
+    // ③ 「A- / A+ / 主题」这一行整体落在导航栏上方，不会被切掉一半
+    expect(
+      800 - tester.getRect(find.text('A+')).bottom,
+      greaterThanOrEqualTo(48),
+    );
+  });
 }

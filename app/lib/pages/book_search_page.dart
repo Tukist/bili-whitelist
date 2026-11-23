@@ -303,6 +303,10 @@ class _BookSearchPageState extends State<BookSearchPage> {
   }
 
   Widget _body(BuildContext context) {
+    // 本页 body 直接顶到屏幕最底（没有底部导航栏拦着），edge-to-edge 下最后
+    // 一个可见元素会落进三键导航栏那片区域 ——「取消搜索」按钮和结果列表末尾
+    // 都要按 viewPadding 让位，否则会被系统栏压住且滚不出来。
+    final bottomInset = MediaQuery.viewPaddingOf(context).bottom;
     if (_sources == null) {
       return const AppStateView(
         kind: AppStateKind.loading,
@@ -321,7 +325,7 @@ class _BookSearchPageState extends State<BookSearchPage> {
             ),
           ),
           Padding(
-            padding: const EdgeInsets.only(bottom: kSpace16),
+            padding: EdgeInsets.only(bottom: kSpace16 + bottomInset),
             child: TextButton(
               onPressed: _cancelSearch,
               child: const Text('取消搜索'),
@@ -397,6 +401,8 @@ class _BookSearchPageState extends State<BookSearchPage> {
         ] else
           ..._groupSlivers(context, groups),
         const SliverToBoxAdapter(child: SizedBox(height: kSpace24)),
+        // 列表末尾多让出导航栏的高度（否则最后一条滚到底也压在系统栏下）
+        SliverToBoxAdapter(child: SizedBox(height: bottomInset)),
       ],
     );
   }

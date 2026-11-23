@@ -104,10 +104,16 @@ class BookSource {
   factory BookSource.fromJson(Map<String, dynamic> json) {
     return BookSource(
       schemaVersion: _asInt(json['schemaVersion'], 1),
-      name: _asString(json['name']),
+      // 展示用的三个字段统一在这里清洗（见 [_cleanLine] / [_cleanUrl]）：
+      // 索引包里出现过 `"缩书文学\n网"` 这种带换行的名字，`maxLines: 1` 兜不住
+      // 换行符，会画成两行重影。放在读取入口而不是解析器里，是因为导入
+      // （[fromJson] / [fromLegado]）、索引下载（走 parseBookSourceText）、
+      // 以及**旧数据从 prefs 读出**（BookSourceStore 也用 [fromJson]）全都
+      // 会经过这里 —— 一处清洗，三条路一起干净。
+      name: _cleanLine(json['name']),
       version: _asString(json['version']),
-      author: _asString(json['author']),
-      baseUrl: _asString(json['baseUrl']),
+      author: _cleanLine(json['author']),
+      baseUrl: _cleanUrl(json['baseUrl']),
       charset: _asString(json['charset'], 'utf-8'),
       enabled: _asBool(json['enabled'], true),
       headers: _asStringMap(json['headers']),
@@ -178,8 +184,8 @@ class BookSource {
   /// 注意 legado 的规则串可能带 `@css:` / `@json:` / `##正则##替换` /
   /// `{{}}` 模板，这里**原样搬运**：R1 只做展示，R2 的规则引擎认得这些前缀。
   static BookSource? fromLegado(Map<String, dynamic> json) {
-    final name = _asString(json['bookSourceName']);
-    final baseUrl = _asString(json['bookSourceUrl']);
+    final name = _cleanLine(json['bookSourceName']);
+    final baseUrl = _cleanUrl(json['bookSourceUrl']);
     if (name.isEmpty || baseUrl.isEmpty) return null;
 
     final ruleSearch = _asMap(json['ruleSearch']);
@@ -570,6 +576,36 @@ String _asString(Object? v, [String fallback = '']) {
   if (v == null) return fallback;
   if (v is String) return v;
   return v.toString();
+}
+
+/// 零宽字符 / BOM：肉眼看不见，却能让同一段文字在 `Text` 里占出额外的行高
+/// 与宽度（`"缩书\u200B文学网"` 看起来完全正常，量出来却比同行邻居宽）。
+final RegExp _kZeroWidth = RegExp('[\u200B\uFEFF]');
+
+/// 连续空白（含 `\r` `\n` `\t`、全角空格 `\u3000`）：压成一个普通空格。
+final RegExp _kWhitespaceRun = RegExp(r'\s+');
+
+/// 单行文本净化：去零宽字符 → 连续空白压成单个空格 → 去首尾空白。
+///
+/// 用于 [BookSource.name] / [BookSource.author] 这类**只该显示一行**的字段。
+/// 为什么不是简单 `trim()`：名字里的 `\n` 不会被 `trim()` 去掉中间的，
+/// 而 `Text(maxLines: 1)` 对含换行的字符串仍会把换行后的内容画在下一行，
+/// 于是列表里出现两行文字上下叠在一起的重影。
+String _cleanLine(Object? v) {
+  final raw = _asString(v);
+  if (raw.isEmpty) return raw;
+  return raw.replaceAll(_kZeroWidth, '').replaceAll(_kWhitespaceRun, ' ').trim();
+}
+
+/// 地址净化：只去零宽字符与首尾空白，**不压中间的空白**。
+///
+/// 地址里出现空白是用户手抄出的脏数据，但真去掉得靠校验而不是猜；
+/// 这里只做「肉眼看不见、又一定不是地址一部分」的处理，免得把
+/// 带查询参数的地址改坏。
+String _cleanUrl(Object? v) {
+  final raw = _asString(v);
+  if (raw.isEmpty) return raw;
+  return raw.replaceAll(_kZeroWidth, '').trim();
 }
 
 int _asInt(Object? v, int fallback) {

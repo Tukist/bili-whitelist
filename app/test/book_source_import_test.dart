@@ -277,6 +277,41 @@ https://mirror.example.com/list.json
     });
   });
 
+  group('名称清洗', () {
+    test('名字里的换行 / 制表符 / 连续空白压成一个空格', () {
+      final r = parseBookSourceText(jsonEncode(_minimal('缩书\n文学\t网  ')));
+      expect(r.sources.single.name, '缩书 文学 网');
+      // 单行：不残留任何换行或制表符
+      expect(r.sources.single.name.contains('\n'), isFalse);
+      expect(r.sources.single.name.contains('\t'), isFalse);
+    });
+
+    test('零宽字符（\\u200B / \\uFEFF）被删掉，不会把名字撑成两截', () {
+      final r = parseBookSourceText(jsonEncode(_minimal('缩书\u200B文学\uFEFF网')));
+      expect(r.sources.single.name, '缩书文学网');
+    });
+
+    test('author 同样清洗；baseUrl 只去首尾空白与零宽（不压中间）', () {
+      final json = _minimal('源')..['author'] = '作者\t甲\n乙';
+      json['baseUrl'] = '  https://a.example\u200B  ';
+      final r = parseBookSourceText(jsonEncode(json));
+      final s = r.sources.single;
+      expect(s.author, '作者 甲 乙');
+      expect(s.baseUrl, 'https://a.example');
+    });
+
+    test('legado 名字里的换行也被清洗（同一个模型出口）', () {
+      final r = parseBookSourceText(jsonEncode(_legado('开源\n阅读 源')));
+      expect(r.sources.single.name, '开源 阅读 源');
+    });
+
+    test('只有空白的名字清洗后变空 → 按缺 name 跳过并给提示', () {
+      final r = parseBookSourceText(jsonEncode(_minimal(' \n\t ')));
+      expect(r.sources, isEmpty);
+      expect(r.errors.single, contains('缺少书源名'));
+    });
+  });
+
   group('legado 兼容', () {
     test('单个 legado 源：字段映射正确 + raw 保留', () {
       final r = parseBookSourceText(jsonEncode(_legado('开源阅读源')));

@@ -495,46 +495,48 @@ class _BookDetailPageState extends State<BookDetailPage> {
   Widget _bottomBar(BuildContext context) {
     final palette = context.palette;
     final hasProgress = _progress != null;
-    return SafeArea(
-      top: false,
-      child: Container(
-        padding: const EdgeInsets.fromLTRB(
-          kPagePadH,
-          kSpace8,
-          kPagePadH,
-          kSpace8,
-        ),
-        decoration: BoxDecoration(
-          color: kPaper,
-          border: Border(top: BorderSide(color: kRule)),
-        ),
-        child: Row(
-          children: [
-            Expanded(
-              flex: 3,
-              child: FilledButton(
-                onPressed: _openReader,
-                style: FilledButton.styleFrom(
-                  backgroundColor: palette.inkFill,
-                  foregroundColor: palette.onInk,
-                  minimumSize: const Size(0, 48),
-                ),
-                child: Text(hasProgress ? '继续阅读' : '开始阅读'),
+    // 系统栏让位由这条 bar 自己按 padding 处理，**不套外层 SafeArea**：
+    // SafeArea 会把 Container 缩短，三键导航栏那一块就露出 Scaffold 的底色，
+    // 底部出现一条与纸色不同的硬边。这里底色（kPaper + 上边框）一直铺到屏幕
+    // 最底，只把两个按钮往上顶 —— 目标 API 35 强制 edge-to-edge 的正解。
+    final bottomInset = MediaQuery.viewPaddingOf(context).bottom;
+    return Container(
+      padding: EdgeInsets.fromLTRB(
+        kPagePadH,
+        kSpace8,
+        kPagePadH,
+        kSpace8 + bottomInset,
+      ),
+      decoration: BoxDecoration(
+        color: kPaper,
+        border: Border(top: BorderSide(color: kRule)),
+      ),
+      child: Row(
+        children: [
+          Expanded(
+            flex: 3,
+            child: FilledButton(
+              onPressed: _openReader,
+              style: FilledButton.styleFrom(
+                backgroundColor: palette.inkFill,
+                foregroundColor: palette.onInk,
+                minimumSize: const Size(0, 48),
               ),
+              child: Text(hasProgress ? '继续阅读' : '开始阅读'),
             ),
-            const SizedBox(width: kSpace8),
-            Expanded(
-              flex: 2,
-              child: OutlinedButton(
-                onPressed: _onShelf ? null : _addToShelf,
-                style: OutlinedButton.styleFrom(
-                  minimumSize: const Size(0, 48),
-                ),
-                child: Text(_onShelf ? '已在书架' : '加入书架'),
+          ),
+          const SizedBox(width: kSpace8),
+          Expanded(
+            flex: 2,
+            child: OutlinedButton(
+              onPressed: _onShelf ? null : _addToShelf,
+              style: OutlinedButton.styleFrom(
+                minimumSize: const Size(0, 48),
               ),
+              child: Text(_onShelf ? '已在书架' : '加入书架'),
             ),
-          ],
-        ),
+          ),
+        ],
       ),
     );
   }

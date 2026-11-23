@@ -26,11 +26,11 @@ class BookSourceStore {
   /// shared_preferences 存储 key（JSON 数组）。
   static const String storageKey = 'reader:sources';
 
-  /// 「待下载的索引链接」存储 key（R1 只存不下载，R2/R3 才真去拉）。
+  /// 「待下载的索引链接」存储 key（由 `book_source_index_service` 消费）。
   ///
   /// 为什么单独存：用户贴进来的是「书源合集索引」（一个 .json 里列着几十个
-  /// 书源地址），R1 没有网络抓取能力，但不能让这条输入凭空消失 —— 存起来，
-  /// 下一版接着用。
+  /// 书源地址），R1 还没有网络抓取能力，但不能让这条输入凭空消失 —— 存起来，
+  /// 选择页（`pages/book_source_picker_page.dart`）直接拿它当默认下载清单。
   static const String indexUrlsKey = 'reader:index_urls';
 
   /// 全局单例（阅读页 / 管理页共用一份）。
@@ -53,7 +53,8 @@ class BookSourceStore {
   /// 批量合并写入：按 [BookSource.key] 同名覆盖、新名追加；返回是否落盘成功。
   ///
   /// 合并而不是整体替换：导入通常是「再补几个源」，整体替换会把用户已有的
-  /// 源清空 —— 那是不可接受的破坏性行为。要清空请逐个 [remove]。
+  /// 源清空 —— 那是不可接受的破坏性行为。真要清空请用 [clear]（管理页的
+  /// 「清空书源」经二次确认后调它）。
   Future<bool> upsertAll(List<BookSource> incoming) async {
     if (incoming.isEmpty) return true;
     try {
@@ -92,6 +93,21 @@ class BookSourceStore {
     }
   }
 
+  /// 清空全部书源（管理页「清空书源」用它，调用方负责二次确认）；幂等。
+  ///
+  /// 为什么要有这个口子：书源上限只有 [maxSources] 个，用户从索引里导了一批
+  /// 不想要的源之后，逐个删 200 次是不现实的 —— 那等于逼人去清 App 数据。
+  /// 删的是整个 key（不是写一个 `[]`），存储里不留空壳。
+  Future<bool> clear() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (!prefs.containsKey(storageKey)) return true;
+      return await prefs.remove(storageKey);
+    } catch (_) {
+      return false;
+    }
+  }
+
   /// 切换某个书源的启用状态；不存在返回 false。
   Future<bool> setEnabled(String name, bool enabled) async {
     final key = name.toLowerCase();
@@ -117,26 +133,38 @@ class BookSourceStore {
 
   /// 记录一批「索引链接」（去重、保持先后）；返回落盘是否成功。
   ///
-  /// R1 只存不用：管理页在「从链接导入」里识别到索引链接时落这里，
-  /// R2 实现网络下载后直接从这里接上，不会丢用户已经粘过的输入。
-  Future<bool> saveIndexUrls(List<String> urls) async {
-    if (urls.isEmpty) return true;
+  /// R1 只存不用；R3 起由选择页（`book_source_index_service`）真去下载。
+  /// 管理页在「从链接导入」里识别到索引链接时落这里，不会丢用户已经粘过的输入。
+  ///
+  /// [replace] = true 时**整份替换**（选择页里那个可编辑的链接框用它）：
+  /// 用户把某一行删掉就是不想再下它，追加模式会让被删的链接下次又冒出来。
+  /// 默认仍是追加（R1 语义不变：粘贴只会往里加）。
+  Future<bool> saveIndexUrls(List<String> urls, {bool replace = false}) async {
+    if (urls.isEmpty && !replace) return true;
     try {
       final prefs = await SharedPreferences.getInstance();
-      final current = prefs.getStringList(indexUrlsKey) ?? const <String>[];
+      final current = replace
+          ? const <String>[]
+          : prefs.getStringList(indexUrlsKey) ?? const <String>[];
       final seen = current.toSet();
       final next = [
         ...current,
         for (final u in urls)
           if (seen.add(u)) u,
       ];
+      if (next.isEmpty) {
+        // 用户把链接框清空了：直接删 key，别留一个空数组在存储里
+        return prefs.containsKey(indexUrlsKey)
+            ? prefs.remove(indexUrlsKey)
+            : true;
+      }
       return prefs.setStringList(indexUrlsKey, next);
     } catch (_) {
       return false;
     }
   }
 
-  /// 读回待下载的索引链接（R1 暂无消费方，留给 R2/R3）。
+  /// 读回待下载的索引链接（选择页初次打开时的默认清单）。
   Future<List<String>> getIndexUrls() async {
     try {
       final prefs = await SharedPreferences.getInstance();
