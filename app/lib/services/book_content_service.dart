@@ -196,6 +196,12 @@ class BookContentService {
         warnings.add('正文第 $page 页没取到（${_describe(e)}）');
         break;
       }
+      // 编码告警必须**每页当场收下**：引擎上的 lastDecodeWarning 只记最近一次
+      // 抓取，下一页成功就把上一页的盖掉了（GBK 站点常是「首页 GBK、翻页 404」）。
+      final decodeWarning = engine.lastDecodeWarning;
+      if (decodeWarning != null && !warnings.contains(decodeWarning)) {
+        warnings.add(decodeWarning);
+      }
 
       String rawHtml;
       try {
@@ -221,9 +227,6 @@ class BookContentService {
 
     if (rule.text.trim().isEmpty) {
       warnings.add('书源没有配置正文规则（content.text），已取整页内容');
-    }
-    if (engine.lastDecodeWarning != null) {
-      warnings.add(engine.lastDecodeWarning!);
     }
 
     final body = parts.join('\n\n');

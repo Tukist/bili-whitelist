@@ -21,11 +21,27 @@
 /// [_serial] 排队。代价：N 个字段要 N 次往返；缓解办法是
 /// [queryFieldMap] 一次取完所有列（[WebViewRuleEngine] 覆写成单次 JS）。
 ///
-/// ## GBK 的诚实口径
-/// 全项目零 GBK 处理，`dart:convert` 也没有 GBK。所以声明 `gbk` 的源**照
-/// UTF-8 强解**（`allowMalformed: true`，不崩、不出异常），并把
-/// 「疑似乱码」写进 [lastDecodeWarning] 由 UI 提示。宁可给用户一堆乱码 +
-/// 一句实话，也不要假装成功。
+/// ## 网页编码的判定口径（v2.75.0）
+/// 中文书站大量是 GBK，而 `dart:convert` 只有 UTF-8。以前这里一律按 UTF-8
+/// 强解，配置了 `charset: gbk` 的源照旧满屏 `��`。现在改成交给
+/// `utils/text_decoding.dart` 的 [decodeTextBytes]（本地书导入用的是同一套，
+/// **不写第二份判定**）：
+///
+/// 顺序：BOM → UTF-16 → **严格 UTF-8** → UTF-8 只坏 ≤1% 字节 → GBK → 兜底。
+///
+/// 为什么严格 UTF-8 排在「书源声明的 gbk」前面：声明经常是错的（站点改版只改
+/// 了输出没改 `<meta>`），而真 GBK 文本几乎不可能同时是合法 UTF-8。反过来的
+/// 错误（声明 utf-8 实际 GBK）由严格解码必然失败接住，落到 GBK 码表。
+///
+/// 提示（charsetHint）的来源优先级：**HTTP 响应头的 charset > 书源的
+/// `charset` 字段**。响应头是站点自己在这次响应里说的，比书源作者抄来的
+/// 声明更贴近事实；两者都错时自动判定会纠正（见上）。
+///
+/// 判定结果带出两个只读事实：
+/// - [lastDecodeEncoding]：实际用的编码（`utf-8` / `gbk` / `utf-8-malformed`…），
+///   UI 用它显示「编码：GBK」这种小字；
+/// - [lastDecodeWarning]：人话告警（疑似 GBK 自动纠正 / 解完仍有乱码），
+///   搜索页分组小字与正文 `warning` 都用它。
 library;
 
 import 'dart:async';
@@ -35,6 +51,7 @@ import 'package:dio/dio.dart';
 import 'package:flutter/widgets.dart';
 import 'package:webview_flutter/webview_flutter.dart';
 
+import '../../utils/text_decoding.dart';
 import 'js_builder.dart';
 import 'selector.dart';
 
@@ -88,15 +105,27 @@ class RuleEngineException implements Exception {
 
 /// 规则引擎接口。
 abstract class BookRuleEngine {
-  /// 最近一次 [fetchHtml] 的解码告警（GBK 源按 UTF-8 强解的提示）；无告警为 null。
+  /// 最近一次 [fetchHtml] 的解码告警（「疑似 GBK 已自动纠正」/「解完仍有乱码」）；
+  /// 没有问题为 null。
   ///
   /// 为什么挂在实例上而不是返回值里：接口签名由调用方定死（改签名会牵连
   /// 搜索服务的错误分类），而解码告警是**提示性**信息，副作用式带出最省事。
+  /// 注意它是「最近一次」：多页抓取时要**每抓完一页就当场收下**，否则后一页
+  /// 成功就把前一页的告警盖掉了（`book_content_service` / `book_detail_service`
+  /// 都是这么做的）。
   String? lastDecodeWarning;
+
+  /// 最近一次 [fetchHtml] **实际使用**的编码（`utf-8` / `gbk` /
+  /// `utf-8-malformed` / `utf-16le`…）；还没抓过为 null。
+  ///
+  /// 与 [lastDecodeWarning] 分开的原因：GBK 是正常结果、不是告警（声明对了就
+  /// 该安静），可 UI 仍要能说「编码：GBK」，否则用户不知道这页是怎么解的。
+  String? lastDecodeEncoding;
 
   /// 抓网页正文。
   ///
-  /// [charset] 只支持 `utf-8` / `gbk`（后者降级为 UTF-8 强解，见文件头）。
+  /// [charset] 是书源声明的编码（默认 `utf-8`），只当**提示**用：
+  /// 优先级是 `响应头 charset` > [charset] > 自动判定，判定顺序见文件头。
   /// 失败抛 [RuleEngineException]（网络 / 超时 / 空内容）。
   Future<String> fetchHtml(
     String url, {
@@ -208,6 +237,65 @@ String injectBaseHref(String html, String baseUrl) {
 String _escapeAttr(String s) =>
     s.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;');
 
+/// 从 HTTP `Content-Type` 里抠出 charset（拿不到 / 写的是别名都返回原样字符串）。
+///
+/// 为什么单列一个函数：响应头才是「站点这次真的用什么编码」的第一手证据，
+/// 而书源的 `charset` 字段是书源作者手抄的（经常抄错，改了站点没改声明）。
+/// 这段解析很碎（引号可有可无、后面还可能跟 `;` 与别的参数），单独放出来
+/// 才好用单测钉住。
+String? parseHeaderCharset(String? contentType) {
+  if (contentType == null || contentType.trim().isEmpty) return null;
+  final match = RegExp(
+    r'charset\s*=\s*"?([^";,\s]+)',
+    caseSensitive: false,
+  ).firstMatch(contentType);
+  final value = match?.group(1)?.trim();
+  if (value == null || value.isEmpty) return null;
+  return value;
+}
+
+/// 「解完仍有乱码」的告警文案。
+///
+/// 抽成常量不是为了省字符，而是 [decodeNoteFor] 要**区分两种告警**：这句是
+/// 坏消息（正文可能缺字），另一句「疑似 GBK」其实是好消息（以前满屏 `��`，
+/// 现在能读了）。两边各写一份字面量，改文案时一定会漏掉一处。
+const String kDecodeGarbledWarning = '解码后仍有乱码，正文可能不完整';
+
+/// 「疑似 GBK、已自动纠正」的告警文案（见 [kDecodeGarbledWarning] 的说明）。
+const String kDecodeGbkGuessWarning = '这个书源疑似 GBK，已按 GBK 解码';
+
+/// 解码结果 → 给人看的一句告警；没问题返回 null。
+///
+/// 两条文案分开是有意的：
+/// - 「疑似 GBK」是**好消息**（以前满屏 `��`，现在能读了），所以要说是「已按
+///   GBK 解码」而不是「有乱码」。站点自己声明了 GBK 就不提示 —— 声明对了是
+///   正常情况，不该在每次搜索都刷一行字；
+/// - 「仍有乱码」才是坏消息：解完还剩一堆 U+FFFD，说明站点多半是繁中 / 日文
+///   等本版还没接的编码，正文可能缺字。
+String? decodeWarningFor(DecodedText decoded, {String? charsetHint}) {
+  if (decoded.isMostlyGarbage) return kDecodeGarbledWarning;
+  if (decoded.encoding == 'gbk' && !isGbkCharset(charsetHint)) {
+    return kDecodeGbkGuessWarning;
+  }
+  return null;
+}
+
+/// 解码事实 → 搜索页分组标题下的一行小字（`null` = 什么都不显示）。
+///
+/// 为什么要压缩成这么短：这是「该源这次是怎么解的」的旁注，不是错误。
+/// 每行都写「本页按 xxx 解码，替换字符比例 0.3%」只会把结果列表挤满；
+/// 用户真正需要区分的是三种情况：正常 UTF-8（不显示）、GBK（可能值得知道）、
+/// 有乱码（可能读不全）。
+///
+/// **「疑似 GBK」不写成「仍有乱码」**：自动判定成功是好消息，标成乱码会让
+/// 用户以为这本书读不了（实机上第一次就踩了这个坑）。
+String? decodeNoteFor(String? encoding, String? warning) {
+  final isGbk = (encoding ?? '').toLowerCase() == 'gbk';
+  final garbled = warning == kDecodeGarbledWarning;
+  if (garbled) return isGbk ? '编码：GBK（仍有乱码）' : '解码有乱码';
+  return isGbk ? '编码：GBK' : null;
+}
+
 /// WebView 实现：隐藏 controller 当执行器，Dio 负责抓网页。
 ///
 /// 用法：调用方把 [buildHost] 返回的 widget 挂在 `Offstage` /
@@ -215,7 +303,8 @@ String _escapeAttr(String s) =>
 /// 然后调 [fetchHtml] / [queryFields]。
 class WebViewRuleEngine extends BookRuleEngine {
   WebViewRuleEngine({WebViewController? controller, Dio? dio})
-      : _dio = dio ??
+      : _controller = controller,
+        _dio = dio ??
             Dio(BaseOptions(
               connectTimeout: kRuleFetchTimeout,
               receiveTimeout: kRuleFetchTimeout,
@@ -230,14 +319,19 @@ class WebViewRuleEngine extends BookRuleEngine {
                     'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
                 'Accept-Language': 'zh-CN,zh;q=0.9',
               },
-            )) {
-    // controller 在这里建（不能放初始化列表）：导航回调要写 [_pageDone]，
-    // 静态方法碰不到实例字段
-    _controller = controller ?? _buildController();
-  }
+            ));
 
   final Dio _dio;
   WebViewController? _controller;
+
+  /// 真 controller，**按需创建**。
+  ///
+  /// 为什么懒建（v2.75.0）：`fetchHtml` 只走 Dio，一个 WebView 都不需要，而
+  /// `WebViewController()` 在 `flutter test` 里构造即抛。以前在构造函数里就建，
+  /// 结果是「解码逻辑根本测不了」—— 为了验一行 GBK 字节得先开一个 WebView。
+  /// 懒建之后单测能注入假 Dio 直接验 `fetchHtml`；真机上首页 `buildHost()`
+  /// 会立刻把它建出来，行为与之前一致。
+  WebViewController get _web => _controller ??= _buildController();
 
   /// 串行队列尾（见文件头「串行求值」）。
   Future<void> _tail = Future<void>.value();
@@ -250,7 +344,7 @@ class WebViewRuleEngine extends BookRuleEngine {
   /// ⚠️ 这里刻意**新建**一个干净的 Dio：`BiliApi` 的 Dio 带 B 站定制的
   /// baseUrl / Referer / Cookie，拿它请求第三方站点既会带上不该带的凭据，
   /// 也会被站点当成盗链拒绝。
-  /// 建 controller（实例方法：导航回调要写 [_pageDone]）。
+  /// 建 controller（实例方法：导航回调要写 [_pageDone]，顶层函数碰不到实例字段）。
   WebViewController _buildController() {
     return WebViewController()
       ..setJavaScriptMode(JavaScriptMode.unrestricted)
@@ -285,10 +379,12 @@ class WebViewRuleEngine extends BookRuleEngine {
   /// 给页面挂载用的 widget（调用方负责藏起来）。
   Widget buildHost() {
     _ensureAlive();
-    return WebViewWidget(controller: _controller!);
+    return WebViewWidget(controller: _web);
   }
 
   /// 真 controller（调试 / 未来要给页面绑定进度时用）。
+  ///
+  /// 懒建意味着在 `buildHost()` 之前它是 null —— 调用方要判空。
   WebViewController? get controller => _controller;
 
   @override
@@ -299,6 +395,7 @@ class WebViewRuleEngine extends BookRuleEngine {
   }) async {
     _ensureAlive();
     lastDecodeWarning = null;
+    lastDecodeEncoding = null;
     Response<List<int>> resp;
     try {
       resp = await _dio.get<List<int>>(
@@ -328,17 +425,17 @@ class WebViewRuleEngine extends BookRuleEngine {
     if (bytes.isEmpty) {
       throw RuleEngineException(RuleErrorKind.empty, '站点返回了空内容：$url');
     }
-    // 一律先按 UTF-8 强解（allowMalformed 保证不抛）。GBK 站点会是乱码，
-    // 但**不会崩**，而且下面会把话说清楚。
-    final text = utf8.decode(bytes, allowMalformed: true);
-    final declared = charset.trim().toLowerCase();
-    if (declared.isNotEmpty && declared != 'utf-8' && declared != 'utf8') {
-      lastDecodeWarning = '该源声明编码为 $charset，本版按 UTF-8 强行解码，正文疑似乱码';
-    } else if (text.contains('\uFFFD')) {
-      // 声明 utf-8 但实际是别的编码（老站点常见）——强解的替换符就是证据
-      lastDecodeWarning = '页面含无法解码的字符（疑似非 UTF-8 编码），部分文字可能是乱码';
-    }
-    return text;
+    // 交给统一的解码判定（`utils/text_decoding.dart`，与本地 TXT 导入同一套）。
+    // 编码提示的优先级：响应头 charset > 书源声明 —— 响应头是站点在这次响应里
+    // 自己说的，比书源作者抄来的声明更贴近事实。
+    final headerCharset = parseHeaderCharset(
+      resp.headers.value(Headers.contentTypeHeader),
+    );
+    final hint = headerCharset ?? charset;
+    final decoded = decodeTextBytes(bytes, charsetHint: hint);
+    lastDecodeEncoding = decoded.encoding;
+    lastDecodeWarning = decodeWarningFor(decoded, charsetHint: hint);
+    return decoded.text;
   }
 
   @override
@@ -477,13 +574,7 @@ class WebViewRuleEngine extends BookRuleEngine {
         '抓到的网页是空的：站点可能返回了空页或拦截了请求',
       );
     }
-    final c = _controller;
-    if (c == null) {
-      throw const RuleEngineException(
-        RuleErrorKind.unsupported,
-        'WebView 不可用（引擎已释放）',
-      );
-    }
+    final c = _web;
     final done = Completer<String>();
     _pageDone = done;
     try {

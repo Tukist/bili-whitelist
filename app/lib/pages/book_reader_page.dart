@@ -1026,6 +1026,18 @@ class _BookReaderPageState extends State<BookReaderPage> {
                 ),
               ),
             ],
+            // 解码告警（「疑似 GBK 已按 GBK 解码」/「仍有乱码」）放在正文末尾：
+            // 网络书以前满屏 `��`，现在能读了，但用户仍该知道这一章是怎么解的 ——
+            // 详情页那行小字只在进书时看得到，读到第 30 章时没人会翻回去。
+            if ((content.warning ?? '').trim().isNotEmpty) ...[
+              const SizedBox(height: kSpace12),
+              Text(
+                content.warning!.trim(),
+                style: kTypeBodyS.copyWith(
+                  color: foreground.withValues(alpha: .5),
+                ),
+              ),
+            ],
             const SizedBox(height: kSpace48),
           ],
         ),
@@ -1154,11 +1166,15 @@ class _BookReaderPageState extends State<BookReaderPage> {
       wordSpacing: base.wordSpacing,
     );
     final scaler = MediaQuery.textScalerOf(context);
-    // 正文末尾提示「有部分内容没取到」：直接并进分页文本（会落在最后一页），
-    // 免得在页面里再叠一层浮层跟页码抢位置。
-    final text = content.partial
-        ? '${content.body}\n\n本章有部分内容没取到'
-        : content.body;
+    // 正文末尾提示「有部分内容没取到」/ 解码告警：直接并进分页文本（会落在
+    // 最后一页），免得在页面里再叠一层浮层跟页码抢位置。
+    final tail = <String>[
+      if (content.partial) '本章有部分内容没取到',
+      if ((content.warning ?? '').trim().isNotEmpty) content.warning!.trim(),
+    ];
+    final text = tail.isEmpty
+        ? content.body
+        : '${content.body}\n\n${tail.join('\n')}';
 
     return LayoutBuilder(
       builder: (context, constraints) {

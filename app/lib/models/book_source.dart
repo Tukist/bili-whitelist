@@ -23,6 +23,8 @@
 /// 直接把原始规则字符串交给规则引擎跑，能少掉一整层有损映射。
 library;
 
+import '../utils/text_decoding.dart';
+
 /// 一个书源（站点）的完整定义。
 ///
 /// 不可变 + [toJson] 往返：[BookSource.fromJson] 与 [BookSource.toJson]
@@ -43,7 +45,11 @@ class BookSource {
   /// 站点根地址（必填，例如 `https://www.example.com`）。
   final String baseUrl;
 
-  /// 网页编码（默认 `utf-8`，可选 `gbk` —— 老站点还有 GBK）。
+  /// 网页编码声明（默认 `utf-8`，GBK 系老站点写 `gbk`）。
+  ///
+  /// 它只是**提示**：抓取时 HTTP 响应头的 `charset` 优先于它，两者都没有用
+  /// （或都写错）时按字节自动判定 —— 很多站声明 gbk 实际吐 utf-8，反过来也有。
+  /// 判定顺序见 `utils/text_decoding.dart` 的文件头。
   final String charset;
 
   /// 是否启用（停用的源不参与搜索，但配置保留）。
@@ -96,6 +102,12 @@ class BookSource {
 
   /// 唯一键（名字小写）：同名书源比大小写不敏感，导入去重与存储合并都用它。
   String get key => name.toLowerCase();
+
+  /// 管理页展示用的编码标签：「GBK」/「自动」。
+  ///
+  /// 口径见 [charsetLabelOf]：**声明 utf-8 也显示「自动」**，因为抓取侧的判定
+  /// 顺序是「严格 UTF-8 优先于任何声明」，声明 utf-8 不改变任何行为。
+  String get charsetLabel => charsetLabelOf(charset);
 
   /// 从存储 / 导入的 JSON 解析。缺字段一律走默认值，**不抛异常**。
   ///
@@ -224,6 +236,11 @@ class BookSource {
       // 本模型没有分组字段，宁可留空也不把分组塞进 author 造成误解。
       author: '',
       baseUrl: baseUrl,
+      // legado（开源阅读）的 BookSource **没有 charset 字段**：它按 BOM / 字节
+      // 分布自己嗅探编码。所以正常的 legado 导出里这个键根本不存在，落到默认
+      // `utf-8`，抓取侧按「自动判定」走（声明 utf-8 不改变任何行为）。
+      // 这里仍读一次 `bookSourceCharset` 只为了兼容少数第三方导出的包 —— 有就
+      // 当提示用，没有就算了，绝不猜一个 GBK 出来。
       charset: _asString(json['bookSourceCharset'], 'utf-8'),
       enabled: _asBool(json['enabled'], true),
       headers: _asStringMap(json['header']),
@@ -571,6 +588,25 @@ class ReplaceRule {
 }
 
 // ==================== 宽容的类型转换（内部用） ====================
+
+/// 书源声明的编码 → 管理页那一行小字（`GBK` / `自动`）。
+///
+/// 为什么 `utf-8` 也归到「自动」：模型里 [BookSource.charset] 的默认值就是
+/// `utf-8`，**无法区分「作者显式写了 utf-8」与「压根没写」**；而抓取侧
+/// （`services/book_rule/rule_engine.dart`）的判定顺序是「严格 UTF-8 判定优先于
+/// 任何声明」，所以写 utf-8 与不写的行为完全一样。显示「自动」比显示「UTF-8」
+/// 更贴近事实（用户不会以为自己锁死了编码）。
+///
+/// 只认得出 GBK 家族就写 `GBK`（`gb2312` / `gb18030` / `cp936` 都是它的别名，
+/// 显示原文只会更让人困惑）；其它声明原样大写，让用户看清自己写了什么。
+String charsetLabelOf(String charset) {
+  final raw = charset.trim();
+  if (raw.isEmpty) return '自动';
+  final v = raw.toLowerCase().replaceAll('_', '-');
+  if (v == 'utf-8' || v == 'utf8' || v == 'auto') return '自动';
+  if (isGbkCharset(v)) return 'GBK';
+  return raw.toUpperCase();
+}
 
 String _asString(Object? v, [String fallback = '']) {
   if (v == null) return fallback;

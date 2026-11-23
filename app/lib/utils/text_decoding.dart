@@ -11,14 +11,24 @@
 /// 1. **BOM 最优先**：`EF BB BF` / `FF FE` / `FE FF` 是文件自己声明的编码，
 ///    比任何统计猜测都可靠（而且 BOM 字符必须从正文里去掉，否则第一个字前面
 ///    会多一个看不见的 U+FEFF）。
-/// 2. **无 BOM 的 UTF-16 靠零字节分布嗅探**：合法 UTF-8 / GBK 文本里几乎不会
+/// 2. **UTF-16 提示 / 无 BOM 嗅探**：合法 UTF-8 / GBK 文本里几乎不会
 ///    出现 `0x00`（除了 NUL 本身），一半字节是 0 只可能是 UTF-16。
+///    这一步必须排在严格 UTF-8 之前：UTF-16LE 的 ASCII 部分（`C\0h\0a\0`）
+///    本身就是**合法的 UTF-8**，先试 UTF-8 会把 UTF-16 解成一串夹 NUL 的乱码。
 /// 3. **严格 UTF-8**：`allowMalformed: false` 能解通就是 UTF-8。UTF-8 的字节
 ///    结构自带校验（首字节 + 后续字节的位模式），误判率极低。
-/// 4. **GBK 码表**：UTF-8 解不通才走这里。
-/// 5. **两边都一堆 U+FFFD**：说明这压根不是这两种编码的文本（二进制文件、
-///    被截断的文件、日文 Shift-JIS 等）。选替换字符更少的那一路解，
-///    并把比例交给调用方（[DecodedText.replacementRatio]）去决定要不要报警。
+///    **这一步必须排在 GBK 提示之前**：中文书站大量声明 `gbk` 实际吐 UTF-8
+///    （站点改版只改了输出、忘了改声明），按提示硬解 GBK 会得到一整页生僻字，
+///    而真 GBK 文本几乎不可能同时是合法 UTF-8（GBK 尾字节 0x40–0xFE 里
+///    大部分落在 UTF-8 延续字节 0x80–0xBF 之外）。
+/// 4. **UTF-8 只坏极少数字节**：网页 / 文件被按字节截断时，末尾缺半个多字节
+///    字符。判据是「坏字节占总字节 ≤ 1%」，这种仍然算 UTF-8（否则整页会转去
+///    GBK，把好好的中文变成满地生僻字）。
+/// 5. **GBK 提示 → GBK 自动判定**：UTF-8 走不通才用码表。提示也会错，
+///    解出来仍是满地乱码就不信提示，继续走自动判定。
+/// 6. **都不行**：说明这压根不是这几种编码的文本（二进制文件、日文 Shift-JIS
+///    等）。选替换字符更少的那一路解，并把比例交给调用方
+///    （[DecodedText.replacementRatio]）去决定要不要报警。
 ///
 /// ## 为什么不用 `+=` 拼字符串
 /// 一本 5MB 的 GBK 小说是 ~250 万个字符。`String +=` 每次都复制整串，复杂度
@@ -97,19 +107,10 @@ DecodedText decodeTextBytes(List<int> bytes, {String? charsetHint}) {
   }
 
   final hint = (charsetHint ?? '').toLowerCase().replaceAll('_', '-');
-  final hintGbk = hint.contains('gbk') ||
-      hint.contains('gb2312') ||
-      hint.contains('gb18030') ||
-      hint.contains('cp936');
+  final hintGbk = isGbkCharset(hint);
   final hintUtf16 = hint.contains('utf-16') || hint.contains('utf16');
 
-  // ---- 2. 提示优先（manifest 里记过的编码比统计更可信）----
-  if (hintGbk) {
-    final gbk = _fromGbk(bytes);
-    // 提示也会错（用户换了文件 / manifest 被手改）：解出来还是满地乱码就
-    // 不信提示，继续走后面的自动判定。
-    if (!gbk.isMostlyGarbage) return gbk;
-  }
+  // ---- 2. UTF-16 提示（必须在严格 UTF-8 之前，见文件头第 2 条）----
   if (hintUtf16) {
     final le = _fromUtf16(bytes, littleEndian: true);
     final be = _fromUtf16(bytes, littleEndian: false);
@@ -121,11 +122,11 @@ DecodedText decodeTextBytes(List<int> bytes, {String? charsetHint}) {
   final utf16 = _sniffUtf16(bytes);
   if (utf16 != null) return utf16;
 
-  // ---- 4. 严格 UTF-8 ----
+  // ---- 4. 严格 UTF-8（排在 gbk 提示之前，见文件头第 3 条）----
   try {
     return DecodedText(text: utf8.decode(bytes, allowMalformed: false));
   } on FormatException {
-    // 不是 UTF-8，往下走 GBK
+    // 不是 UTF-8，往下走
   }
 
   // ---- 5. 先看「UTF-8 只坏了几个字节」的情况 ----
@@ -141,12 +142,35 @@ DecodedText decodeTextBytes(List<int> bytes, {String? charsetHint}) {
     return loose;
   }
 
-  // ---- 6. GBK ----
+  // ---- 6. GBK 码表 ----
+  // 到这一步已经确认「不是 UTF-8、也不是被截断的 UTF-8」，剩下的中文文本
+  // 只有 GBK 这一种可能（本项目不支持的编码交给下面的兜底与调用方报警）。
   final gbk = _fromGbk(bytes);
   if (!gbk.isMostlyGarbage) return gbk;
 
-  // ---- 7. 两边都烂：选替换字符更少的那一路，比例交给调用方判断 ----
+  // ---- 7. 两边都烂：提示优先，其次选替换字符更少的那一路 ----
+  // 提示（书源声明的 charset / manifest 记过的编码）在这时候还有用：两份都是
+  // 乱码时，「按它说的编码解的」那份更符合用户的预期（站点的清洗规则也是按
+  // 那个编码的页面写的）。没提示才比替换字符比例。
+  if (hintGbk) return gbk;
   return loose.replacementRatio <= gbk.replacementRatio ? loose : gbk;
+}
+
+/// 这个编码名是不是 GBK 家族（`gbk` / `gb2312` / `gb18030` / `cp936`）。
+///
+/// 名字先归一（小写 + 去掉一切非字母数字，`GB_2312` / `gb-2312` 都认），
+/// 调用方不必自己清洗。抽成公开函数是为了让规则引擎复用同一套判定：
+/// 「GBK 是不是站点自己声明的」决定了要不要提示「疑似 GBK，已按 GBK 解码」
+/// —— 两处各写一份正则迟早不一致。
+bool isGbkCharset(String? name) {
+  // 归一：小写 + 去掉一切非字母数字（`GB_2312` / `gb-2312` / ` GB2312 ` 都
+  // 该认出来 —— 书源作者手写这些名字时怎么排的都有）
+  final hint = (name ?? '').toLowerCase().replaceAll(RegExp(r'[^a-z0-9]'), '');
+  if (hint.isEmpty) return false;
+  return hint.contains('gbk') ||
+      hint.contains('gb2312') ||
+      hint.contains('gb18030') ||
+      hint.contains('cp936');
 }
 
 /// 这段字节像不像 GBK 编码的中文文本。

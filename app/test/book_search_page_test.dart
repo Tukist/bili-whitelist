@@ -336,4 +336,48 @@ void main() {
     expect(find.text('· JS源21'), findsNothing); // 只列前 20 个
     expect(find.text('还有 5 个'), findsOneWidget);
   });
+
+  testWidgets('GBK 源：分组标题下有一行「编码：GBK」，条目照常显示', (tester) async {
+    final engine = _GbkEngine(
+      onFetch: (_) async => 'A',
+      onQueryMap: (html, list, fields) async => {
+        'name': ['斗罗大陆'],
+        'detailUrl': ['https://a.example/book/1'],
+      },
+    );
+    await _pump(
+      tester,
+      store: _FakeSourceStore([_source('源A', 'a.example')]),
+      holder: RuleEngineHolder.withEngine(engine),
+    );
+
+    await tester.enterText(find.byType(TextField), '斗罗');
+    await tester.tap(find.widgetWithText(FilledButton, '搜索'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('源A · 1 条'), findsOneWidget);
+    expect(find.text('编码：GBK'), findsOneWidget);
+    expect(find.text('斗罗大陆'), findsOneWidget);
+  });
+}
+
+/// 会「报 GBK」的假引擎：只把 `lastDecodeEncoding` 摆好，求值仍走注入回调。
+///
+/// 为什么要它：分组标题下那行编码小字读的是 `BookSearchGroup.decodeNote`，
+/// 而它由搜索服务从引擎的解码事实里抄出来 —— 默认的 [FakeRuleEngine] 永远
+/// 不设这个字段，这条路就测不到。
+class _GbkEngine extends FakeRuleEngine {
+  _GbkEngine({super.onFetch, super.onQueryMap});
+
+  @override
+  Future<String> fetchHtml(
+    String url, {
+    Map<String, String>? headers,
+    String charset = 'utf-8',
+  }) async {
+    fetchedUrls.add(url);
+    lastDecodeEncoding = 'gbk';
+    if (onFetch != null) return onFetch!(url);
+    return '<html></html>';
+  }
 }

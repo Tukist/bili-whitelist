@@ -732,6 +732,15 @@ class _BookSourcePageState extends State<BookSourcePage> {
                 color: theme.colorScheme.onSurfaceVariant,
               ),
             ),
+          // 声明的编码：只占一行小字（「自动」也是信息 —— 说明这个源没写死，
+          // 抓取时按字节自动判定）。为什么不并进上面那行：既有的行文案
+          // （`v1.2` / baseUrl）是可断言的稳定契约，别为了省一行去拼字符串。
+          Text(
+            '编码：${source.charsetLabel}',
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
         ],
       ),
       trailing: Row(

@@ -531,33 +531,48 @@ class _BookSearchPageState extends State<BookSearchPage> {
       margin: const EdgeInsets.only(top: kSpace8),
       padding: const EdgeInsets.fromLTRB(kPagePadH, 6, kPagePadH, 6),
       color: kPaperCool.withValues(alpha: .5),
-      child: Row(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Expanded(
-            child: Text(
-              '${group.sourceName} · ${group.items.length} 条',
-              style: kTypeTitleS.copyWith(color: kInkBlack),
-            ),
-          ),
-          // 上次检测的健康状态（没测过的源不显示 —— 空着比「未检测」更安静）
-          if (health != null)
-            Padding(
-              padding: const EdgeInsets.only(right: kSpace8),
-              child: Text(
-                '检测：${health.label}',
-                style: kTypeBodyS.copyWith(
-                  color: _healthColor(health.status, palette),
-                  fontSize: 11,
+          Row(
+            children: [
+              Expanded(
+                child: Text(
+                  '${group.sourceName} · ${group.items.length} 条',
+                  style: kTypeTitleS.copyWith(color: kInkBlack),
                 ),
               ),
-            ),
-          if (group.status != BookSearchStatus.ok)
-            Text(
-              _statusLabel(group.status),
-              style: kTypeBodyS.copyWith(
-                color: group.status == BookSearchStatus.error
-                    ? kError
-                    : kInkGray50,
+              // 上次检测的健康状态（没测过的源不显示 —— 空着比「未检测」更安静）
+              if (health != null)
+                Padding(
+                  padding: const EdgeInsets.only(right: kSpace8),
+                  child: Text(
+                    '检测：${health.label}',
+                    style: kTypeBodyS.copyWith(
+                      color: _healthColor(health.status, palette),
+                      fontSize: 11,
+                    ),
+                  ),
+                ),
+              if (group.status != BookSearchStatus.ok)
+                Text(
+                  _statusLabel(group.status),
+                  style: kTypeBodyS.copyWith(
+                    color: group.status == BookSearchStatus.error
+                        ? kError
+                        : kInkGray50,
+                  ),
+                ),
+            ],
+          ),
+          // 这次抓取的编码旁注：**每个源一行、只在分组标题下**（正常 UTF-8
+          // 的源没有这行）。逐条结果都挂一行会把列表挤成一团乱码似的。
+          if (group.decodeNote != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text(
+                group.decodeNote!,
+                style: kTypeBodyS.copyWith(color: kInkGray50, fontSize: 11),
               ),
             ),
         ],

@@ -170,6 +170,11 @@ class BookDetailService {
           headers: source.headers,
           charset: source.charset,
         );
+        // 编码告警**当场**收下（引擎上只留最近一次抓取的结果，后面目录页一抓
+        // 就会被盖掉）。GBK 站点以前是「搜得到、点进去满屏乱码」，现在能读了，
+        // 但这行提示仍要能到详情页 —— 用户可以据此判断书架里存的书源对不对。
+        final decodeWarning = engine.lastDecodeWarning;
+        if (decodeWarning != null) warnings.add(decodeWarning);
       } catch (e) {
         // 详情页失败不是终点：目录、搜索种子都还在
         warnings.add('详情页没取到（${_describe(e)}）');
@@ -323,6 +328,11 @@ class BookDetailService {
             headers: source.headers,
             charset: source.charset,
           );
+          // 同详情页：每页抓完就当场收下编码告警
+          final decodeWarning = engine.lastDecodeWarning;
+          if (decodeWarning != null && !warnings.contains(decodeWarning)) {
+            warnings.add(decodeWarning);
+          }
         } catch (e) {
           // 第一页失败 → 没目录；后面几页失败 → 保留已取到的
           if (page == 1) {

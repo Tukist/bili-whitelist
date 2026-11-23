@@ -182,11 +182,32 @@ void main() {
     expect(find.text('甲'), findsOneWidget);
     expect(find.text('https://甲.example'), findsOneWidget);
     expect(find.text('v1.2'), findsNWidgets(2));
+    // 声明的编码：这两个夹具都没写 charset → 显示「自动」（不代表 utf-8，
+    // 而是「抓取时按字节判定」）
+    expect(find.text('编码：自动'), findsNWidgets(2));
     expect(find.byType(Switch), findsNWidgets(2));
     expect(find.byIcon(Icons.delete_outline), findsNWidgets(2));
     // 停用的源开关是关的
     final switches = tester.widgetList<Switch>(find.byType(Switch)).toList();
     expect(switches.where((s) => s.value).length, 1);
+  });
+
+  testWidgets('声明 gbk 的源：列表行显示「编码：GBK」', (tester) async {
+    final store = BookSourceStore();
+    await store.upsertAll([
+      BookSource(
+        name: 'GBK源',
+        baseUrl: 'https://gbk.example',
+        charset: 'gbk',
+        search: const SearchRule(url: '/s?q={{key}}', list: '.item'),
+        toc: const TocRule(),
+        content: const ContentRule(),
+      ),
+    ]);
+    await _pump(tester, store: store);
+
+    expect(find.text('编码：GBK'), findsOneWidget);
+    expect(find.text('编码：自动'), findsNothing);
   });
 
   testWidgets('从剪贴板导入：落库 + 列表立刻出现新源', (tester) async {

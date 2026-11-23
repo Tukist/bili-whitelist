@@ -190,6 +190,61 @@ void main() {
     });
   });
 
+  group('网络抓取场景：声明经常是错的（v2.75.0）', () {
+    // 这一组全部来自真实书站的形态：中文站大量是 GBK，而 `<meta charset>` /
+    // 书源的 `charset` 字段常常是「改版忘了改」的旧值。判定顺序必须是
+    // 严格 UTF-8 在前、声明在后，否则声明错一页就全是生僻字。
+
+    test('声明 gbk 实际是 UTF-8：按 UTF-8 解（声明错了也不吃亏）', () {
+      final bytes = utf8.encode('第一章 风起');
+      final r = decodeTextBytes(bytes, charsetHint: 'gbk');
+      expect(r.text, '第一章 风起');
+      expect(r.encoding, 'utf-8');
+      expect(r.replacementRatio, 0);
+    });
+
+    test('声明 utf-8 实际是 GBK：落到 GBK 码表（不是一地 U+FFFD）', () {
+      const bytes = [0xC4, 0xE3, 0xBA, 0xC3]; // '你好' 的 GBK
+      final r = decodeTextBytes(bytes, charsetHint: 'utf-8');
+      expect(r.text, '你好');
+      expect(r.encoding, 'gbk');
+      expect(r.replacementRatio, 0);
+    });
+
+    test('UTF-8 只坏一个字节时仍算 UTF-8，不被 gbk 提示带跑', () {
+      final bytes = [
+        ...utf8.encode('这是UTF-8正文，末尾被按字节截断' * 4),
+        0xE8, // 半个汉字
+      ];
+      final r = decodeTextBytes(bytes, charsetHint: 'gbk');
+      expect(r.encoding, 'utf-8-malformed');
+      expect(r.text.startsWith('这是UTF-8正文'), isTrue);
+      expect(r.isMostlyGarbage, isFalse);
+    });
+
+    test('isGbkCharset 认别名、不误判（规则引擎复用它写提示文案）', () {
+      expect(isGbkCharset('GBK'), isTrue);
+      expect(isGbkCharset('gb2312'), isTrue);
+      expect(isGbkCharset('gb18030'), isTrue);
+      expect(isGbkCharset('cp936'), isTrue);
+      expect(isGbkCharset('GB_2312'), isTrue); // `_` 归一成 `-` 后仍认得出
+      expect(isGbkCharset('utf-8'), isFalse);
+      expect(isGbkCharset('big5'), isFalse);
+      expect(isGbkCharset(''), isFalse);
+      expect(isGbkCharset(null), isFalse);
+    });
+
+    test('两份都解不通时，声明 gbk 就按 gbk 给（兜底仍守声明）', () {
+      // 0xFF 既不是合法 UTF-8 也不是 GBK 首字节：两份都是 U+FFFD
+      final r = decodeTextBytes(
+        const [0xFF, 0xFF, 0xFF, 0xFF],
+        charsetHint: 'gbk',
+      );
+      expect(r.encoding, 'gbk');
+      expect(r.isMostlyGarbage, isTrue);
+    });
+  });
+
   test('5MB GBK 文本解码在可接受时间内完成（< 3 秒）', () {
     // 一段 GBK 中文重复到 ~5MB：验证「Uint16List + String.fromCharCodes」
     // 没有退化成 O(n²)，顺便防住有人改回 `+=` 拼接。

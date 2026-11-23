@@ -109,6 +109,13 @@ class BookSearchGroup {
   /// 两者在空结果文案里要分开说。
   final RuleErrorKind? errorKind;
 
+  /// 这次抓取的**编码旁注**（「编码：GBK」/「解码有乱码」）；正常 UTF-8 为 null。
+  ///
+  /// 为什么放在分组上：搜索页只在分组标题下显示一行小字，不该为了这行字
+  /// 去持有引擎（引擎在页面里是共享单例，多源并发时它的
+  /// `lastDecodeEncoding` 早就被别的源覆盖了）。归到分组才是按源的事实。
+  final String? decodeNote;
+
   const BookSearchGroup({
     required this.sourceName,
     required this.status,
@@ -116,6 +123,7 @@ class BookSearchGroup {
     this.items = const [],
     this.httpStatus,
     this.errorKind,
+    this.decodeNote,
   });
 
   bool get hasItems => items.isNotEmpty;
@@ -281,6 +289,9 @@ class BookSearchService {
 
     final items = <BookSearchItem>[];
     final seenUrls = <String>{};
+    // 这次搜索里出现过的编码旁注（正常 UTF-8 不产生，所以多数源是空的）
+    final decodeNotes = <String>{};
+    String? notes() => decodeNotes.isEmpty ? null : decodeNotes.join('；');
 
     for (var page = 1; page <= pages; page++) {
       // 搜索模板常写相对路径（`/search?q={{key}}`），必须先按 baseUrl 补全，
@@ -305,9 +316,17 @@ class BookSearchService {
         );
       } catch (e) {
         // 第一页就失败 → 整个源算失败；后面几页失败 → 保留已拿到的结果
-        if (page == 1) return _errorGroup(source, e);
+        if (page == 1) return _errorGroup(source, e, decodeNote: notes());
         break;
       }
+
+      // 解码事实**当场**收下：引擎上的 lastDecode* 只记最近一次抓取，
+      // 翻第二页就把第一页的盖掉了（见 BookRuleEngine.lastDecodeWarning 的注释）
+      final note = decodeNoteFor(
+        engine.lastDecodeEncoding,
+        engine.lastDecodeWarning,
+      );
+      if (note != null) decodeNotes.add(note);
 
       Map<String, List<String?>> columns;
       try {
@@ -318,7 +337,7 @@ class BookSearchService {
           fields: fields,
         );
       } catch (e) {
-        if (page == 1) return _errorGroup(source, e);
+        if (page == 1) return _errorGroup(source, e, decodeNote: notes());
         break;
       }
 
@@ -353,6 +372,7 @@ class BookSearchService {
           sourceName: source.name,
           status: BookSearchStatus.error,
           message: '搜到 $droppedForUrl 条，但都取不到详情页地址（detailUrl 规则可能已失效）',
+          decodeNote: notes(),
         );
       }
     }
@@ -362,16 +382,22 @@ class BookSearchService {
         sourceName: source.name,
         status: BookSearchStatus.noResult,
         message: '没有找到「$keyword」',
+        decodeNote: notes(),
       );
     }
     return BookSearchGroup(
       sourceName: source.name,
       status: BookSearchStatus.ok,
       items: items,
+      decodeNote: notes(),
     );
   }
 
-  BookSearchGroup _errorGroup(BookSource source, Object error) {
+  BookSearchGroup _errorGroup(
+    BookSource source,
+    Object error, {
+    String? decodeNote,
+  }) {
     final unsupported =
         error is RuleEngineException && error.kind == RuleErrorKind.unsupported;
     return BookSearchGroup(
@@ -381,6 +407,7 @@ class BookSearchService {
       message: _describe(error),
       httpStatus: error is RuleEngineException ? error.statusCode : null,
       errorKind: error is RuleEngineException ? error.kind : null,
+      decodeNote: decodeNote,
     );
   }
 

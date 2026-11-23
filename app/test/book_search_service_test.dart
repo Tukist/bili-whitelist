@@ -508,4 +508,106 @@ void main() {
       expect(buildSearchUrl('/s?tab={{ TAB }}', 'x', 1), '/s?tab={{ TAB }}');
     });
   });
+
+  group('解码旁注（v2.75.0）', () {
+    // 旁注只是「这个源这次是怎么解的」的说明，**不许影响状态判定**：
+    // GBK 解出来的结果照样是 ok，旁注只是分组标题下的一行小字。
+    test('GBK 源（自动判定）：分组带「编码：GBK」，状态仍然是 ok', () async {
+      final engine = _EncodingEngine(
+        encoding: 'gbk',
+        // 真实链路里「没声明、自动判成 GBK」一定同时带这句好消息
+        decodeWarning: kDecodeGbkGuessWarning,
+        onQueryMap: (html, list, fields) async => {
+          'name': ['斗罗大陆'],
+          'detailUrl': ['https://a.example/book/1'],
+        },
+      );
+      final groups = await BookSearchService(engine: engine).search(
+        sources: [_source('甲')],
+        keyword: '斗罗',
+      );
+      expect(groups.single.status, BookSearchStatus.ok);
+      expect(groups.single.items.single.name, '斗罗大陆');
+      // 自动纠正成功就是「编码：GBK」，**不许**被写成「仍有乱码」
+      expect(groups.single.decodeNote, '编码：GBK');
+    });
+
+    test('正常 UTF-8 源：没有旁注（不打扰用户）', () async {
+      final engine = _EncodingEngine(
+        encoding: 'utf-8',
+        onQueryMap: (html, list, fields) async => {
+          'name': ['斗罗大陆'],
+          'detailUrl': ['https://a.example/book/1'],
+        },
+      );
+      final groups = await BookSearchService(engine: engine).search(
+        sources: [_source('甲')],
+        keyword: '斗罗',
+      );
+      expect(groups.single.decodeNote, isNull);
+    });
+
+    test('解出乱码：旁注说「解码有乱码」，结果照常返回', () async {
+      final engine = _EncodingEngine(
+        encoding: 'gbk',
+        decodeWarning: '解码后仍有乱码，正文可能不完整',
+        onQueryMap: (html, list, fields) async => {
+          'name': ['斗罗大陆'],
+          'detailUrl': ['https://a.example/book/1'],
+        },
+      );
+      final groups = await BookSearchService(engine: engine).search(
+        sources: [_source('甲')],
+        keyword: '斗罗',
+      );
+      expect(groups.single.status, BookSearchStatus.ok);
+      expect(groups.single.decodeNote, '编码：GBK（仍有乱码）');
+    });
+
+    test('0 条结果也带旁注（用户要知道「按 GBK 解了但没这本书」）', () async {
+      final engine = _EncodingEngine(
+        encoding: 'gbk',
+        onQueryMap: (html, list, fields) async => {
+          'name': <String?>[],
+          'detailUrl': <String?>[],
+        },
+      );
+      final groups = await BookSearchService(engine: engine).search(
+        sources: [_source('甲')],
+        keyword: '没有的书',
+      );
+      expect(groups.single.status, BookSearchStatus.noResult);
+      expect(groups.single.decodeNote, '编码：GBK');
+    });
+  });
+}
+
+/// 会「报编码事实」的假引擎：只把 `lastDecodeEncoding` / `lastDecodeWarning`
+/// 摆好，求值仍走 [FakeRuleEngine] 的注入回调。
+///
+/// 为什么需要它：真引擎（[WebViewRuleEngine]）的解码信息是旁注字段，假引擎
+/// 默认不设，搜索服务那条「抓完就收下旁注」的路就测不到。
+class _EncodingEngine extends FakeRuleEngine {
+  _EncodingEngine({
+    required this.encoding,
+    this.decodeWarning,
+    super.onQueryMap,
+  });
+
+  final String? encoding;
+  final String? decodeWarning;
+
+  @override
+  Future<String> fetchHtml(
+    String url, {
+    Map<String, String>? headers,
+    String charset = 'utf-8',
+  }) async {
+    fetchedUrls.add(url);
+    // 与真实现同序：先当作「这次什么都不知道」，再按本次结果写
+    lastDecodeEncoding = encoding;
+    lastDecodeWarning = decodeWarning;
+    if (onFetch != null) return onFetch!(url);
+    return '<html></html>';
+  }
 }

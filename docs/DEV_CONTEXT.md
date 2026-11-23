@@ -4,7 +4,7 @@
 > 不是设计愿景。改完代码如果动了模块职责、红线、存储 key，**顺手改这里**
 > （这份文档随开发维护；`CHANGELOG.md` 归发布脚本，别手改）。
 >
-> 最近一次对齐：v2.74.0（2026-11-23，MOBI 本地书）。
+> 最近一次对齐：v2.75.0（2026-11-23，网络书源 GBK 解码）。
 
 ---
 
@@ -124,7 +124,7 @@ bash app/tools/release_all.sh 2.71.0 --notes C:/Users/HP/.kimi-tmp/v2710.md
 | `selector.dart` | 选择器语法解析：`css:` / `xpath:` / `class.xxx` / `@text` / `@html` / `@href` / `@src` / `@attr:` / `regex:` / `##正则##替换` / `||` 回退链 |
 | `js_builder.dart` | 选择器 → 待求值 JS 表达式（纯函数，可单测） |
 | `legado_compat.dart` | legado 字段名映射 + `isJsSource`（`<js>` / `@js:` / 非占位符 `{{…}}`） |
-| `rule_engine.dart` | 引擎接口 + WebView 实现；`_unwrapJsValue` 负责剥 `runJavaScriptReturningResult` 的多层返回值 |
+| `rule_engine.dart` | 引擎接口 + WebView 实现；`_unwrapJsValue` 负责剥 `runJavaScriptReturningResult` 的多层返回值；**v2.75.0 起 `fetchHtml` 的字节解码交给 `utils/text_decoding.dart`**（响应头 charset > 书源声明 > 自动判定），结果带出 `lastDecodeEncoding`（实际编码）与 `lastDecodeWarning`（人话告警）；`parseHeaderCharset` / `decodeWarningFor` / `decodeNoteFor` 是这段判定的纯函数入口。**controller 懒建**（`fetchHtml` 不需要 WebView），所以单测能注入假 Dio 直接验 GBK 字节；`loadHtmlString` 求值仍走同一个串行队列 |
 | `engine_holder.dart` | 全 App 唯一引擎单例（一个实例一个 WebView 页面），求值必须串行 |
 | `example_sources.dart` | **内置书源清单**（常量名仍是 `kExampleBookSources`）：维基文库（中文经典）+ 标准电子书（英文经典）。每条的搜索 / 详情 / 目录 / 正文选择器都是**先 curl 真页、再写规则**（证据写在文件头注释里）；改动前必须重新抓页面 |
 
@@ -163,10 +163,13 @@ bash app/tools/release_all.sh 2.71.0 --notes C:/Users/HP/.kimi-tmp/v2710.md
 - `cache/download_manager.dart`：离线缓存下载 / 索引 / 占用统计；`cache/playback_progress.dart`：按 `(bvid,page)` 存播放位置
 - `utils/`：`bili_html.dart`、`import_parser.dart`（BV 号解析）、`book_source_import.dart`、`log_redact.dart`（日志脱敏）、`share_text.dart`、`relative_time.dart`、`sentence_splitter.dart`、`comment_links.dart`、`clipboard_link.dart`
 - `utils/` 里的**纯函数**（v2.72.0，本地书导入）：
-  - `text_decoding.dart`：`decodeBytes` / `decodeTextBytes` / `looksLikeGbk` / `replacementRatio`。
-    判定顺序 BOM → 无 BOM UTF-16 嗅探 → 严格 UTF-8 → GBK 码表 → 兜底
-    （UTF-8 宽松 vs GBK 取坏字符少的那个）。GBK 解码用 `Uint16List` +
-    `String.fromCharCodes`，5MB 文本不到 1 秒。
+  - `text_decoding.dart`：`decodeBytes` / `decodeTextBytes` / `looksLikeGbk` / `looksLikeUtf8` /
+    `isGbkCharset` / `replacementRatio`。**本地书导入与网络书源抓取共用同一套**
+    （v2.75.0 起网络链路也走它，不再各写一份）。判定顺序 BOM → UTF-16（提示 /
+    嗅探）→ **严格 UTF-8** → UTF-8 只坏 ≤1% 字节 → GBK → 兜底（UTF-8 宽松 vs
+    GBK 取坏字符少的那个；提示是 gbk 时优先给 GBK）。
+    严格 UTF-8 排在「声明 gbk」之前是关键：中文站大量声明 gbk 实际吐 UTF-8。
+    GBK 解码用 `Uint16List` + `String.fromCharCodes`，5MB 文本不到 1 秒。
   - `gbk_table.dart`：**生成物，勿手改**（`app/tools/gen_gbk_table.py` 生成，
     `python tools/gen_gbk_table.py --check` 可校验是否最新）。24066 = 126×191 项，
     索引 `(lead-0x81)*191 + (trail-0x40)`，未映射位置是 U+FFFD。
@@ -322,6 +325,55 @@ Standard Ebooks 覆盖）。盗版 / 聚合爬站一律不接。
 - `noResult` 时会**换一门语言的关键词再搜一次**（默认「历史」→ 备选 `love`）：
   否则英文站点会稳定显示「没结果」，被当成坏源。仍 0 条才判 `noResult`，
   之后才做验证页复核。
+
+**网络抓取的编码判定（v2.75.0）**
+
+网络书一直是「搜得到、点进去满屏 `��`」：`fetchHtml` 拿 `ResponseType.bytes` 后
+一律 `utf8.decode(allowMalformed: true)`，而中文书站大量是 GBK。现在字节交给
+`utils/text_decoding.dart`（与本地 TXT 导入同一套，**没有第二份判定**）：
+
+| 顺序 | 判据 | 说明 |
+|---|---|---|
+| 1 | BOM / UTF-16 | `EF BB BF`、`FF FE`、`FE FF`；无 BOM 的 UTF-16 靠零字节分布嗅探 |
+| 2 | **严格 UTF-8** | `allowMalformed: false` 解得通就是 UTF-8 —— **排在「声明 gbk」之前** |
+| 3 | UTF-8 只坏 ≤1% 字节 | 按字节截断的页面仍算 UTF-8，不整页转 GBK |
+| 4 | GBK 码表 | 到这一步只剩 GBK 一种可能；提示只在「两边都解不通」的兜底里起作用（是 gbk 就优先给 GBK） |
+| 5 | 兜底 | 两边都是 U+FFFD 时取坏字符少的 |
+
+- **hint 优先级：HTTP 响应头的 `charset` > 书源的 `charset` 字段 > 自动判定**。
+  响应头是站点在这次响应里自己说的，比书源作者手抄的声明更贴近事实。
+- **为什么很多源声明是错的**：站点改版只改输出没改 `<meta>` / `content-type`，
+  「声明 gbk 实际 utf-8」比反过来更常见。所以声明只当提示，不当命令；声明写错
+  （任一边）时自动判定会纠正，纠正完**不报警**（结果是好的）。
+- **告警只有两句**（`decodeWarningFor`，文案是常量 `kDecodeGbkGuessWarning` /
+  `kDecodeGarbledWarning`）：「这个书源疑似 GBK，已按 GBK 解码」（站点没声明、
+  我们猜对了，是**好消息**）与「解码后仍有乱码，正文可能不完整」（解完还剩一堆
+  U+FFFD，多半是繁中 / 日文等本版没接的编码）。站点自己声明了 GBK 不提示 ——
+  声明对了是正常情况。
+- **带出去的三个事实**：引擎上的 `lastDecodeEncoding` / `lastDecodeWarning`，
+  以及 `BookSearchGroup.decodeNote`（`decodeNoteFor` 压成「编码：GBK」/
+  「解码有乱码」/「编码：GBK（仍有乱码）」；**「疑似 GBK」不算乱码**）。
+  两个引擎字段都只记**最近一次**抓取，所以多页抓取必须**每页抓完当场收下**
+  （正文 / 目录服务都是这么做的，后一页成功不会盖掉前一页的告警）。
+- UI：搜索页**分组标题下**一行小字（每源一次，不逐条）；详情页复用
+  `BookDetailResult.warning`；阅读页在正文末尾（滚动模式一段小字、分页模式并进
+  最后一页）；书源管理页每行一行「编码：GBK / 编码：自动」。
+- `charsetLabelOf`：`gbk` / `gb2312` / `gb18030` / `cp936` → 显示 `GBK`；
+  **`utf-8` 与没写都显示「自动」**（模型默认值就是 utf-8，无法区分「显式写了
+  utf-8」与「没写」，而两者在判定上行为完全一样）；其它名字原样大写。
+- legado（开源阅读）的书源**没有 charset 字段**（它自己按 BOM / 字节分布嗅探），
+  所以 `fromLegado` 里的 `bookSourceCharset` 读取只是兼容少数第三方导出，
+  正常 legado 源一律自动判定。
+
+**本机实测（2026-11-23，模拟器 `bili_test`，debug 包 `adb install -r`）**：宿主机起
+一个只吐 GBK 字节、`Content-Type: text/html`（**不带 charset**）的本地页面
+（`10.0.2.2:8899`，脚本 `C:/Users/HP/.kimi-tmp/gbk_test_server.py`，不入库），
+书源声明 `utf-8`、搜索地址走绝对 `http://`（`normalizeUrl` 会把「与 baseUrl 同站
+的 http」升级成 https，所以把 baseUrl 写成 `http://x.invalid` 绕开这一步）。
+搜索 → 分组标题「GbkLocal · 2 条」+ 一行「编码：GBK」+ 书名 **斗罗大陆 / 吞噬星空**
+正常显示（以前这里是一屏 `��`）。取证图 `docs/screenshots/v2.75.0/h_gbk_search_emulator.png`
+与书源页的「编码：自动」`h_source_charset_label.png`（`.gitignore` 里
+`docs/screenshots/v*/*.png` 默认不入库）。
 
 **本地书（v2.72.0 导入与阅读；v2.73.0 起 parser 分派 + schema 2 + EPUB + PDF；
 v2.74.0 加 MOBI）**：
@@ -566,6 +618,32 @@ v2.74.0 加 MOBI）**：
       极难查。
     - **cp1252 不能用 latin1 解**：0x80–0x9F 是弯引号 / 破折号 / 省略号 / €，
       latin1 会解成 C1 控制字符，正文看上去像坏了，其实只是编码表错了。
+18. **网络书源的编码判定：严格 UTF-8 必须排在「声明 gbk」之前**（v2.75.0）。
+    书源的 `charset` 字段与站点的 `<meta>` / `content-type` 都**只是提示**，
+    抄错的比例很高（改版只改输出不改声明）。踩过的具体形态：
+    - **声明 gbk、实际 utf-8**：按提示硬解 GBK 会得到一整页生僻字，而且
+      `replacementRatio` 很低（GBK 码表几乎能解一切双字节），错误**不会**被
+      「乱码比例」兜住 —— 只能靠「严格 UTF-8 能不能解通」挡住。反过来的
+      （声明 utf-8 实际 GBK）由严格解码必然失败接住。
+    - **响应头 charset 优先于书源声明**：`content-type: text/html; charset=gbk`
+      是站点这次响应自己说的，比书源作者写的准。两条提示都错时自动判定纠正。
+    - **引擎上的 `lastDecodeWarning` / `lastDecodeEncoding` 只记最近一次抓取**：
+      多页抓取（正文分页、目录分页）必须**每页抓完就当场收下**，否则后一页成功
+      就把前一页的告警盖掉了（`book_content_service` / `book_detail_service`
+      都按这个写法）。别在循环外面读一次就当整章的结果。
+    - **`WebViewController` 在 `flutter test` 里构造即抛**，所以 v2.75.0 把引擎的
+      controller 改成**懒建**（`fetchHtml` 只走 Dio）。想在单测里验编码，构造
+      `WebViewRuleEngine(dio: Dio()..httpClientAdapter = 假适配器)` 就行，
+      不要为了测一行字节去开 WebView。
+    - GBK 字节**只能写字面量**（`[0xC4,0xE3,0xBA,0xC3]`）：Dart 没有 GBK 编码器，
+      「源码写中文再 encode」这条路本身就不存在。
+    - **「疑似 GBK」不能在 UI 上显示成「仍有乱码」**：自动纠正成功是好消息，
+      两条告警必须分开压成小字（`kDecodeGbkGuessWarning` → 「编码：GBK」，
+      `kDecodeGarbledWarning` → 「编码：GBK（仍有乱码）」）。2026-11-23 实机第一次
+      就是把两句合成一句，GBK 页面明明正常显示、小字却写着「仍有乱码」。
+    - **`normalizeUrl` 会把同站的 `http` 升级成 `https`**（去重与重定向口径需要），
+      所以拿本地 HTTP 服务做实测时 baseUrl 不能与被请求 URL 同 host，否则请求被
+      改成 https 直接 `HandshakeException`。
 
 ---
 
@@ -574,12 +652,12 @@ v2.74.0 加 MOBI）**：
 - 测试目录：`app/test/`，共 271 个 `*_test.dart`；`test/live_danmaku_fakes.dart` 与
   `test/mobi_test_builder.dart` 是辅助文件（没有 `main()`；后者文件名不匹配
   `*_test.dart`，门禁根本不会把它当测试文件）。
-- 当前基线：**271 个文件、7 批、通过用例数见下**（v2.74.0 实跑）：
+- 当前基线：**271 个文件、7 批、通过用例数见下**（v2.75.0 实跑）：
 
 | 项 | 结果 |
 |----|------|
 | `flutter analyze` | 0 issue（10–70s，冷启动更久） |
-| `flutter test` 分批 | 7 批全部通过，合计 **4123** 个用例 |
+| `flutter test` 分批 | 7 批全部通过，合计 **4144** 个用例 |
 | `flutter build apk --debug` | 通过 |
 
 - 分层策略：
@@ -596,6 +674,7 @@ v2.74.0 加 MOBI）**：
 
 | 版本 | 主题 | 关键文件 |
 |------|------|----------|
+| v2.75.0 | **网络书源接 GBK 解码 + 自动判定**（H 批）。① `WebViewRuleEngine.fetchHtml` 不再 `utf8.decode(allowMalformed: true)` 一把梭，字节交给 `utils/text_decoding.dart` 的 `decodeTextBytes`（与本地 TXT 导入**同一套判定**，不写第二份）：BOM → UTF-16 → **严格 UTF-8** → UTF-8 只坏 ≤1% 字节 → GBK（先信提示、再自动）→ 兜底；关键改动是**严格 UTF-8 排在「声明 gbk」之前**（站点改版只改输出不改声明，「声明 gbk 实际 utf-8」比反过来常见，硬解 GBK 得到的是「能解但全是生僻字」——乱码比例兜不住这种错）。hint 优先级 **HTTP 响应头 charset > 书源 `charset` 字段**（响应头是站点这次响应自己说的），`parseHeaderCharset` 解析 `content-type` 的 `charset=`（引号 / 大小写 / 多余参数都容忍）。② 判定事实带出两个字段：`lastDecodeEncoding`（实际编码）与 `lastDecodeWarning`（两句人话：「这个书源疑似 GBK，已按 GBK 解码」/「解码后仍有乱码，正文可能不完整」；站点自己声明了 GBK 不提示）；两者都只记**最近一次**抓取，所以正文 / 目录服务改成**每页抓完当场收下**（后一页成功不会盖掉前一页的告警；正文服务还顺手去掉了循环外那次重复收集）。③ UI：`BookSearchGroup` 加纯增量字段 `decodeNote`（`decodeNoteFor` 压成「编码：GBK」/「解码有乱码」/「编码：GBK（仍有乱码）」，正常 UTF-8 为 null），搜索页只在**分组标题下**显示一行小字；阅读页滚动模式在正文末尾加一段小字、分页模式并进最后一页（原来只显示 `partial`，`warning` 根本没渲染）；详情页复用既有 `warning` 链路。④ 书源管理页每行加一行「编码：GBK / 编码：自动」（`charsetLabelOf`：GBK 家族别名统一显示 GBK，utf-8 与没写都显示「自动」——模型默认值就是 utf-8，两者在判定上行为一致）；`fromLegado` 加注释说明 legado 的 BookSource 没有 charset 字段（它自己嗅探），正常 legado 源一律自动判定，读 `bookSourceCharset` 只为兼容少数第三方导出。⑤ 可测性：`WebViewController` 在 `flutter test` 里构造即抛，所以引擎的 controller 改成**懒建**（`fetchHtml` 只走 Dio），单测能注入假 Dio 适配器直接断言「GBK 字节 → 正确中文」。⑥ 实机（模拟器 `bili_test`，2026-11-23，`adb install -r`）：宿主机起一个只吐 GBK 字节、不带 charset 的页面 → 搜索得到 2 条中文书名（斗罗大陆 / 吞噬星空），分组标题下显示「编码：GBK」；实机上发现「疑似 GBK」被压成「仍有乱码」，于是把两句告警抽成 `kDecodeGbkGuessWarning` / `kDecodeGarbledWarning` 常量分开处理。新增 21 个用例（`text_decoding` 5 / `book_rule_engine` 9 / `book_search_service` 4 / `book_search_page` 1 / `book_source_page` 1 / `book_source_import` 1），既有断言一条没删没放宽 | `services/book_rule/rule_engine.dart`、`utils/text_decoding.dart`、`services/book_search_service.dart`、`services/book_content_service.dart`、`services/book_detail_service.dart`、`models/book_source.dart`、`pages/book_search_page.dart`、`pages/book_source_page.dart`、`pages/book_reader_page.dart`、`test/book_rule_engine_test`、`test/text_decoding_test`、`test/book_search_service_test`、`test/book_search_page_test`、`test/book_source_page_test`、`test/book_source_import_test` |
 | v2.74.0 | 一次发版覆盖三批：**PDF 本地书**（F1）、**MOBI 本地书**（G，本条）与 EPUB / 解析器分派那批的收尾。**MOBI**：① `utils/mobi_reader.dart`（纯 Dart，无 Flutter 依赖）：`PdbFile.parse`（78 字节头 + 记录表，记录无长度字段 → 任何偏移越界都抛可读异常）、`parseMobiHeader`（compression / textLength / recordCount / recordSize / encryption / textEncoding / fileVersion / extraDataFlags / full name）、`palmdocDecompress`（LZ77：`0x01–0x08` 字面量组、`0x80–0xBF` 空格 + 字符对、`0xC0–0xFF` 11 位距离 + 3–10 长度；截断 / 回溯距离 0 或越界 / 解出超长都抛异常，不会死循环）、`trimTrailingEntries`（记录尾部附加数据，条数 = `extraDataFlags` 置位数、长度 = 末尾反向变长整数）、`exthValue`（100 作者 / 503 书名，坏了返回 null）、`decodeCp1252`（0x80–0x9F 单独一张 32 项表，**不用 latin1**）。② `MobiBookParser`：支持 compression 1 / 2；**17480（HUFF/CDIC）明确拒绝**并提示用 Calibre 转 EPUB；按 `textLength` 截断、逐条剥 trailing entry 再解压；UTF-8 解出大量 U+FFFD 回退 cp1252 并记 warning；正文复用 `restoreParagraphs(html,'block')`（先删 `<head>`，与 EPUB 同一套清洗）；章节按 `<mbp:pagebreak>` 切段 + 每段首个 `<h1>`–`<h3>`（或 class 含 `chapter`/`ctitle`/`title` 的 `<p>`）启发式命名，≥2 段带标题才用这套，否则退 `splitTxtChapters`，再不行按 3000 字分块；书名 EXTH 503 > full name > PalmDB 名 > 文件名，作者 EXTH 100；**AZW3/KF8 明确拒绝**（`fileVersion >= 8`，或记录里出现 `BOUNDARY` / `FDST`）——不半解析，避免「能打开但全是乱码」；原文件 ≤ 100MB、解压后正文 ≤ 64MB。③ 接入：`dispatcher` 认 `mobi` / `azw` / `prc`（`azw3` 故意不认，`unsupportedMessage` 直接给「在 Calibre 里转成 EPUB 再导入」）；`FilePickerPlugin` 的 `EXTRA_MIME_TYPES` 加 `application/x-mobipocket-ebook` / `application/vnd.amazon.ebook`，MIME→扩展名兜底认 `mobi` / `azw3`；书架角标与导入提示复用 `format.toUpperCase()`（自动出现「MOBI」「共 N 章」）；`_cleanName` 改为复用 `titleFromFileName`（原来另抄了一份 txt/epub/pdf 后缀名单，导致书架出现「mobi_g_test.mobi」）。④ 测试：`test/mobi_reader_test.dart`（PDB 边界 / PalmDOC roundtrip + 畸形输入 / cp1252 / EXTH / trailing entry / KF8）、`test/mobi_book_parser_test.dart`（3 章中文书、无标题退化、cp1252、HUFF / DRM / KF8、损坏文件）、`test/mobi_test_builder.dart`（现造夹具，**不往仓库放二进制样本**），本地书导入链路另加 MOBI 两条（落盘 format/书名/目录 + 重复导入幂等）。**已知限制**：没解析 NCX，章节标题是启发式 | `utils/mobi_reader.dart`（新）、`services/local_book_parser.dart`（`MobiBookParser`）、`services/local_book_store.dart`（`_cleanName` 复用后缀表）、`services/local_book_import_service.dart`、`pages/reading_page.dart`（提示文案）、`android/.../FilePickerPlugin.kt`、`test/mobi_reader_test.dart`（新）、`test/mobi_book_parser_test.dart`（新）、`test/mobi_test_builder.dart`（新，辅助文件）、`test/local_book_parser_test.dart`、`test/book_local_import_test.dart` |
 | v2.73.0 | 一次发版覆盖三批：**EPUB + PDF 本地书** 与 **内置精选书源 + 可用性检测**。① **解析器按格式分派**：新抽象 `LocalBookParser`（`format` / `canParse` / `parse`）+ `TxtBookParser` / `EpubBookParser` / `PdfBookParser` + `LocalBookParsers.dispatcher`，统一产出 `ParsedLocalBook{title, author, format, chapters[{title,text,imagePage}], coverBytes, idSeed, warnings, meta, sourcePath, pageWidth, pageHeight}`；需要**原文件路径**的格式（PDF）实现能力接口 `FileBasedLocalBookParser.parseFile`，导入服务用 `is` 分流，TXT / EPUB 照旧 `parse(bytes)`；加 MOBI / AZW3 / UMD 只需新增实现并在 `parsers` 挂一行。② **EPUB**：`archive` 解 zip → `META-INF/container.xml` → OPF 的 `dc:title` / `dc:creator` / manifest / **spine 顺序**（章节顺序只看 spine，不看文件名）→ 标题取 EPUB3 `nav.xhtml`、退 EPUB2 `toc.ncx`、再退「第 N 章」→ 每章 XHTML 复用 `restoreParagraphs(html,'block')`（先删 `<head>`）→ 封面取 `<meta name="cover">` 或 `properties="cover-image"`；路径按 OPF / nav 各自目录解析（`%20` 解码、`..` 归一、大小写兜底）；**手写极简 XML 扫描器**（`xml` 只是间接依赖，直接 import 会红门禁）；防 zip bomb 按 entry 声明的 size 记账（单章 8MB / 全本 200MB，`EpubLimits` 可注入），解压后再校验一次。③ **存储 schema 2**：`manifest.json` + `chapters/N.txt`（一章一文件）+ 可选 `cover.jpg|png`，`LocalChapter` 从 `{start,end}` 变 `{file}`；**v1 惰性迁移**（读到旧 manifest 时按偏移切开写新章文件、**最后**才写新清单，任一步失败原样退回 v1 可读路径，成功后删 `book.txt`）；书 id 仍 `localBookIdFor(书名, idSeed)` —— TXT 的 seed 是全文（与 v2.72.0 逐字节一致），EPUB 是「文件名 + zip 字节数 + 首 2KB」，PDF 是「文件名 + 字节数」。④ **PDF（下拉式漫画）**：新 `PdfRenderPlugin.kt`（通道 `bili_whitelist/pdf`，`MainActivity` 手动注册）用系统 `PdfRenderer` 把一页渲染成 PNG 写进 `<filesDir>/reader/pdfcache/<书id>/<页号>@<宽>.png`，**只回路径**；单线程 executor + `synchronized` 串行，`PdfRenderer` / `ParcelFileDescriptor` / `Page` 全部成对关闭；`PdfBookParser` **不解析文字**，`chapters` = 每页一条 `{title: 第 N 页, imagePage: true}`（没有 `chapters/N.txt`），封面取第一页 400 宽，页数 ≤ 3000、原文件 ≤ 100MB，原文件另存 `book.pdf`（manifest 的 `sourceFile`）；`BookContentResult.imagePath` 非空即图片页 → `Image.file` 铺满可用宽、纵向可滚、失败可重试，按钮换「上一页 / 下一页」+「第 N / M 页」，`pageMode == paged` 强制逐页滚动并提示「PDF 只能逐页浏览」；`planPdfCacheEviction` 纯函数（300MB / 每本 500 页，mtime 最旧先删，`keepPath` 即当前页永不删，2 分钟节流）；删书按同一 cacheKey 清 `pdfcache/<id>/`，覆盖导入也清一次；`FilePickerPlugin` 的 MIME 加 `application/pdf`，导入提示「（PDF，共 N 页）」、书架角标 `PDF`。⑤ **内置书源**：`example_sources.dart`（常量名仍是 `kExampleBookSources`）从 1 条变 2 条 —— 新增 **维基文库（中文经典）**（搜索 `/w/index.php?search={{key}}&ns0=1&fulltext=1` + `ul.mw-search-results > li`，书名/链接用 `div.mw-search-result-heading a:not([title*="/"])` 排掉章节子页面；目录直接取图书页 `ul li a[title*="/"]`；正文 `div.mw-content-ltr.mw-parser-output` + 6 条清洗规则），**标准电子书**保留并复核；每条选择器都 `curl` 真页点数（维基：搜索 20 条 / 三國演義目录 123 条 / 正文 1 容器；SE：搜索 12 条 / 目录 12 章 / 正文 1 个 section），评估后排除 Gutenberg（503）/ ctext（Cloudflare）/ en.wikisource（版本页无目录）；管理页文案改「添加内置书源」，同名源不覆盖。⑥ **可用性检测**：`book_source_health_service.dart` 的 `probe` 复用 `BookSearchService` **真搜一次** → `ok` / `noResult` / `blocked`（401/403/407/412/429/451 或 HTTP 200 验证页，`noResult` 时**多抓一次**复核）/ `networkError` / `unsupportedJs`（`usesJs` 判定，不发请求）/ `badRule`；`probeAll` 并发 2、可取消、带进度；结果单 key `reader:source_health` 存 200 条（按 `at` 裁最旧，坏数据回空表，**不进 Gist**）；纯函数 `classifyGroup` / `summarizeSearchFailures`；管理页每行状态角标 + 长按「检测这个源」、AppBar「检测全部书源（较慢）」只测 `enabled && !usesJs`，清空书源连带清检测结果；搜索页分组标题显示上次检测结果、0 条时区分「没搜到」与「可能已失效（上次检测：被拦）」、整页 0 条给归类汇总；增量字段 `RuleEngineException.statusCode`、`BookSearchGroup.httpStatus` / `errorKind`（既有调用点零改动） | `services/local_book_parser`（新）、`services/local_book_store`（升 schema 2 + v1 惰性迁移 + PDF）、`services/local_book_import_service`、`services/local_chapter_loader`、`services/chapter_content_loader`、`services/book_content_service`、`services/pdf_renderer_bridge`（新）、`services/pdf_cache_policy`（新）、`services/book_source_health_service`（新）、`services/book_rule/example_sources`、`services/book_search_service`、`services/book_rule/rule_engine`、`pages/book_reader_page`、`pages/reading_page`、`pages/book_source_page`、`pages/book_search_page`、`android/.../PdfRenderPlugin.kt`（新）、`MainActivity.kt`、`FilePickerPlugin.kt`、`test/txt_book_parser_test`（新）、`test/epub_book_parser_test`（新）、`test/local_book_parser_test`（新）、`test/local_book_store_test`、`test/book_local_import_test`、`test/reading_page_local_import_test`、`test/pdf_book_parser_test`（新）、`test/pdf_cache_policy_test`（新）、`test/pdf_local_book_test`（新）、`test/pdf_book_import_test`（新）、`test/book_source_health_service_test`（新）、`test/example_book_source_test`、`test/book_source_page_test`、`test/book_search_page_test`、`docs/DEV_CONTEXT.md` |
 | v2.72.0 | 一次发版覆盖三批：左右翻页 + 本地 TXT 导入 + 本地书阅读与删除。① **左右翻页**：`reader:settings` 加 `pageMode`（`scroll` 默认 / `paged`），正文按可用宽高用 `TextPainter` 二分切页、`PageView` 承载，前后哨兵页实现「末页再滑 = 下一章 / 首页前滑 = 上一章」，页码 `3 / 12`；分页模式不可选中（横滑与选字抢手势，取舍写进注释）；`ReadingProgress.pageIndex` 存页内位置，字号变化按比例落回相近页；顶栏加「翻页方式」切换并落盘。② **本地 TXT 导入**：纯 Dart GBK 解码（码表由 Python 生成）+ 自动编码判定（BOM / UTF-16 嗅探 / 严格 UTF-8 / GBK）、中文网文章节切分（第X章·回·节·卷·集 / 楔子番外 / Chapter N；无标题按 3000 字分「第 N 节」）、本地书落盘 `reader/local/<id>/`（正文一份 + 章节偏移）+ 书架伪 URL `local:<id>`、原生 `pickBookFile`（流式拷到私有目录，100MB，requestCode 9051）、阅读页「导入本地书」（Wrap 防溢出、导入中禁用）。③ **本地书阅读与删除**：阅读页抽 `ChapterContentLoader`（网络 / 本地两种实现），本地书与网络书共用同一页（不建 WebView 引擎、不查章节缓存、不请求网络、不显示缓存入口），`source` 改为可空但既有调用点零改动；书架点本地书按 `getBook(id).chapters` 拼目录直接进阅读页并按 `reader:progress` 续读，文件丢失弹「本地书籍文件已丢失」+「从书架移除」；长按删除连带清 `reader/local/<id>/` + 章节缓存 + 书架项（先删文件，删不掉不动书架）；书架行加「本地」角标 | `services/book_paginator`（新）、`services/chapter_content_loader`（新）、`services/local_chapter_loader`（新）、`services/local_book_store`（新）、`services/local_book_import_service`（新）、`utils/text_decoding`（新）、`utils/gbk_table`（生成物）、`utils/txt_chapter_splitter`（新）、`app/tools/gen_gbk_table.py`（新）、`book_reader_page`、`reading_page`、`bookshelf_store`、`FilePickerPlugin.kt`、`test/book_paginator_test`（新）、`test/local_chapter_loader_test`（新）、`test/book_reader_page_local_test`（新）、`test/reading_page_local_import_test`（新）、`test/book_reader_page_test`、`test/bookshelf_store_test` |

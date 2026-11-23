@@ -430,5 +430,24 @@ https://mirror.example.com/list.json
       expect(s.content.paragraphBreak, 'br');
       expect(s.toc.maxPages, 1);
     });
+
+    test('管理页的编码标签：只有 GBK 家族才写具体编码，其余一律「自动」', () {
+      // utf-8 与「没写」在抓取侧行为完全一样（严格 UTF-8 判定优先于任何声明），
+      // 所以标签也统一显示「自动」——不能让用户以为自己锁死了编码。
+      expect(charsetLabelOf('gbk'), 'GBK');
+      expect(charsetLabelOf('GB2312'), 'GBK');
+      expect(charsetLabelOf('gb18030'), 'GBK');
+      expect(charsetLabelOf('cp936'), 'GBK');
+      expect(charsetLabelOf('utf-8'), '自动');
+      expect(charsetLabelOf('UTF8'), '自动');
+      expect(charsetLabelOf('  '), '自动');
+      expect(charsetLabelOf('big5'), 'BIG5'); // 认不出就原样大写，让用户看清
+      final gbk = BookSource.fromJson({
+        'name': 'n',
+        'baseUrl': 'https://n.example',
+        'charset': 'gbk',
+      });
+      expect(gbk.charsetLabel, 'GBK');
+    });
   });
 }

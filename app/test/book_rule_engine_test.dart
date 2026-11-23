@@ -1,12 +1,54 @@
-// 规则引擎里**可纯测**的那部分（R2）。
+// 规则引擎里**可纯测**的那部分（R2 / v2.75.0）。
 //
 // 真 WebView 在 `flutter test` 里建不出来（`WebViewController()` 构造即抛），
-// 所以引擎能被单测的只有：`<base href>` 注入（相对链接解析全靠它）和
-// [FakeRuleEngine] 的默认行为（它是所有搜索测试的地基，行为不能悄悄变）。
+// 所以能被单测的是三块：
+// - `<base href>` 注入（相对链接解析全靠它）；
+// - [FakeRuleEngine] 的默认行为（它是所有搜索测试的地基，行为不能悄悄变）；
+// - `fetchHtml` 的**解码判定**（v2.75.0 起 controller 懒建 + Dio 可注入，
+//   所以能拿假适配器吐 GBK 字节，直接断言「字节 → 中文」这条路）。
+import 'dart:typed_data';
+
+import 'package:dio/dio.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:bili_whitelist_app/services/book_rule/rule_engine.dart';
 import 'package:bili_whitelist_app/services/book_rule/selector.dart';
+
+/// 假 Dio 适配器：不回真网络，直接吐死字节 + 指定响应头。
+///
+/// 为什么不用 `flutter_test` 的网络 mock：我们要的是「响应头 + 字节」这两样
+/// 原样进 `fetchHtml`，适配器是最贴身的一层，超时 / 重定向这些行为也一起保留。
+class _BytesAdapter implements HttpClientAdapter {
+  _BytesAdapter(this.bytes, {this.contentType});
+
+  final List<int> bytes;
+
+  /// `Content-Type` 响应头的值（null = 不下发这个头）。
+  final String? contentType;
+
+  /// 被请求过的 URL（按调用顺序）。
+  final List<String> urls = [];
+
+  @override
+  void close({bool force = false}) {}
+
+  @override
+  Future<ResponseBody> fetch(
+    RequestOptions options,
+    Stream<Uint8List>? requestStream,
+    Future<void>? cancelFuture,
+  ) async {
+    urls.add(options.uri.toString());
+    return ResponseBody.fromBytes(
+      bytes,
+      200,
+      statusMessage: 'OK',
+      headers: {
+        if (contentType != null) Headers.contentTypeHeader: [contentType!],
+      },
+    );
+  }
+}
 
 void main() {
   group('injectBaseHref', () {
@@ -110,6 +152,137 @@ void main() {
       final engine = FakeRuleEngine();
       await engine.dispose();
       expect(engine.disposeCount, 1);
+    });
+  });
+
+  group('fetchHtml 的编码判定（v2.75.0）', () {
+    // 夹具一律字节字面量：'你好' 的 GBK 是 C4 E3 BA C3、UTF-8 是 E4 BD A0 E5 A5
+    // BD。Dart 没有 GBK 编码器（这正是本地书那条路必须有码表的原因），
+    // 所以 GBK 侧只能写字面量，不能「源码写中文再 encode」。
+    const gbkNiHao = [0xC4, 0xE3, 0xBA, 0xC3];
+    const utf8NiHao = [0xE4, 0xBD, 0xA0, 0xE5, 0xA5, 0xBD];
+
+    WebViewRuleEngine engineFor(_BytesAdapter adapter) {
+      final dio = Dio()..httpClientAdapter = adapter;
+      return WebViewRuleEngine(dio: dio);
+    }
+
+    test('GBK 字节 + 源声明 gbk：解出中文，编码 gbk，不报乱码', () async {
+      final adapter = _BytesAdapter(gbkNiHao);
+      final engine = engineFor(adapter);
+      final html = await engine.fetchHtml(
+        'https://gbk.example/',
+        charset: 'gbk',
+      );
+      expect(html, '你好');
+      expect(engine.lastDecodeEncoding, 'gbk');
+      expect(engine.lastDecodeWarning, isNull);
+      expect(adapter.urls, ['https://gbk.example/']);
+      await engine.dispose();
+    });
+
+    test('GBK 字节 + 源声明 utf-8（声明错了）：自动纠正并给提示', () async {
+      final engine = engineFor(_BytesAdapter(gbkNiHao));
+      final html = await engine.fetchHtml(
+        'https://x.example/',
+        charset: 'utf-8',
+      );
+      expect(html, '你好');
+      expect(engine.lastDecodeEncoding, 'gbk');
+      expect(engine.lastDecodeWarning, contains('疑似 GBK'));
+      await engine.dispose();
+    });
+
+    test('UTF-8 字节 + 源声明 gbk（声明错了）：按 UTF-8 解，且安静', () async {
+      final engine = engineFor(_BytesAdapter(utf8NiHao));
+      final html = await engine.fetchHtml(
+        'https://x.example/',
+        charset: 'gbk',
+      );
+      expect(html, '你好');
+      expect(engine.lastDecodeEncoding, 'utf-8');
+      // 声明写错了但纠正对了：这时候不该吓用户说「有乱码」
+      expect(engine.lastDecodeWarning, isNull);
+      await engine.dispose();
+    });
+
+    test('响应头 charset 优先于书源声明（站点自己说的更可信）', () async {
+      final adapter = _BytesAdapter(
+        gbkNiHao,
+        contentType: 'text/html; charset=gbk',
+      );
+      final engine = engineFor(adapter);
+      // 书源写 utf-8、响应头写 gbk：按 gbk 解，而且「已声明」所以不提示
+      final html = await engine.fetchHtml(
+        'https://x.example/',
+        charset: 'utf-8',
+      );
+      expect(html, '你好');
+      expect(engine.lastDecodeEncoding, 'gbk');
+      expect(engine.lastDecodeWarning, isNull);
+      await engine.dispose();
+    });
+
+    test('响应头写 utf-8 但字节是 GBK：自动判定仍然救回来', () async {
+      final adapter = _BytesAdapter(
+        gbkNiHao,
+        contentType: 'text/html; charset=utf-8',
+      );
+      final engine = engineFor(adapter);
+      final html = await engine.fetchHtml(
+        'https://x.example/',
+        charset: 'utf-8',
+      );
+      expect(html, '你好');
+      expect(engine.lastDecodeEncoding, 'gbk');
+      expect(engine.lastDecodeWarning, contains('疑似 GBK'));
+      await engine.dispose();
+    });
+
+    test('解完仍是一堆 U+FFFD：给「正文可能不完整」的告警', () async {
+      final engine = engineFor(_BytesAdapter([0xFF, 0xFF, 0xFF, 0xFF]));
+      final html = await engine.fetchHtml('https://x.example/');
+      expect(html.contains('\uFFFD'), isTrue);
+      expect(engine.lastDecodeWarning, '解码后仍有乱码，正文可能不完整');
+      await engine.dispose();
+    });
+
+    test('空响应仍然抛 empty（既有行为不变）', () async {
+      final engine = engineFor(_BytesAdapter(const []));
+      await expectLater(
+        engine.fetchHtml('https://x.example/'),
+        throwsA(
+          isA<RuleEngineException>()
+              .having((e) => e.kind, 'kind', RuleErrorKind.empty),
+        ),
+      );
+      await engine.dispose();
+    });
+  });
+
+  group('parseHeaderCharset / decodeNoteFor（纯函数）', () {
+    test('Content-Type 的各种写法都能抠出 charset', () {
+      expect(parseHeaderCharset('text/html; charset=gbk'), 'gbk');
+      expect(parseHeaderCharset('text/html; charset="GB2312"'), 'GB2312');
+      expect(parseHeaderCharset('text/html;charset=UTF-8; foo=bar'), 'UTF-8');
+      expect(parseHeaderCharset('Text/HTML; Charset = gb18030'), 'gb18030');
+      expect(parseHeaderCharset('text/html'), isNull);
+      expect(parseHeaderCharset('   '), isNull);
+      expect(parseHeaderCharset(null), isNull);
+    });
+
+    test('分组小字：正常 UTF-8 不显示，GBK 与乱码各有一句', () {
+      expect(decodeNoteFor('utf-8', null), isNull);
+      expect(decodeNoteFor(null, null), isNull);
+      expect(decodeNoteFor('gbk', null), '编码：GBK');
+      // 「疑似 GBK」是自动纠正成功的**好消息**：不能写成「仍有乱码」
+      // （实机第一次就是这么错的：GBK 页面明明正常显示，小字却吓人）
+      expect(decodeNoteFor('gbk', kDecodeGbkGuessWarning), '编码：GBK');
+      expect(decodeNoteFor('utf-8', kDecodeGarbledWarning), '解码有乱码');
+      expect(decodeNoteFor('gbk', kDecodeGarbledWarning), '编码：GBK（仍有乱码）');
+      // 文案常量与 decodeWarningFor 的产出必须一致（改一处漏另一处就会静默变回旧行为）
+      expect(kDecodeGarbledWarning, '解码后仍有乱码，正文可能不完整');
+      expect(kDecodeGbkGuessWarning, '这个书源疑似 GBK，已按 GBK 解码');
     });
   });
 }
