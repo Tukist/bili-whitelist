@@ -11,13 +11,17 @@
 /// 自己判断「是站点坏了还是书源规则过期了」。
 library;
 
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 
 import '../models/book_source.dart';
+import '../services/book_content_service.dart';
 import '../services/book_detail_service.dart';
 import '../services/book_rule/engine_holder.dart';
 import '../services/book_search_service.dart';
 import '../services/bookshelf_store.dart';
+import '../services/chapter_cache_store.dart';
 import '../theme/app_palette.dart';
 import '../theme/app_tokens.dart';
 import '../widgets/app_snack.dart';
@@ -43,6 +47,12 @@ class BookDetailPage extends StatefulWidget {
   /// 测试注入：书架存储（默认 [BookshelfStore.instance]）。
   final BookshelfStore? shelfStore;
 
+  /// 测试注入：正文服务（「缓存整本」用）。
+  final BookContentService? contentService;
+
+  /// 测试注入：章节离线缓存（默认 [ChapterCacheStore.instance]）。
+  final ChapterCacheStore? cacheStore;
+
   const BookDetailPage({
     super.key,
     required this.source,
@@ -51,6 +61,8 @@ class BookDetailPage extends StatefulWidget {
     this.holder,
     this.detailService,
     this.shelfStore,
+    this.contentService,
+    this.cacheStore,
   });
 
   @override
@@ -65,11 +77,15 @@ class _BookDetailPageState extends State<BookDetailPage> {
   ReadingProgress? _progress;
   bool _onShelf = false;
 
+  /// 离线缓存统计（0 章时详情页不显示这一行）。
+  CacheStats _cacheStats = CacheStats.empty;
+
   /// 收起的卷（默认全部展开；只存「卷下标:卷名」，防同名卷互相影响）。
   final Set<String> _collapsedVolumes = {};
 
   RuleEngineHolder get _holder => widget.holder ?? RuleEngineHolder.instance;
   BookshelfStore get _shelf => widget.shelfStore ?? BookshelfStore.instance;
+  ChapterCacheStore get _cache => widget.cacheStore ?? ChapterCacheStore.instance;
 
   BookDetailService get _service =>
       widget.detailService ?? BookDetailService(engine: _holder.engine);
@@ -118,6 +134,9 @@ class _BookDetailPageState extends State<BookDetailPage> {
         _onShelf = books.any((b) => b.key == bookKeyFor(widget.detailUrl));
         _loading = false;
       });
+      // 缓存统计单独刷、**不阻塞首屏**：它只是一个附加信息，而目录/详情才是
+      // 用户要看的东西（本地存储在个别机型上解析慢，不该拖着整页一起等）。
+      unawaited(_refreshCacheStats());
     } catch (e) {
       if (!mounted) return;
       setState(() {
@@ -127,11 +146,22 @@ class _BookDetailPageState extends State<BookDetailPage> {
     }
   }
 
-  /// 从阅读页回来只需刷新进度（目录不会变）。
+  /// 从阅读页回来只需刷新进度 + 缓存统计（目录不会变）。
+  ///
+  /// 缓存统计也要刷：阅读页在「在线阅读」时会顺手把当前章写进缓存，
+  /// 回到详情页看到「已缓存 N/M 章」跟上，才不会让人以为按钮点了没生效。
   Future<void> _reloadProgress() async {
     final progress = await _shelf.getProgress(widget.detailUrl);
     if (!mounted) return;
     setState(() => _progress = progress);
+    await _refreshCacheStats();
+  }
+
+  /// 只刷缓存统计（失败/超时由 store 自己兜底成 0 章）。
+  Future<void> _refreshCacheStats() async {
+    final stats = await _cache.stats(bookKeyFor(widget.detailUrl));
+    if (!mounted) return;
+    setState(() => _cacheStats = stats);
   }
 
   // ==================== 动作 ====================
@@ -156,6 +186,7 @@ class _BookDetailPageState extends State<BookDetailPage> {
           initialIndex: target,
           holder: widget.holder,
           shelfStore: widget.shelfStore,
+          cacheStore: widget.cacheStore,
         ),
       ),
     );
@@ -188,6 +219,61 @@ class _BookDetailPageState extends State<BookDetailPage> {
       context,
       ok ? '已加入书架' : '加入书架失败（书架已满或存储不可用）',
       kind: ok ? SnackKind.info : SnackKind.error,
+    );
+  }
+
+  /// 缓存整本（带进度对话框与取消）。
+  ///
+  /// 走的是阅读页同一个 [BookContentService.cacheChapters]：串行 + 章间隔 +
+  /// 单章失败跳过 + 撞上限即停。这里只负责「给用户一个能看见进度、能停下来的
+  /// 入口」—— 缓存策略不在页面里重写一遍。
+  Future<void> _cacheWholeBook() async {
+    final result = _result;
+    if (result == null || result.chapters.isEmpty) {
+      AppSnack.show(context, '目录还是空的，先确认书源的目录规则');
+      return;
+    }
+    final service = widget.contentService ??
+        BookContentService(engine: _holder.engine, cache: _cache);
+    final batch = await showCacheProgressDialog(
+      context,
+      title: '缓存整本',
+      totalChapters: result.chapters.length,
+      run: (onProgress, isCancelled) => service.cacheChapters(
+        source: widget.source,
+        chapters: result.chapters,
+        bookKey: bookKeyFor(widget.detailUrl),
+        fromIndex: 0,
+        toIndex: result.chapters.length - 1,
+        bookName: result.info.name.trim().isEmpty ? _title : result.info.name.trim(),
+        sourceName: widget.source.name,
+        detailUrl: widget.detailUrl,
+        cache: _cache,
+        onProgress: onProgress,
+        isCancelled: isCancelled,
+      ),
+    );
+    if (!mounted || batch == null) return;
+    await _reloadProgress();
+    if (!mounted) return;
+    final rejected = batch.rejectedReason;
+    if (rejected != null) {
+      AppSnack.show(
+        context,
+        '$rejected（本次已缓存 ${batch.saved} 章）',
+        kind: SnackKind.error,
+      );
+      return;
+    }
+    if (batch.cancelled) {
+      AppSnack.show(context, '已取消，本次缓存 ${batch.saved} 章');
+      return;
+    }
+    AppSnack.show(
+      context,
+      '已缓存 ${batch.saved} 章（失败 ${batch.failed}）'
+      '${batch.skipped > 0 ? '，${batch.skipped} 章本来就有' : ''}',
+      kind: batch.failed > 0 ? SnackKind.error : SnackKind.info,
     );
   }
 
@@ -367,6 +453,13 @@ class _BookDetailPageState extends State<BookDetailPage> {
                 : '${result.volumes!.length} 卷',
             style: kTypeBodyS.copyWith(color: kInkGray50),
           ),
+          const Spacer(),
+          // 有缓存才显示，没有就不占地方
+          if (_cacheStats.hasCache)
+            Text(
+              _cacheStats.label,
+              style: kTypeBodyS.copyWith(color: context.palette.accentDeep),
+            ),
         ],
       ),
     );
@@ -536,6 +629,17 @@ class _BookDetailPageState extends State<BookDetailPage> {
               child: Text(_onShelf ? '已在书架' : '加入书架'),
             ),
           ),
+          const SizedBox(width: kSpace8),
+          Expanded(
+            flex: 2,
+            child: OutlinedButton(
+              onPressed: _cacheWholeBook,
+              style: OutlinedButton.styleFrom(
+                minimumSize: const Size(0, 48),
+              ),
+              child: const Text('缓存整本'),
+            ),
+          ),
         ],
       ),
     );
@@ -561,4 +665,119 @@ class _TocRow {
 
   factory _TocRow.chapter(TocChapter chapter, int index) =>
       _TocRow._(chapter: chapter, chapterIndex: index);
+}
+
+// ==================== 缓存进度对话框 ====================
+
+/// 弹「缓存进度」对话框：正常完成返回批次结果，任务失败返回空结果。
+///
+/// 为什么对话框自己跑任务（而不是页面跑完再弹）：只有这样才能把「取消」
+/// 真正传到 [BookContentService.cacheChapters] 的 `isCancelled` —— 页面侧
+/// `await` 一个 `showDialog` 的同时拿不到这次任务的句柄。
+Future<CacheBatchResult?> showCacheProgressDialog(
+  BuildContext context, {
+  required String title,
+  required int totalChapters,
+  required Future<CacheBatchResult> Function(
+    void Function(int done, int total) onProgress,
+    bool Function() isCancelled,
+  ) run,
+}) {
+  return showDialog<CacheBatchResult>(
+    context: context,
+    barrierDismissible: false,
+    builder: (_) => _CacheProgressDialog(
+      title: title,
+      totalChapters: totalChapters,
+      run: run,
+    ),
+  );
+}
+
+class _CacheProgressDialog extends StatefulWidget {
+  final String title;
+  final int totalChapters;
+
+  /// `(onProgress, isCancelled) → 批次结果`。
+  final Future<CacheBatchResult> Function(
+    void Function(int done, int total) onProgress,
+    bool Function() isCancelled,
+  ) run;
+
+  const _CacheProgressDialog({
+    required this.title,
+    required this.totalChapters,
+    required this.run,
+  });
+
+  @override
+  State<_CacheProgressDialog> createState() => _CacheProgressDialogState();
+}
+
+class _CacheProgressDialogState extends State<_CacheProgressDialog> {
+  int _done = 0;
+  bool _cancelRequested = false;
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_run());
+  }
+
+  Future<void> _run() async {
+    CacheBatchResult result;
+    try {
+      result = await widget.run((done, _) {
+        if (!mounted) return;
+        setState(() => _done = done);
+      }, () => _cancelRequested);
+    } catch (_) {
+      result = const CacheBatchResult.empty();
+    }
+    if (!mounted) return;
+    Navigator.of(context).pop(result);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final total = widget.totalChapters;
+    return PopScope(
+      // 返回键也不许直接关：关了任务还在后台跑，用户会以为已经停了
+      canPop: false,
+      child: AlertDialog(
+        title: Text(widget.title),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            LinearProgressIndicator(
+              value: total > 0 ? (_done / total).clamp(0.0, 1.0) : null,
+              minHeight: 6,
+              backgroundColor: kRule,
+            ),
+            const SizedBox(height: kSpace12),
+            Text(
+              total > 0 ? '正在缓存 $_done/$total 章' : '正在缓存…',
+              style: kTypeBodyS.copyWith(color: kInkGray70),
+            ),
+            if (_cancelRequested) ...[
+              const SizedBox(height: kSpace4),
+              Text(
+                '正在停止（当前这一章存完就停）…',
+                style: kTypeBodyS.copyWith(color: kInkGray50),
+              ),
+            ],
+          ],
+        ),
+        actions: [
+          TextButton(
+            onPressed: _cancelRequested
+                ? null
+                : () => setState(() => _cancelRequested = true),
+            child: Text(_cancelRequested ? '正在取消…' : '取消'),
+          ),
+        ],
+      ),
+    );
+  }
 }

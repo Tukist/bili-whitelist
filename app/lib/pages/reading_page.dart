@@ -6,6 +6,7 @@ import '../models/book_source.dart';
 import '../services/book_rule/engine_holder.dart';
 import '../services/book_source_store.dart';
 import '../services/bookshelf_store.dart';
+import '../services/chapter_cache_store.dart';
 import '../theme/app_palette.dart';
 import '../theme/app_tokens.dart';
 import '../widgets/app_snack.dart';
@@ -38,11 +39,15 @@ class ReadingPage extends StatefulWidget {
   /// 测试注入：规则引擎宿主（默认 [RuleEngineHolder.instance]）。
   final RuleEngineHolder? holder;
 
+  /// 测试注入：章节离线缓存（默认 [ChapterCacheStore.instance]）。
+  final ChapterCacheStore? cacheStore;
+
   const ReadingPage({
     super.key,
     this.store,
     this.shelfStore,
     this.holder,
+    this.cacheStore,
   });
 
   @override
@@ -59,8 +64,12 @@ class ReadingPageState extends State<ReadingPage> {
   /// 每本书的进度（key = `bookKeyFor(detailUrl)`）。
   Map<String, ReadingProgress> _progressByKey = const {};
 
+  /// 每本书的离线缓存统计（没有缓存的书不会进这张表）。
+  Map<String, CacheStats> _cacheStatsByKey = const {};
+
   BookSourceStore get _store => widget.store ?? BookSourceStore.instance;
   BookshelfStore get _shelf => widget.shelfStore ?? BookshelfStore.instance;
+  ChapterCacheStore get _cache => widget.cacheStore ?? ChapterCacheStore.instance;
 
   @override
   void initState() {
@@ -77,15 +86,21 @@ class ReadingPageState extends State<ReadingPage> {
     final sources = await _store.getAll();
     final books = await _shelf.getBooks();
     final progress = <String, ReadingProgress>{};
+    final cacheStats = <String, CacheStats>{};
     for (final book in books) {
       final p = await _shelf.getProgress(book.detailUrl);
       if (p != null) progress[book.key] = p;
+      // 只留「有缓存」的书：没缓存的书不该在书架上多出一行 0/0，
+      // 那只会让每一行都变长、还什么都说明不了。
+      final c = await _cache.stats(book.key);
+      if (c.hasCache) cacheStats[book.key] = c;
     }
     if (!mounted) return;
     setState(() {
       _sources = sources;
       _books = books;
       _progressByKey = progress;
+      _cacheStatsByKey = cacheStats;
     });
   }
 
@@ -148,6 +163,7 @@ class ReadingPageState extends State<ReadingPage> {
           initialIndex: progress?.chapterIndex ?? 0,
           holder: widget.holder,
           shelfStore: widget.shelfStore,
+          cacheStore: widget.cacheStore,
         ),
       ),
     );
@@ -381,6 +397,25 @@ class ReadingPageState extends State<ReadingPage> {
                       color: context.palette.accentDeep,
                     ),
                   ),
+                  if (_cacheStatsByKey[book.key] != null) ...[
+                    const SizedBox(height: kSpace2),
+                    Row(
+                      children: [
+                        Icon(
+                          Icons.offline_pin_outlined,
+                          size: 13,
+                          color: kInkGray50,
+                        ),
+                        const SizedBox(width: kSpace4),
+                        Text(
+                          _cacheStatsByKey[book.key]!.label,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: kTypeBodyS.copyWith(color: kInkGray50),
+                        ),
+                      ],
+                    ),
+                  ],
                 ],
               ),
             ),

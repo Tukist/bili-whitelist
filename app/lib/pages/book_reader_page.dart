@@ -5,6 +5,13 @@
 /// - `SingleChildScrollView`：整章是一个连续文本块，不需要懒加载（一章几万字
 ///   对 Flutter 的文本排版毫无压力），换来「选中文本可跨段拖动」。
 ///
+/// ## 「点正文呼出控制层」为什么要两条路
+/// 外层 `GestureDetector.onTap` 只兜得住「点在空白 / 行尾」——点在字形上时
+/// 手势竞技场里 `SelectableText` 的选择识别器先赢，外层根本收不到点击。
+/// 所以正文的 `SelectableText` 自己挂了 `onTap: _toggleControls`（Flutter 给
+/// 它留的官方钩子，在 `onSingleTapUp` 里回调）；长按选中走的是另一条识别器，
+/// 不冲突。**不要**为了省事把正文换成不可选中的 `Text`。
+///
 /// ## 为什么不支持左右滑动切换章节
 /// 横滑手势会和「长按选中文本后拖动选择区」冲突（拖动选择手柄时页面跟着
 /// 翻章，用户会以为选中范围乱了）。所以本页**不做**横滑翻章，只给按钮。
@@ -25,9 +32,17 @@ import '../services/book_detail_service.dart';
 import '../services/book_rule/engine_holder.dart';
 import '../services/book_rule/rule_engine.dart';
 import '../services/bookshelf_store.dart';
+import '../services/chapter_cache_store.dart';
 import '../theme/app_palette.dart';
 import '../theme/app_tokens.dart';
+import '../widgets/app_snack.dart';
 import '../widgets/app_state_view.dart';
+
+/// 进度条**填充段**的 key（测试用：断言它真的有非零尺寸）。
+///
+/// 为什么要把 key 暴露成常量：填充段的经典 bug 是「数值对、画不出来」——
+/// 光断言语义标签或 `widthFactor` 都抓不到，必须能量到一个真实尺寸的盒子。
+const Key kReaderProgressFillKey = ValueKey<String>('reader-progress-fill');
 
 class BookReaderPage extends StatefulWidget {
   final BookSource source;
@@ -56,6 +71,9 @@ class BookReaderPage extends StatefulWidget {
   /// 测试注入：书架 / 进度存储。
   final BookshelfStore? shelfStore;
 
+  /// 测试注入：章节离线缓存（默认 [ChapterCacheStore.instance]）。
+  final ChapterCacheStore? cacheStore;
+
   const BookReaderPage({
     super.key,
     required this.source,
@@ -67,6 +85,7 @@ class BookReaderPage extends StatefulWidget {
     this.contentService,
     this.detailService,
     this.shelfStore,
+    this.cacheStore,
   });
 
   @override
@@ -93,8 +112,28 @@ class _BookReaderPageState extends State<BookReaderPage> {
   /// 滚动停止后延迟保存（防止每一帧都写盘）。
   Timer? _saveTimer;
 
+  /// 阅读进度（0~1）。用 [ValueNotifier] + 局部重建而不是每帧 `setState`：
+  /// 滚动时整页重建 `SelectableText` 会掉帧，而进度条只要它自己那一小块。
+  final ValueNotifier<double> _readingProgress = ValueNotifier<double>(0);
+
+  /// 批量缓存状态（进度条那一行 / 取消按钮用）。
+  bool _caching = false;
+  int _cacheDone = 0;
+  int _cacheTotal = 0;
+  bool _cacheCancelRequested = false;
+
+  /// 这本书的离线缓存统计（底部「缓存」按钮显示「已缓存 N/M」用）。
+  ///
+  /// 数字来自 [ChapterCacheStore.stats]，以清单为准；读失败时 store 自己会
+  /// 回 [CacheStats.empty]，这里不需要再兜一层 try。
+  CacheStats _cacheStats = CacheStats.empty;
+
   RuleEngineHolder get _holder => widget.holder ?? RuleEngineHolder.instance;
   BookshelfStore get _store => widget.shelfStore ?? BookshelfStore.instance;
+  ChapterCacheStore get _cache => widget.cacheStore ?? ChapterCacheStore.instance;
+
+  /// 这本书在缓存里的唯一键（与书架同一套归一化规则）。
+  String get _bookKey => bookKeyFor(widget.detailUrl);
 
   BookContentService get _service =>
       widget.contentService ?? BookContentService(engine: _holder.engine);
@@ -122,6 +161,7 @@ class _BookReaderPageState extends State<BookReaderPage> {
     unawaited(_saveProgress());
     _holder.reset();
     _scroll.dispose();
+    _readingProgress.dispose();
     super.dispose();
   }
 
@@ -213,6 +253,9 @@ class _BookReaderPageState extends State<BookReaderPage> {
       final result = await _service.loadContent(
         source: widget.source,
         chapter: chapter,
+        cache: _cache,
+        bookKey: _bookKey,
+        chapterIndex: _clampIndex(index),
       );
       if (!mounted || token != _loadToken) return;
       setState(() {
@@ -223,8 +266,12 @@ class _BookReaderPageState extends State<BookReaderPage> {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted || token != _loadToken) return;
         _applyOffset(restoreOffset ?? 0);
+        _updateProgress();
         unawaited(_saveProgress());
       });
+      // 顺手刷一次缓存统计：章节可能是刚写进缓存的（正文服务命中缓存后
+      // 回填），也可能用户在别的页面清过，每次进章都重新问一遍最省心。
+      unawaited(_refreshCacheStats());
     } catch (e) {
       if (!mounted || token != _loadToken) return;
       setState(() {
@@ -255,11 +302,28 @@ class _BookReaderPageState extends State<BookReaderPage> {
 
   void _onScroll() {
     if (!_scroll.hasClients) return;
+    _updateProgress();
     _saveTimer?.cancel();
     // 停止滚动 1.5 秒后保存（连续滚动时只在最后一次触发写盘）
     _saveTimer = Timer(const Duration(milliseconds: 1500), () {
       unawaited(_saveProgress());
     });
+  }
+
+  /// 重算进度条数值（滚动 / 切章 / 布局完成后调）。
+  ///
+  /// `maxScrollExtent <= 0`（内容不满一屏 / 还没布局）时章内比例记 0 —— 除以 0
+  /// 会得到 NaN，`LinearProgress` 类的组件拿到 NaN 会直接画崩。
+  void _updateProgress() {
+    if (!mounted) return;
+    final offset = _scroll.hasClients ? _scroll.offset : 0.0;
+    final max = _scroll.hasClients ? _scroll.position.maxScrollExtent : 0.0;
+    _readingProgress.value = computeReadingProgress(
+      _clampIndex(_index),
+      _chapters.length,
+      offset,
+      max,
+    );
   }
 
   Future<void> _saveProgress() async {
@@ -287,6 +351,7 @@ class _BookReaderPageState extends State<BookReaderPage> {
     await _saveProgress();
     if (!mounted) return;
     setState(() => _index = index);
+    _updateProgress();
     await _load(index);
     if (!mounted) return;
     setState(() => _controlsVisible = true);
@@ -364,6 +429,131 @@ class _BookReaderPageState extends State<BookReaderPage> {
       ),
     );
     if (picked != null) await _goTo(picked);
+  }
+
+  // ==================== 离线缓存 ====================
+
+  /// 刷新这本书的缓存统计（底部按钮标签用）。
+  ///
+  /// 静默失败：拿不到统计就当没有缓存 —— 按钮退回「缓存」文案，比抛错或
+  /// 转圈卡住更合适（统计只是装饰，不影响能不能点）。
+  Future<void> _refreshCacheStats() async {
+    final stats = await _cache.stats(_bookKey);
+    if (!mounted) return;
+    if (stats.cachedChapters == _cacheStats.cachedChapters &&
+        stats.totalChapters == _cacheStats.totalChapters) {
+      return; // 没变就不重建
+    }
+    setState(() => _cacheStats = stats);
+  }
+
+  /// 缓存菜单：本章 / 从本章到最后一章。
+  Future<void> _showCacheMenu() async {
+    if (_chapters.isEmpty) {
+      AppSnack.show(context, '目录还没加载出来，暂时无法缓存');
+      return;
+    }
+    if (_caching) {
+      AppSnack.show(context, '正在缓存，先等这一批完成');
+      return;
+    }
+    // 「剩余」从当前章算到最后一章（当前章通常已在缓存里，会被跳过）
+    final remaining = _chapters.length - _clampIndex(_index);
+    final choice = await showModalBottomSheet<int>(
+      context: context,
+      backgroundColor: kPaperRaised,
+      builder: (sheetContext) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.download_for_offline_outlined),
+              title: const Text('缓存本章'),
+              subtitle: Text(_currentChapter?.name ?? ''),
+              onTap: () => Navigator.of(sheetContext).pop(0),
+            ),
+            ListTile(
+              leading: const Icon(Icons.move_to_inbox_outlined),
+              title: Text('缓存剩余 $remaining 章'),
+              subtitle: const Text('从当前章缓存到最后一章'),
+              // 只剩当前这一章时它和「缓存本章」是同一件事
+              enabled: remaining > 1,
+              onTap: remaining > 1
+                  ? () => Navigator.of(sheetContext).pop(1)
+                  : null,
+            ),
+          ],
+        ),
+      ),
+    );
+    if (choice == null || !mounted) return;
+    await _startCache(
+      _clampIndex(_index),
+      choice == 0 ? _clampIndex(_index) : _chapters.length - 1,
+    );
+  }
+
+  /// 跑一批缓存，并在底部控制条里显示「正在缓存 x/y」+ 取消。
+  Future<void> _startCache(int from, int to) async {
+    if (_caching || _chapters.isEmpty) return;
+    setState(() {
+      _caching = true;
+      _cacheDone = 0;
+      _cacheTotal = to - from + 1;
+      _cacheCancelRequested = false;
+    });
+    CacheBatchResult result;
+    try {
+      result = await _service.cacheChapters(
+        source: widget.source,
+        chapters: _chapters,
+        bookKey: _bookKey,
+        fromIndex: from,
+        toIndex: to,
+        bookName: widget.bookName,
+        sourceName: widget.source.name,
+        detailUrl: widget.detailUrl,
+        cache: _cache,
+        onProgress: (done, total) {
+          if (!mounted) return;
+          setState(() {
+            _cacheDone = done;
+            _cacheTotal = total;
+          });
+        },
+        isCancelled: () => _cacheCancelRequested,
+      );
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _caching = false);
+      unawaited(_refreshCacheStats());
+      AppSnack.show(context, '缓存失败：${_describe(e)}', kind: SnackKind.error);
+      return;
+    }
+    if (!mounted) return;
+    setState(() => _caching = false);
+    // 这一批不管成功 / 取消 / 被拒，都可能已经写进去几章，标签必须跟着变
+    unawaited(_refreshCacheStats());
+
+    final rejected = result.rejectedReason;
+    if (rejected != null) {
+      AppSnack.show(
+        context,
+        '$rejected（本次已缓存 ${result.saved} 章）',
+        kind: SnackKind.error,
+      );
+      return;
+    }
+    if (result.cancelled) {
+      AppSnack.show(context, '已取消，本次缓存 ${result.saved} 章');
+      return;
+    }
+    AppSnack.show(
+      context,
+      '已缓存 ${result.saved} 章（失败 ${result.failed}）'
+      '${result.skipped > 0 ? '，${result.skipped} 章本来就有' : ''}',
+      kind: result.failed > 0 ? SnackKind.error : SnackKind.info,
+    );
   }
 
   // ==================== 配色 ====================
@@ -489,7 +679,12 @@ class _BookReaderPageState extends State<BookReaderPage> {
     }
 
     return GestureDetector(
-      // 点正文区域（非文本选中手势落点）呼出/隐藏控制层
+      // 点正文区域呼出/隐藏控制层。这是**兜底**：点在文字之间的空白、
+      // 行尾留白、段落外的垂直间隙时由它接住。
+      //
+      // 点在字形上时事件会被 `SelectableText` 自己的选择手势吃掉（手势竞技场
+      // 里内层先赢），所以正文的 `SelectableText` 另外挂了一个 `onTap`
+      // ——见下面的注释。
       behavior: HitTestBehavior.translucent,
       onTap: _toggleControls,
       child: SingleChildScrollView(
@@ -503,6 +698,13 @@ class _BookReaderPageState extends State<BookReaderPage> {
           children: [
             SelectableText(
               content.body,
+              // 为什么用 `SelectableText.onTap` 而不是外层手势：
+              // 1. 它是 Flutter 官方给 `SelectableText` 留的「点一下」钩子
+              //    （`_SelectableTextSelectionGestureDetectorBuilder
+              //    .onSingleTapUp` 里回调），单击点中字形时**必定**触发；
+              // 2. 长按选中 / 拖动选择手柄走的是另一条识别器，完全不受影响；
+              // 3. 不用自己搭手势竞技场，也不用把正文降级成不可选中的 `Text`。
+              onTap: _toggleControls,
               style: TextStyle(
                 fontSize: _settings.fontSize,
                 height: _settings.lineHeight,
@@ -557,10 +759,26 @@ class _BookReaderPageState extends State<BookReaderPage> {
               style: kTypeBody.copyWith(color: foreground),
             ),
           ),
+          // 「离线」小标记：只说明这一章来自缓存，不占地方也不喧哗
+          if (_content?.fromCache == true)
+            Padding(
+              padding: const EdgeInsets.only(right: kSpace4),
+              child: Text(
+                '离线',
+                style: kTypeBodyS.copyWith(
+                  color: foreground.withValues(alpha: .55),
+                ),
+              ),
+            ),
           IconButton(
             tooltip: '目录',
             icon: Icon(Icons.list, color: foreground),
             onPressed: _showDirectory,
+          ),
+          IconButton(
+            tooltip: '缓存',
+            icon: Icon(Icons.cloud_download_outlined, color: foreground),
+            onPressed: _showCacheMenu,
           ),
         ],
       ),
@@ -580,11 +798,17 @@ class _BookReaderPageState extends State<BookReaderPage> {
     // 用 padding 会让内容重新滑到导航栏下面。
     final bottomInset = MediaQuery.viewPaddingOf(context).bottom;
     return Container(
-      color: background.withValues(alpha: .94),
+      // **不透明**：半透明（原来是 .94）时背后正文会透上来，尤其是滚动到
+      // 段落中间、缓存进度行多占一行的时候，能看到一团「鬼影」压在按钮后面。
+      // 底色本来就是纸色，直接铺实与四周没有色差，不需要模糊滤镜（
+      // backdropFilter 每帧都要抓背后图层，性能和观感都不划算）。
+      color: background,
       padding: EdgeInsets.only(bottom: kSpace16 + bottomInset, top: kSpace4),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
+          _progressBar(context),
+          if (_caching) _cachingRow(context, foreground),
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
             children: [
@@ -612,8 +836,12 @@ class _BookReaderPageState extends State<BookReaderPage> {
               ),
             ],
           ),
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
+          // 字号 + 主题 + 缓存。用 `Wrap` 而不是 `Row`：缓存按钮要显示
+          // 「已缓存 120/120」这种会变长的标签，窄屏（320dp）上 Row 必定
+          // 溢出（黄黑条）；Wrap 超了会自动折到下一行，控制条变高但不出错。
+          Wrap(
+            alignment: WrapAlignment.center,
+            crossAxisAlignment: WrapCrossAlignment.center,
             children: [
               TextButton(
                 onPressed: () => _changeFont(-1),
@@ -635,7 +863,7 @@ class _BookReaderPageState extends State<BookReaderPage> {
                   style: TextStyle(fontSize: 18, color: foreground),
                 ),
               ),
-              const SizedBox(width: kSpace16),
+              _cacheButton(foreground),
               IconButton(
                 tooltip: '阅读主题：${_themeLabel(_settings.theme)}',
                 icon: Icon(_themeIcon(_settings.theme), color: foreground),
@@ -645,6 +873,115 @@ class _BookReaderPageState extends State<BookReaderPage> {
           ),
         ],
       ),
+    );
+  }
+
+  /// 底部控制条上的「缓存」入口。
+  ///
+  /// 为什么还要在底部放一个：顶栏那个云下载图标是「顺手做的」，用户按需求
+  /// 在控制层里找「缓存」会找不到 —— 阅读器的主要操作都在底部，缓存属于
+  /// 阅读态操作，就该在这儿。顶栏图标保留（两条路都通，也保住既有测试）。
+  ///
+  /// 标签三态：缓存中 → 「缓存中」；有缓存 → 「已缓存 N/M」；没有 → 「缓存」。
+  /// 这里**故意**不用 [CircularProgressIndicator]：它是一段无限动画，
+  /// widget 测试里 `pumpAndSettle` 会一直等下去（超时失败）。
+  ///
+  /// 也**故意**不用 `TextButton.icon`：它返回的是私有子类 `_TextButtonWithIcon`，
+  /// `find.byType(TextButton)`（精确匹配运行时类型）找不到它，测试要么写
+  /// predicate 要么只能靠 tooltip，容易失配。这里直接给 `TextButton` + 一行
+  /// `Row`，类型干净、也方便断言。
+  Widget _cacheButton(Color foreground) {
+    final stats = _cacheStats;
+    final label = _caching
+        ? '缓存中'
+        : stats.hasCache
+            ? (stats.totalChapters > 0
+                ? '已缓存 ${stats.cachedChapters}/${stats.totalChapters}'
+                : '已缓存 ${stats.cachedChapters} 章')
+            : '缓存';
+    return TextButton(
+      onPressed: _showCacheMenu,
+      style: TextButton.styleFrom(foregroundColor: foreground),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(
+            _caching
+                ? Icons.downloading_outlined
+                : Icons.download_for_offline_outlined,
+            size: 18,
+            color: foreground,
+          ),
+          const SizedBox(width: kSpace4),
+          Text(label),
+        ],
+      ),
+    );
+  }
+
+  /// 阅读进度细线（2dp）。
+  ///
+  /// 为什么不写文字百分比：阅读页的卖点是「素净」，多一行数字会把注意力从
+  /// 正文上拽走。可读性交给无障碍 —— [Semantics] 里给「第 N 章 / 共 M 章、
+  /// 本章 xx%」。
+  Widget _progressBar(BuildContext context) {
+    final palette = context.palette;
+    return ValueListenableBuilder<double>(
+      valueListenable: _readingProgress,
+      builder: (context, value, _) {
+        final total = _chapters.length;
+        final index = _clampIndex(_index) + 1;
+        return Semantics(
+          label: total <= 0
+              ? '阅读进度未知'
+              : '阅读进度 ${(value * 100).round()}%，第 $index 章，共 $total 章',
+          child: SizedBox(
+            height: 2,
+            width: double.infinity,
+            child: Stack(
+              children: [
+                ColoredBox(color: kRule, child: const SizedBox.expand()),
+                // 填充条：**必须**再套一层 SizedBox.expand。
+                // `FractionallySizedBox` 只把**宽度**收成紧约束，高度原样
+                // 下传（这里是 0..2 的松约束）；而 `ColoredBox` 是
+                // `RenderProxyBox`，没有子节点时取 `constraints.smallest`
+                // → 高度 0 → 高度为 0 的盒子不绘制，进度条永远只有灰轨道。
+                FractionallySizedBox(
+                  alignment: Alignment.centerLeft,
+                  widthFactor: value,
+                  child: SizedBox.expand(
+                    key: kReaderProgressFillKey,
+                    child: ColoredBox(color: palette.accent),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  /// 缓存进行中：一行进度 + 取消。
+  Widget _cachingRow(BuildContext context, Color foreground) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: [
+        Text(
+          '正在缓存 $_cacheDone/$_cacheTotal',
+          style: kTypeBodyS.copyWith(color: foreground),
+        ),
+        TextButton(
+          onPressed: _cacheCancelRequested
+              ? null
+              : () => setState(() => _cacheCancelRequested = true),
+          style: TextButton.styleFrom(
+            foregroundColor: foreground,
+            disabledForegroundColor: foreground.withValues(alpha: .35),
+          ),
+          child: const Text('取消'),
+        ),
+      ],
     );
   }
 
@@ -664,4 +1001,33 @@ class _BookReaderPageState extends State<BookReaderPage> {
 String _describe(Object error) {
   if (error is RuleEngineException) return error.message;
   return '${error.runtimeType}';
+}
+
+/// 全书阅读进度（0~1，**纯函数**）。
+///
+/// `(章下标 + 章内比例) / 总章数`，其中章内比例 = `offset / maxScrollExtent`。
+///
+/// 三处必须兜底的边界（都是真机上会出现的）：
+/// - `totalChapters <= 0`：目录还没加载出来 → 0；
+/// - `maxScrollExtent <= 0`：本章不满一屏（短章 / 刚布局完）→ 章内比例记 0，
+///   否则 `x / 0` 会得到 `Infinity` 或 `NaN`，进度条直接画崩；
+/// - offset 越界（切换字号后内容变矮，旧 offset 比 max 大）→ 夹到 `[0, 1]`。
+double computeReadingProgress(
+  int chapterIndex,
+  int totalChapters,
+  double offset,
+  double maxScrollExtent,
+) {
+  if (totalChapters <= 0) return 0;
+  final index = chapterIndex < 0 ? 0 : chapterIndex;
+  var within = 0.0;
+  if (maxScrollExtent > 0 &&
+      offset.isFinite &&
+      maxScrollExtent.isFinite &&
+      offset > 0) {
+    within = (offset / maxScrollExtent).clamp(0.0, 1.0);
+  }
+  final value = (index + within) / totalChapters;
+  if (!value.isFinite) return 0;
+  return value.clamp(0.0, 1.0);
 }

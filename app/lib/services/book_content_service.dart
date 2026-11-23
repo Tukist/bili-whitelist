@@ -22,6 +22,7 @@ import 'book_detail_service.dart' show TocChapter;
 import 'book_rule/legado_compat.dart';
 import 'book_rule/rule_engine.dart';
 import 'book_rule/selector.dart';
+import 'chapter_cache_store.dart';
 
 /// 正文加载结果。
 class BookContentResult {
@@ -40,12 +41,19 @@ class BookContentResult {
   /// 给用户看的一句话（分页失败 / 正文规则为空 / 解码疑似乱码）。
   final String? warning;
 
+  /// 这一章是不是**从离线缓存读出来的**（阅读页据此显示「离线」小标记）。
+  ///
+  /// 缓存命中时 [pageCount] 恒为 1、[partial] 为 false、[warning] 为 null：
+  /// 缓存里存的是当初清洗完的成品，没有「第几页」「站点怎么了」这些现场信息。
+  final bool fromCache;
+
   const BookContentResult({
     required this.title,
     required this.body,
     this.pageCount = 1,
     this.partial = false,
     this.warning,
+    this.fromCache = false,
   });
 
   bool get isEmpty => body.trim().isEmpty;
@@ -55,19 +63,43 @@ class BookContentResult {
 class BookContentService {
   final BookRuleEngine engine;
 
-  BookContentService({required this.engine});
+  /// 离线缓存（null → [ChapterCacheStore.instance]；测试可注入临时目录的实例）。
+  final ChapterCacheStore? cache;
+
+  BookContentService({required this.engine, this.cache});
 
   /// 同章最多翻几页（硬上限，防「下一页」永远翻不完）。
   static const int maxContentPages = 10;
+
+  /// 批量缓存时章与章之间的兜底间隔（书源自己没写 `requestIntervalMs` 时用）。
+  ///
+  /// 为什么默认要歇一下：连续几百个请求不做间隔，站点很容易直接封 IP /
+  /// 返回验证码页，一次「缓存整本」把用户的书源打死。200ms 对整本缓存只是
+  /// 多花几十秒，换来的是站点把这一批请求当正常阅读。
+  static const Duration defaultCacheInterval = Duration(milliseconds: 200);
+
+  ChapterCacheStore get _cacheStore => cache ?? ChapterCacheStore.instance;
 
   /// 加载一章正文。
   ///
   /// **第一页就失败时抛 [RuleEngineException]**：阅读页需要把「没内容」与
   /// 「只拿到一部分」分开显示 —— 前者给错误 + 重试，后者照常阅读 + 提示。
   /// 后面几页失败不抛，写进 [BookContentResult.partial] / `warning`。
+  ///
+  /// ## 离线缓存（[preferCache]）
+  /// - 传了 [bookKey] 与 [chapterIndex] 时先查缓存：命中直接返回
+  ///   （[BookContentResult.fromCache] = true），**一个网络请求都不发**；
+  /// - 没命中走原有抓取流程，成功后**顺手回写**缓存（阅读即缓存，用户不必
+  ///   先手动点「缓存」才能离线看当前这章）。回写失败静默 —— 用户此刻要的是
+  ///   正文，不是一条「缓存失败」的提示；
+  /// - `bookKey` / `chapterIndex` 为空则不碰缓存（详情页 / 搜索预览等场景）。
   Future<BookContentResult> loadContent({
     required BookSource source,
     required TocChapter chapter,
+    bool preferCache = true,
+    ChapterCacheStore? cache,
+    String? bookKey,
+    int? chapterIndex,
   }) async {
     final rule = source.content;
     final chapterUrl = chapter.url.trim();
@@ -77,6 +109,22 @@ class BookContentService {
         RuleErrorKind.empty,
         '这一章没有可用的地址（目录规则可能取错了）',
       );
+    }
+
+    final store = cache ?? _cacheStore;
+    final key = (bookKey ?? '').trim();
+    final canCache = key.isNotEmpty && chapterIndex != null;
+
+    // ① 先查缓存：命中就到此为止（不建请求、不解析规则）
+    if (preferCache && canCache) {
+      final cached = await store.readChapter(
+        key,
+        chapterIndex,
+        chapterUrl: chapterUrl,
+      );
+      if (cached != null && cached.trim().isNotEmpty) {
+        return BookContentResult(title: title, body: cached, fromCache: true);
+      }
     }
 
     final warnings = <String>[];
@@ -170,12 +218,134 @@ class BookContentService {
       );
     }
 
+    // ② 在线读到就顺手存一份：下次进这章直接离线可读。
+    //    只写「完整章」（partial 的残章别把缺页状态一起固化下来）。
+    if (preferCache && canCache && !partial) {
+      await store.saveChapter(
+        key,
+        chapterIndex,
+        ChapterCacheEntry(name: title, url: chapterUrl, body: body),
+        sourceName: source.name,
+      );
+    }
+
     return BookContentResult(
       title: title,
       body: body,
       pageCount: usedPages < 1 ? 1 : usedPages,
       partial: partial,
       warning: warnings.isEmpty ? null : warnings.join('；'),
+    );
+  }
+
+  /// 批量缓存一段章节（串行、可取消、单章失败跳过）。
+  ///
+  /// 与 [loadContent] 的区别：这里**不吞任何失败原因**。撞上限要立刻停下来并
+  /// 把原因带回去（继续跑只会白打几百个网络请求，还什么都存不下）。
+  ///
+  /// 参数 [fromIndex] / [toIndex] 是闭区间；越界自动夹取。[onProgress] 在每章
+  /// 处理完（含跳过）后回调一次，`done/total` 都是本次范围里的计数。
+  Future<CacheBatchResult> cacheChapters({
+    required BookSource source,
+    required List<TocChapter> chapters,
+    required String bookKey,
+    int fromIndex = 0,
+    int? toIndex,
+    String bookName = '',
+    String sourceName = '',
+    String detailUrl = '',
+    ChapterCacheStore? cache,
+    void Function(int done, int total)? onProgress,
+    bool Function()? isCancelled,
+    Duration? interval,
+  }) async {
+    final store = cache ?? _cacheStore;
+    final key = bookKey.trim();
+    if (key.isEmpty || chapters.isEmpty) {
+      return const CacheBatchResult.empty();
+    }
+    var from = fromIndex < 0 ? 0 : fromIndex;
+    if (from >= chapters.length) from = chapters.length - 1;
+    var to = toIndex ?? chapters.length - 1;
+    if (to >= chapters.length) to = chapters.length - 1;
+    if (to < from) {
+      return const CacheBatchResult.empty();
+    }
+    final total = to - from + 1;
+    final gap = interval ??
+        (source.requestIntervalMs > 0
+            ? Duration(milliseconds: source.requestIntervalMs)
+            : defaultCacheInterval);
+
+    var saved = 0;
+    var failed = 0;
+    var skipped = 0;
+    var cancelled = false;
+    String? rejected;
+
+    for (var i = from; i <= to; i++) {
+      if (isCancelled?.call() ?? false) {
+        cancelled = true;
+        break;
+      }
+      final chapter = chapters[i];
+      // 已有缓存（且章节地址一致）就跳过：重抓一遍纯属浪费站点配额
+      final cached = await store.readChapter(key, i, chapterUrl: chapter.url);
+      if (cached != null && cached.trim().isNotEmpty) {
+        skipped++;
+      } else {
+        try {
+          // preferCache: false + 不传缓存实例：抓完由下面显式写，才能拿到
+          // 写失败的具体原因（上限 / IO），而不是被 loadContent 静默吞掉。
+          final result = await loadContent(
+            source: source,
+            chapter: chapter,
+            preferCache: false,
+            bookKey: key,
+            chapterIndex: i,
+          );
+          final write = await store.saveChapter(
+            key,
+            i,
+            ChapterCacheEntry(
+              name: chapter.name,
+              url: chapter.url,
+              body: result.body,
+            ),
+            bookName: bookName,
+            sourceName: sourceName,
+            detailUrl: detailUrl.isEmpty ? key : detailUrl,
+            totalChapters: chapters.length,
+          );
+          if (!write.ok) {
+            if (write.failure == CacheSaveFailure.quota) {
+              // 到上限就停：再跑下去一章都存不进，只会把站点打烦
+              rejected = write.message;
+              failed++;
+              onProgress?.call(saved + failed + skipped, total);
+              break;
+            }
+            failed++;
+          } else {
+            saved++;
+          }
+        } catch (_) {
+          // 单章失败跳过（站点偶发 500 / 规则只对个别页面失效），
+          // 让其余章照常缓存 —— 整批中止对用户毫无帮助。
+          failed++;
+        }
+      }
+      onProgress?.call(saved + failed + skipped, total);
+      if (i < to) await Future<void>.delayed(gap);
+    }
+
+    return CacheBatchResult(
+      total: total,
+      saved: saved,
+      failed: failed,
+      skipped: skipped,
+      cancelled: cancelled,
+      rejectedReason: rejected,
     );
   }
 
@@ -191,6 +361,46 @@ class BookContentService {
         .replaceAll('@page', '$page');
     return normalizeUrl(filled, chapterUrl);
   }
+}
+
+/// 批量缓存的结果（阅读页 / 详情页据此弹提示）。
+class CacheBatchResult {
+  /// 本次范围内的章数。
+  final int total;
+
+  /// 新写入缓存成功。
+  final int saved;
+
+  /// 抓取或写盘失败（跳过，不中止）。
+  final int failed;
+
+  /// 本来就有缓存、这次跳过没抓。
+  final int skipped;
+
+  /// 用户中途取消。
+  final bool cancelled;
+
+  /// 撞上限时停下并带回来的原因（null = 没撞上限）。
+  final String? rejectedReason;
+
+  const CacheBatchResult({
+    this.total = 0,
+    this.saved = 0,
+    this.failed = 0,
+    this.skipped = 0,
+    this.cancelled = false,
+    this.rejectedReason,
+  });
+
+  const CacheBatchResult.empty()
+      : total = 0,
+        saved = 0,
+        failed = 0,
+        skipped = 0,
+        cancelled = false,
+        rejectedReason = null;
+
+  int get done => saved + failed + skipped;
 }
 
 /// 段落还原（**纯函数**）：HTML 片段 → 纯文本。
