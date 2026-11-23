@@ -180,7 +180,7 @@ class LocalBook {
   final String name;
   final String author;
 
-  /// 格式：`txt` / `epub`（书架角标据此显示）。
+  /// 格式：`txt` / `epub` / `pdf` / `mobi`（书架角标据此显示）。
   final String format;
 
   /// 解码用的编码（`utf-8` / `gbk` / `utf-16le` …，见 `utils/text_decoding.dart`）。
@@ -1001,12 +1001,11 @@ String _baseName(String path) {
 /// 为什么去扩展名：书架上一行「斗破苍穹.txt」比「斗破苍穹」难看，而且用户
 /// 从文件名得到的书名通常就是书名本身。`xxx.txt.txt` 只去一层，避免把
 /// 书名里真的带点的书（《三体 2.黑暗森林.txt》）削掉后半截。
+///
+/// 后缀名单**只维护在 `titleFromFileName` 一处**（v2.74.0 加 MOBI 时就是
+/// 因为这里另抄了一份 txt/epub/pdf，书架上出现了「mobi_g_test.mobi」）。
 String _cleanName(String raw) {
-  var name = raw.trim();
-  final lower = name.toLowerCase();
-  if (lower.endsWith('.txt')) name = name.substring(0, name.length - 4).trim();
-  if (lower.endsWith('.epub')) name = name.substring(0, name.length - 5).trim();
-  if (lower.endsWith('.pdf')) name = name.substring(0, name.length - 4).trim();
+  var name = titleFromFileName(raw);
   if (name.isEmpty) name = raw.trim();
   return name.replaceAll(RegExp(r'\s+'), ' ');
 }

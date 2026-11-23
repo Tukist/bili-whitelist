@@ -2,7 +2,8 @@
 ///
 /// 流程固定成一条流水线，**全在这一层**，页面只负责「点按钮 → 转圈 → 看一句话」：
 /// 原生选文件 → 读字节 → `LocalBookParsers.dispatcher` 按扩展名选解析器
-/// → 解析（TXT 解码切章 / EPUB 解压取 spine / PDF 读页数并按页渲染封面）
+/// → 解析（TXT 解码切章 / EPUB 解压取 spine / PDF 读页数并按页渲染封面 /
+/// MOBI 解 PalmDOC 后按 HTML 启发式分章）
 /// → 落盘（[LocalBookStore]）
 /// → 上书架（[BookshelfStore]，`sourceName: 本地文件`、`detailUrl: local:<id>`）
 /// → 删掉原生留下的临时文件。
@@ -42,7 +43,7 @@ class PickedBookFile {
   /// 字节数（原生实际拷了多少）。
   final int sizeBytes;
 
-  /// 扩展名（小写、不含点；`txt` / `epub` / `pdf` / 空串）。
+  /// 扩展名（小写、不含点；`txt` / `epub` / `pdf` / `mobi` / 空串）。
   final String ext;
 
   const PickedBookFile({

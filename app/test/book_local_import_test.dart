@@ -15,6 +15,8 @@ import 'package:bili_whitelist_app/services/bookshelf_store.dart';
 import 'package:bili_whitelist_app/services/local_book_import_service.dart';
 import 'package:bili_whitelist_app/services/local_book_store.dart';
 
+import 'mobi_test_builder.dart';
+
 const String _utf8Book = '第一章 风起\n'
     'UTF-8 正文第一段。\n'
     '第二章 云涌\n'
@@ -362,14 +364,15 @@ void main() {
     });
 
     test('不支持的格式 → 一句「暂不支持 X 格式」，临时文件也清掉', () async {
-      // v2.74.0 起 PDF 已支持，这里换成还没有实现的 MOBI（语义词不变：
+      // v2.74.0 起 PDF / MOBI 都已支持，这里换成还没有实现的 UMD（语义词不变：
       // 「不支持的格式要给出支持列表 + 清掉临时文件」）
-      final file = await fakePicked('论文.mobi', const [1, 2, 3], ext: 'mobi');
+      final file = await fakePicked('论文.umd', const [1, 2, 3], ext: 'umd');
       final result = await service.pickAndImport();
 
       expect(result.isOk, isFalse);
       expect(result.error, contains('暂不支持'));
-      expect(result.error, contains('MOBI'));
+      expect(result.error, contains('UMD'));
+      expect(result.error, contains('MOBI'), reason: '支持列表要带上 MOBI');
       expect(file.existsSync(), isFalse);
     });
 
@@ -380,6 +383,50 @@ void main() {
       expect(result.isOk, isFalse);
       expect(result.error, contains('打不开'));
       expect(result.error, isNot(contains('Exception')));
+    });
+  });
+
+  group('MOBI 导入（G 批）', () {
+    List<int> buildMobi() => buildMobiBook(
+          dbName: '三章测试书',
+          exthAuthor: '测试作者',
+          html: '<h2>第一章 起风</h2><p>正文一。</p><mbp:pagebreak/>'
+              '<h2>第二章 落雨</h2><p>正文二。</p><mbp:pagebreak/>'
+              '<h2>第三章 转晴</h2><p>正文三。</p>',
+        );
+
+    test('落盘 format=mobi，书架名去掉 .mobi，目录与正文都对', () async {
+      final file = await fakePicked('三章.mobi', buildMobi(), ext: 'mobi');
+      final result = await service.pickAndImport();
+
+      expect(result.isOk, isTrue);
+      final book = result.book!;
+      expect(book.format, 'mobi');
+      expect(book.name, '三章', reason: '书名不能带 .mobi 后缀');
+      expect(book.author, '测试作者');
+      expect(book.chapterCount, 3);
+      expect(
+        book.chapters.map((c) => c.title).toList(),
+        <String>['第一章 起风', '第二章 落雨', '第三章 转晴'],
+      );
+      expect(await books.readChapter(book.id, 1), '第二章 落雨\n正文二。');
+
+      final shelved = await shelf.getBooks();
+      expect(shelved.single.detailUrl, 'local:${book.id}');
+      expect(shelved.single.chapterCount, 3);
+      expect(file.existsSync(), isFalse, reason: '原生临时文件要清掉');
+    });
+
+    test('同一个文件重复导入仍是同一本（id 由文件名 + 字节指纹决定）', () async {
+      final bytes = buildMobi();
+      await fakePicked('三章.mobi', bytes, ext: 'mobi');
+      final first = await service.pickAndImport();
+      await fakePicked('三章.mobi', bytes, ext: 'mobi');
+      final second = await service.pickAndImport();
+
+      expect(second.book!.id, first.book!.id);
+      expect((await shelf.getBooks()).length, 1);
+      expect((await books.getBooks()).length, 1);
     });
   });
 }

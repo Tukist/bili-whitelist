@@ -31,14 +31,15 @@ import 'book_source_page.dart';
 /// 3. **书架** —— 真读 [BookshelfStore]：封面 + 书名 + 作者 +「读到 第 N 章」，
 ///    点击直接进阅读页（有进度就定位），长按移除（二次确认）。
 ///
-/// ## E1（v2.72.0）新增「导入本地书」/ E3（v2.73.0）支持 EPUB / F1（v2.74.0）支持 PDF
-/// 手机里的 `.txt` / `.epub` / `.pdf` 不用书源也能读：拉起系统选择器 → 按扩展名选
-/// 解析器（`LocalBookParsers.dispatcher`：TXT 解码切章 / EPUB 解压取 spine /
-/// PDF 读页数、每页一张图）→ 落盘 → 上书架。整条链路在
-/// [LocalBookImportService] 里，页面只负责「转圈 + 说一句话」。
+/// ## E1（v2.72.0）新增「导入本地书」/ E3（v2.73.0）支持 EPUB /
+/// F1（v2.74.0）支持 PDF / G 批（v2.74.0）支持 MOBI
+/// 手机里的 `.txt` / `.epub` / `.pdf` / `.mobi` 不用书源也能读：拉起系统选择器 →
+/// 按扩展名选解析器（`LocalBookParsers.dispatcher`：TXT 解码切章 / EPUB 解压取 spine /
+/// PDF 读页数、每页一张图 / MOBI 解 PalmDOC 后按 HTML 启发式分章）→ 落盘 → 上书架。
+/// 整条链路在 [LocalBookImportService] 里，页面只负责「转圈 + 说一句话」。
 ///
-/// 书架行的「本地」角标之外还有**格式角标**（`TXT` / `EPUB`）与本地封面：
-/// 这两样只在 manifest 里（`ShelfBook` 是为网络书设计的，不加格式字段），
+/// 书架行的「本地」角标之外还有**格式角标**（`TXT` / `EPUB` / `PDF` / `MOBI`）与
+/// 本地封面：这两样只在 manifest 里（`ShelfBook` 是为网络书设计的，不加格式字段），
 /// 所以 [reload] 里顺手把本地 manifest 收进 `_localBooksById`。
 ///
 /// 书架为空时保留 R1 的空态文案（「导入书源后，在搜索里找书加入书架」）：
@@ -416,7 +417,7 @@ class ReadingPageState extends State<ReadingPage> {
           Text('阅读', style: theme.textTheme.titleSmall),
           const SizedBox(height: 2),
           Text(
-            '书源式阅读：导入书源找书，或直接导入本地 TXT / EPUB / PDF',
+            '书源式阅读：导入书源找书，或直接导入本地 TXT / EPUB / PDF / MOBI',
             style: theme.textTheme.bodySmall?.copyWith(
               color: theme.colorScheme.onSurfaceVariant,
             ),

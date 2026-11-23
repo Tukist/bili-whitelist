@@ -8,6 +8,39 @@
 
 ---
 
+## v2.74.0 (2026-11-24)
+
+本地书又多了 Kindle 系格式：`.mobi` / `.azw` 能直接导入阅读。同时把发布流程里那个每次都踩的坑修了。
+
+### MOBI
+
+- **零依赖手写解析**：PalmDB 容器 → PalmDOC header → 记录拼接（逐条剥 trailing entry）→ 解码 → HTML 转纯文本 → 切章。
+- 支持 **compression 1（无压缩）与 2（PalmDOC LZ77）**。HUFF/CDIC 压缩不解析，明确提示「请用 Calibre 转 EPUB」——那套实现代价过高，做半成品只会给你一堆乱码。
+- 编码：UTF-8 或 cp1252。cp1252 用完整表（0x80–0x9F 的引号、破折号、省略号都正确，不是拿 latin1 糊弄）。
+- 书名/作者：优先读 EXTH（`503` 书名、`100` 作者），退化到 PalmDB 名、再退化到文件名。EXTH 坏了只让作者空着，不整本失败。
+- 章节：按 `<mbp:pagebreak>` 切段，每段首个 `<h1>~<h3>` 或 class 含 `chapter`/`title` 的短段落当章名；**至少两段有标题**才用这套（否则一本「每页一个 pagebreak」的书会变成 200 个假章），不满足就回退到中文「第X章」正则，再回退到按长度分块。
+- **AZW3 / KF8 明确拒绝**：「暂不支持 AZW3/KF8，请在 Calibre 里转成 EPUB 再导入」。检测方式是 MOBI header 的 `fileVersion >= 8` 或出现 `BOUNDARY`/`FDST` 记录，放在 HUFF/DRM 判定之前，不会给出误导性提示。
+
+### 发布流程加固
+
+`release_all.sh` 之前的毛病：`git push` 撞上本机 Clash 代理（`127.0.0.1:7897`）失败时，只留一行 fatal，脚本继续往下跑并打印「发布完成」，而远端根本没有 commit、Release 也没建。v2.73.0 就是这么翻车的，只能手工补救。
+
+现在：
+
+- **push 固定走 SSH over 443**（`ssh://git@ssh.github.com:443/...`），不再读 https 的 origin，可用 `AMOTV_PUSH_REMOTE` 覆盖。
+- **失败立刻非零退出**，打印「发布中止：推送失败，未创建 Release」+ 本地 commit 短 sha + 四条可照抄的补救命令，并提醒**不要直接重跑**（会再自增构建号）。
+- **补上以前根本不存在的「打 tag + push tag」**——之前所有版本的 tag 都是手工补的。
+- **顺序**改成 commit → push commit → tag → push tag → build → `gh release create --verify-tag` → **自检**（远端 main 是否等于本地 HEAD、tag 是否指向同一 commit、asset 是否 `state=uploaded` 且大小与本地一致）。任一不符就报差异并非零退出。
+
+### 已知限制
+
+- MOBI 没有解析 NCX 目录索引，章名来自启发式，个别排版特殊的书章名可能是「第 N 章」而不是原标题。
+- 只认 `.mobi` / `.azw` / `.prc`；`.azw3` 走「不支持」提示（同样是建议转 EPUB）。
+- HUFF/CDIC 压缩的 MOBI 不解析。
+- MOBI 里的图片不显示（阅读页只有文字），与 TXT/EPUB 一致。
+
+---
+
 ## v2.73.0 (2026-11-23)
 
 这次把「本地书」从只会读 TXT 扩到 EPUB 和 PDF，并且给书源加了健康检测——搜不到书时你能看出是「这个源没这本书」还是「这个源已经废了」。

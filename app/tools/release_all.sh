@@ -15,8 +15,21 @@
 #   --subject "…"   单行 commit 标题；省略则取正文首个非空行
 #   --all-abis      仍构建 3 个 ABI（默认只打 arm64-v8a）
 #   --with-screenshots  把 docs/screenshots 下的取证图也提交（默认不入库，本地留档）
-#   --no-push       只本地提交，不 push、不打 release
+#   --no-push       只本地提交（不 push、不打 tag、不发 Release）
 #   --dry-run       只打印计划 + 跑安全扫描，不改任何文件、不碰索引
+#
+# 环境变量：
+#   AMOTV_PUSH_REMOTE  push 用的远端，默认
+#                      ssh://git@ssh.github.com:443/Tukist/bili-whitelist.git
+#     https remote 会走本机 Clash 代理（127.0.0.1:7897），代理没起时直接连不上；
+#     SSH over 443 不受影响。脚本**不读** `git remote get-url origin`。
+#
+# 执行顺序（v2.74.0 起，失败即停）：
+#   版本自增 → CHANGELOG 段 → 安全扫描 → commit → push commit → 打 tag 并 push tag
+#   → 构建 release APK → 复制成 app-<abi>-v<ver>-release.apk → 从 CHANGELOG 抽该版本段
+#   → gh release create → 自检（远端 main/tag 是否等于本地 HEAD、资产 state=uploaded
+#   且大小与本地一致）
+#   任一步失败：立刻 exit 非零并打印手工补救命令，**不会**在失败后继续跑到「发布完成」。
 #
 # 默认行为（与旧流程的两处差异，均为用户确认过的取舍）：
 #   1. 只打 arm64-v8a —— 用户手机是 arm64；模拟器调试用 debug 包。
@@ -46,6 +59,10 @@ GH_REPO="$OWNER/$REPO"
 PUBSPEC="app/pubspec.yaml"
 CHANGELOG="CHANGELOG.md"
 
+# push 远端：显式 SSH over 443（https remote 走 Clash 代理，代理没起就断）。
+# 不要改成 `git remote get-url origin`——那会拿回 https URL，又踩同一个坑。
+PUSH_REMOTE="${AMOTV_PUSH_REMOTE:-ssh://git@ssh.github.com:443/$OWNER/$REPO.git}"
+
 die() { echo "!! $*" >&2; exit 1; }
 say() { echo "==> $*"; }
 
@@ -66,7 +83,7 @@ while [ $# -gt 0 ]; do
     --with-screenshots) WITH_SHOTS=1; shift ;;
     --no-push) NO_PUSH=1; shift ;;
     --dry-run) DRY=1; shift ;;
-    -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
+    -h|--help) awk 'NR==1{next} /^# ={10,}/{ if (++n==2) exit; next } {sub(/^# ?/,""); print}' "$0"; exit 0 ;;
     -*) die "未知参数：$1（-h 看用法）" ;;
     *) [ -z "$VER" ] || die "多余的参数：$1"; VER="$1"; shift ;;
   esac
@@ -181,12 +198,15 @@ if [ "$DRY" = "1" ]; then
   echo ""
   echo "---- dry-run 计划 ----"
   echo "  版本：$OLD_FULL → $NEW_FULL"
-  echo "  tag ：$TAG"
+  echo "  tag ：$TAG（推送顺序：commit → tag）"
   echo "  commit subject：$SUBJECT"
   echo "  ABI ：$([ "$ALL_ABIS" = "1" ] && echo '3 个（arm64 + v7a + x86_64）' || echo '仅 arm64-v8a')"
   echo "  取证图：$([ "$WITH_SHOTS" = "1" ] && echo '入库' || echo '不入库（本地留档）')"
-  echo "  push/release：$([ "$NO_PUSH" = "1" ] && echo '跳过' || echo '会执行')"
+  echo "  push 远端：$PUSH_REMOTE"
+  echo "  push/release：$([ "$NO_PUSH" = "1" ] && echo '跳过' || echo '会执行（commit + tag 各推一次，末尾自检）')"
+  echo "  后续步骤：$([ "$NO_PUSH" = "1" ] && echo '无' || echo '构建 APK → gh release create → 自检 ls-remote/asset')"
   echo "----------------------"
+  echo "（dry-run：以上只是计划，未改任何文件、未动索引、未联网）"
   exit 0
 fi
 
@@ -229,20 +249,46 @@ awk -v ver="$VER" '
 git add -A
 [ "$WITH_SHOTS" = "1" ] || git reset -q -- docs/screenshots 2>/dev/null || true
 
-# ---------------- commit + push ----------------
+# ---------------- commit + push + tag ----------------
+# 顺序固定：commit → push commit → 打 tag → push tag →（构建 → Release → 自检）。
+# 推送失败必须停在这里：以前用 `if` 兜住 push 失败，脚本会继续跑到「发布完成」，
+# 而远端其实没有 commit/tag/Release（v2.73.0 就是这么翻车的）。
 MSG_FILE="$(mktemp)"
 printf '%s\n' "$MSG" > "$MSG_FILE"
 git commit -q -F "$MSG_FILE" || die "commit 失败"
 COMMIT="$(git rev-parse --short HEAD)"
+FULL_SHA="$(git rev-parse HEAD)"
 say "已提交：$COMMIT"
 
 if [ "$NO_PUSH" = "1" ]; then
-  say "--no-push：跳过 push 与 release"
+  say "--no-push：跳过 push / tag / release（本地 commit 保留：$COMMIT）"
   exit 0
 fi
 
-git push -q origin main
-say "已推送 origin/main"
+push_abort() {
+  local stage="$1"
+  echo "" >&2
+  echo "!! 发布中止：推送失败，未创建 Release。" >&2
+  echo "   本地提交 $COMMIT（$FULL_SHA）已保留；卡在这一步：$stage" >&2
+  echo "   （远端可能只成功了一部分：下面的命令顺序执行即可，重复推送是幂等的）" >&2
+  echo "   远端：$PUSH_REMOTE" >&2
+  echo "   修复网络后手工执行：" >&2
+  echo "     git push $PUSH_REMOTE $FULL_SHA:refs/heads/main" >&2
+  echo "     git tag -f $TAG $FULL_SHA && git push $PUSH_REMOTE refs/tags/$TAG" >&2
+  echo "     cd app && flutter build apk --release --target-platform android-arm64 --split-per-abi" >&2
+  echo "     gh release create $TAG <apk 路径> --repo $GH_REPO --target main --verify-tag --title $TAG --notes-file $NOTES_FILE" >&2
+  echo "   注意：不要直接重跑本脚本——它会再自增构建号、再提交一次；按上面命令补完即可。" >&2
+  echo "   若远端已有同名 tag 指向别的 commit：git push --force $PUSH_REMOTE refs/tags/$TAG" >&2
+  exit 1
+}
+
+say "推送 commit → $PUSH_REMOTE"
+git push "$PUSH_REMOTE" "$FULL_SHA:refs/heads/main" || push_abort "push commit 到 main"
+
+say "打 tag $TAG 并推送（轻量 tag，与既有 tag 一致）"
+git tag -f "$TAG" "$FULL_SHA" || die "本地打 tag 失败：$TAG"
+git push "$PUSH_REMOTE" "refs/tags/$TAG" || push_abort "push tag $TAG"
+say "远端已更新：main + $TAG"
 
 # ---------------- 构建 ----------------
 export PUB_HOSTED_URL="https://pub.flutter-io.cn"
@@ -254,11 +300,13 @@ FLUTTER_BIN="/c/flutter/bin/flutter"
 cd app
 if [ "$ALL_ABIS" = "1" ]; then
   say "构建 release APK（3 ABI，--split-per-abi）…"
-  "$FLUTTER_BIN" build apk --release --split-per-abi
+  "$FLUTTER_BIN" build apk --release --split-per-abi \
+    || die "构建失败：commit 与 tag 已推到远端，但 Release 未创建。修好构建后手工跑 flutter build + gh release create $TAG --repo $GH_REPO --target main --verify-tag --notes-file $NOTES_FILE"
   ABIS="arm64-v8a armeabi-v7a x86_64"
 else
   say "构建 release APK（仅 arm64-v8a）…"
-  "$FLUTTER_BIN" build apk --release --target-platform android-arm64 --split-per-abi
+  "$FLUTTER_BIN" build apk --release --target-platform android-arm64 --split-per-abi \
+    || die "构建失败：commit 与 tag 已推到远端，但 Release 未创建。修好构建后手工跑 flutter build + gh release create $TAG --repo $GH_REPO --target main --verify-tag --notes-file $NOTES_FILE"
   ABIS="arm64-v8a"
 fi
 
@@ -274,21 +322,72 @@ for abi in $ABIS; do
 done
 
 # ---------------- 上传 release ----------------
+# --target main 只在 tag 不存在时才生效（这里 tag 已推过，属于兜底）；--verify-tag 保证
+# Release 挂的是我们刚推的那个 tag，而不是 gh 从 main 现造一个。
 if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
   say "Release $TAG 已存在 → 补资产 + 更新说明"
-  gh release upload "$TAG" "${APKS[@]}" --repo "$GH_REPO" --clobber
-  gh release edit "$TAG" --repo "$GH_REPO" --notes-file "$NOTES_FILE"
+  gh release upload "$TAG" "${APKS[@]}" --repo "$GH_REPO" --clobber \
+    || die "上传资产失败（Release $TAG 已存在但不完整）：修好后手工 gh release upload $TAG ${APKS[*]} --repo $GH_REPO --clobber"
+  gh release edit "$TAG" --repo "$GH_REPO" --notes-file "$NOTES_FILE" \
+    || die "更新 Release 说明失败：gh release edit $TAG --repo $GH_REPO --notes-file $NOTES_FILE"
 else
   say "创建 Release $TAG …"
   gh release create "$TAG" "${APKS[@]}" --repo "$GH_REPO" \
-    --title "$TAG" --notes-file "$NOTES_FILE"
+    --target main --verify-tag --title "$TAG" --notes-file "$NOTES_FILE" \
+    || die "gh release create 失败（commit 与 tag 已推送）：修好后手工 gh release create $TAG ${APKS[*]} --repo $GH_REPO --target main --verify-tag --title $TAG --notes-file $NOTES_FILE"
 fi
 
-# ---------------- 校验 ----------------
-say "校验产物"
+say "Release 现状"
 gh release view "$TAG" --repo "$GH_REPO" \
   --json tagName,isDraft,isPrerelease,url,assets \
-  -q '"  tag=\(.tagName)  draft=\(.isDraft)  prerelease=\(.isPrerelease)\n  \(.url)\n" + (.assets[] | "  \(.name)  \(.size) B  \(.state)")'
+  -q '"  tag=\(.tagName)  draft=\(.isDraft)  prerelease=\(.isPrerelease)\n  \(.url)\n" + (.assets[] | "  \(.name)  \(.size) B  \(.state)")' \
+  || true
+
+# ---------------- 自检 ----------------
+# 少了这步，「脚本说发布完成、远端其实什么都没有」根本发现不了（v2.73.0 的教训）。
+say "自检：远端 main / tag / Release 资产"
+CHECK_FAIL=""
+
+REMOTE_MAIN="$(git ls-remote "$PUSH_REMOTE" refs/heads/main 2>/dev/null | awk '{print $1}' || true)"
+[ "$REMOTE_MAIN" = "$FULL_SHA" ] \
+  || CHECK_FAIL="${CHECK_FAIL}  远端 main 指向 ${REMOTE_MAIN:-<空>}，本地 HEAD 是 $FULL_SHA"$'\n'
+
+# 现在是轻量 tag，ref 即 commit；万一以后换成附注 tag，^{} 会给出 peeled commit
+REMOTE_TAG="$(git ls-remote "$PUSH_REMOTE" "refs/tags/$TAG" "refs/tags/$TAG^{}" 2>/dev/null \
+  | awk '{print $1}' | tail -1 || true)"
+[ "$REMOTE_TAG" = "$FULL_SHA" ] \
+  || CHECK_FAIL="${CHECK_FAIL}  远端 tag $TAG 指向 ${REMOTE_TAG:-<空>}，应为 $FULL_SHA"$'\n'
+
+ASSETS="$(gh release view "$TAG" --repo "$GH_REPO" --json assets \
+  -q '.assets[] | "\(.name)|\(.size)|\(.state)"' 2>/dev/null || true)"
+if [ -z "$ASSETS" ]; then
+  CHECK_FAIL="${CHECK_FAIL}  Release $TAG 查询失败或没有任何资产"$'\n'
+else
+  for apk in "${APKS[@]}"; do
+    name="$(basename "$apk")"
+    local_size="$(wc -c < "$apk" | tr -d ' ')"
+    row="$(printf '%s\n' "$ASSETS" | awk -F'|' -v n="$name" '$1 == n')"
+    if [ -z "$row" ]; then
+      CHECK_FAIL="${CHECK_FAIL}  $name 不在 Release 资产里"$'\n'
+      continue
+    fi
+    remote_size="$(printf '%s' "$row" | cut -d'|' -f2)"
+    state="$(printf '%s' "$row" | cut -d'|' -f3)"
+    [ "$state" = "uploaded" ] \
+      || CHECK_FAIL="${CHECK_FAIL}  $name 的 state=$state（应为 uploaded）"$'\n'
+    [ "$remote_size" = "$local_size" ] \
+      || CHECK_FAIL="${CHECK_FAIL}  $name 远端 $remote_size B ≠ 本地 $local_size B"$'\n'
+  done
+fi
+
+if [ -n "$CHECK_FAIL" ]; then
+  echo "!! 自检失败，这次发布不算完成：" >&2
+  printf '%s' "$CHECK_FAIL" >&2
+  echo "   手工核验：git ls-remote $PUSH_REMOTE refs/heads/main refs/tags/$TAG" >&2
+  echo "             gh release view $TAG --repo $GH_REPO --json assets" >&2
+  exit 1
+fi
+say "自检通过：远端 main=$COMMIT，tag $TAG 已推送，${#APKS[@]} 个资产 state=uploaded 且大小一致"
 
 cd "$ROOT"
 echo ""

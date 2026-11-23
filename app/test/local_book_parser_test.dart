@@ -53,11 +53,22 @@ void main() {
     });
 
     test('不支持的格式 → null', () {
-      // v2.74.0 起 PDF 已支持（见下一条），这里换成还没有实现的格式
-      expect(LocalBookParsers.dispatcher('mobi'), isNull);
-      expect(LocalBookParsers.dispatcher('azw3'), isNull);
+      // v2.74.0 起 PDF / MOBI 都已支持，这里换成还没有实现的格式
       expect(LocalBookParsers.dispatcher('umd'), isNull);
+      // AZW3 是**有意不做**（KF8 正文布局不同，半解析只会出乱码），仍不分派
+      expect(LocalBookParsers.dispatcher('azw3'), isNull);
       expect(LocalBookParsers.dispatcher(''), isNull);
+    });
+
+    test('mobi / azw / prc 归 MobiBookParser（v2.74.0）', () {
+      expect(LocalBookParsers.dispatcher('mobi'), isA<MobiBookParser>());
+      expect(LocalBookParsers.dispatcher('.MOBI'), isA<MobiBookParser>());
+      expect(LocalBookParsers.dispatcher('azw'), isA<MobiBookParser>());
+      expect(LocalBookParsers.dispatcher('prc'), isA<MobiBookParser>());
+      expect(
+        LocalBookParsers.dispatcher('', fileName: '斗破苍穹.mobi'),
+        isA<MobiBookParser>(),
+      );
     });
 
     test('pdf 归 PdfBookParser（v2.74.0）', () {
@@ -72,12 +83,20 @@ void main() {
 
   group('不支持格式的文案', () {
     test('带格式名 + 说明支持哪些', () {
-      final msg = LocalBookParsers.unsupportedMessage('mobi');
+      final msg = LocalBookParsers.unsupportedMessage('umd');
       expect(msg, contains('暂不支持'));
-      expect(msg, contains('MOBI'));
+      expect(msg, contains('UMD'));
       expect(msg, contains('TXT'));
       expect(msg, contains('EPUB'));
       expect(msg, contains('PDF'));
+      expect(msg, contains('MOBI'));
+    });
+
+    test('AZW3 给的是「用 Calibre 转 EPUB」这种能照做的下一步', () {
+      final msg = LocalBookParsers.unsupportedMessage('azw3');
+      expect(msg, contains('AZW3/KF8'));
+      expect(msg, contains('Calibre'));
+      expect(msg, contains('EPUB'));
     });
 
     test('扩展名是空串时说的是「认不出」而不是「暂不支持 格式」', () {
@@ -88,17 +107,17 @@ void main() {
 
     test('大小写与点都归一到同一句', () {
       expect(
-        LocalBookParsers.unsupportedMessage('.Mobi'),
-        LocalBookParsers.unsupportedMessage('mobi'),
+        LocalBookParsers.unsupportedMessage('.Umd'),
+        LocalBookParsers.unsupportedMessage('umd'),
       );
-      expect(LocalBookParsers.unsupportedMessage('.Mobi'), contains('MOBI'));
+      expect(LocalBookParsers.unsupportedMessage('.Umd'), contains('UMD'));
     });
   });
 
   group('解析器的共同契约', () {
     test('每种解析器都自报格式与上限', () {
       final formats = LocalBookParsers.parsers.map((p) => p.format).toList();
-      expect(formats, containsAll(<String>['txt', 'epub', 'pdf']));
+      expect(formats, containsAll(<String>['txt', 'epub', 'pdf', 'mobi']));
       for (final p in LocalBookParsers.parsers) {
         expect(p.maxBytes, greaterThan(0), reason: '${p.format} 必须有上限');
       }

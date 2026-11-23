@@ -109,6 +109,10 @@ class FilePickerPlugin(private val activity: Activity) {
      * DocumentsUI 会按 EXTRA_MIME_TYPES 严格过滤，只写 `text/plain` +
      * `application/epub+zip` 时 .pdf 是灰的、点不动。通配的 `type` 只是兜底，
      * 真正决定哪些能点的是这一行。
+     *
+     * **MOBI / AZW（v2.74.0）**：Kindle 系的格式没有统一 MIME，各家 provider
+     * 分别报 `application/x-mobipocket-ebook` 与 `application/vnd.amazon.ebook`，
+     * 两个都列上，否则网盘里的 .mobi 会是灰的（与 PDF 同一个坑）。
      */
     private fun pickBookFile(result: MethodChannel.Result) {
         if (pendingResult != null) {
@@ -121,7 +125,10 @@ class FilePickerPlugin(private val activity: Activity) {
             type = MIME_ANY
             putExtra(
                 Intent.EXTRA_MIME_TYPES,
-                arrayOf(MIME_TEXT, MIME_EPUB, MIME_PDF, MIME_BINARY)
+                arrayOf(
+                    MIME_TEXT, MIME_EPUB, MIME_PDF,
+                    MIME_MOBI, MIME_AZW, MIME_BINARY
+                )
             )
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
@@ -325,8 +332,8 @@ class FilePickerPlugin(private val activity: Activity) {
     /**
      * 取扩展名（小写、不含点）：优先用文件名，其次按 MIME 猜，最后 `bin`。
      *
-     * 为什么要 ext：Dart 侧用它区分 txt / epub（E3 的 EPUB 解析要按格式分流），
-     * 拼在临时文件名里也方便 `run-as` 排查「到底拷进来了什么」。
+     * 为什么要 ext：Dart 侧用它区分 txt / epub / pdf / mobi（解析器按格式
+     * 分派），拼在临时文件名里也方便 `run-as` 排查「到底拷进来了什么」。
      */
     private fun extensionOf(name: String, mime: String?): String {
         val dot = name.lastIndexOf('.')
@@ -340,6 +347,9 @@ class FilePickerPlugin(private val activity: Activity) {
             // 有的 provider 报 application/pdf，有的报 octet-stream；文件名没扩展名
             // 时只能靠 MIME，至少让 .pdf 能落到 pdf 分支（v2.74.0）
             "application/pdf" -> "pdf"
+            // Kindle 系：mobi / azw3 各家 provider 报的类型不统一（v2.74.0）
+            MIME_MOBI -> "mobi"
+            MIME_AZW -> "azw3"
             else -> "bin"
         }
     }
@@ -371,6 +381,13 @@ class FilePickerPlugin(private val activity: Activity) {
         private const val MIME_TEXT = "text/plain"
         private const val MIME_EPUB = "application/epub+zip"
         private const val MIME_PDF = "application/pdf"
+
+        /** Kindle 旧格式（MOBI 6 / 早期 AZW）。v2.74.0 */
+        private const val MIME_MOBI = "application/x-mobipocket-ebook"
+
+        /** Kindle 新格式（AZW3 / KF8）。本版明确不支持，列进来是为了能选中并把话说清。 */
+        private const val MIME_AZW = "application/vnd.amazon.ebook"
+
         private const val MIME_BINARY = "application/octet-stream"
 
         private const val BOM = '\uFEFF'

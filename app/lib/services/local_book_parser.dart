@@ -3,7 +3,7 @@
 ///
 /// ## 为什么要把格式拆成 parser
 /// 上层（导入编排、落盘、书架、阅读页）**只认识章节列表**，不认识 TXT 的字符
-/// 偏移，也不认识 EPUB 的 zip / OPF / spine。这样再加 MOBI / AZW3 / UMD 时：
+/// 偏移，也不认识 EPUB 的 zip / OPF / spine。这样再加 AZW3 / UMD 时：
 /// 写一个新的 `LocalBookParser` 实现 + 在 [LocalBookParsers.parsers] 里挂一行，
 /// 存储、书架、阅读、删除这些已经踩过坑的代码一行都不用动。这是 legado / 阅读
 /// 这类多格式阅读器的做法（**只借鉴结构，不抄实现**）。
@@ -32,6 +32,7 @@ import 'dart:typed_data';
 import 'package:archive/archive.dart';
 import 'package:path_provider/path_provider.dart';
 
+import '../utils/mobi_reader.dart';
 import '../utils/text_decoding.dart';
 import '../utils/txt_chapter_splitter.dart';
 import 'book_content_service.dart' show restoreParagraphs;
@@ -87,7 +88,7 @@ class ParsedLocalBook {
   /// 作者（EPUB 的 `<dc:creator>`；TXT 没有这个概念，空串）。
   final String author;
 
-  /// 格式标识：`txt` / `epub`（写进 manifest，书架据此显示角标）。
+  /// 格式标识：`txt` / `epub` / `pdf` / `mobi`（写进 manifest，书架据此显示角标）。
   final String format;
 
   final List<ParsedChapter> chapters;
@@ -727,15 +728,383 @@ class PdfBookParser implements FileBasedLocalBookParser {
   }
 }
 
+// ============================================================================
+// MOBI / AZW
+// ============================================================================
+
+/// MOBI 解析器（G 批，v2.74.0）：PalmDB → PalmDOC LZ77 → cp1252 / UTF-8 → HTML。
+///
+/// ## 为什么 MOBI 不做成「抽出纯文本就完事」
+/// MOBI 的正文本来就是一份（或几份拼起来的）HTML：段落靠 `<p>`、换章靠
+/// `<mbp:pagebreak>`、章标题在 `<h1>`–`<h3>` 里。直接剥标签会丢掉「哪里换章」
+/// 这条唯一的目录线索，所以走「先拿 HTML，再按 HTML 结构切章」。
+///
+/// ## 章节标题：**没有解析 NCX**
+/// Mobipocket 的目录在 INDX 记录里（一串按索引压缩的标签表 + 二进制偏移），
+/// 解析成本远高于 HTML 启发式，而收益只是「章名更准一点」。本批的取舍：
+/// 1. 按 `<mbp:pagebreak>` 切段，每段第一个 `<h1>/<h2>/<h3>`（或
+///    `class="chapter"/"title"/"ctitle"` 的 `<p>`）当章名；
+/// 2. 一个标题都没找到（或者只有 1 个，说明不是「一章一段」的排版）→ 把整本
+///    当纯文本交给 `splitTxtChapters`（它自己还会退到 3000 字分块）；
+/// 3. 两条路都空 → 报「没有可读的正文」。
+/// 写进 `docs/DEV_CONTEXT.md` 的已知坑：**章节标题是启发式，可能不如原书目录**。
+///
+/// ## 明确不支持的两种
+/// - **HUFF/CDIC（compression = 17480）**：等于在 PalmDOC 之上再套一层霍夫曼
+///   + CDIC 字典，实现代价（还容易解错）远大于收益，给「请用 Calibre 转 EPUB」；
+/// - **AZW3 / KF8**：`version >= 8`，或者记录里出现 `BOUNDARY` / `FDST`
+///   （双格式 AZW 的 KF8 部分）。KF8 的正文布局与 MOBI 6 不同，半解析只会
+///   得到乱码正文，所以**宁可拒绝**也不要给用户一本「能打开但全是乱码」的书。
+class MobiBookParser implements LocalBookParser {
+  /// 原始文件上限 100MB（与原生 `FilePickerPlugin.MAX_BOOK_BYTES` 一致）。
+  static const int defaultMaxBytes = 100 * 1024 * 1024;
+
+  /// 解压后正文的字节上限。
+  ///
+  /// 与 `LocalBookStore.maxTextChars`（20M 字）同量级：UTF-8 中文 3 字节/字，
+  /// 64MB 已经超过 20M 字。超过这条线时先在**解压阶段**停住，而不是先把
+  /// 几百 MB 拼进内存再让导入服务去拒绝。
+  static const int defaultMaxTextBytes = 64 * 1024 * 1024;
+
+  final int maxTextBytes;
+
+  const MobiBookParser({this.maxTextBytes = defaultMaxTextBytes});
+
+  @override
+  String get format => 'mobi';
+
+  @override
+  int get maxBytes => defaultMaxBytes;
+
+  /// 认 `mobi` / `azw` / `prc`。
+  ///
+  /// 为什么认 `azw`：老 Kindle 的 .azw 既可能是 MOBI 6 也可能是 KF8，光看扩展名
+  /// 分不出来 —— 先归 MOBI 解析器，读到 `version >= 8` 再给「请转 EPUB」的
+  /// 明确提示。`azw3` 不认（解析器给不出任何可读内容，分派层直接说「暂不支持
+  /// AZW3/KF8」更干脆）。
+  @override
+  bool canParse(String fileName, String ext) {
+    final e = ext.trim().toLowerCase();
+    const known = <String>{'mobi', 'azw', 'prc'};
+    if (e.isNotEmpty) return known.contains(e);
+    final lower = fileName.trim().toLowerCase();
+    return lower.endsWith('.mobi') ||
+        lower.endsWith('.azw') ||
+        lower.endsWith('.prc');
+  }
+
+  @override
+  Future<ParsedLocalBook> parse(
+    Uint8List bytes, {
+    required String fileName,
+    String? charsetHint,
+  }) async {
+    if (bytes.isEmpty) {
+      throw const LocalBookParseException('这个文件是空的');
+    }
+    if (bytes.length > maxBytes) {
+      throw const LocalBookParseException('文件太大（超过 100 MB）');
+    }
+
+    final warnings = <String>[];
+    final PdbFile pdb;
+    final MobiHeader header;
+    try {
+      pdb = PdbFile.parse(bytes);
+      if (pdb.records.isEmpty) {
+        throw const MobiFormatException(
+          '这不是有效的 MOBI 文件（记录表是空的）',
+        );
+      }
+      header = MobiHeader.parse(pdb.records[0]);
+    } on MobiFormatException catch (e) {
+      // 容器层的异常文案已经是「给用户看的那句话」，原样往上抛
+      throw LocalBookParseException(e.message);
+    }
+
+    if (pdb.creator != 'MOBI') {
+      throw const LocalBookParseException(
+        '这不是有效的 MOBI 文件（容器标识不是 BOOKMOBI，可能只是改了扩展名）',
+      );
+    }
+    // KF8 放在最前面判：它的压缩方式往往是 HUFF，先报「HUFF 不支持」会误导
+    if (header.isKf8 || _hasKf8Marker(pdb)) {
+      throw const LocalBookParseException(
+        '暂不支持 AZW3/KF8 格式，请在 Calibre 里转成 EPUB 再导入',
+      );
+    }
+    if (header.encryption != 0) {
+      throw const LocalBookParseException(
+        '这本书有 DRM 加密，暂时打不开（可以在 Calibre 里转换后再导入）',
+      );
+    }
+    if (header.compression == 17480) {
+      throw const LocalBookParseException(
+        '这本书用的是 HUFF/CDIC 压缩，暂不支持（请在 Calibre 里转成 EPUB 再导入）',
+      );
+    }
+    if (header.compression != 0 &&
+        header.compression != 1 &&
+        header.compression != 2) {
+      throw LocalBookParseException(
+        '这本书的压缩方式（${header.compression}）暂不支持，'
+        '请在 Calibre 里转成 EPUB 再导入',
+      );
+    }
+    if (header.textLength <= 0) {
+      throw const LocalBookParseException('这个文件里没有正文');
+    }
+    if (header.textLength > maxTextBytes) {
+      final mb = (maxTextBytes / (1024 * 1024)).toStringAsFixed(0);
+      throw LocalBookParseException(
+        '这本书解压后的正文超过 $mb MB，暂时不支持（内存吃不消）',
+      );
+    }
+    if (header.recordCount <= 0) {
+      throw const LocalBookParseException('这个 MOBI 里没有正文记录');
+    }
+    if (1 + header.recordCount > pdb.records.length) {
+      throw LocalBookParseException(
+        'MOBI 文件不完整（声明了 ${header.recordCount} 条正文记录，'
+        '实际只有 ${pdb.records.length - 1} 条）',
+      );
+    }
+
+    // ---- 拼接 / 解压正文记录（record 1..recordCount）----
+    final recordSize = header.recordSize > 0 ? header.recordSize : 4096;
+    final builder = BytesBuilder(copy: false);
+    try {
+      for (var i = 1; i <= header.recordCount; i++) {
+        final remaining = header.textLength - builder.length;
+        if (remaining <= 0) break;
+        // 最后一条只该解到正文末尾，否则会把尾部 padding 当成正文
+        final want = remaining < recordSize ? remaining : recordSize;
+        var raw = pdb.records[i];
+        // trailing entry（多字节重叠数之类的元信息）必须先剥掉再解压
+        if (header.extraDataFlags != 0) {
+          raw = trimTrailingEntries(raw, header.extraDataFlags);
+        }
+        if (header.compression == 2) {
+          builder.add(palmdocDecompress(raw, expectedLength: want));
+        } else {
+          final take = raw.length < want ? raw.length : want;
+          if (take < want) {
+            warnings.add('第 $i 条正文记录比声明的短（文件可能不完整）');
+          }
+          builder.add(Uint8List.sublistView(raw, 0, take));
+        }
+      }
+    } on MobiFormatException catch (e) {
+      throw LocalBookParseException('MOBI 正文解压失败：${e.message}');
+    }
+
+    var data = builder.takeBytes();
+    if (data.length > header.textLength) {
+      // 最后一条记录的 padding 不属于正文
+      data = Uint8List.sublistView(data, 0, header.textLength);
+    }
+    if (data.length < header.textLength) {
+      warnings.add('正文解压后比声明的短（文件可能不完整，尾部有缺章风险）');
+    }
+    if (data.isEmpty) {
+      throw const LocalBookParseException('这个文件里没有正文');
+    }
+
+    // ---- 解码 ----
+    final String html;
+    final String encoding;
+    if (header.textEncoding == 65001) {
+      // 宽松解一遍再看 U+FFFD 比例：整本按 cp1252 解只会得到更离谱的结果，
+      // 但「声明 UTF-8、实际是 cp1252」的自制书确实存在，比例高就回退。
+      final loose = utf8.decode(data, allowMalformed: true);
+      if (replacementRatio(loose) > kMaxReadableReplacementRatio) {
+        html = decodeCp1252(data);
+        encoding = 'cp1252';
+        warnings.add('MOBI 声明 UTF-8 但解码大量失败，已按 cp1252 重新解码');
+      } else {
+        html = loose;
+        encoding = 'utf-8';
+      }
+    } else {
+      html = decodeCp1252(data);
+      encoding = 'cp1252';
+    }
+    final cleaned = _stripBomPrefix(html);
+    if (cleaned.trim().isEmpty) {
+      throw const LocalBookParseException('文件里没有可读的正文');
+    }
+
+    final plain = _htmlToText(cleaned);
+    if (plain.isEmpty) {
+      throw const LocalBookParseException('文件里没有可读的正文');
+    }
+
+    final split = _splitMobiHtml(cleaned, plain, warnings);
+    if (split.chapters.isEmpty) {
+      throw const LocalBookParseException('文件里没有可读的正文');
+    }
+
+    // ---- 书名 / 作者 ----
+    // 书名优先级：EXTH 503（Calibre 改过的显示书名）> record 0 里的 full name
+    // > PalmDB 的 32 字节数据库名 > 文件名。都不空时取第一个非空即可。
+    final record0 = pdb.records[0];
+    final exthTitle = (exthValue(record0, kExthTitle) ?? '').trim();
+    final fromFileName = titleFromFileName(fileName);
+    final title = _firstNonEmpty(<String>[
+      exthTitle,
+      header.fullName.trim(),
+      pdb.name.trim(),
+      fromFileName,
+    ]);
+    // EXTH 坏了只影响作者，不影响整本书（见 `exthValue` 的注释）
+    final author = (exthValue(record0, kExthAuthor) ?? '').trim();
+
+    final head = bytes.length <= 2048 ? bytes : bytes.sublist(0, 2048);
+    return ParsedLocalBook(
+      title: title.isEmpty ? '未命名' : title,
+      author: author,
+      format: format,
+      chapters: split.chapters,
+      idSeed: 'mobi|$fileName|${bytes.length}|${latin1.decode(head)}',
+      warnings: warnings,
+      meta: {
+        'encoding': encoding,
+        'compression': '${header.compression}',
+        'chapters': split.strategy,
+      },
+    );
+  }
+}
+
+/// 切好的 MOBI 章节 + 用了哪种切法（写进 meta 方便排查）。
+class _MobiSplit {
+  final List<ParsedChapter> chapters;
+  final String strategy;
+
+  const _MobiSplit(this.chapters, this.strategy);
+}
+
+/// `<mbp:pagebreak/>`：Mobipocket 的「强制换页」，实际书里几乎就是章边界。
+final RegExp _mobiPagebreakRe = RegExp(
+  r'<mbp:pagebreak\s*/?>',
+  caseSensitive: false,
+);
+
+/// 段落里的标题：`<h1>`–`<h3>`。
+final RegExp _mobiHeadingRe = RegExp(
+  r'<h([1-3])\b[^<>]*>([\s\S]*?)</h[1-3]\s*>',
+  caseSensitive: false,
+);
+
+/// 有些书不用 `<hN>`，而是 `<p class="chapterTitle">第一章</p>`。
+final RegExp _mobiTitleParaRe = RegExp(
+  r'''<p\b[^>]*class\s*=\s*("[^"]*"|'[^']*')[^>]*>([\s\S]*?)</p\s*>''',
+  caseSensitive: false,
+);
+
+/// 按 pagebreak + 标题启发式切章，退化到 `splitTxtChapters`。
+///
+/// 只在「至少 2 个段有标题」时才用 pagebreak 方案：有些书每页一个 pagebreak
+/// 但只有扉页有一个 `<h1>`，那种书按段切会得到一本「第 1 章…第 200 章」的假目录，
+/// 交给 `splitTxtChapters`（它认「第X章」）反而更准。
+_MobiSplit _splitMobiHtml(
+  String html,
+  String plain,
+  List<String> warnings,
+) {
+  final segments = html.split(_mobiPagebreakRe);
+  if (segments.length >= 2) {
+    var titled = 0;
+    for (final seg in segments) {
+      if (_headingOf(seg) != null) titled++;
+    }
+    if (titled >= 2) {
+      final chapters = <ParsedChapter>[];
+      for (final seg in segments) {
+        final text = _htmlToText(seg);
+        // 空白段（封面页 / 只有分隔符）不产生空章
+        if (text.isEmpty) continue;
+        final title = _headingOf(seg) ?? '第 ${chapters.length + 1} 章';
+        chapters.add(ParsedChapter(title: title, text: text));
+      }
+      if (chapters.isNotEmpty) return _MobiSplit(chapters, 'pagebreak');
+    }
+  }
+
+  // 退化：整本当纯文本，用 TXT 的章节识别（含「一个标题都没有就按 3000 字分块」）
+  warnings.add('MOBI 里没有可用的分页 / 标题结构，已按正文的章节标题行切分');
+  final slices = splitTxtChapters(plain);
+  return _MobiSplit(
+    [
+      for (final s in slices)
+        ParsedChapter(title: s.title, text: plain.substring(s.start, s.end)),
+    ],
+    'txt',
+  );
+}
+
+/// 一段 HTML 里第一个像章标题的短文本（没有 → null）。
+String? _headingOf(String segment) {
+  final h = _mobiHeadingRe.firstMatch(segment);
+  if (h != null) {
+    final t = _plainText(h.group(2) ?? '');
+    if (t.isNotEmpty && t.length <= maxTitleChars) return t;
+  }
+  for (final m in _mobiTitleParaRe.allMatches(segment)) {
+    final cls = (m.group(1) ?? '').toLowerCase();
+    // 只认明确表示「标题」的 class；`header` / `subtitle` 这类太容易误伤
+    if (!cls.contains('chapter') &&
+        !cls.contains('ctitle') &&
+        !cls.contains('title')) {
+      continue;
+    }
+    final t = _plainText(m.group(2) ?? '');
+    if (t.isNotEmpty && t.length <= maxTitleChars) return t;
+    break;
+  }
+  return null;
+}
+
+/// KF8 的「双格式」标记：MOBI6 部分之后有一条 `BOUNDARY` 记录，KF8 正文以
+/// `FDST` 开头。见到就说明这个文件带了 KF8 部分，按「不支持 AZW3」处理。
+bool _hasKf8Marker(PdbFile pdb) {
+  for (var i = 1; i < pdb.records.length; i++) {
+    final r = pdb.records[i];
+    if (_startsWithAscii(r, 'BOUNDARY') || _startsWithAscii(r, 'FDST')) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool _startsWithAscii(List<int> bytes, String ascii) {
+  if (bytes.length < ascii.length) return false;
+  for (var i = 0; i < ascii.length; i++) {
+    if ((bytes[i] & 0xFF) != ascii.codeUnitAt(i)) return false;
+  }
+  return true;
+}
+
+String _firstNonEmpty(List<String> values) {
+  for (final v in values) {
+    if (v.trim().isNotEmpty) return v.trim();
+  }
+  return '';
+}
+
+String _stripBomPrefix(String text) =>
+    text.startsWith('\uFEFF') ? text.substring(1) : text;
+
 /// 按扩展名挑解析器（全项目唯一的「格式 → parser」入口）。
 class LocalBookParsers {
   LocalBookParsers._();
 
-  /// 支持的解析器。**要加 MOBI / AZW3 / UMD 就在这里挂一行**，其余代码不动。
+  /// 支持的解析器。**再加格式就在这里挂一行**，其余代码不动。
   static const List<LocalBookParser> parsers = <LocalBookParser>[
     TxtBookParser(),
     EpubBookParser(),
     PdfBookParser(),
+    MobiBookParser(),
   ];
 
   /// 按 [ext]（原生报的扩展名，大小写与点都容忍）选解析器；不支持 → null。
@@ -752,6 +1121,11 @@ class LocalBookParsers {
     final e = _normExt(ext);
     final supported = parsers.map((p) => p.format.toUpperCase()).join(' / ');
     if (e.isEmpty) return '认不出这个文件的格式（目前支持 $supported）';
+    // 已知但有意不做的格式：给一条能照做的建议，比「暂不支持 AZW3」有用
+    if (e == 'azw3' || e == 'kf8') {
+      return '暂不支持 AZW3/KF8 格式，请在 Calibre 里转成 EPUB 再导入'
+          '（目前支持 $supported）';
+    }
     return '暂不支持 ${e.toUpperCase()} 格式（目前支持 $supported）';
   }
 
@@ -759,17 +1133,27 @@ class LocalBookParsers {
       ext.trim().toLowerCase().replaceAll('.', '');
 }
 
-/// 文件名 → 书名（去掉 `.txt` / `.epub` / `.pdf` 扩展名）。
+/// 文件名 → 书名（去掉 `.txt` / `.epub` / `.pdf` / `.mobi` 等扩展名）。
 ///
 /// 只去一层：`xxx.txt.txt` 只掉一个后缀，避免把书名里真的带点的书
 /// （《三体 2.黑暗森林》）削掉后半截。
 String titleFromFileName(String fileName) {
   var name = fileName.trim();
+  const suffixes = <String>[
+    '.txt',
+    '.epub',
+    '.pdf',
+    '.mobi',
+    '.azw3',
+    '.azw',
+    '.prc',
+  ];
   final lower = name.toLowerCase();
-  if (lower.endsWith('.txt')) name = name.substring(0, name.length - 4);
-  if (lower.endsWith('.epub')) name = name.substring(0, name.length - 5);
-  if (name.toLowerCase().endsWith('.pdf')) {
-    name = name.substring(0, name.length - 4);
+  for (final s in suffixes) {
+    if (lower.endsWith(s)) {
+      name = name.substring(0, name.length - s.length);
+      break;
+    }
   }
   return name.trim();
 }
