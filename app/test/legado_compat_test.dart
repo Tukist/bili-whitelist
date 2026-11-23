@@ -53,11 +53,24 @@ void main() {
       expect(legadoSelector('  ').kind, SelectorKind.none);
     });
 
-    test('&& 组合运算符明确判不支持（不能当 CSS 硬跑）', () {
+    test('&& 组合运算符按「并列」解析（v2.77.0 设计契约变更）', () {
+      // v2.76.0 及以前这里断言 unsupported（理由：当 CSS 硬跑会静默返回空）。
+      // 用真实语料量过之后改成真支持：`&&` 出现在 622 个源（25.1%），
+      // 语义在 legado 源码里是明确的「并列」——两支各自取值后按 \n 拼接。
+      // 契约变更点：原来「判死」的源现在能跑，所以断言从 unsupported 改成
+      // 「两支都在 concat 里」。仍然不支持的 `%%` 由 selector.dart 报出来。
       final v = legadoSelector('@css:div.book && @css:span.title');
+      expect(v.kind, SelectorKind.css);
+      expect(v.query, 'div.book');
+      expect(v.concat.length, 1);
+      expect(v.concat.single.kind, SelectorKind.css);
+      expect(v.isRunnable, isTrue);
+    });
+
+    test('%% 仍然是「语法不支持」，且与「需要 JS」分开报', () {
+      final v = legadoSelector('@css:div.book %% @css:span.title');
       expect(v.kind, SelectorKind.unsupported);
-      expect(v.reason, kSelectorReasonSyntax);
-      // 这是「语法不支持」，不是「需要 JS」——两者在 UI 上要分开说
+      expect(v.reason, kSelectorReasonInterleave);
       expect(v.needsJs, isFalse);
     });
 

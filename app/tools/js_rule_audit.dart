@@ -32,21 +32,38 @@
 /// dart run app/tools/js_rule_audit.dart                 # 用内置的 4 个索引
 /// dart run app/tools/js_rule_audit.dart --json out.json  # 额外落一份机读结果
 /// dart run app/tools/js_rule_audit.dart https://x/a.json  # 只测指定索引
+/// dart run app/tools/js_rule_audit.dart --selectors      # I2：选择器语法统计
+/// dart run app/tools/js_rule_audit.dart --selectors /tmp/a.json  # 用本地语料
 /// ```
 ///
 /// 下载到的 JSON **不落盘**（只在内存里用一次）；`--json` 写的是统计结果，
 /// 路径由调用方给，默认不写 —— 别把 32MB 语料或统计产物提交进仓库。
+/// 参数既可以是 URL，也可以是**本地文件路径**（I2 批加的）：反复调统计口径时
+/// 没必要每次重下 33MB。
 ///
-/// ## 为什么是纯 `dart:` 标准库、不 import 项目代码
-/// 这个工具要能 `dart run` 直接跑（不需要 `flutter` 依赖链）。分类逻辑与
-/// `lib/services/book_rule/legado_compat.dart` 的 `jsUsageOf` 同口径，但那边
-/// 面向的是**已映射的模型字段**，这里面向**原始 legado 键名**，两边无法共用
-/// 一份字段表 —— 字段表在下面按原始键名各写一份，改口径时两处一起看。
+/// ## `--selectors` 模式（I2 批）
+/// I1 只回答了「多少源需要 JS」。真实语料里还有第二道门：**选择器写法本身
+/// 解析不了**（`@tag.` / `@a.0` / `p.1@a.0@text`）。这个模式按原始规则串统计
+/// 语法特征（前缀 / 组合子 / 索引 / 取值后缀 / 链式），并把 top 20 未识别
+/// 写法连着出现源数打出来；最后给出「**真正可搜索**」的源数：不靠 JS、
+/// 且所有会执行的选择器都能解析。
+///
+/// ## 为什么是纯 `dart:` 标准库（除了解析器本身）
+/// 这个工具要能 `dart run` 直接跑（不需要 `flutter` 依赖链）。所以除了
+/// `selector.dart` / `legado_compat.dart`（两者都是**零 Flutter 依赖**的纯函数）
+/// 之外不 import 项目代码 —— 选择器能不能解析必须问**真的那个解析器**，
+/// 自己再写一份判定只会和 App 的口径悄悄漂移。
+/// JS 分类逻辑与 `jsUsageOf` 同口径，但那边面向**已映射的模型字段**，
+/// 这里面向**原始 legado 键名**，两边无法共用一份字段表 —— 字段表在下面按
+/// 原始键名各写一份，改口径时两处一起看。
 library;
 
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+
+import 'package:bili_whitelist_app/services/book_rule/legado_compat.dart';
+import 'package:bili_whitelist_app/services/book_rule/selector.dart';
 
 /// 默认抽样用的 4 个公开索引（legado 书源聚合站）。
 const List<String> kDefaultIndexUrls = [
@@ -229,6 +246,7 @@ const List<String> _kCategories = [
 /// 主流程：下载 → 分类 → 打印五张表。
 Future<void> main(List<String> argv) async {
   String? jsonOut;
+  var selectorsMode = false;
   final urls = <String>[];
   for (var i = 0; i < argv.length; i++) {
     final a = argv[i];
@@ -239,9 +257,11 @@ Future<void> main(List<String> argv) async {
         exitCode = 2;
         return;
       }
+    } else if (a == '--selectors') {
+      selectorsMode = true;
     } else if (a == '-h' || a == '--help') {
       stdout.writeln('用法：dart run app/tools/js_rule_audit.dart '
-          '[--json <out.json>] [索引 URL ...]');
+          '[--selectors] [--json <out.json>] [索引 URL 或本地文件 ...]');
       return;
     } else if (a.startsWith('--')) {
       stderr.writeln('未知参数：$a');
@@ -258,6 +278,8 @@ Future<void> main(List<String> argv) async {
     ..connectionTimeout = const Duration(seconds: 20);
 
   final audits = <SourceAudit>[];
+  // --selectors 要拿原始 JSON 再扫一遍选择器串；与 audits 一一对应（同序）
+  final raws = <Map<String, dynamic>>[];
   final failures = <String, String>{};
   final perIndex = <String, int>{};
   final overlaps = <String, int>{};
@@ -265,9 +287,9 @@ Future<void> main(List<String> argv) async {
   final seenNames = <String>{};
 
   for (final url in targets) {
-    stdout.writeln('下载 $url …');
+    stdout.writeln('读取 $url …');
     try {
-      final body = await _fetch(client, url);
+      final body = await _load(client, url);
       final sources = _extractSources(body);
       stdout.writeln('  ${sources.length} 个源');
       perIndex[url] = sources.length;
@@ -282,6 +304,7 @@ Future<void> main(List<String> argv) async {
           continue;
         }
         audits.add(audit);
+        raws.add(raw);
       }
     } catch (e) {
       // 一个索引挂了不该拖累整批：记下来继续
@@ -300,6 +323,12 @@ Future<void> main(List<String> argv) async {
   final report = _Report(audits: audits, failures: failures, perIndex: perIndex);
   report.printAll(overlaps: overlaps);
 
+  _SelectorReport? selectors;
+  if (selectorsMode) {
+    selectors = _SelectorReport(raws, audits);
+    selectors.printAll();
+  }
+
   if (jsonOut != null && jsonOut.trim().isNotEmpty) {
     final file = File(jsonOut);
     await file.parent.create(recursive: true);
@@ -315,10 +344,18 @@ Future<void> main(List<String> argv) async {
       ],
       'uniqueSources': audits.length,
       'summary': report.summaryJson(),
+      if (selectors != null) 'selectors': selectors.summaryJson(),
       'sources': [for (final a in audits) a.toJson()],
     }));
     stdout.writeln('\n机读结果已写入 $jsonOut');
   }
+}
+
+/// 读一个索引：本地存在的路径直接读文件，否则当 URL 下载。
+Future<String> _load(HttpClient client, String target) async {
+  final file = File(target);
+  if (file.existsSync()) return file.readAsString();
+  return _fetch(client, target);
 }
 
 /// 下载一个索引（超时 / 网络错误都抛，由调用方记成「失败」）。
@@ -491,6 +528,326 @@ final RegExp _kJavaCall = RegExp(r'java\.([A-Za-z_][A-Za-z0-9_]*)');
 Set<String> _javaApisIn(String text) => {
       for (final m in _kJavaCall.allMatches(text)) m.group(1)!,
     };
+
+// ==================== I2：选择器语法统计 ====================
+//
+// 纯正则 / 纯字符串层面统计「用户到底写了什么」，**不看解析结果** ——
+// 这样同一份报告在「加语法之前」和「加语法之后」都能跑，前后数字才可比。
+// 唯一例外是「能不能解析」：那必须问真的解析器（[legadoSelector]）。
+
+/// 执行字段里**不是选择器**的那些（地址 / 模板），语法统计要跳过。
+const Set<String> kUrlExecutedFields = {
+  'searchUrl',
+  'ruleBookInfo.tocUrl',
+  'ruleToc.nextTocUrl',
+  'ruleContent.nextContentUrl',
+};
+
+/// 「不支持」的原因码 → 给人看的名字。
+String _reasonLabel(String reason) => switch (reason) {
+      'js' => '需要 JS',
+      'jsonPath' => 'JSONPath（未接）',
+      'syntax' => '语法不认识',
+      'empty' => '空规则',
+      'parse' => '解析异常',
+      'text' => 'text. 按文字筛选',
+      'interleave' => '%% 交叉合并',
+      _ => '其它（$reason）',
+    };
+
+class _SelectorReport {
+  _SelectorReport(this.raws, this.audits) {
+    _scan();
+  }
+
+  final List<Map<String, dynamic>> raws;
+  final List<SourceAudit> audits;
+
+  /// 特征 → 出现过的源数（一个源只计一次）。
+  final Map<String, int> featureSources = {};
+
+  /// 未识别写法（原文截断）→ 出现源数。
+  final Map<String, int> unrecognized = {};
+
+  /// 原因码 → 源数（一个源在一个原因下只计一次）。
+  final Map<String, int> reasonSources = {};
+
+  var runnable = 0;
+  var blockedByJs = 0;
+  var blockedBySelector = 0;
+  var missingSearchRule = 0;
+  var total = 0;
+
+  /// 被选择器语法挡住的源里，**只差这一条**就能跑的（实现优先级用）。
+  final Map<String, int> soleBlocker = {};
+
+  /// 「只差一条」的源里，那条规则原文 → 源数（决定先补哪个语法）。
+  final Map<String, int> soleBlockerRules = {};
+
+  void _scan() {
+    total = raws.length;
+    for (var i = 0; i < raws.length; i++) {
+      final raw = raws[i];
+      final audit = audits[i];
+
+      // ---- 特征统计（去重：一个源一个特征只记一次）----
+      final features = <String>{};
+      final problems = <String>{}; // 这个源的选择器问题（原因码去重）
+      for (final path in kExecutedFields) {
+        if (kUrlExecutedFields.contains(path)) continue;
+        final v = _lookup(raw, path);
+        if (v is! String || v.trim().isEmpty) continue;
+        // JS 规则不是「语法不认识」，它走 JS 那条线（见 I1 分类）
+        if (_jsStylesIn(v).isNotEmpty) continue;
+        features.addAll(_featuresOf(v));
+        final parsed = legadoSelector(v);
+        if (!parsed.isRunnable && !parsed.isEmpty) {
+          problems.add(_problemCode(parsed));
+          final key = _truncate(v.trim().replaceAll(RegExp(r'\s+'), ' '), 80);
+          unrecognized.update(key, (n) => n + 1, ifAbsent: () => 1);
+        }
+      }
+      for (final f in features) {
+        featureSources.update(f, (n) => n + 1, ifAbsent: () => 1);
+      }
+
+      // ---- 可搜索判定 ----
+      final usesJs = audit.executedJsFields.isNotEmpty;
+      final hasSearchRule = ((_lookup(raw, 'searchUrl') as String?) ?? '')
+                  .trim()
+                  .isNotEmpty &&
+          ((_lookup(raw, 'ruleSearch.bookList') as String?) ?? '')
+              .trim()
+              .isNotEmpty;
+      for (final p in problems) {
+        reasonSources.update(p, (n) => n + 1, ifAbsent: () => 1);
+      }
+      if (!hasSearchRule) {
+        missingSearchRule++;
+        continue;
+      }
+      if (usesJs) {
+        blockedByJs++;
+        continue;
+      }
+      if (problems.isEmpty) {
+        runnable++;
+      } else {
+        blockedBySelector++;
+        if (problems.length == 1) {
+          final p = problems.first;
+          soleBlocker.update(p, (n) => n + 1, ifAbsent: () => 1);
+          // 同一个源可能有多条坏规则；只记第一条就够看优先级
+          final bad = <String>[];
+          for (final path in kExecutedFields) {
+            if (kUrlExecutedFields.contains(path)) continue;
+            final v = _lookup(raw, path);
+            if (v is! String || v.trim().isEmpty) continue;
+            if (_jsStylesIn(v).isNotEmpty) continue;
+            final parsed = legadoSelector(v);
+            if (!parsed.isRunnable && !parsed.isEmpty) {
+              bad.add(_truncate(v.trim().replaceAll(RegExp(r'\s+'), ' '), 80));
+            }
+          }
+          if (bad.isNotEmpty) {
+            soleBlockerRules.update(bad.first, (n) => n + 1, ifAbsent: () => 1);
+          }
+        }
+      }
+    }
+  }
+
+  /// 把 [SelectorValue] 归一成原因码（可读性交给 [_reasonLabel]）。
+  String _problemCode(SelectorValue v) {
+    if (v.needsJs) return 'js';
+    if (v.kind == SelectorKind.jsonPath) return 'jsonPath';
+    return v.reason ?? 'syntax';
+  }
+
+  Map<String, dynamic> summaryJson() => {
+        'total': total,
+        'runnable': runnable,
+        'blockedByJs': blockedByJs,
+        'blockedBySelector': blockedBySelector,
+        'missingSearchRule': missingSearchRule,
+        'features': {for (final e in _sortedFeatures()) e.key: e.value},
+        'reasons': reasonSources,
+        'soleBlocker': soleBlocker,
+        'unrecognized': [
+          for (final e in _sortedUnrecognized())
+            {'rule': e.key, 'sources': e.value},
+        ],
+      };
+
+  List<MapEntry<String, int>> _sortedFeatures() {
+    final list = featureSources.entries.toList()
+      ..sort((a, b) => b.value != a.value
+          ? b.value.compareTo(a.value)
+          : a.key.compareTo(b.key));
+    return list;
+  }
+
+  List<MapEntry<String, int>> _sortedUnrecognized() {
+    final list = unrecognized.entries.toList()
+      ..sort((a, b) => b.value != a.value
+          ? b.value.compareTo(a.value)
+          : a.key.compareTo(b.key));
+    return list;
+  }
+
+  void printAll() {
+    stdout.writeln('');
+    stdout.writeln('════════ 表⑥ 执行字段的选择器语法特征（按源数） ════════');
+    final features = _sortedFeatures();
+    if (features.isEmpty) {
+      stdout.writeln('  （一条非 JS 选择器都没有）');
+    } else {
+      for (final e in features) {
+        final pct = total == 0 ? 0.0 : e.value * 100 / total;
+        stdout.writeln('  ${_pad(e.key, 24)} ${_pad('${e.value}', 6)}'
+            '${pct.toStringAsFixed(1)}%');
+      }
+    }
+
+    stdout.writeln('');
+    stdout.writeln('════════ 表⑦ top 20 未识别写法（原文 · 出现源数） ════════');
+    final gaps = _sortedUnrecognized();
+    if (gaps.isEmpty) {
+      stdout.writeln('  （全部可解析）');
+    } else {
+      for (final e in gaps.take(20)) {
+        stdout.writeln('  ${_pad('${e.value}', 6)}${e.key}');
+      }
+      if (gaps.length > 20) {
+        stdout.writeln('  … 还有 ${gaps.length - 20} 种未列出');
+      }
+    }
+
+    stdout.writeln('');
+    stdout.writeln('════════ 表⑧ 真正可搜索的源（不靠 JS + 选择器全可解析） ════════');
+    final pct = total == 0 ? 0.0 : runnable * 100 / total;
+    stdout.writeln('  去重源            ${_pad('$total', 6)}');
+    stdout.writeln('  可搜索            ${_pad('$runnable', 6)}'
+        '${pct.toStringAsFixed(1)}%');
+    stdout.writeln('  被 JS 挡          ${_pad('$blockedByJs', 6)}'
+        '${(blockedByJs * 100 / total).toStringAsFixed(1)}%');
+    stdout.writeln('  被选择器语法挡    ${_pad('$blockedBySelector', 6)}'
+        '${(blockedBySelector * 100 / total).toStringAsFixed(1)}%');
+    stdout.writeln('  缺搜索规则        ${_pad('$missingSearchRule', 6)}'
+        '${(missingSearchRule * 100 / total).toStringAsFixed(1)}%');
+
+    if (reasonSources.isNotEmpty) {
+      final reasons = reasonSources.entries.toList()
+        ..sort((a, b) => b.value.compareTo(a.value));
+      stdout.writeln('');
+      stdout.writeln('  按原因分组（一个源可命中多个原因）：');
+      for (final e in reasons) {
+        stdout.writeln('    ${_pad(_reasonLabel(e.key), 22)} ${e.value}');
+      }
+      stdout.writeln('');
+      stdout.writeln('  「只差这一条就能跑」的源（实现优先级）：');
+      final sole = soleBlocker.entries.toList()
+        ..sort((a, b) => b.value.compareTo(a.value));
+      for (final e in sole) {
+        stdout.writeln('    ${_pad(_reasonLabel(e.key), 22)} ${e.value}');
+      }
+      final soleRules = soleBlockerRules.entries.toList()
+        ..sort((a, b) => b.value != a.value
+            ? b.value.compareTo(a.value)
+            : a.key.compareTo(b.key));
+      if (soleRules.isNotEmpty) {
+        stdout.writeln('');
+        stdout.writeln('  其中 top 15「只差这一条」的规则原文：');
+        for (final e in soleRules.take(15)) {
+          stdout.writeln('    ${_pad(e.value.toString(), 6)}${e.key}');
+        }
+      }
+    }
+  }
+}
+
+/// 一条规则串的语法特征（原始串层面，与解析实现无关）。
+Set<String> _featuresOf(String raw) {
+  final out = <String>{};
+  final text = raw.trim();
+  if (text.isEmpty) return out;
+  // 只看首段：`A || B` 的两个分支常常写法不同，按首段归类才不重不漏
+  final head = text.split('||').first.trim();
+  final lower = head.toLowerCase();
+
+  if (lower.startsWith('@css:')) {
+    out.add('前缀 @css:');
+  } else if (lower.startsWith('css:')) {
+    out.add('前缀 css:');
+  } else if (lower.startsWith('@xpath:')) {
+    out.add('前缀 @XPath:');
+  } else if (lower.startsWith('xpath:')) {
+    out.add('前缀 xpath:');
+  } else if (lower.startsWith('@json:') || lower.startsWith('json:')) {
+    out.add('前缀 @json:');
+  } else if (lower.startsWith('@regex:') || lower.startsWith('regex:')) {
+    out.add('前缀 regex:');
+  } else if (lower.startsWith('@tag.')) {
+    out.add('前缀 @tag.');
+  } else if (lower.startsWith('tag.')) {
+    out.add('前缀 tag.');
+  } else if (lower.startsWith('class.')) {
+    out.add('前缀 class.');
+  } else if (lower.startsWith('id.')) {
+    out.add('前缀 id.');
+  } else if (lower.startsWith('text.')) {
+    out.add('前缀 text.');
+  } else if (lower.startsWith('children')) {
+    out.add('前缀 children');
+  } else if (head.startsWith('//') || head.startsWith('(//')) {
+    out.add('前缀 //（XPath）');
+  } else if (head.startsWith('@')) {
+    out.add('前缀 @其它');
+  } else {
+    out.add('前缀 无（CSS）');
+  }
+
+  if (text.contains('&&')) out.add('组合子 &&');
+  if (text.contains('||')) out.add('组合子 ||');
+  if (text.contains('%%')) out.add('组合子 %%');
+
+  for (final seg in _rawSegments(text)) {
+    if (RegExp(r'\.-?\d+(?::-?\d+)*$').hasMatch(seg)) out.add('索引 .N');
+    if (RegExp(r'!-?\d+(?::-?\d+)*$').hasMatch(seg)) out.add('索引 !N');
+    if (RegExp(r'\[\s*-?\d+\s*\]$').hasMatch(seg)) out.add('索引 [N]');
+  }
+
+  final body = text.split('##').first.trim();
+  final getter = RegExp(r'@([A-Za-z][\w\-]*)$').firstMatch(body);
+  if (getter != null) {
+    final name = getter.group(1)!;
+    final low = name.toLowerCase();
+    if (low == 'text' || low == 'html' || low == 'href' || low == 'src') {
+      out.add('取值 @$low');
+    } else if (low == 'owntext' || low == 'textnodes' || low == 'all') {
+      out.add('取值 @$low');
+    } else {
+      out.add('取值 @属性名');
+    }
+  }
+  if (RegExp(r'@attr:', caseSensitive: false).hasMatch(text)) {
+    out.add('取值 @attr:');
+  }
+  if (text.contains('##')) out.add('清洗 ##正则##替换');
+  if ('@'.allMatches(text).length >= 2) out.add('链式（≥2 个 @）');
+  return out;
+}
+
+/// 把一条规则串按 `||` / `&&` / `@` 粗切成段（只用于看「段尾有没有索引」）。
+List<String> _rawSegments(String raw) => [
+      for (final a in raw.split('||'))
+        for (final b in a.split('&&'))
+          for (final c in b.split('@'))
+            if (c.trim().isNotEmpty) c.trim(),
+    ];
+
+String _truncate(String text, int max) =>
+    text.length <= max ? text : '${text.substring(0, max)}…';
 
 /// 统计 + 打印。
 class _Report {

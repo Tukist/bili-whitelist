@@ -637,6 +637,10 @@ String _selectorMessage(SelectorValue v, String what) {
       return '$what需要 JS（${v.raw}），本版暂不支持 JS 书源';
     case kSelectorReasonEmpty:
       return '$what是空的';
+    case kSelectorReasonTextFilter:
+      return '$what用了 text. 按文字筛元素（${v.raw}），本版暂不支持';
+    case kSelectorReasonInterleave:
+      return '$what用了 %% 交叉合并（${v.raw}），本版暂不支持';
     default:
       return '$what写法暂不支持（${v.raw}）';
   }

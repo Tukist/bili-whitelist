@@ -267,4 +267,226 @@ void main() {
       expect(s, contains('href'));
     });
   });
+
+  // ==================== v2.77.0：链式 / 索引 / 并列 / 扩展取值 ====================
+  //
+  // 下面每条规则串都是**真实语料里抄的**（`app/tools/js_rule_audit.dart
+  // --selectors` 对 2483 个去重源的统计），不是编出来的「理想形态」。
+  // 括号里是这条写法在语料里出现的串数。
+  group('链式 @A@B@C（v2.77.0）', () {
+    test('class.grid@tag.tr!0：先 .grid，再在其下取 tr 并跳过第一个（54 串）', () {
+      final v = parseSelector('class.grid@tag.tr!0');
+      expect(v.kind, SelectorKind.css);
+      expect(v.query, '.grid');
+      expect(v.steps.length, 1);
+      expect(v.steps.first.kind, SelectorKind.css);
+      expect(v.steps.first.query, 'tr');
+      // `!0` 是排除第一个（跳过表头那一行），不是「取第一个」
+      expect(v.steps.first.indexes, [0]);
+      expect(v.steps.first.indexExclude, isTrue);
+      expect(v.isRunnable, isTrue);
+    });
+
+    test('id.info@tag.p.2@text##最后更新：：链 + 索引 + 取值后缀 + 清洗（35 串）', () {
+      final v = parseSelector('id.info@tag.p.2@text##最后更新：');
+      expect(v.query, '#info');
+      expect(v.steps.single.query, 'p');
+      expect(v.steps.single.indexes, [2]);
+      expect(v.steps.single.indexExclude, isFalse);
+      expect(v.attr, isNull); // @text = 默认取文本
+      expect(v.suffixRegex, '最后更新：');
+      expect(v.suffixReplacement, isNull); // 只写正则 = 删掉匹配
+    });
+
+    test('p.1@a.0@text：两段索引各自作用在自己那一段上', () {
+      final v = parseSelector('p.1@a.0@text');
+      expect(v.query, 'p');
+      expect(v.indexes, [1]);
+      expect(v.steps.single.query, 'a');
+      expect(v.steps.single.indexes, [0]);
+    });
+
+    test('id.fmimg@tag.img@src：取值后缀只作用于链尾（56 串）', () {
+      final v = parseSelector('id.fmimg@tag.img@src');
+      expect(v.query, '#fmimg');
+      expect(v.steps.single.query, 'img');
+      expect(v.attr, 'src');
+    });
+
+    test('@a@text：链首多一个 @ = 从当前节点开始（3 个源）', () {
+      final v = parseSelector('@a@text');
+      expect(v.kind, SelectorKind.self);
+      expect(v.steps.single.query, 'a');
+      expect(v.steps.single.kind, SelectorKind.css);
+    });
+
+    test('回退链的每一支各自带自己的链（21 串）', () {
+      final v = parseSelector(
+        'class.book-img-text@tag.li||class.book-list-wrap@class.book-list@tag.li',
+      );
+      expect(v.query, '.book-img-text');
+      expect(v.steps.single.query, 'li');
+      expect(v.fallbacks.single.query, '.book-list-wrap');
+      expect(v.fallbacks.single.steps.length, 2);
+      expect(v.fallbacks.single.steps.first.query, '.book-list');
+      expect(v.fallbacks.single.steps.last.query, 'li');
+    });
+
+    test('链上任一段不支持 → 整条不支持（不给半真半假的结果）', () {
+      final v = parseSelector('class.a@text.作者');
+      expect(v.kind, SelectorKind.unsupported);
+      expect(v.reason, kSelectorReasonTextFilter);
+    });
+  });
+
+  group('索引 .N / !N（v2.77.0）', () {
+    test('.N 是「选中」，!N 是「排除」—— 两者语义相反', () {
+      final pick = parseSelector('tag.td.0@tag.a@href');
+      expect(pick.indexes, [0]);
+      expect(pick.indexExclude, isFalse);
+
+      final skip = parseSelector('tag.tr!0');
+      expect(skip.indexes, [0]);
+      expect(skip.indexExclude, isTrue);
+    });
+
+    test('多索引用 : 分隔（class.listmain@dd!0:1:2 这类写法）', () {
+      final v = parseSelector('class.listmain@dd!0:1:2:3');
+      expect(v.steps.single.query, 'dd');
+      expect(v.steps.single.indexes, [0, 1, 2, 3]);
+      expect(v.steps.single.indexExclude, isTrue);
+    });
+
+    test('负数索引（从末尾数）', () {
+      final v = parseSelector('div.-1');
+      expect(v.query, 'div');
+      expect(v.indexes, [-1]);
+      expect(v.indexExclude, isFalse);
+    });
+
+    test('索引在列表规则上同样生效（class.vrResult!0）', () {
+      final v = parseSelector('class.vrResult!0');
+      expect(v.query, '.vrResult');
+      expect(v.indexes, [0]);
+      expect(v.indexExclude, isTrue);
+    });
+
+    test('索引与取值后缀共存：a.2@title（取第 3 个 a 的 title 属性）', () {
+      final v = parseSelector('a.2@title');
+      expect(v.query, 'a');
+      expect(v.indexes, [2]);
+      expect(v.attr, 'title');
+    });
+  });
+
+  group('&& 并列（v2.77.0，622 个源）', () {
+    test('[property=og:novel:category]@content&&[property=og:novel:status]@content', () {
+      final v = parseSelector(
+        '[property=og:novel:category]@content&&[property=og:novel:status]@content',
+      );
+      expect(v.kind, SelectorKind.css);
+      expect(v.query, '[property=og:novel:category]');
+      expect(v.attr, 'content');
+      expect(v.concat.length, 1);
+      expect(v.concat.single.query, '[property=og:novel:status]');
+      expect(v.concat.single.attr, 'content');
+      expect(v.isRunnable, isTrue);
+    });
+
+    test('三段并列 + 段间空格（真实语料里就这么写）', () {
+      final v = parseSelector('[property=og:novel:update_time]@content&& '
+          '[property=og:novel:category]@content&& '
+          '[property=og:novel:status]@content');
+      expect(v.concat.length, 2);
+      expect(v.concat.first.query, '[property=og:novel:category]');
+      expect(v.concat.last.query, '[property=og:novel:status]');
+    });
+
+    test('&& 的每一支可以带自己的链与索引', () {
+      final v = parseSelector(
+        'class.info@class.fix@tag.p.1@text&&class.info@class.fix@tag.p.2@text',
+      );
+      expect(v.query, '.info');
+      expect(v.concat.single.steps.length, 2);
+      expect(v.concat.single.steps.last.indexes, [2]);
+    });
+
+    test('|| 与 && 同时出现时先拆 ||（回退优先）', () {
+      final v = parseSelector('class.a@text&&class.b@text||class.c@text');
+      expect(v.query, '.a');
+      expect(v.concat.single.query, '.b');
+      expect(v.fallbacks.single.query, '.c');
+    });
+  });
+
+  group('取值后缀扩展（v2.77.0）', () {
+    test('@content：legado 的最后一段就是属性名（2382 串）', () {
+      final v = parseSelector('[property=og:novel:book_name]@content');
+      expect(v.query, '[property=og:novel:book_name]');
+      expect(v.attr, 'content');
+    });
+
+    test('@ownText / @textNodes / @all 走 legado 的三个特殊取值', () {
+      expect(parseSelector('class.brief@ownText').attr, 'ownText');
+      expect(parseSelector('li.1@textNodes').attr, 'textNodes');
+      expect(parseSelector('div.info@all').attr, 'all');
+    });
+
+    test('裸标签名不当属性，当链式段（class.txt-list@li = 取 li，347 串）', () {
+      final v = parseSelector('class.txt-list@li');
+      expect(v.query, '.txt-list');
+      expect(v.attr, isNull);
+      expect(v.steps.single.query, 'li');
+    });
+
+    test('XPath 的属性轴 /@content 不切后缀（13 串）', () {
+      final v = parseSelector("//meta[@property='og:novel:book_name']/@content");
+      expect(v.kind, SelectorKind.xpath);
+      expect(v.query, "//meta[@property='og:novel:book_name']/@content");
+      expect(v.attr, isNull);
+      expect(v.steps, isEmpty);
+    });
+
+    test('##…##替换### = 只替换第一个（legado 的第四个字段）', () {
+      final v =
+          parseSelector(r'##data-bid="([^"]+)"##https://m.qidian.com/book/$1###');
+      expect(v.kind, SelectorKind.self); // 只有清洗 → 取当前节点文本
+      expect(v.suffixRegex, r'data-bid="([^"]+)"');
+      expect(v.suffixReplacement, r'https://m.qidian.com/book/$1');
+      expect(v.suffixReplaceFirst, isTrue);
+    });
+  });
+
+  group('children（v2.77.0）', () {
+    test('class.shu_cont@children = 该节点的直接子元素', () {
+      final v = parseSelector('class.shu_cont@children');
+      expect(v.query, '.shu_cont');
+      expect(v.steps.single.kind, SelectorKind.children);
+      expect(v.isRunnable, isTrue);
+    });
+
+    test('单独写 children 也是取子元素', () {
+      expect(parseSelector('children').kind, SelectorKind.children);
+    });
+  });
+
+  group('明确不支持的写法（v2.77.0）', () {
+    test('text.xxx 按文字筛元素：reason=text（36 个源）', () {
+      final v = parseSelector('text.作者：@text');
+      expect(v.kind, SelectorKind.unsupported);
+      expect(v.reason, kSelectorReasonTextFilter);
+      expect(v.needsJs, isFalse);
+    });
+
+    test('%% 交叉合并：reason=interleave（5 个源）', () {
+      final v = parseSelector('tag.td.2@tag.a@text%%tag.td.4@text');
+      expect(v.kind, SelectorKind.unsupported);
+      expect(v.reason, kSelectorReasonInterleave);
+    });
+
+    test('@get:{x} 依赖 java.put 的变量表 → 算「需要 JS」', () {
+      final v = parseSelector('@get:{n}');
+      expect(v.needsJs, isTrue);
+    });
+  });
 }

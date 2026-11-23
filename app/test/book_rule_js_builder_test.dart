@@ -97,6 +97,59 @@ void main() {
     });
   });
 
+  // ==================== v2.77.0：链式 / 索引 / 并列 / 扩展取值 ====================
+  group('buildQueryFieldsJs（v2.77.0 新语法）', () {
+    test('链式与索引都写进 spec，且脚本里有 applyIndex', () {
+      final js = buildQueryFieldsJs(parseSelector('class.grid@tag.tr!0'), null);
+      expect(js, contains('"steps":[{"kind":"css","query":"tr"'));
+      expect(js, contains('"indexes":[0]'));
+      expect(js, contains('"indexExclude":true'));
+      // 过滤逻辑必须真的在脚本里（否则 JSON 里写了索引也不会生效）
+      expect(js, contains('function applyIndex('));
+      expect(js, contains('spec.indexExclude'));
+    });
+
+    test('&& 的并列分支进 concat，取值时按换行拼', () {
+      final js = buildQueryFieldsJs(
+        parseSelector('@css:.book'),
+        parseSelector(
+          '[property=og:novel:category]@content&&[property=og:novel:status]@content',
+        ),
+      );
+      expect(js, contains('"concat":[{"kind":"css"'));
+      expect(js, contains('"attr":"content"'));
+      expect(js, contains(r"parts.join('\n')"));
+    });
+
+    test('ownText / textNodes / all 三个取值在 JS 侧有实现', () {
+      final js = buildQueryFieldsJs(
+        parseSelector('@css:.book'),
+        parseSelector('@css:.brief@textNodes'),
+      );
+      expect(js, contains('"attr":"textNodes"'));
+      expect(js, contains('function textNodes('));
+      expect(js, contains('function ownText('));
+      expect(js, contains("g === 'all'"));
+    });
+
+    test('children 走 root.children，不用 :scope', () {
+      final js =
+          buildQueryFieldsJs(parseSelector('class.shu_cont@children'), null);
+      expect(js, contains('"kind":"children"'));
+      expect(js, contains('root.children'));
+      expect(js.contains(':scope'), isFalse);
+    });
+
+    test('##…### 的「只替换一次」传到脚本里', () {
+      final js = buildQueryFieldsJs(
+        parseSelector('@css:.book'),
+        parseSelector(r'##b(\d+)##$1###'),
+      );
+      expect(js, contains('"suffixReplaceFirst":true'));
+      expect(js, contains('spec.suffixReplaceFirst'));
+    });
+  });
+
   group('buildQueryFieldsMultiJs', () {
     test('一次往返取六列，字段名都在 out 里', () {
       final js = buildQueryFieldsMultiJs(

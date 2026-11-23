@@ -535,6 +535,12 @@ String? _runnableProblem(SelectorValue selector, String what) {
   if (selector.needsJs) {
     return '$what需要 JS（${selector.raw}），本版暂不支持';
   }
+  if (selector.reason == kSelectorReasonTextFilter) {
+    return '$what用了 text. 按文字筛元素（${selector.raw}），本版暂不支持';
+  }
+  if (selector.reason == kSelectorReasonInterleave) {
+    return '$what用了 %% 交叉合并（${selector.raw}），本版暂不支持';
+  }
   return '$what写法暂不支持（${selector.raw}）';
 }
 

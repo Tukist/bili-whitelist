@@ -194,16 +194,25 @@ Map<String, dynamic> _specMap(SelectorValue v) => {
         SelectorKind.xpath => 'xpath',
         SelectorKind.regex => 'regex',
         SelectorKind.self => 'self',
+        SelectorKind.children => 'children',
         SelectorKind.jsonPath => 'json',
         _ => 'none',
       },
       'query': v.query,
-      // null = 取文本；'html' / 'href' / 'src' / 属性名 = 其它取值方式
+      // null = 取文本；'html' / 'href' / 'src' / 'ownText' / 'textNodes' / 'all'
+      // / 属性名 = 其它取值方式
       'attr': v.attr,
       'suffixRegex': v.suffixRegex,
       // null 与 '' 语义不同：null = 「删掉匹配」，'' = 「替换成空」（等价）
       'suffixReplacement': v.suffixReplacement,
+      // true = 只替换第一个（legado 的 `##正则##替换###`）
+      'suffixReplaceFirst': v.suffixReplaceFirst,
       'fallbacks': [for (final f in v.fallbacks) _specMap(f)],
+      // v2.77.0：链式 / 索引 / 并列
+      'steps': [for (final s in v.steps) _specMap(s)],
+      'indexes': v.indexes,
+      'indexExclude': v.indexExclude,
+      'concat': [for (final c in v.concat) _specMap(c)],
     };
 
 // ==================== 内部：共用的 JS 工具函数 ====================
@@ -213,42 +222,97 @@ Map<String, dynamic> _specMap(SelectorValue v) => {
 /// 注意：这里**不能出现 `$`** —— 这段是 Dart 插值字符串的一部分，任何 `$`
 /// 都会被 Dart 当模板变量吞掉，JS 就会莫名少一段。
 const String _kJsHelpers = r'''
-function pickNodes(spec) {
+function toArray(list) { return Array.prototype.slice.call(list || []); }
+function pickOne(spec) {
   var tries = [spec].concat((spec && spec.fallbacks) || []);
   for (var t = 0; t < tries.length; t++) {
     var s = tries[t];
     if (!s) continue;
     // 正则规则没有节点概念：拿 document 当唯一上下文，值从整页文本里取
     if (s.kind === 'regex') return [document];
-    // 只写了取值后缀（`@text`）：列表就是这个上下文节点本身
-    if (s.kind === 'self') return [document];
     var nodes = queryAll(document, s);
     if (nodes.length) return nodes;
   }
   return [];
 }
+function pickNodes(spec) {
+  // `&&` 并列：每一支各自从 document 找一遍，结果按顺序接起来
+  var branches = [spec].concat((spec && spec.concat) || []);
+  var out = [];
+  for (var b = 0; b < branches.length; b++) {
+    var one = branches[b];
+    if (!one) continue;
+    var got = pickOne(one);
+    for (var i = 0; i < got.length; i++) out.push(got[i]);
+  }
+  return out;
+}
+function applyIndex(nodes, spec) {
+  var idx = (spec && spec.indexes) || [];
+  if (!idx.length) return nodes;
+  var len = nodes.length;
+  var chosen = [];
+  for (var k = 0; k < idx.length; k++) {
+    var v = idx[k];
+    // 负数从末尾数：legado 的 !-1 / .-1 就是这个意思
+    var i = v < 0 ? len + v : v;
+    if (i >= 0 && i < len && chosen.indexOf(i) < 0) chosen.push(i);
+  }
+  chosen.sort(function (a, b) { return a - b; });
+  var out = [];
+  if (spec.indexExclude) {
+    // `!N` = 排除这些下标（`class.grid@tag.tr!0` 跳过表头）
+    for (var j = 0; j < len; j++) {
+      if (chosen.indexOf(j) < 0) out.push(nodes[j]);
+    }
+  } else {
+    // `.N` = 只取这些下标（保持页面顺序）
+    for (var m = 0; m < chosen.length; m++) out.push(nodes[chosen[m]]);
+  }
+  return out;
+}
 function queryAll(root, spec) {
   if (!root || !spec) return [];
-  if (spec.kind === 'self') return [root];
-  if (!spec.query) return [];
-  try {
-    if (spec.kind === 'xpath') {
-      var snap = document.evaluate(spec.query, root, null,
-        XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
-      var arr = [];
-      for (var i = 0; i < snap.snapshotLength; i++) {
-        arr.push(snap.snapshotItem(i));
+  var head;
+  if (spec.kind === 'self') {
+    head = [root];
+  } else if (spec.kind === 'children') {
+    head = toArray(root.children);
+  } else if (spec.kind === 'regex') {
+    head = [root];
+  } else if (!spec.query) {
+    head = [];
+  } else {
+    try {
+      if (spec.kind === 'xpath') {
+        var snap = document.evaluate(spec.query, root, null,
+          XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+        head = [];
+        for (var i = 0; i < snap.snapshotLength; i++) {
+          head.push(snap.snapshotItem(i));
+        }
+      } else if (spec.kind === 'css') {
+        head = toArray(root.querySelectorAll(spec.query));
+      } else {
+        head = [];
       }
-      return arr;
+    } catch (e) {
+      // 选择器语法错误 / 页面结构变了：当作「这条取不到」，不要炸整脚本
+      head = [];
     }
-    if (spec.kind === 'css') {
-      return Array.prototype.slice.call(root.querySelectorAll(spec.query));
-    }
-  } catch (e) {
-    // 选择器语法错误 / 页面结构变了：当作「这条取不到」，不要炸整脚本
-    return [];
   }
-  return [];
+  var cur = applyIndex(head, spec);
+  // `@` 链：在上一段的结果上继续收窄，逐层展开
+  var steps = spec.steps || [];
+  for (var s = 0; s < steps.length; s++) {
+    var next = [];
+    for (var n = 0; n < cur.length; n++) {
+      var got = queryAll(cur[n], steps[s]);
+      for (var g = 0; g < got.length; g++) next.push(got[g]);
+    }
+    cur = next;
+  }
+  return cur;
 }
 function rootText(root) {
   if (!root) return '';
@@ -259,6 +323,30 @@ function rootText(root) {
   if (t === undefined || t === null) t = root.textContent;
   return t === undefined || t === null ? '' : String(t);
 }
+function ownText(node) {
+  // legado 的 ownText：只取「直接文本节点」，按空格拼（jsoup 会折叠空白）
+  var out = [];
+  var kids = node.childNodes || [];
+  for (var i = 0; i < kids.length; i++) {
+    var k = kids[i];
+    if (!k || k.nodeType !== 3) continue;
+    var t = k.textContent;
+    if (t && String(t).trim()) out.push(String(t).trim());
+  }
+  return out.join(' ');
+}
+function textNodes(node) {
+  // legado 的 textNodes：直接文本节点，按换行拼
+  var out = [];
+  var kids = node.childNodes || [];
+  for (var i = 0; i < kids.length; i++) {
+    var k = kids[i];
+    if (!k || k.nodeType !== 3) continue;
+    var t = k.textContent;
+    if (t && String(t).trim()) out.push(String(t).trim());
+  }
+  return out.join('\n');
+}
 function rawOf(node, spec) {
   var g = spec ? spec.attr : null;
   if (!g || g === 'text') return rootText(node);
@@ -266,6 +354,12 @@ function rawOf(node, spec) {
     var h = node.innerHTML;
     return h === undefined || h === null ? null : String(h);
   }
+  if (g === 'all') {
+    var o = node.outerHTML;
+    return o === undefined || o === null ? null : String(o);
+  }
+  if (g === 'ownText') return ownText(node);
+  if (g === 'textNodes') return textNodes(node);
   if (!node.getAttribute) return null;
   var v = node.getAttribute(g);
   return v === undefined || v === null ? null : String(v);
@@ -284,7 +378,9 @@ function absolutize(v, spec) {
 function applySuffix(v, spec) {
   if (v === null || !spec || !spec.suffixRegex) return v;
   try {
-    var re = new RegExp(spec.suffixRegex, 'g');
+    // 只有明确需要全局替换时才带 g：`###` 结尾的规则是「只替换一次」，
+    // 当成全局会把后面的匹配也吃掉（那些规则多半是改 URL 的）
+    var re = new RegExp(spec.suffixRegex, spec.suffixReplaceFirst ? '' : 'g');
     return v.replace(re,
       spec.suffixReplacement === null ? '' : spec.suffixReplacement);
   } catch (e) {
@@ -316,7 +412,7 @@ function valueOfNode(node, spec) {
   v = String(v).trim();
   return v === '' ? null : v;
 }
-function firstValue(node, spec) {
+function firstValueOne(node, spec) {
   var tries = [spec].concat((spec && spec.fallbacks) || []);
   for (var t = 0; t < tries.length; t++) {
     var s = tries[t];
@@ -325,7 +421,7 @@ function firstValue(node, spec) {
     if (s.kind === 'regex') {
       v = valueOfNode(node, s);
     } else if (s.kind === 'json') {
-      // JSONPath 本批只解析不执行（R3 接 JSON 接口源）
+      // JSONPath 本版只解析不执行（JSON 接口源还没接）
       v = null;
     } else {
       var nodes = queryAll(node, s);
@@ -339,5 +435,16 @@ function firstValue(node, spec) {
     if (v !== null && v !== '') return v;
   }
   return null;
+}
+function firstValue(node, spec) {
+  // `&&` 并列：每一支各取一遍，非空的按 `\n` 拼起来（legado 同义）
+  var branches = [spec].concat((spec && spec.concat) || []);
+  if (branches.length === 1) return firstValueOne(node, spec);
+  var parts = [];
+  for (var b = 0; b < branches.length; b++) {
+    var v = firstValueOne(node, branches[b]);
+    if (v !== null && v !== '') parts.push(v);
+  }
+  return parts.length ? parts.join('\n') : null;
 }
 ''';

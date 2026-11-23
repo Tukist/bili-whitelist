@@ -59,26 +59,20 @@ const Set<String> kNonRuleLegadoFields = {
 
 /// legado 规则串 → [SelectorValue]。
 ///
-/// 简写（`class.xxx`）与前缀（`@css:` / `@XPath:`）都由 [parseSelector] 处理，
-/// 这里只补一件 legado 特有的事：**组合运算符 `&&` 明确判不支持**。
-/// 为什么不放 [parseSelector] 里：那个文件只认「项目自己的最小语法」，
-/// `&&` 是 legado 生态的写法，属于兼容层的事。
-SelectorValue legadoSelector(String? raw) {
-  final value = parseSelector(raw);
-  if (value.kind == SelectorKind.css || value.kind == SelectorKind.xpath) {
-    if (value.query.contains('&&')) {
-      // 当 CSS 硬跑的后果是「静默返回空」——用户只会看到「搜不到书」，
-      // 完全查不出原因。宁可说清楚「这条用了 && 组合，暂不支持」。
-      return SelectorValue(
-        raw: value.raw,
-        kind: SelectorKind.unsupported,
-        query: value.query,
-        reason: kSelectorReasonSyntax,
-      );
-    }
-  }
-  return value;
-}
+/// **v2.77.0 起基本是 [parseSelector] 的薄别名**：`class.` 简写、`@css:` /
+/// `@XPath:` 前缀、`@` 链、`.N` / `!N` 索引、`&&` 并列、`||` 回退都在
+/// `selector.dart` 里做了，这里不再重复判定。
+///
+/// 保留这个函数是因为调用点（搜索 / 详情 / 目录 / 正文 / 健康检测）都按
+/// 「legado 兼容层」这个名字取规则，语义也确实属于兼容层；哪天要看「哪条
+/// 规则是 legado 特有的」，改这一个地方就行。
+///
+/// 一个历史说明：v2.76.0 及以前这里把 `&&` 直接判成 `unsupported`（理由是
+/// 「当 CSS 硬跑的后果是静默返回空」）。v2.77.0 用真实语料量了：`&&` 出现在
+/// **622 个源（25.1%）**，而且语义在 legado 源码里是明确的「并列」（两段
+/// 各自取值后按 `\n` 拼接），所以改成真支持；仍然不支持的 `%%`（5 个源）
+/// 由 `selector.dart` 明确报 `interleave`。
+SelectorValue legadoSelector(String? raw) => parseSelector(raw);
 
 /// 一个源的 JS 使用情况（P0 精确化）。
 ///

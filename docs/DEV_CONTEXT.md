@@ -4,7 +4,7 @@
 > 不是设计愿景。改完代码如果动了模块职责、红线、存储 key，**顺手改这里**
 > （这份文档随开发维护；`CHANGELOG.md` 归发布脚本，别手改）。
 >
-> 最近一次对齐：v2.76.0（2026-11-23，JS 判定精确化 + 书源 JS 抽样审计）。
+> 最近一次对齐：v2.77.0（2026-11-23，书源选择器补语法：链式 / 索引 / `&&`）。
 
 ---
 
@@ -121,9 +121,9 @@ bash app/tools/release_all.sh 2.71.0 --notes C:/Users/HP/.kimi-tmp/v2710.md
 
 | 文件 | 职责 |
 |------|------|
-| `selector.dart` | 选择器语法解析：`css:` / `xpath:` / `class.xxx` / `@text` / `@html` / `@href` / `@src` / `@attr:` / `regex:` / `##正则##替换` / `||` 回退链 |
-| `js_builder.dart` | 选择器 → 待求值 JS 表达式（纯函数，可单测） |
-| `legado_compat.dart` | legado 字段名映射 + `jsUsageOf`（**v2.76.0**：`JsUsage{executedJs, unexecutedJs, executedFields, blockedApis}`，只把 `search/detail/toc/content` 里会执行的字段计入判定；`usesJs` 是它的薄视图）+ `normalizeUrl` |
+| `selector.dart` | 选择器语法解析：`css:` / `xpath:` / `class.xxx` / `text.`（**明确不支持**，报 `text`）/ `@text` / `@html` / `@href` / `@src` / `@ownText` / `@textNodes` / `@all` / `@attr:` / **`@属性名`**（`@content`）/ `regex:` / `##正则##替换`（含 `###` = 只替换第一个）/ `\|\|` 回退链 / **`&&` 并列** / **`@` 链式** / **`.N` 选索引** / **`!N` 排除索引** / `children` |
+| `js_builder.dart` | 选择器 → 待求值 JS 表达式（纯函数，可单测）。v2.77.0 起 `queryAll` 自己走链式 + 索引（`applyIndex`），`firstValue` 处理 `&&` 并列，`rawOf` 多认 `ownText` / `textNodes` / `all` |
+| `legado_compat.dart` | legado 字段名映射 + `jsUsageOf`（**v2.76.0**：`JsUsage{executedJs, unexecutedJs, executedFields, blockedApis}`，只把 `search/detail/toc/content` 里会执行的字段计入判定；`usesJs` 是它的薄视图）+ `normalizeUrl`。**v2.77.0 起 `legadoSelector` 是 `parseSelector` 的薄别名**（`&&` 不再单独判死） |
 | `rule_engine.dart` | 引擎接口 + WebView 实现；`_unwrapJsValue` 负责剥 `runJavaScriptReturningResult` 的多层返回值；**v2.75.0 起 `fetchHtml` 的字节解码交给 `utils/text_decoding.dart`**（响应头 charset > 书源声明 > 自动判定），结果带出 `lastDecodeEncoding`（实际编码）与 `lastDecodeWarning`（人话告警）；`parseHeaderCharset` / `decodeWarningFor` / `decodeNoteFor` 是这段判定的纯函数入口。**controller 懒建**（`fetchHtml` 不需要 WebView），所以单测能注入假 Dio 直接验 GBK 字节；`loadHtmlString` 求值仍走同一个串行队列 |
 | `engine_holder.dart` | 全 App 唯一引擎单例（一个实例一个 WebView 页面），求值必须串行 |
 | `example_sources.dart` | **内置书源清单**（常量名仍是 `kExampleBookSources`）：维基文库（中文经典）+ 标准电子书（英文经典）。每条的搜索 / 详情 / 目录 / 正文选择器都是**先 curl 真页、再写规则**（证据写在文件头注释里）；改动前必须重新抓页面 |
@@ -308,7 +308,7 @@ Standard Ebooks 覆盖）。盗版 / 聚合爬站一律不接。
 | `blocked` | 被拦 | 401/403/407/412/429/451，或 HTTP 200 的验证页（Cloudflare / Turnstile 特征串；`noResult` 时**多抓一次**复核） |
 | `networkError` | 连不上 | 超时 / DNS / 连接失败 / 其它 5xx |
 | `unsupportedJs` | 需 JS，本版跑不了 | `usesJs` 判定，**不发请求** |
-| `badRule` | 规则本身跑不起来 | 地址拼不出、没配列表规则、JSONPath、`&&` 组合 |
+| `badRule` | 规则本身跑不起来 | 地址拼不出、没配列表规则、JSONPath、`%%` 交叉合并、`text.` 按文字筛选中 |
 
 - 管理页每行有角标（绿「可用 N 条」/ 灰「没结果」/ 红「被拦」/ 红「连不上」/
   黄「需 JS」/ 黄「规则坏」/ 灰「未检测」），长按菜单「检测这个源」；AppBar
@@ -366,6 +366,111 @@ dart run app/tools/js_rule_audit.dart https://x/a.json       # 只测指定索�
 - **抽样之外还有一道门**：很多源即使不依赖 JS，规则也用了 `@tag.` / `@a.0` /
   `p.1@a.0@text` 这类本版选择器不认的写法（`class.x@tag.a@href` 很常见）。
   P0/P1 只解决 JS，不解决这些；要评估「真正可搜」的比例得再抽一次语法样本。
+
+**选择器语法抽样与补语法（v2.77.0，I2 批）**
+
+I1 的数字只说「多少源需要 JS」。这一批量的是**第二道门**：规则本身没坏，
+但选择器写法本版解析不了，于是取不到值。工具加了 `--selectors` 模式：
+
+```bash
+# 用本地语料（反复调口径时不必每次重下 33MB；参数是 URL 也行）
+dart run app/tools/js_rule_audit.dart --selectors /tmp/a.json /tmp/b.json
+dart run app/tools/js_rule_audit.dart --selectors --json /tmp/out.json ...
+```
+
+这个模式**直接 import `lib/services/book_rule/selector.dart`**（纯 Dart，没有
+Flutter 依赖），所以「能不能解析」问的是**真的那个解析器**，不再维护第二份判定
+逻辑 —— I1 的 JS 字段表还是两处各写一份（口径同源但无法共用），而语法这块从
+v2.77.0 起只有一处。
+
+2026-11-23 实跑（同一份 2483 个去重源、27175 条非 JS 执行字段规则串）：
+
+| 语法特征 | 出现源数 | 占比 |
+|---|---|---|
+| 前缀 无（纯 CSS） | 1765 | 71.1% |
+| 取值 `@text` | 1620 | 65.2% |
+| 取值 `@href` | 1496 | 60.2% |
+| `##正则##替换` | 1488 | 59.9% |
+| 索引 `.N` | 1475 | 59.4% |
+| 链式（`@` ≥ 2 个） | 1454 | 58.6% |
+| 取值 `@html` | 1186 | 47.8% |
+| 取值 `@src` | 1105 | 44.5% |
+| 取值 `@属性名`（`@content` 等） | 1044 | 42.0% |
+| 前缀 `class.` | 1029 | 41.4% |
+| 前缀 `tag.` | 787 | 31.7% |
+| 前缀 `id.` | 673 | 27.1% |
+| 组合子 `&&` | 622 | 25.1% |
+| 取值 `@textNodes` | 452 | 18.2% |
+| 索引 `!N` | 389 | 15.7% |
+| 组合子 `\|\|` | 378 | 15.2% |
+| 前缀 `//`（XPath） | 89 | 3.6% |
+| 前缀 `@其它`（基本是 `@get:`） | 90 | 3.6% |
+| 取值 `@ownText` | 57 | 2.3% |
+| 前缀 `@css:` | 48 | 1.9% |
+| 前缀 `text.` | 36 | 1.4% |
+| 索引 `[N]` | 32 | 1.3% |
+| 前缀 `@json:` | 27 | 1.1% |
+| 取值 `@all` | 12 | 0.5% |
+| 前缀 `@tag.` | 7 | 0.3% |
+| 组合子 `%%` | 5 | 0.2% |
+
+**本批实现 / 不实现的依据就是这张表**（只做高频且语义能从 legado 源码确认的）：
+
+| 语法 | 语料 | 决定 | 依据 |
+|---|---|---|---|
+| `@` 链式（`p.1@a.0@text`） | 1454 源 / 58.6% | **做** | legado `getElements` 按 `@` 切段、逐段 `getElementsSingle` |
+| `.N` 选索引 | 1475 源 / 59.4% | **做** | `AnalyzeByJSoup`：`split == '.'` → 选择 |
+| `!N` 排除索引 | 389 源 / 15.7% | **做** | 同上：`split == '!'` → **排除**（与 `.N` 语义相反） |
+| `&&` 并列 | 622 源 / 25.1% | **做** | `getStringList` 里 `results` 按顺序 `addAll`，`getString` 再 `join("\n")` |
+| `@属性名`（`@content`） | 1044 源 / 42.0% | **做** | `getResultLast` 的 `else` 分支就是 `element.attr(lastRule)` |
+| 段尾裸标签名（`@li` / `@a`） | 660 源 / 26.6% | **做**（当链式段） | 这些规则在 legado 里是 `attr("li")` → 恒空，当链式只会多跑通、不会弄坏 |
+| `@textNodes` / `@ownText` / `@all` | 452 / 57 / 12 源 | **做** | `getResultLast` 的三个具名分支 |
+| `children` | 7 源 | **做** | `ElementsSingle`：`beforeRule == "children" → temp.children()` |
+| `##…##替换###` | 语料里遍地 | **做** | legado `rule.split("##")` 第 4 段 = `replaceFirst` |
+| `text.xxx`（按自身文字筛） | 36 源 / 1.4% | **不做**，报 `text` | 语义确定但占比低；新增一种 kind 不值当 |
+| `%%` 交叉合并 | 5 源 / 0.2% | **不做**，报 `interleave` | 只有 5 个源，交错顺序记错就是整列表错位 |
+| `@get:` / `@put:` | 27 源「只差这条」 | **不做**，算「需要 JS」 | 它们读写 `java.put` 的变量表，没有 JS 就没有那张表 |
+| `[N]` 索引 | 32 源 | **不做** | 语料里这 32 条全是 JSONPath `$.a[0]` 或 XPath `text()[1]`，不是 legado 的 `[N]` 索引 |
+
+**「真正可搜」的比例（同一份语料，前后对比）**
+
+定义：不靠 JS（执行字段没有 JS）+ 所有会执行的选择器都能解析 + 配了搜索地址与
+列表规则。口径只认这三条，**不看站点当下是否可达**（那是健康检测的事）。
+
+| | 修复前（= I1 时点口径） | v2.77.0 之后 |
+|---|---|---|
+| 去重源 | 2483 | 2483 |
+| **可搜索** | **495（19.9%）** | **754（30.4%）** |
+| 被 JS 挡 | 1176（47.4%） | 1176（47.4%） |
+| 被选择器语法挡 | 302（12.2%） | **43（1.7%）** |
+| 缺搜索规则 | 510（20.5%） | 510（20.5%） |
+
+- 净增 **+259 个源（+10.4 个百分点，相对提升 52%）**。这 259 个源一个 JS 都没碰，
+  纯粹是「写法认不出来」—— 这就是 I1 报告里说的「第二道门」。
+- 剩下的 43 个按原因：`@get:` 31（算需要 JS）、`text.` 9、`%%` 3。
+- 被选择器挡的源里，修之前「只差一条就能跑」的最高频写法是
+  `[property="og:novel:category"]@content&&…`（29 源）、`@get:{n}`（27）、
+  `[property=og:novel:update_time]@content&&…`（26）；修之后只剩长尾。
+- `@get:` 从「语法不认识」改判「需要 JS」后，UI 上的原因终于说得对了
+  （原来会显示「写法暂不支持」，用户看不出这是 JS 缺能力）。
+
+**新语法的三条硬约定**
+
+1. **`!N` 是排除，`.` 是选**，两者语义相反。`class.grid@tag.tr!0` 是「除第一行
+   之外的所有 tr」（跳过表头），不是「取第一行」。这条是查 legado 源码定的，
+   语料里 389 个源用 `!N`、1475 个源用 `.N`，猜错一个就是整列错位。
+2. **最后一段永远是「取值」**：`@text` / `@html` / `@href` / `@src` / `@ownText` /
+   `@textNodes` / `@all`，其余裸词是**属性名**（`@content`）。唯一例外是
+   `kLegadoChainTags` 里那些结构标签（`@li` / `@a` / `@tr`…）—— 它们当链式段，
+   因为在 legado 里按属性读恒为空。
+3. **链上任一段不支持 → 整条不支持**。半条链跑出来的是错值，比「明确说不支持」
+   更难排查。
+
+**JS 侧怎么验的**：`flutter test` 里没有 JS 引擎，所以单测只断言脚本文本；
+真正跑一遍是拿 `node` + 一个几十行的假 DOM 跑生成的脚本，验了六件事：
+`tr!0` 跳过第一行、`#info → p.2` 选中第 3 个、`&&` 两属性按 `\n` 拼、
+`@textNodes`、`children` 只取直接子元素、`###` 只替换第一个匹配。
+这一步不进仓库（脚本在仓外临时目录），但它比文本断言可信得多。
 
 **网络抓取的编码判定（v2.75.0）**
 
@@ -689,6 +794,25 @@ v2.74.0 加 MOBI）**：
     - **`normalizeUrl` 会把同站的 `http` 升级成 `https`**（去重与重定向口径需要），
       所以拿本地 HTTP 服务做实测时 baseUrl 不能与被请求 URL 同 host，否则请求被
       改成 https 直接 `HandshakeException`。
+19. **选择器语法三条反直觉的点（v2.77.0，都踩过）**：
+    - **`!N` 是「排除」，不是「取第 N 个」**。legado 源码里 `.` 才是选择
+      （`split == '.'` → 逐个 add），`!` 是把这些下标置空再 `removeAll`。
+      `class.grid@tag.tr!0` 的意思是「除第一行之外的所有 tr」，写成「取第一个」
+      会让搜索列表只剩一行。
+    - **最后一段 `@某词` 是取值名，不是选择器**。`@content` 是取 `content` 属性
+      （`getResultLast` 的 `else` 分支 = `element.attr(name)`）。所以
+      `[property=og:novel:category]@content` 能取到值，而
+      `class.txt-list@li` 这种「想取 li」的写法在 legado 里其实拿不到东西
+      （`attr("li")` 恒空）—— 本版把**结构标签名**当链式段处理（见
+      `kLegadoChainTags`），只多跑通、不会弄坏。反过来 `title` / `style` /
+      `value` 这些**不能**进那张表：它们作属性名远比作标签名常见。
+    - **`##正则##替换###` 尾巴多一个 `##` 是「只替换第一个」**（legado
+      `rule.split("##")` 的第 4 段 → `replaceFirst`）。按全局替换处理会把
+      `#` / `##` 拼进 URL 尾巴 —— 语料里用 `###` 结尾的规则很多，而且大半是
+      在改 URL。
+    - 另外：`text.xxx`（按自身文字筛元素）、`%%`（交叉合并）、`@get:{x}`
+      （读 `java.put` 的变量）**明确不支持**，解析器分别报 `text` /
+      `interleave` / `js`。绝不「当 CSS 硬跑」—— 那只会静默返回空值。
 
 ---
 
@@ -697,12 +821,12 @@ v2.74.0 加 MOBI）**：
 - 测试目录：`app/test/`，共 271 个 `*_test.dart`；`test/live_danmaku_fakes.dart` 与
   `test/mobi_test_builder.dart` 是辅助文件（没有 `main()`；后者文件名不匹配
   `*_test.dart`，门禁根本不会把它当测试文件）。
-- 当前基线：**271 个文件、7 批、通过用例数见下**（v2.76.0 实跑）：
+- 当前基线：**271 个文件、7 批、通过用例数见下**（v2.77.0 实跑）：
 
 | 项 | 结果 |
 |----|------|
 | `flutter analyze` | 0 issue（10–70s，冷启动更久） |
-| `flutter test` 分批 | 7 批全部通过，合计 **4153** 个用例 |
+| `flutter test` 分批 | 7 批全部通过，合计 **4185** 个用例（v2.76.0 是 4153，I2 批 +32） |
 | `flutter build apk --debug` | 通过 |
 
 - 分层策略：
@@ -719,6 +843,7 @@ v2.74.0 加 MOBI）**：
 
 | 版本 | 主题 | 关键文件 |
 |------|------|----------|
+| v2.77.0 | **书源选择器补语法（I2 批）：链式 / 索引 / `&&` 并列 / 扩展取值**。先量后做 —— `app/tools/js_rule_audit.dart` 加 `--selectors` 模式（**import 真的 `selector.dart`**，不再维护第二份判定；参数可以是 URL 也可以是本地文件），对同一份 2483 个去重源、27175 条非 JS 执行字段规则串统计出语法特征：链式 58.6%、`.N` 59.4%、`!N` 15.7%、`&&` 25.1%、`@属性名` 42.0%、`@textNodes` 18.2%、`text.` 1.4%、`%%` 0.2%。按这张表只做高频且语义能从 legado 源码确认的：① **`@` 链式**（`p.1@a.0@text` / `class.grid@tag.tr!0`）：`selector.dart` 按 `@` 切段逐段收窄（引号 / 括号 / `##` 内不切，XPath 属性轴 `/@content` 不切），`js_builder` 的 `queryAll` 递归展开；② **索引**：`.N` = **选**、`!N` = **排除**（legado `ElementsSingle` 两个分支的原义，`.0:1:2` 是索引列表，负数从末尾数），`applyIndex` 在每一段上生效；③ **`&&` 并列**：各支取一遍后按 `\n` 拼（`getStringList` 的 `addAll` + `getString` 的 `join("\n")`），`legadoSelector` 不再把 `&&` 判死；④ **取值后缀扩展**：最后一段裸词当属性名（`@content` / `@data-original`，语料 1044 源）、`@ownText` / `@textNodes` / `@all`、`children`、只有 `##正则##替换` 的规则退化成「取自身」、`##…##替换###` 按 legado 的第 4 段切「只替换第一个」；⑤ 段尾裸标签名（`@li` / `@a` / `@tr`，660 源）当**链式段**而不是属性名 —— 那些规则在 legado 里是 `attr("li")` 恒空，当链式只多跑通不会弄坏（`kLegadoChainTags` 故意不收 `title` / `style` / `value`）。**明确不做**：`text.xxx`（1.4%，报 `text`）、`%%`（0.2%，报 `interleave`）、`@get:` / `@put:`（改判「需要 JS」，原来错报「语法不认识」）。⑥ **效果**：真正可搜索的源 **495（19.9%）→ 754（30.4%）**，被选择器语法挡的源 302（12.2%）→ **43（1.7%）**；剩下 43 个里 `@get:` 31、`text.` 9、`%%` 3。⑦ 验证：新增 34 个用例（真实语料规则串做夹具，不是理想形态）；`flutter test` 没有 JS 引擎，所以另用 `node` + 几十行假 DOM 跑生成的脚本，验了「`!0` 跳过第一行 / `.2` 选中第 3 个 / `&&` 按 `\n` 拼 / `@textNodes` / `children` / `###` 只替换一次」六件事。⑧ 契约变更（一条既有断言）：`legadoSelector('… && …')` 从 `unsupported` 改为可执行（`&&` 真支持），断言改成「两支都在 `concat` 里」并补 `%%` 仍不支持的断言 | `services/book_rule/selector.dart`、`services/book_rule/js_builder.dart`、`services/book_rule/legado_compat.dart`、`app/tools/js_rule_audit.dart`、`test/book_rule_selector_test.dart`、`test/book_rule_js_builder_test.dart`、`test/legado_compat_test.dart` |
 | v2.76.0 | **书源 JS 判定精确化（P0）+ 真实语料抽样审计（I1 批）**。① 新工具 `app/tools/js_rule_audit.dart`（纯 `dart:` 标准库，`dart run app/tools/js_rule_audit.dart` 直接跑，可选 `--json <仓外路径>`）：拉 4 个公开索引、按**本 App 实际执行的字段**把每个源分成 `noJs` / `jsInUnexecutedField` / `jsTransformOnly` / `jsUnsupportedApi` / `jsNeedsJsonPath` / `jsNeedsAjax`，打五张表（总量、各分类 top10、`java.*` 频次、三种 JS 写法占比、需 ajax 的源里同时需 JSONPath 的比例）。**语料与产物不入库**。② 真实数字（2483 个去重源，2026-11-23）：`noJs` 48.8%、`jsInUnexecutedField` 2.4%、`jsTransformOnly` 20.3%、`jsUnsupportedApi` 2.8%、`jsNeedsJsonPath` 14.4%、`jsNeedsAjax` 11.3%。旧口径（扫整份 raw）判死 50.6% ≈ 流传的「51%」；新口径 48.2%，P0 净救回 **60 个（2.4%）**。门槛：P0+P1 覆盖 22.7% ≥ 20% → 值得做；ajax+jsonPath 25.7% < 60% → P2 不是唯一路径。`jsTransformOnly` 里 496/503 不调任何 `java.*`。③ `legado_compat.dart` 新增 `JsUsage{executedJs, unexecutedJs, executedFields, blockedApis}` 与 `jsUsageOf(source)`：只有 `search.*` / `detail.*` / `toc.*` / `content.*` 里会执行的字段有 JS 才判死；`exploreUrl` / `loginUrl` / `checkKeyWord` / `init` / `preUpdateJs` / `ruleExplore.*` / `ruleContent.replaceRegex` 里的 JS 不算（`raw` 里已映射字段仍扫一遍并按模型字段名去重，手搓源也不漏判）。`usesJs` 变成 `jsUsageOf(...).executedJs` 的**薄视图**（签名不变，5 处调用点零改动）。④ UI 口径统一：书源管理页每行加「部分 JS（不影响搜索）」小字（这类源照常被「检测全部」探测）；索引选择页筛选文案改「只看能直接搜索的」，`BookSourceIndexResult` 加纯增量 `partialJsKeys` / `partialJs(s)` / `partialJsCount`，行角标分「需 JS」（红）与「部分 JS」（accent）；健康检测与搜索失败文案改成点名具体字段（`search.list 等需要 JS 规则…`）。⑤ 契约变更（两条既有断言）：`checkKeyWord` 里的 JS 从「判死」改为「不判死 + 记 `unexecutedJs`」；并补 `ruleSearch.bookList` 用 JS 仍判死的断言。原以为会冲突的 `detail.wordCount` 断言**保持原样**——`book_detail_service._detailFields` 确实会执行它，属于执行字段。⑥ 端到端：抽样里的 `手机小说下载网`（`ruleBookInfo.init` 里 `org.jsoup` + `java.ajax`，搜索/目录/正文全是普通 CSS）作为真实语料 fixture 进单测；真实页面 `curl` 验证 `search.php?...searchkey=凡人` 200、`.listBox ul li` 命中 100 条（书名可读）。**已知边界**：不少源在不依赖 JS 的同时还用了 `@tag.` / `@a.0` / `p.1@a.0@text` 这类本版不认的选择器写法，P0/P1 不解决这些 | `services/book_rule/legado_compat.dart`、`app/tools/js_rule_audit.dart`（新）、`services/book_source_index_service.dart`、`services/book_source_health_service.dart`、`services/book_search_service.dart`、`pages/book_source_page.dart`、`pages/book_source_picker_page.dart`、`pages/book_search_page.dart`、`test/legado_compat_test.dart`、`test/book_source_index_service_test.dart`、`test/book_source_picker_page_test.dart`、`test/book_source_page_test.dart`、`test/book_search_page_test.dart`、`docs/DEV_CONTEXT.md` |
 | v2.75.0 | **网络书源接 GBK 解码 + 自动判定**（H 批）。① `WebViewRuleEngine.fetchHtml` 不再 `utf8.decode(allowMalformed: true)` 一把梭，字节交给 `utils/text_decoding.dart` 的 `decodeTextBytes`（与本地 TXT 导入**同一套判定**，不写第二份）：BOM → UTF-16 → **严格 UTF-8** → UTF-8 只坏 ≤1% 字节 → GBK（先信提示、再自动）→ 兜底；关键改动是**严格 UTF-8 排在「声明 gbk」之前**（站点改版只改输出不改声明，「声明 gbk 实际 utf-8」比反过来常见，硬解 GBK 得到的是「能解但全是生僻字」——乱码比例兜不住这种错）。hint 优先级 **HTTP 响应头 charset > 书源 `charset` 字段**（响应头是站点这次响应自己说的），`parseHeaderCharset` 解析 `content-type` 的 `charset=`（引号 / 大小写 / 多余参数都容忍）。② 判定事实带出两个字段：`lastDecodeEncoding`（实际编码）与 `lastDecodeWarning`（两句人话：「这个书源疑似 GBK，已按 GBK 解码」/「解码后仍有乱码，正文可能不完整」；站点自己声明了 GBK 不提示）；两者都只记**最近一次**抓取，所以正文 / 目录服务改成**每页抓完当场收下**（后一页成功不会盖掉前一页的告警；正文服务还顺手去掉了循环外那次重复收集）。③ UI：`BookSearchGroup` 加纯增量字段 `decodeNote`（`decodeNoteFor` 压成「编码：GBK」/「解码有乱码」/「编码：GBK（仍有乱码）」，正常 UTF-8 为 null），搜索页只在**分组标题下**显示一行小字；阅读页滚动模式在正文末尾加一段小字、分页模式并进最后一页（原来只显示 `partial`，`warning` 根本没渲染）；详情页复用既有 `warning` 链路。④ 书源管理页每行加一行「编码：GBK / 编码：自动」（`charsetLabelOf`：GBK 家族别名统一显示 GBK，utf-8 与没写都显示「自动」——模型默认值就是 utf-8，两者在判定上行为一致）；`fromLegado` 加注释说明 legado 的 BookSource 没有 charset 字段（它自己嗅探），正常 legado 源一律自动判定，读 `bookSourceCharset` 只为兼容少数第三方导出。⑤ 可测性：`WebViewController` 在 `flutter test` 里构造即抛，所以引擎的 controller 改成**懒建**（`fetchHtml` 只走 Dio），单测能注入假 Dio 适配器直接断言「GBK 字节 → 正确中文」。⑥ 实机（模拟器 `bili_test`，2026-11-23，`adb install -r`）：宿主机起一个只吐 GBK 字节、不带 charset 的页面 → 搜索得到 2 条中文书名（斗罗大陆 / 吞噬星空），分组标题下显示「编码：GBK」；实机上发现「疑似 GBK」被压成「仍有乱码」，于是把两句告警抽成 `kDecodeGbkGuessWarning` / `kDecodeGarbledWarning` 常量分开处理。新增 21 个用例（`text_decoding` 5 / `book_rule_engine` 9 / `book_search_service` 4 / `book_search_page` 1 / `book_source_page` 1 / `book_source_import` 1），既有断言一条没删没放宽 | `services/book_rule/rule_engine.dart`、`utils/text_decoding.dart`、`services/book_search_service.dart`、`services/book_content_service.dart`、`services/book_detail_service.dart`、`models/book_source.dart`、`pages/book_search_page.dart`、`pages/book_source_page.dart`、`pages/book_reader_page.dart`、`test/book_rule_engine_test`、`test/text_decoding_test`、`test/book_search_service_test`、`test/book_search_page_test`、`test/book_source_page_test`、`test/book_source_import_test` |
 | v2.74.0 | 一次发版覆盖三批：**PDF 本地书**（F1）、**MOBI 本地书**（G，本条）与 EPUB / 解析器分派那批的收尾。**MOBI**：① `utils/mobi_reader.dart`（纯 Dart，无 Flutter 依赖）：`PdbFile.parse`（78 字节头 + 记录表，记录无长度字段 → 任何偏移越界都抛可读异常）、`parseMobiHeader`（compression / textLength / recordCount / recordSize / encryption / textEncoding / fileVersion / extraDataFlags / full name）、`palmdocDecompress`（LZ77：`0x01–0x08` 字面量组、`0x80–0xBF` 空格 + 字符对、`0xC0–0xFF` 11 位距离 + 3–10 长度；截断 / 回溯距离 0 或越界 / 解出超长都抛异常，不会死循环）、`trimTrailingEntries`（记录尾部附加数据，条数 = `extraDataFlags` 置位数、长度 = 末尾反向变长整数）、`exthValue`（100 作者 / 503 书名，坏了返回 null）、`decodeCp1252`（0x80–0x9F 单独一张 32 项表，**不用 latin1**）。② `MobiBookParser`：支持 compression 1 / 2；**17480（HUFF/CDIC）明确拒绝**并提示用 Calibre 转 EPUB；按 `textLength` 截断、逐条剥 trailing entry 再解压；UTF-8 解出大量 U+FFFD 回退 cp1252 并记 warning；正文复用 `restoreParagraphs(html,'block')`（先删 `<head>`，与 EPUB 同一套清洗）；章节按 `<mbp:pagebreak>` 切段 + 每段首个 `<h1>`–`<h3>`（或 class 含 `chapter`/`ctitle`/`title` 的 `<p>`）启发式命名，≥2 段带标题才用这套，否则退 `splitTxtChapters`，再不行按 3000 字分块；书名 EXTH 503 > full name > PalmDB 名 > 文件名，作者 EXTH 100；**AZW3/KF8 明确拒绝**（`fileVersion >= 8`，或记录里出现 `BOUNDARY` / `FDST`）——不半解析，避免「能打开但全是乱码」；原文件 ≤ 100MB、解压后正文 ≤ 64MB。③ 接入：`dispatcher` 认 `mobi` / `azw` / `prc`（`azw3` 故意不认，`unsupportedMessage` 直接给「在 Calibre 里转成 EPUB 再导入」）；`FilePickerPlugin` 的 `EXTRA_MIME_TYPES` 加 `application/x-mobipocket-ebook` / `application/vnd.amazon.ebook`，MIME→扩展名兜底认 `mobi` / `azw3`；书架角标与导入提示复用 `format.toUpperCase()`（自动出现「MOBI」「共 N 章」）；`_cleanName` 改为复用 `titleFromFileName`（原来另抄了一份 txt/epub/pdf 后缀名单，导致书架出现「mobi_g_test.mobi」）。④ 测试：`test/mobi_reader_test.dart`（PDB 边界 / PalmDOC roundtrip + 畸形输入 / cp1252 / EXTH / trailing entry / KF8）、`test/mobi_book_parser_test.dart`（3 章中文书、无标题退化、cp1252、HUFF / DRM / KF8、损坏文件）、`test/mobi_test_builder.dart`（现造夹具，**不往仓库放二进制样本**），本地书导入链路另加 MOBI 两条（落盘 format/书名/目录 + 重复导入幂等）。**已知限制**：没解析 NCX，章节标题是启发式 | `utils/mobi_reader.dart`（新）、`services/local_book_parser.dart`（`MobiBookParser`）、`services/local_book_store.dart`（`_cleanName` 复用后缀表）、`services/local_book_import_service.dart`、`pages/reading_page.dart`（提示文案）、`android/.../FilePickerPlugin.kt`、`test/mobi_reader_test.dart`（新）、`test/mobi_book_parser_test.dart`（新）、`test/mobi_test_builder.dart`（新，辅助文件）、`test/local_book_parser_test.dart`、`test/book_local_import_test.dart` |

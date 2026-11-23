@@ -24,7 +24,7 @@
 /// | `blocked` | 401/403/407/412/429/451，或「HTTP 200 + 验证页」（Cloudflare / Turnstile） |
 /// | `networkError` | 超时、连不上、DNS、证书、其它 5xx |
 /// | `unsupportedJs` | [jsUsageOf] 里 `executedJs` 为真（执行字段里有 `<js>` / `@js:` / 非占位符 `{{…}}`）—— 不发请求 |
-/// | `badRule` | 规则本身跑不起来：地址拼不出、列表规则为空、JSONPath、`&&` 组合… |
+/// | `badRule` | 规则本身跑不起来：地址拼不出、列表规则为空、JSONPath、`%%` 交叉合并、`text.` 按文字筛… |
 ///
 /// **验证页为什么要多抓一次**：Cloudflare 之类的挑战页通常回 **HTTP 200**，
 /// 正文只有一段脚本，列表自然一条都命不中 —— 只看分组会说成「没结果」，
