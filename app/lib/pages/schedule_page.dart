@@ -27,9 +27,11 @@ const double kScheduleRowHeadW = 44;
 
 /// 日程页（v2.33.0 新增）：「像 Excel 一样可编辑的网格」。
 ///
-/// 作为主页 PageView 的一页（与主页共享 AppBar，**不带自己的 Scaffold**，
-/// 同 [HistoryPage] / [WatchStatsPage]）；从底部导航「日程」项（下标 2）
-/// 进入。
+/// 页面本身仍是「PageView 的一页」的写法（**不带自己的 Scaffold**，
+/// 同 [HistoryPage] / [WatchStatsPage]）；但 v2.69.0 起底部导航第 3 项
+/// 换成了「阅读」，本页改由「个人 → 设置 → 打开日程」push 出来，
+/// 外面套的 Scaffold 在 `pages/schedule_screen.dart`（[ScheduleScreen]）。
+/// 内容逻辑一行没改，只换了宿主。
 ///
 /// 交互五件套（对应需求原话）：
 /// 1. **点格子 → 编辑面板**（底部弹层）：改文字 / 选颜色 / 清除此格
@@ -791,8 +793,9 @@ class SchedulePageState extends State<SchedulePage> {
                   child: SingleChildScrollView(
                     // 横向主导（内层）：两层同在一个格子里，
                     // 横向拖给内层、纵向拖给外层，是 Flutter 的标准嵌套解法；
-                    // 它也比外层的 PageView 更"深"，所以网格横向滚动不会
-                    // 把主页 tab 一起滑走。
+                    // 它也比外层滚动视图更"深"，所以网格横向滚动不会把外层
+                    // 纵向滚动一起带走（v2.69.0 前外层还是主页 PageView，
+                    // 现在是设置区 push 出来的独立页）。
                     controller: _hBody,
                     scrollDirection: Axis.horizontal,
                     child: GestureDetector(

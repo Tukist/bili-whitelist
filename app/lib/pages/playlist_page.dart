@@ -47,8 +47,9 @@ import 'history_page.dart';
 import 'inbox_page.dart';
 import 'login_page.dart';
 import 'player_page.dart';
+import 'reading_page.dart';
 import 'recommend_page.dart';
-import 'schedule_page.dart';
+import 'schedule_screen.dart';
 import 'search_page.dart';
 import 'update_dialog.dart';
 import 'upowner_page.dart';
@@ -60,10 +61,12 @@ import 'watch_stats_page.dart';
 // v2.33.0 在「UP 主」与「历史」之间插入了「日程」，历史与个人各 +1。
 // v2.68.0 又把「UP 主」换成了「推荐」（下标不变，仍是 1；UP 主管理迁到
 // 「个人 → 设置 → UP 主管理」全屏页）。
+// v2.69.0 把「日程」换成了「阅读」（书源式阅读器，下标不变，仍是 2；
+// 日程迁到「个人 → 设置 → 日程」全屏页，功能一条没少）。
 // 之所以把这些下标提升成具名常量：本页里有 [PlaylistPage] 的 PageView 顺序、
 // [_PlaylistPageState._tab] 初值、[_PlaylistPageState._reloadTab] 的分支、
 // NavigationBar 的 destinations 顺序**四处**必须完全对齐，任何一处漏改都是
-// "点了历史进了日程"这类静默错位。以前这里散着 `2` / `3` 两个字面量，
+// "点了历史进了阅读"这类静默错位。以前这里散着 `2` / `3` 两个字面量，
 // 插一页就要满页找；提成常量后，"再插一页"只需改这一处 + 两个列表。
 
 /// 合集（白名单视频）：PageView 第 1 页。
@@ -72,8 +75,11 @@ const int kTabCollections = 0;
 /// 推荐（按兴趣标签推送，v2.68.0 取代原「UP 主」页签）：PageView 第 2 页。
 const int kTabRecommend = 1;
 
-/// 日程（v2.33.0 新增）：PageView 第 3 页，夹在推荐与历史之间。
-const int kTabSchedule = 2;
+/// 阅读（v2.69.0 取代原「日程」页签）：PageView 第 3 页，夹在推荐与历史之间。
+///
+/// 下标沿用日程的 2：换的是「这一页是什么」，不是「页签在第几位」——
+/// 这样历史(3)/个人(4) 与它们各自的测试锚点都不用动。
+const int kTabReading = 2;
 
 /// 历史记录：PageView 第 4 页（v2.33.0 起由 2 → 3）。
 const int kTabHistory = 3;
@@ -121,10 +127,11 @@ const int kTabPersonal = 4;
 ///   去登录解锁 1080P」提示入口（v2.16.21，不默认静默降级）
 /// - **底部导航 5 个目的地**（v2.19.0 起把原「统计」+「设置」合并为
 ///   **「个人」**；v2.33.0 在「UP 主」与「历史」之间插入 **「日程」**；
-///   v2.68.0 把「UP 主」换成 **「推荐」**；取代更早的 AppBar 历史/统计/管理
-///   三个图标；同时保留 PageView 左右滑动）：
+///   v2.68.0 把「UP 主」换成 **「推荐」**；v2.69.0 把「日程」换成
+///   **「阅读」**；取代更早的 AppBar 历史/统计/管理三个图标；同时保留
+///   PageView 左右滑动）：
 ///   合集(0) → **推荐**(1，v2.68.0：按最近观看的标签推热门/新片，已看不推) →
-///   **日程**(2，v2.33.0 新增，本地可编辑网格) →
+///   **阅读**(2，v2.69.0：书源式阅读器，R1 只有书源管理与书架空态) →
 ///   **历史记录**(3，播放历史，点击续播) →
 ///   **个人**(4)：**观看统计在上**（v2.17.9+ 每日真实观看时长；v2.17.10+
 ///   克莱因蓝 GitHub 式热力单张大图 + 总览在热力下方 + 点日期格看当天历史）、
@@ -132,6 +139,8 @@ const int kTabPersonal = 4;
 ///   见 watch_stats_page.dart / widgets/manage_panel.dart）。
 ///   原「UP 主」页上的两个管理动作（移除白名单 UP 主、导入我的 UP）没丢：
 ///   迁到设置区的「UP 主管理」全屏页（见 [_openUpownerManage]）。
+///   原「日程」页的可编辑网格也没丢：迁到设置区的「日程」全屏页
+///   （见 [_openSchedule] / `pages/schedule_screen.dart`）。
 ///   下标唯一真相 = 本文件顶部的 [kTabCollections] 一组常量。
 ///   切换目的地 = animateToPage(kDurBase) + 显式幂等刷新目标页数据
 ///   （见 [_goToPage]/[_reloadTab]）；图标 + 文字标签常显（Material 3
@@ -239,8 +248,8 @@ class _PlaylistPageState extends State<PlaylistPage> {
   bool get _hasData => _data.videos.isNotEmpty;
 
   /// 主页 PageView（v2.33.0 起 5 页：合集主页 / **推荐**（v2.68.0 取代
-  /// UP 主管理）/ **日程** / 历史记录 / 个人），初始停在合集主页
-  /// （index 0，与底部导航首项一致）。
+  /// UP 主管理）/ **阅读**（v2.69.0 取代日程）/ 历史记录 / 个人），初始停在
+  /// 合集主页（index 0，与底部导航首项一致）。
   final PageController _pageController = PageController(initialPage: 0);
 
   /// 当前选中的底部导航目的地（= PageView 当前页；点导航与滑动都会同步它，
@@ -261,6 +270,11 @@ class _PlaylistPageState extends State<PlaylistPage> {
   final GlobalKey<WatchStatsPageState> _statsKey =
       GlobalKey<WatchStatsPageState>();
 
+  /// 阅读页 State 的全局 key：切回阅读页时刷新书源条数（用户可能刚从
+  /// 「书源管理」页导入/删了几个源回来；PageView 相邻页存活，不刷新就会
+  /// 一直显示旧数字）。
+  final GlobalKey<ReadingPageState> _readingKey = GlobalKey<ReadingPageState>();
+
   /// 底部导航切页（幂等）：同步 [_tab] + 动画切到第 [i] 页 + 显式刷新目标页。
   ///
   /// 显式刷新必须保留：[onPageChanged] 只在滚动落页时触发，用户快速连点导航
@@ -274,15 +288,18 @@ class _PlaylistPageState extends State<PlaylistPage> {
   }
 
   /// 目标页数据刷新（幂等）：[kTabHistory] / [kTabPersonal]（观看统计）页重读
-  /// 本地表；[kTabCollections] 重算合集统计（切回来时把「已看 X/Y」对齐刚看完
-  /// 的那几集）；[kTabRecommend] 让推荐页按 TTL 重算（刚看完的视频会从池子里
-  /// 消失，但 30 分钟内不重复打请求）。
+  /// 本地表；[kTabReading] 重读书源条数（用户可能刚在书源管理页导入了几个）；
+  /// [kTabCollections] 重算合集统计（切回来时把「已看 X/Y」对齐刚看完的那几集）；
+  /// [kTabRecommend] 让推荐页按 TTL 重算。
   ///
-  /// [kTabSchedule]（日程）**故意不在这里刷新**：日程表全在内存里、每次改动
-  /// 即刻落库，切回来不需要重读；反而重读会把用户正在编辑的态打断。
+  /// 关于推荐页那句「刚看完的视频会从池子里消失」：**只在 TTL 过期后才成立**。
+  /// 推荐服务在 30 分钟内直接返回内存里的结果，看完一个视频立刻切回推荐页
+  /// 它还在池子里；等 TTL 到点重算时才按新的观看记录把它摘掉。切页这里
+  /// 走的是非 force 的 reload，所以「切页本身不会把刚看完的摘掉」。
   void _reloadTab(int i) {
     if (i == kTabCollections) unawaited(_refreshCollectionStats());
     if (i == kTabRecommend) unawaited(_recommendKey.currentState?.reload());
+    if (i == kTabReading) _readingKey.currentState?.reload();
     if (i == kTabHistory) _historyKey.currentState?.reload();
     if (i == kTabPersonal) _statsKey.currentState?.reload();
   }
@@ -1256,6 +1273,9 @@ class _PlaylistPageState extends State<PlaylistPage> {
       // 原底部导航「UP 主」页的两个管理动作（移除 / 导入我的 UP）的唯一入口
       // （v2.68.0：该页签已换成「推荐」）
       onOpenUpowners: _openUpownerManage,
+      // 原底部导航「日程」页的唯一入口（v2.69.0：该页签已换成「阅读」；
+      // 网格编辑 / 拖动填充 / 导入 xlsx 一条没少，只是换了壳）
+      onOpenSchedule: _openSchedule,
       onCheckUpdate: _manualCheckUpdate,
       // 次级「登录 / 重新登录」入口：推登录页（测试可注入替身）
       onLogin: () {
@@ -1628,6 +1648,20 @@ class _PlaylistPageState extends State<PlaylistPage> {
     if (mounted) unawaited(_load());
   }
 
+  /// 打开「日程」全屏页（v2.69.0：原底部导航「日程」页签被「阅读」取代，
+  /// 这一页整体搬到设置区入口后面）。
+  ///
+  /// 为什么只包一层 Scaffold：日程页是按「PageView 的一页」写的、自身不带
+  /// Scaffold（见它的类注释）。包装页在 `pages/schedule_screen.dart`，
+  /// 里面直接放 [ScheduleScreen] —— 网格编辑 / 拖动填充 / 导入 xlsx /
+  /// 本地存储全在原页内部，一行逻辑都没改，所以不需要在这里做任何刷新回调：
+  /// 日程自己每次改动即刻落库，返回时也不用重读。
+  Future<void> _openSchedule() async {
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(builder: (_) => const ScheduleScreen()),
+    );
+  }
+
   /// 从首页 UP 管理页移除白名单 UP 主。
   Future<void> _removeUpowner(Upowner up) async {
     final ok = await showDialog<bool>(
@@ -1770,10 +1804,11 @@ class _PlaylistPageState extends State<PlaylistPage> {
           // 无 key 时只能按 index 匹配 Element，State 可能错配/被重置
           // （「个人」页的 ManagePanel 持有输入框与账号状态）。
           //
-          // ★ 顺序必须与 [kTabCollections] / [kTabRecommend] / [kTabSchedule] /
+          // ★ 顺序必须与 [kTabCollections] / [kTabRecommend] / [kTabReading] /
           //   [kTabHistory] / [kTabPersonal] 及下面 NavigationBar 的
           //   destinations **逐项对齐**（v2.33.0 在中间插了「日程」，
-          //   v2.68.0 把第 2 项从 UP 主管理换成了推荐）。
+          //   v2.68.0 把第 2 项从 UP 主管理换成了推荐，
+          //   v2.69.0 把第 3 项从日程换成了阅读）。
           _buildCollectionHome(theme, cards),
           // 「推荐」（kTabRecommend，v2.68.0）：按最近观看的标签推热门/新片，
           // 已看过的不出现。同样**不是**路由、是本 PageView 的一页。
@@ -1781,11 +1816,11 @@ class _PlaylistPageState extends State<PlaylistPage> {
           // 不给 api：PlaylistPage 没有注入点，让 [RecommendPage] 用默认
           // [BiliApi]（点卡片取元数据时才真正发请求）。
           RecommendPage(key: _recommendKey),
-          // 「日程」（kTabSchedule，v2.33.0 新增）：本地可编辑网格，数据只在
-          // 本机（ScheduleStore → SharedPreferences，不进 Gist，理由见该类注释）。
+          // 「阅读」（kTabReading，v2.69.0 取代原「日程」页签）：书源式阅读器。
+          // R1 只到「书源管理 + 书架空态」，搜索/阅读器在 R2/R3。
           // 页面**不是**路由、是本 PageView 的一页（同历史/个人），因此没有
           // 自己的 Scaffold/AppBar，顶部标题由页面内部自绘。
-          const SchedulePage(key: ValueKey('schedule')),
+          ReadingPage(key: _readingKey),
           HistoryPage(key: _historyKey),
           // 「个人」（kTabPersonal，v2.19.0 把原「统计」+「设置」合并）：观看统计
           // 在上、设置在下的同一滚动流——设置区以 [WatchStatsPage.settingsSection]
@@ -1805,7 +1840,7 @@ class _PlaylistPageState extends State<PlaylistPage> {
       ),
       // 底部导航（v2.18.0+，v2.19.0 起 4 个目的地；**v2.33.0 起 5 个**——
       // 在「UP 主」与「历史」之间插入「日程」；v2.68.0 第 2 项由「UP 主」
-      // 换成「推荐」，Material 3）：
+      // 换成「推荐」；v2.69.0 第 3 项由「日程」换成「阅读」，Material 3）：
       // 图标 + 文字标签常显（触摸目标 ≥ 48dp 由 NavigationBar +
       // materialTapTargetSize 保证）。
       // 选中态墨色与指示器底由 app_theme 的 navigationBarTheme 统一配置，
@@ -1834,20 +1869,20 @@ class _PlaylistPageState extends State<PlaylistPage> {
                 tooltip: '合集（白名单视频）',
               ),
               // 「推荐」（v2.68.0 取代原「UP 主」）：explore 图标 = 发现/推荐，
-              // 与 video_library / calendar_month / history / account_circle
+              // 与 video_library / auto_stories / history / account_circle
               // 互不撞脸。
               NavigationDestination(
                 icon: Icon(Icons.explore_outlined),
                 label: '推荐',
                 tooltip: '推荐（按你的兴趣标签）',
               ),
-              // 「日程」（v2.33.0 新增）：图标用 calendar_month_outlined 而不是
-              // event_note——日历格形状与页面里那张网格表最贴，且与
-              // video_library / explore / history / account_circle 互不撞脸。
+              // 「阅读」（v2.69.0 取代原「日程」）：图标用 auto_stories_outlined
+              // （摊开的书）—— 书源式阅读器的语义比 calendar_month 准确，
+              // 且与 video_library / explore / history / account_circle 互不撞脸。
               NavigationDestination(
-                icon: Icon(Icons.calendar_month_outlined),
-                label: '日程',
-                tooltip: '日程（可编辑表格）',
+                icon: Icon(Icons.auto_stories_outlined),
+                label: '阅读',
+                tooltip: '阅读（书架与书源）',
               ),
               NavigationDestination(
                 icon: Icon(Icons.history),
@@ -2036,8 +2071,9 @@ class _PlaylistPageState extends State<PlaylistPage> {
           child: Text(
             // 底部导航项列表写在这里也是"硬编码的 tab 清单"之一（虽然只是文案，
             // 但页脚列错项同样是 bug）——v2.33.0 插入「日程」、v2.68.0 把
-            // 「UP 主」换成「推荐」后都同步改过这里。
-            'v$_version · 底部导航切换：合集 / 推荐 / 日程 / 历史 / 个人',
+            // 「UP 主」换成「推荐」、v2.69.0 把「日程」换成「阅读」后
+            // 都同步改过这里。
+            'v$_version · 底部导航切换：合集 / 推荐 / 阅读 / 历史 / 个人',
             style: theme.textTheme.labelSmall?.copyWith(
               color: theme.colorScheme.outline,
             ),

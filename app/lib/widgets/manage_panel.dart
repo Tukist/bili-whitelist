@@ -71,6 +71,13 @@ class ManagePanel extends StatefulWidget {
   /// 这一行（弹层宿主/旧调用方不受影响）。
   final VoidCallback? onOpenUpowners;
 
+  /// 打开「日程」（v2.69.0+）：可编辑表格 / 支持导入 xlsx。
+  ///
+  /// 为什么要有这个入口：底部导航原来的「日程」页签被「阅读」取代，日程页
+  /// 本身（网格编辑、拖动填充、导入 Excel）一条功能都没删，只剩设置区这一处
+  /// 入口。为空则不渲染这一节（弹层宿主/旧调用方不受影响）。
+  final VoidCallback? onOpenSchedule;
+
   /// 检查更新入口（宿主弹更新对话框）。
   final VoidCallback onCheckUpdate;
 
@@ -102,6 +109,7 @@ class ManagePanel extends StatefulWidget {
     this.bili,
     required this.onManageCollections,
     this.onOpenUpowners,
+    this.onOpenSchedule,
     required this.onCheckUpdate,
     required this.onLogin,
     this.onSessionChanged,
@@ -623,6 +631,30 @@ class _ManagePanelState extends State<ManagePanel> {
               onPressed: widget.onOpenUpowners,
               icon: const Icon(Icons.person_outline, size: 18),
               label: const Text('UP 主管理'),
+            ),
+          ),
+          const SizedBox(height: 16),
+          const Divider(height: 1),
+          const SizedBox(height: 16),
+        ],
+        // ---- 日程（v2.69.0：底部导航「日程」页签换成「阅读」后，可编辑表格
+        //      只剩这里一个入口 —— 功能没删，只是换了壳）----
+        if (widget.onOpenSchedule != null) ...[
+          Text('日程', style: theme.textTheme.titleMedium),
+          const SizedBox(height: 4),
+          Text(
+            '可编辑表格 / 支持导入 xlsx（数据只存本机）。',
+            style: theme.textTheme.bodySmall?.copyWith(
+              color: theme.colorScheme.onSurfaceVariant,
+            ),
+          ),
+          const SizedBox(height: 8),
+          SizedBox(
+            width: double.infinity,
+            child: OutlinedButton.icon(
+              onPressed: widget.onOpenSchedule,
+              icon: const Icon(Icons.calendar_month_outlined, size: 18),
+              label: const Text('打开日程'),
             ),
           ),
           const SizedBox(height: 16),
