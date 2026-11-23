@@ -1,10 +1,13 @@
 /// 搜索书籍页（R3 新增）：全屏 Scaffold + AppBar「搜索书籍」。
 ///
-/// ## 只搜「启用且不需要 JS」的源
-/// [BookSearchService] 已经会给需要 JS 的源生成 `unsupported` 分组，但那要
+/// ## 只搜「启用且**执行字段**里没有 JS」的源
+/// [BookSearchService] 已经会给要 JS 的源生成 `unsupported` 分组，但那要
 /// 先把源塞进并发池里走一圈（虽然不发请求）。这一页直接**在入参上过滤**：
 /// 真正可搜的源才进去；被跳过的源名单独列一行「N 个源需要 JS 规则，已跳过」。
 /// 用户能看到「为什么少了几个源」，而不是莫名其妙少了结果。
+///
+/// 判定用 [jsUsageOf]（I1 起）：只有发现页 / 登录页 / 校验词这些**本版不执行**
+/// 的字段用了 JS 的源照常搜 —— 旧口径扫整份 raw 会把它们整源判死。
 ///
 /// ## 结果两种视图
 /// - 分组：默认。每个源一块，标题「源名 · N 条」，失败/不支持的源把原因写在
@@ -148,7 +151,8 @@ class _BookSearchPageState extends State<BookSearchPage> {
     final sources = _sources;
     if (sources == null) return;
 
-    // 只搜「启用 且 不需要 JS」的源（见文件头）
+    // 只搜「启用 且 执行字段里没有 JS」的源（见文件头）。
+    // 注意：`usesJs` 是 `jsUsageOf(...).executedJs` 的薄视图，签名没变。
     final searchable = [
       for (final s in sources)
         if (s.enabled && !usesJs(s)) s,
@@ -683,7 +687,8 @@ class _BookSearchPageState extends State<BookSearchPage> {
                   ),
                 const SizedBox(height: kSpace8),
                 Text(
-                  '这些源用了 <js> / @js: / {{…}} 规则，本版跑不了 —— 不是它们失效了。',
+                  '这些源的搜索 / 目录 / 正文规则用了 <js> / @js: / {{…}}，'
+                  '本版跑不了 —— 不是它们失效了。',
                   style: kTypeBodyS.copyWith(color: kInkGray50, fontSize: 12),
                 ),
               ],

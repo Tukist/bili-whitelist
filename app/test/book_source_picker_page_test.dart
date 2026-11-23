@@ -57,9 +57,15 @@ class _FakeIndexService extends BookSourceIndexService {
 BookSourceIndexResult _result(
   List<BookSource> sources, {
   Set<String> jsKeys = const {},
+  Set<String> partialJsKeys = const {},
   List<IndexUrlOutcome> outcomes = const [],
 }) =>
-    BookSourceIndexResult(sources: sources, jsKeys: jsKeys, outcomes: outcomes);
+    BookSourceIndexResult(
+      sources: sources,
+      jsKeys: jsKeys,
+      partialJsKeys: partialJsKeys,
+      outcomes: outcomes,
+    );
 
 const String _kLink = 'https://index.example/a.json';
 
@@ -171,7 +177,7 @@ void main() {
     expect(find.text('已导入'), findsOneWidget);
   });
 
-  testWidgets('筛选：只看不需要 JS 的', (tester) async {
+  testWidgets('筛选：只看能直接搜索的（执行字段无 JS）', (tester) async {
     final store = BookSourceStore();
     await store.saveIndexUrls([_kLink]);
     final plain = _src('普通');
@@ -186,9 +192,39 @@ void main() {
     await _download(tester);
     expect(find.text('JS源'), findsOneWidget);
 
-    await tester.tap(find.text('只看不需要 JS 的'));
+    await tester.tap(find.text('只看能直接搜索的'));
     await tester.pumpAndSettle();
     expect(find.text('JS源'), findsNothing);
+    expect(find.text('普通'), findsOneWidget);
+  });
+
+  testWidgets('部分 JS 的源：标「部分 JS」，筛选不藏它（能直接搜）', (tester) async {
+    final store = BookSourceStore();
+    await store.saveIndexUrls([_kLink]);
+    final plain = _src('普通');
+    final partial = _src('部分JS源');
+    final js = _src('JS源');
+    await _pump(
+      tester,
+      store: store,
+      service: _FakeIndexService(
+        _result(
+          [plain, partial, js],
+          jsKeys: {js.key},
+          partialJsKeys: {partial.key},
+        ),
+      ),
+    );
+    await _download(tester);
+
+    // 两个角标必须分开：部分 JS 能搜，需 JS 跑不了
+    expect(find.text('部分 JS'), findsOneWidget);
+    expect(find.text('需 JS'), findsOneWidget);
+
+    await tester.tap(find.text('只看能直接搜索的'));
+    await tester.pumpAndSettle();
+    expect(find.text('JS源'), findsNothing);
+    expect(find.text('部分JS源'), findsOneWidget);
     expect(find.text('普通'), findsOneWidget);
   });
 

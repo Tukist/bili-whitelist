@@ -4,7 +4,7 @@
 > 不是设计愿景。改完代码如果动了模块职责、红线、存储 key，**顺手改这里**
 > （这份文档随开发维护；`CHANGELOG.md` 归发布脚本，别手改）。
 >
-> 最近一次对齐：v2.75.0（2026-11-23，网络书源 GBK 解码）。
+> 最近一次对齐：v2.76.0（2026-11-23，JS 判定精确化 + 书源 JS 抽样审计）。
 
 ---
 
@@ -123,7 +123,7 @@ bash app/tools/release_all.sh 2.71.0 --notes C:/Users/HP/.kimi-tmp/v2710.md
 |------|------|
 | `selector.dart` | 选择器语法解析：`css:` / `xpath:` / `class.xxx` / `@text` / `@html` / `@href` / `@src` / `@attr:` / `regex:` / `##正则##替换` / `||` 回退链 |
 | `js_builder.dart` | 选择器 → 待求值 JS 表达式（纯函数，可单测） |
-| `legado_compat.dart` | legado 字段名映射 + `isJsSource`（`<js>` / `@js:` / 非占位符 `{{…}}`） |
+| `legado_compat.dart` | legado 字段名映射 + `jsUsageOf`（**v2.76.0**：`JsUsage{executedJs, unexecutedJs, executedFields, blockedApis}`，只把 `search/detail/toc/content` 里会执行的字段计入判定；`usesJs` 是它的薄视图）+ `normalizeUrl` |
 | `rule_engine.dart` | 引擎接口 + WebView 实现；`_unwrapJsValue` 负责剥 `runJavaScriptReturningResult` 的多层返回值；**v2.75.0 起 `fetchHtml` 的字节解码交给 `utils/text_decoding.dart`**（响应头 charset > 书源声明 > 自动判定），结果带出 `lastDecodeEncoding`（实际编码）与 `lastDecodeWarning`（人话告警）；`parseHeaderCharset` / `decodeWarningFor` / `decodeNoteFor` 是这段判定的纯函数入口。**controller 懒建**（`fetchHtml` 不需要 WebView），所以单测能注入假 Dio 直接验 GBK 字节；`loadHtmlString` 求值仍走同一个串行队列 |
 | `engine_holder.dart` | 全 App 唯一引擎单例（一个实例一个 WebView 页面），求值必须串行 |
 | `example_sources.dart` | **内置书源清单**（常量名仍是 `kExampleBookSources`）：维基文库（中文经典）+ 标准电子书（英文经典）。每条的搜索 / 详情 / 目录 / 正文选择器都是**先 curl 真页、再写规则**（证据写在文件头注释里）；改动前必须重新抓页面 |
@@ -325,6 +325,47 @@ Standard Ebooks 覆盖）。盗版 / 聚合爬站一律不接。
 - `noResult` 时会**换一门语言的关键词再搜一次**（默认「历史」→ 备选 `love`）：
   否则英文站点会稳定显示「没结果」，被当成坏源。仍 0 条才判 `noResult`，
   之后才做验证页复核。
+
+**JS 判定的真实抽样（v2.76.0，I1 批）**
+
+工具 `app/tools/js_rule_audit.dart`（纯 `dart:` 标准库，`dart run` 直接跑）：
+
+```bash
+dart run app/tools/js_rule_audit.dart                       # 用内置 4 个公开索引
+dart run app/tools/js_rule_audit.dart --json /tmp/a.json     # 额外落机读结果
+dart run app/tools/js_rule_audit.dart https://x/a.json       # 只测指定索引
+```
+
+**下载到的 32MB 语料与统计产物都不入库**（`--json` 指到仓外目录）。分类口径
+按「本 App 实际执行的字段」：`search.*` / `detail.*` / `toc.*` / `content.*`
+里真的拿去抓页面的那些；`exploreUrl` / `loginUrl` / `checkKeyWord` / `init` /
+`preUpdateJs` / `ruleExplore.*` / `ruleContent.replaceRegex` 一律算「不执行」。
+
+2026-11-23 实跑（4 个索引：22 / 128 / 3907 / 2117 条，跨文件同名去重 1994 个，
+**去重后 2483 个源**）：
+
+| 分类 | 数量 | 占比 |
+|---|---|---|
+| `noJs` | 1212 | 48.8% |
+| `jsInUnexecutedField`（只在发现页 / 登录页 / init / isVip 等处用 JS） | 60 | 2.4% |
+| `jsTransformOnly`（执行字段有 JS，但没有网络调用） | 503 | 20.3% |
+| `jsUnsupportedApi`（执行字段的 JS 用了白名单外的 `java.*`） | 70 | 2.8% |
+| `jsNeedsJsonPath`（`@json:` / `$.`，本版未接） | 358 | 14.4% |
+| `jsNeedsAjax`（`java.ajax` / `connect` / `post` / `Packages.` / `org.jsoup`） | 280 | 11.3% |
+
+- **旧口径（扫整份 raw）判死 1256 个（50.6%）≈ 流传的「51% 需要 JS」**；
+  新口径（只看执行字段）1196 个（48.2%）。P0 本身只救回 **60 个（2.4%）**，
+  数字不大但每一个都是白丢的源。
+- 门槛：`jsInUnexecutedField + jsTransformOnly = 22.7% ≥ 20%` → **P0+P1 值得做**；
+  `jsNeedsAjax + jsNeedsJsonPath = 25.7% < 60%` → **P2 不是唯一有意义的路**。
+- `jsTransformOnly` 里 **496 / 503 一个 `java.*` 都不调**（纯字符串变换），
+  这是 P1 的主要工作面。`java.*` 频次 top：`ajax` 235 / `put` 195 / `get` 171 /
+  `getString` 129 / `timeFormat` 58 / `log` 53。
+- 写法占比：`<js>` 26.3%、`@js:` 28.1%、`{{…}}` 26.4%（一个源可多种）。
+- 需 ajax 的 280 个里 **115 个（41.1%）同时需要 JSONPath**。
+- **抽样之外还有一道门**：很多源即使不依赖 JS，规则也用了 `@tag.` / `@a.0` /
+  `p.1@a.0@text` 这类本版选择器不认的写法（`class.x@tag.a@href` 很常见）。
+  P0/P1 只解决 JS，不解决这些；要评估「真正可搜」的比例得再抽一次语法样本。
 
 **网络抓取的编码判定（v2.75.0）**
 
@@ -534,7 +575,11 @@ v2.74.0 加 MOBI）**：
    `Offstage(offstage: true)` 包在 `SizedBox(width: 1, height: 1)` 里——尺寸不能为 0，
    否则 WebView 不布局、JS 不执行（见 `book_search_page.dart` 的 `_hiddenHost`）。
 5. **`@js` 书源不支持**：legado 的 `java.ajax` 是同步调用，浏览器里同步 XHR 被 CORS 拦。
-   `legado_compat.isJsSource` 会判定并在 UI 标「需要 JS 规则，暂不支持」。
+   `legado_compat.jsUsageOf` 会判定并在 UI 标「需要 JS 规则，暂不支持」。
+   **v2.76.0 起口径收紧**：只有 `search/detail/toc/content` 里**会执行**的字段
+   有 JS 才判死；`exploreUrl` / `loginUrl` / `checkKeyWord` / `init` /
+   `preUpdateJs` / `ruleExplore.*` 里的 JS 本版根本不跑，这类源能正常搜
+   （`JsUsage.unexecutedJs`，UI 标「部分 JS（不影响搜索）」）。
 6. **发布脚本的 push 必须走 SSH over 443**（v2.74.0 起）：https remote 会走本机 Clash
    代理 `127.0.0.1:7897`，代理没起时 push 直接连不上。脚本现在 push 用
    `AMOTV_PUSH_REMOTE`（默认 `ssh://git@ssh.github.com:443/Tukist/bili-whitelist.git`），
@@ -652,12 +697,12 @@ v2.74.0 加 MOBI）**：
 - 测试目录：`app/test/`，共 271 个 `*_test.dart`；`test/live_danmaku_fakes.dart` 与
   `test/mobi_test_builder.dart` 是辅助文件（没有 `main()`；后者文件名不匹配
   `*_test.dart`，门禁根本不会把它当测试文件）。
-- 当前基线：**271 个文件、7 批、通过用例数见下**（v2.75.0 实跑）：
+- 当前基线：**271 个文件、7 批、通过用例数见下**（v2.76.0 实跑）：
 
 | 项 | 结果 |
 |----|------|
 | `flutter analyze` | 0 issue（10–70s，冷启动更久） |
-| `flutter test` 分批 | 7 批全部通过，合计 **4144** 个用例 |
+| `flutter test` 分批 | 7 批全部通过，合计 **4153** 个用例 |
 | `flutter build apk --debug` | 通过 |
 
 - 分层策略：
@@ -674,6 +719,7 @@ v2.74.0 加 MOBI）**：
 
 | 版本 | 主题 | 关键文件 |
 |------|------|----------|
+| v2.76.0 | **书源 JS 判定精确化（P0）+ 真实语料抽样审计（I1 批）**。① 新工具 `app/tools/js_rule_audit.dart`（纯 `dart:` 标准库，`dart run app/tools/js_rule_audit.dart` 直接跑，可选 `--json <仓外路径>`）：拉 4 个公开索引、按**本 App 实际执行的字段**把每个源分成 `noJs` / `jsInUnexecutedField` / `jsTransformOnly` / `jsUnsupportedApi` / `jsNeedsJsonPath` / `jsNeedsAjax`，打五张表（总量、各分类 top10、`java.*` 频次、三种 JS 写法占比、需 ajax 的源里同时需 JSONPath 的比例）。**语料与产物不入库**。② 真实数字（2483 个去重源，2026-11-23）：`noJs` 48.8%、`jsInUnexecutedField` 2.4%、`jsTransformOnly` 20.3%、`jsUnsupportedApi` 2.8%、`jsNeedsJsonPath` 14.4%、`jsNeedsAjax` 11.3%。旧口径（扫整份 raw）判死 50.6% ≈ 流传的「51%」；新口径 48.2%，P0 净救回 **60 个（2.4%）**。门槛：P0+P1 覆盖 22.7% ≥ 20% → 值得做；ajax+jsonPath 25.7% < 60% → P2 不是唯一路径。`jsTransformOnly` 里 496/503 不调任何 `java.*`。③ `legado_compat.dart` 新增 `JsUsage{executedJs, unexecutedJs, executedFields, blockedApis}` 与 `jsUsageOf(source)`：只有 `search.*` / `detail.*` / `toc.*` / `content.*` 里会执行的字段有 JS 才判死；`exploreUrl` / `loginUrl` / `checkKeyWord` / `init` / `preUpdateJs` / `ruleExplore.*` / `ruleContent.replaceRegex` 里的 JS 不算（`raw` 里已映射字段仍扫一遍并按模型字段名去重，手搓源也不漏判）。`usesJs` 变成 `jsUsageOf(...).executedJs` 的**薄视图**（签名不变，5 处调用点零改动）。④ UI 口径统一：书源管理页每行加「部分 JS（不影响搜索）」小字（这类源照常被「检测全部」探测）；索引选择页筛选文案改「只看能直接搜索的」，`BookSourceIndexResult` 加纯增量 `partialJsKeys` / `partialJs(s)` / `partialJsCount`，行角标分「需 JS」（红）与「部分 JS」（accent）；健康检测与搜索失败文案改成点名具体字段（`search.list 等需要 JS 规则…`）。⑤ 契约变更（两条既有断言）：`checkKeyWord` 里的 JS 从「判死」改为「不判死 + 记 `unexecutedJs`」；并补 `ruleSearch.bookList` 用 JS 仍判死的断言。原以为会冲突的 `detail.wordCount` 断言**保持原样**——`book_detail_service._detailFields` 确实会执行它，属于执行字段。⑥ 端到端：抽样里的 `手机小说下载网`（`ruleBookInfo.init` 里 `org.jsoup` + `java.ajax`，搜索/目录/正文全是普通 CSS）作为真实语料 fixture 进单测；真实页面 `curl` 验证 `search.php?...searchkey=凡人` 200、`.listBox ul li` 命中 100 条（书名可读）。**已知边界**：不少源在不依赖 JS 的同时还用了 `@tag.` / `@a.0` / `p.1@a.0@text` 这类本版不认的选择器写法，P0/P1 不解决这些 | `services/book_rule/legado_compat.dart`、`app/tools/js_rule_audit.dart`（新）、`services/book_source_index_service.dart`、`services/book_source_health_service.dart`、`services/book_search_service.dart`、`pages/book_source_page.dart`、`pages/book_source_picker_page.dart`、`pages/book_search_page.dart`、`test/legado_compat_test.dart`、`test/book_source_index_service_test.dart`、`test/book_source_picker_page_test.dart`、`test/book_source_page_test.dart`、`test/book_search_page_test.dart`、`docs/DEV_CONTEXT.md` |
 | v2.75.0 | **网络书源接 GBK 解码 + 自动判定**（H 批）。① `WebViewRuleEngine.fetchHtml` 不再 `utf8.decode(allowMalformed: true)` 一把梭，字节交给 `utils/text_decoding.dart` 的 `decodeTextBytes`（与本地 TXT 导入**同一套判定**，不写第二份）：BOM → UTF-16 → **严格 UTF-8** → UTF-8 只坏 ≤1% 字节 → GBK（先信提示、再自动）→ 兜底；关键改动是**严格 UTF-8 排在「声明 gbk」之前**（站点改版只改输出不改声明，「声明 gbk 实际 utf-8」比反过来常见，硬解 GBK 得到的是「能解但全是生僻字」——乱码比例兜不住这种错）。hint 优先级 **HTTP 响应头 charset > 书源 `charset` 字段**（响应头是站点这次响应自己说的），`parseHeaderCharset` 解析 `content-type` 的 `charset=`（引号 / 大小写 / 多余参数都容忍）。② 判定事实带出两个字段：`lastDecodeEncoding`（实际编码）与 `lastDecodeWarning`（两句人话：「这个书源疑似 GBK，已按 GBK 解码」/「解码后仍有乱码，正文可能不完整」；站点自己声明了 GBK 不提示）；两者都只记**最近一次**抓取，所以正文 / 目录服务改成**每页抓完当场收下**（后一页成功不会盖掉前一页的告警；正文服务还顺手去掉了循环外那次重复收集）。③ UI：`BookSearchGroup` 加纯增量字段 `decodeNote`（`decodeNoteFor` 压成「编码：GBK」/「解码有乱码」/「编码：GBK（仍有乱码）」，正常 UTF-8 为 null），搜索页只在**分组标题下**显示一行小字；阅读页滚动模式在正文末尾加一段小字、分页模式并进最后一页（原来只显示 `partial`，`warning` 根本没渲染）；详情页复用既有 `warning` 链路。④ 书源管理页每行加一行「编码：GBK / 编码：自动」（`charsetLabelOf`：GBK 家族别名统一显示 GBK，utf-8 与没写都显示「自动」——模型默认值就是 utf-8，两者在判定上行为一致）；`fromLegado` 加注释说明 legado 的 BookSource 没有 charset 字段（它自己嗅探），正常 legado 源一律自动判定，读 `bookSourceCharset` 只为兼容少数第三方导出。⑤ 可测性：`WebViewController` 在 `flutter test` 里构造即抛，所以引擎的 controller 改成**懒建**（`fetchHtml` 只走 Dio），单测能注入假 Dio 适配器直接断言「GBK 字节 → 正确中文」。⑥ 实机（模拟器 `bili_test`，2026-11-23，`adb install -r`）：宿主机起一个只吐 GBK 字节、不带 charset 的页面 → 搜索得到 2 条中文书名（斗罗大陆 / 吞噬星空），分组标题下显示「编码：GBK」；实机上发现「疑似 GBK」被压成「仍有乱码」，于是把两句告警抽成 `kDecodeGbkGuessWarning` / `kDecodeGarbledWarning` 常量分开处理。新增 21 个用例（`text_decoding` 5 / `book_rule_engine` 9 / `book_search_service` 4 / `book_search_page` 1 / `book_source_page` 1 / `book_source_import` 1），既有断言一条没删没放宽 | `services/book_rule/rule_engine.dart`、`utils/text_decoding.dart`、`services/book_search_service.dart`、`services/book_content_service.dart`、`services/book_detail_service.dart`、`models/book_source.dart`、`pages/book_search_page.dart`、`pages/book_source_page.dart`、`pages/book_reader_page.dart`、`test/book_rule_engine_test`、`test/text_decoding_test`、`test/book_search_service_test`、`test/book_search_page_test`、`test/book_source_page_test`、`test/book_source_import_test` |
 | v2.74.0 | 一次发版覆盖三批：**PDF 本地书**（F1）、**MOBI 本地书**（G，本条）与 EPUB / 解析器分派那批的收尾。**MOBI**：① `utils/mobi_reader.dart`（纯 Dart，无 Flutter 依赖）：`PdbFile.parse`（78 字节头 + 记录表，记录无长度字段 → 任何偏移越界都抛可读异常）、`parseMobiHeader`（compression / textLength / recordCount / recordSize / encryption / textEncoding / fileVersion / extraDataFlags / full name）、`palmdocDecompress`（LZ77：`0x01–0x08` 字面量组、`0x80–0xBF` 空格 + 字符对、`0xC0–0xFF` 11 位距离 + 3–10 长度；截断 / 回溯距离 0 或越界 / 解出超长都抛异常，不会死循环）、`trimTrailingEntries`（记录尾部附加数据，条数 = `extraDataFlags` 置位数、长度 = 末尾反向变长整数）、`exthValue`（100 作者 / 503 书名，坏了返回 null）、`decodeCp1252`（0x80–0x9F 单独一张 32 项表，**不用 latin1**）。② `MobiBookParser`：支持 compression 1 / 2；**17480（HUFF/CDIC）明确拒绝**并提示用 Calibre 转 EPUB；按 `textLength` 截断、逐条剥 trailing entry 再解压；UTF-8 解出大量 U+FFFD 回退 cp1252 并记 warning；正文复用 `restoreParagraphs(html,'block')`（先删 `<head>`，与 EPUB 同一套清洗）；章节按 `<mbp:pagebreak>` 切段 + 每段首个 `<h1>`–`<h3>`（或 class 含 `chapter`/`ctitle`/`title` 的 `<p>`）启发式命名，≥2 段带标题才用这套，否则退 `splitTxtChapters`，再不行按 3000 字分块；书名 EXTH 503 > full name > PalmDB 名 > 文件名，作者 EXTH 100；**AZW3/KF8 明确拒绝**（`fileVersion >= 8`，或记录里出现 `BOUNDARY` / `FDST`）——不半解析，避免「能打开但全是乱码」；原文件 ≤ 100MB、解压后正文 ≤ 64MB。③ 接入：`dispatcher` 认 `mobi` / `azw` / `prc`（`azw3` 故意不认，`unsupportedMessage` 直接给「在 Calibre 里转成 EPUB 再导入」）；`FilePickerPlugin` 的 `EXTRA_MIME_TYPES` 加 `application/x-mobipocket-ebook` / `application/vnd.amazon.ebook`，MIME→扩展名兜底认 `mobi` / `azw3`；书架角标与导入提示复用 `format.toUpperCase()`（自动出现「MOBI」「共 N 章」）；`_cleanName` 改为复用 `titleFromFileName`（原来另抄了一份 txt/epub/pdf 后缀名单，导致书架出现「mobi_g_test.mobi」）。④ 测试：`test/mobi_reader_test.dart`（PDB 边界 / PalmDOC roundtrip + 畸形输入 / cp1252 / EXTH / trailing entry / KF8）、`test/mobi_book_parser_test.dart`（3 章中文书、无标题退化、cp1252、HUFF / DRM / KF8、损坏文件）、`test/mobi_test_builder.dart`（现造夹具，**不往仓库放二进制样本**），本地书导入链路另加 MOBI 两条（落盘 format/书名/目录 + 重复导入幂等）。**已知限制**：没解析 NCX，章节标题是启发式 | `utils/mobi_reader.dart`（新）、`services/local_book_parser.dart`（`MobiBookParser`）、`services/local_book_store.dart`（`_cleanName` 复用后缀表）、`services/local_book_import_service.dart`、`pages/reading_page.dart`（提示文案）、`android/.../FilePickerPlugin.kt`、`test/mobi_reader_test.dart`（新）、`test/mobi_book_parser_test.dart`（新）、`test/mobi_test_builder.dart`（新，辅助文件）、`test/local_book_parser_test.dart`、`test/book_local_import_test.dart` |
 | v2.73.0 | 一次发版覆盖三批：**EPUB + PDF 本地书** 与 **内置精选书源 + 可用性检测**。① **解析器按格式分派**：新抽象 `LocalBookParser`（`format` / `canParse` / `parse`）+ `TxtBookParser` / `EpubBookParser` / `PdfBookParser` + `LocalBookParsers.dispatcher`，统一产出 `ParsedLocalBook{title, author, format, chapters[{title,text,imagePage}], coverBytes, idSeed, warnings, meta, sourcePath, pageWidth, pageHeight}`；需要**原文件路径**的格式（PDF）实现能力接口 `FileBasedLocalBookParser.parseFile`，导入服务用 `is` 分流，TXT / EPUB 照旧 `parse(bytes)`；加 MOBI / AZW3 / UMD 只需新增实现并在 `parsers` 挂一行。② **EPUB**：`archive` 解 zip → `META-INF/container.xml` → OPF 的 `dc:title` / `dc:creator` / manifest / **spine 顺序**（章节顺序只看 spine，不看文件名）→ 标题取 EPUB3 `nav.xhtml`、退 EPUB2 `toc.ncx`、再退「第 N 章」→ 每章 XHTML 复用 `restoreParagraphs(html,'block')`（先删 `<head>`）→ 封面取 `<meta name="cover">` 或 `properties="cover-image"`；路径按 OPF / nav 各自目录解析（`%20` 解码、`..` 归一、大小写兜底）；**手写极简 XML 扫描器**（`xml` 只是间接依赖，直接 import 会红门禁）；防 zip bomb 按 entry 声明的 size 记账（单章 8MB / 全本 200MB，`EpubLimits` 可注入），解压后再校验一次。③ **存储 schema 2**：`manifest.json` + `chapters/N.txt`（一章一文件）+ 可选 `cover.jpg|png`，`LocalChapter` 从 `{start,end}` 变 `{file}`；**v1 惰性迁移**（读到旧 manifest 时按偏移切开写新章文件、**最后**才写新清单，任一步失败原样退回 v1 可读路径，成功后删 `book.txt`）；书 id 仍 `localBookIdFor(书名, idSeed)` —— TXT 的 seed 是全文（与 v2.72.0 逐字节一致），EPUB 是「文件名 + zip 字节数 + 首 2KB」，PDF 是「文件名 + 字节数」。④ **PDF（下拉式漫画）**：新 `PdfRenderPlugin.kt`（通道 `bili_whitelist/pdf`，`MainActivity` 手动注册）用系统 `PdfRenderer` 把一页渲染成 PNG 写进 `<filesDir>/reader/pdfcache/<书id>/<页号>@<宽>.png`，**只回路径**；单线程 executor + `synchronized` 串行，`PdfRenderer` / `ParcelFileDescriptor` / `Page` 全部成对关闭；`PdfBookParser` **不解析文字**，`chapters` = 每页一条 `{title: 第 N 页, imagePage: true}`（没有 `chapters/N.txt`），封面取第一页 400 宽，页数 ≤ 3000、原文件 ≤ 100MB，原文件另存 `book.pdf`（manifest 的 `sourceFile`）；`BookContentResult.imagePath` 非空即图片页 → `Image.file` 铺满可用宽、纵向可滚、失败可重试，按钮换「上一页 / 下一页」+「第 N / M 页」，`pageMode == paged` 强制逐页滚动并提示「PDF 只能逐页浏览」；`planPdfCacheEviction` 纯函数（300MB / 每本 500 页，mtime 最旧先删，`keepPath` 即当前页永不删，2 分钟节流）；删书按同一 cacheKey 清 `pdfcache/<id>/`，覆盖导入也清一次；`FilePickerPlugin` 的 MIME 加 `application/pdf`，导入提示「（PDF，共 N 页）」、书架角标 `PDF`。⑤ **内置书源**：`example_sources.dart`（常量名仍是 `kExampleBookSources`）从 1 条变 2 条 —— 新增 **维基文库（中文经典）**（搜索 `/w/index.php?search={{key}}&ns0=1&fulltext=1` + `ul.mw-search-results > li`，书名/链接用 `div.mw-search-result-heading a:not([title*="/"])` 排掉章节子页面；目录直接取图书页 `ul li a[title*="/"]`；正文 `div.mw-content-ltr.mw-parser-output` + 6 条清洗规则），**标准电子书**保留并复核；每条选择器都 `curl` 真页点数（维基：搜索 20 条 / 三國演義目录 123 条 / 正文 1 容器；SE：搜索 12 条 / 目录 12 章 / 正文 1 个 section），评估后排除 Gutenberg（503）/ ctext（Cloudflare）/ en.wikisource（版本页无目录）；管理页文案改「添加内置书源」，同名源不覆盖。⑥ **可用性检测**：`book_source_health_service.dart` 的 `probe` 复用 `BookSearchService` **真搜一次** → `ok` / `noResult` / `blocked`（401/403/407/412/429/451 或 HTTP 200 验证页，`noResult` 时**多抓一次**复核）/ `networkError` / `unsupportedJs`（`usesJs` 判定，不发请求）/ `badRule`；`probeAll` 并发 2、可取消、带进度；结果单 key `reader:source_health` 存 200 条（按 `at` 裁最旧，坏数据回空表，**不进 Gist**）；纯函数 `classifyGroup` / `summarizeSearchFailures`；管理页每行状态角标 + 长按「检测这个源」、AppBar「检测全部书源（较慢）」只测 `enabled && !usesJs`，清空书源连带清检测结果；搜索页分组标题显示上次检测结果、0 条时区分「没搜到」与「可能已失效（上次检测：被拦）」、整页 0 条给归类汇总；增量字段 `RuleEngineException.statusCode`、`BookSearchGroup.httpStatus` / `errorKind`（既有调用点零改动） | `services/local_book_parser`（新）、`services/local_book_store`（升 schema 2 + v1 惰性迁移 + PDF）、`services/local_book_import_service`、`services/local_chapter_loader`、`services/chapter_content_loader`、`services/book_content_service`、`services/pdf_renderer_bridge`（新）、`services/pdf_cache_policy`（新）、`services/book_source_health_service`（新）、`services/book_rule/example_sources`、`services/book_search_service`、`services/book_rule/rule_engine`、`pages/book_reader_page`、`pages/reading_page`、`pages/book_source_page`、`pages/book_search_page`、`android/.../PdfRenderPlugin.kt`（新）、`MainActivity.kt`、`FilePickerPlugin.kt`、`test/txt_book_parser_test`（新）、`test/epub_book_parser_test`（新）、`test/local_book_parser_test`（新）、`test/local_book_store_test`、`test/book_local_import_test`、`test/reading_page_local_import_test`、`test/pdf_book_parser_test`（新）、`test/pdf_cache_policy_test`（新）、`test/pdf_local_book_test`（新）、`test/pdf_book_import_test`（新）、`test/book_source_health_service_test`（新）、`test/example_book_source_test`、`test/book_source_page_test`、`test/book_search_page_test`、`docs/DEV_CONTEXT.md` |

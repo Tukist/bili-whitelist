@@ -85,10 +85,52 @@ void main() {
     });
 
     test('raw 里的 JS 规则也判得到（本模型没映射成字段的那些）', () {
+      // 设计契约变更（I1）：这条原来用 checkKeyWord 断言「判 JS」。新口径下
+      // checkKeyWord 属于**本版不执行**的字段（搜索接口根本不看它），所以
+      // 有 JS 也不该把整源判死 —— 换成真的会执行的 bookList 来断言。
+      final s = _source(raw: {
+        'ruleSearch': {'bookList': '@js:java.getString("list")'},
+      });
+      expect(usesJs(s), isTrue);
+      expect(jsUsageOf(s).executedFields, ['search.list']);
+    });
+
+    test('只在 checkKeyWord 里写 JS 不判死（本版不执行该字段）', () {
       final s = _source(raw: {
         'ruleSearch': {'checkKeyWord': '<js>x</js>'},
       });
-      expect(usesJs(s), isTrue);
+      expect(usesJs(s), isFalse);
+      final usage = jsUsageOf(s);
+      expect(usage.executedJs, isFalse);
+      expect(usage.unexecutedJs, isTrue);
+      expect(usage.canRun, isTrue);
+      expect(usage.executedFields, isEmpty);
+    });
+
+    test('发现页 / 登录页 / 初始化里的 JS 不影响搜索', () {
+      final s = _source(raw: {
+        'exploreUrl': '发现@js:java.ajax(...)',
+        'loginUrl': 'https://a.example/login?<js>x</js>',
+        'init': '@js:java.put("k","v")',
+        'preUpdateJs': '@js:1',
+        'ruleExplore': {'bookList': '@js:java.getString("list")'},
+      });
+      expect(usesJs(s), isFalse);
+      expect(jsUsageOf(s).unexecutedJs, isTrue);
+      // 这些脚本就算调了网络也不该出现在 blockedApis 里：我们不执行它们
+      expect(jsUsageOf(s).blockedApis, isEmpty);
+    });
+
+    test('执行字段的脚本 API 会列进 blockedApis（本版一个 JS 都不跑）', () {
+      final s = _source(
+        name: '<js>java.ajax("/api?q=" + key)</js>',
+        contentText: '@js:java.getElements("a")',
+      );
+      final usage = jsUsageOf(s);
+      expect(usage.executedJs, isTrue);
+      expect(usage.canRun, isFalse);
+      expect(usage.executedFields, containsAll(['search.name', 'content.text']));
+      expect(usage.blockedApis, containsAll(['java.ajax', 'java.getElements']));
     });
 
     test('raw 里只有占位符不判 JS', () {
@@ -139,6 +181,70 @@ void main() {
         content: const ContentRule(text: '@css:.content'),
       );
       expect(usesJs(s), isTrue);
+    });
+  });
+
+  group('真实语料回归（I1 抽样：手机小说下载网的原始规则）', () {
+    // 这条源是 `app/tools/js_rule_audit.dart` 抽样里 `jsInUnexecutedField`
+    // 的代表：`ruleBookInfo.init` 里写了 org.jsoup + java.ajax（旧版据此整源
+    // 判死），而搜索 / 目录 / 正文全是普通 CSS。规则串是原始 JSON 里抄的，
+    // 不是编的。
+    final source = BookSource(
+      name: '手机小说下载网',
+      baseUrl: 'http://www.xiaxs.la',
+      search: const SearchRule(
+        url: 'http://www.xiaxs.la/search.php?s=&searchkey={{key}}',
+        list: '.listBox ul li',
+        name: 'a@text##全集',
+        detailUrl: 'a@href',
+        cover: 'img@src',
+        author: 'em@text',
+      ),
+      toc: const TocRule(list: '.pc_list a', name: 'text'),
+      content: const ContentRule(text: '#content1@html'),
+      raw: {
+        'bookSourceName': '手机小说下载网',
+        'searchUrl': 'http://www.xiaxs.la/search.php?s=&searchkey={{key}}',
+        'ruleSearch': {
+          'bookList': '.listBox ul li',
+          'name': 'a@text##全集',
+          'bookUrl': 'a@href',
+        },
+        'ruleBookInfo': {
+          'init': '<js>\n'
+              'var act=org.jsoup.Jsoup.parse(result).select(".downButton").attr("href");\n'
+              'var url = "http://www.xiaxs.la"+act;\n'
+              'java.put("url",url);\n'
+              'java.ajax(url)</js>\n',
+        },
+        'ruleToc': {'chapterList': '.pc_list a'},
+        'ruleContent': {'content': '#content1@html'},
+      },
+    );
+
+    test('init 里的网络调用不判死，也不算拦路石', () {
+      final usage = jsUsageOf(source);
+      expect(usage.executedJs, isFalse);
+      expect(usage.unexecutedJs, isTrue);
+      expect(usage.executedFields, isEmpty);
+      // init 里的 java.ajax / org.jsoup / java.put 我们根本不执行 → 不该出现
+      expect(usage.blockedApis, isEmpty);
+      expect(usesJs(source), isFalse);
+    });
+
+    test('搜索 / 目录 / 正文规则都落在本版支持的语法里', () {
+      for (final rule in [
+        source.search.list,
+        source.search.name,
+        source.search.detailUrl,
+        source.search.cover,
+        source.search.author,
+        source.toc.list,
+        source.content.text,
+      ]) {
+        final value = legadoSelector(rule);
+        expect(value.isRunnable, isTrue, reason: '这条规则跑不了：$rule');
+      }
     });
   });
 

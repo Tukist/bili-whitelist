@@ -292,6 +292,24 @@ void main() {
       expect(result.jsCount, 1);
       expect(result.summary, contains('1 个需 JS'));
     });
+
+    test('只在发现页用了 JS 的源：进 partialJsKeys，不算「需 JS」', () async {
+      // 设计契约变更（I1）：旧口径扫整份 raw，exploreUrl 里有 JS 就整源判死。
+      // 本 App 从不执行发现页，所以这类源应该能直接搜。
+      final explore = _legado('只在发现页用JS')
+        ..['exploreUrl'] = '@js:java.ajax("/explore")';
+      final adapter = _FakeAdapter({
+        _u1: (_) => _json([_legado('普通源'), explore]),
+      });
+      final result = await _service(adapter).fetchIndexes(urls: [_u1]);
+
+      final partial = result.sources.firstWhere((s) => s.name == '只在发现页用JS');
+      expect(result.needsJs(partial), isFalse);
+      expect(result.partialJs(partial), isTrue);
+      expect(result.jsCount, 0);
+      expect(result.partialJsCount, 1);
+      expect(result.summary, contains('不影响搜索'));
+    });
   });
 
   group('进度 / 串行', () {

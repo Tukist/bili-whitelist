@@ -219,12 +219,16 @@ class BookSearchService {
     String keyword,
     int pages,
   ) async {
-    // 需要 JS 的源：**先判、后发请求**（省一次注定失败的抓取）
-    if (usesJs(source)) {
+    // 执行字段里有 JS 的源：**先判、后发请求**（省一次注定失败的抓取）。
+    // 只在发现页 / 登录页用了 JS 的源不受影响（旧版会整源判死，见 JsUsage）。
+    final usage = jsUsageOf(source);
+    if (usage.executedJs) {
+      final fields = usage.executedFields.take(2).join('、');
+      final more = usage.executedFields.length > 2 ? ' 等' : '';
       return BookSearchGroup(
         sourceName: source.name,
         status: BookSearchStatus.unsupported,
-        message: '该源需要 JS 规则（<js> / @js: / {{…}}），本版暂不支持',
+        message: '该源的 $fields$more 需要 JS 规则（<js> / @js: / {{…}}），本版暂不支持',
       );
     }
     if (source.search.url.trim().isEmpty) {

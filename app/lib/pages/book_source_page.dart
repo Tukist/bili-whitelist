@@ -390,8 +390,9 @@ class _BookSourcePageState extends State<BookSourcePage> {
 
   /// 检测全部书源（AppBar 溢出菜单，**较慢**）。
   ///
-  /// 只测「启用 且 不需要 JS」的：停用的源用户已经不想用了，需要 JS 的本版
-  /// 根本跑不了（发请求也只会得空结果）。跳过的数量写在进度框里，不假装
+  /// 只测「启用 且 不需要 JS」的：停用的源用户已经不想用了，**执行字段**里
+  /// 用了 JS 的本版根本跑不了（发请求也只会得空结果）。只在发现页 / 登录页
+  /// 用了 JS 的源**能搜**，所以照常检测。跳过的数量写在进度框里，不假装
   /// 「全测完了」。
   Future<void> _probeAll() async {
     final all = _sources ?? const <BookSource>[];
@@ -741,6 +742,17 @@ class _BookSourcePageState extends State<BookSourcePage> {
               color: theme.colorScheme.onSurfaceVariant,
             ),
           ),
+          // 「部分 JS」= 只在发现页 / 登录页 / 校验词这些**本版不执行**的字段
+          // 里有 JS。它照常能搜，不能标成「需 JS，暂不支持」——那会让用户
+          // 白删一个其实好用的源。逐行现算（每个源一次递归扫 raw）：书源上限
+          // 200 个，规模与旧版「每次进页面算一遍 jsOnly」同量级。
+          if (jsUsageOf(source).unexecutedJs)
+            Text(
+              '部分 JS（不影响搜索）',
+              style: theme.textTheme.bodySmall?.copyWith(
+                color: context.palette.accent,
+              ),
+            ),
         ],
       ),
       trailing: Row(

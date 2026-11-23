@@ -48,8 +48,8 @@ class _BookSourcePickerPageState extends State<BookSourcePickerPage> {
   /// 搜索关键词（每敲一个字重算一次 [_visible]；6000 条 contains 是毫秒级）。
   String _query = '';
 
-  /// 只看不需要 JS 的源。
-  bool _onlyNoJs = false;
+  /// 只看能直接搜索的源（执行字段里没有 JS）。
+  bool _onlySearchable = false;
 
   /// 只看当前还没导入的源。
   ///
@@ -65,7 +65,13 @@ class _BookSourcePickerPageState extends State<BookSourcePickerPage> {
   List<BookSource> _visible = const [];
 
   /// 需要 JS 的源的 key（下载时算好，过滤时只做 Set 查找）。
+  ///
+  /// 口径 = **执行字段**里有 JS（真跑不了）；只在发现页 / 登录页用了 JS 的
+  /// 源在 [_partialJsKeys] 里，它们能直接搜。
   Set<String> _jsKeys = const {};
+
+  /// 只有部分字段用 JS 的源 key（能搜，只标角标）。
+  Set<String> _partialJsKeys = const {};
 
   /// 当前已导入的源 key（「只看没导入的」与剩余额度都靠它）。
   Set<String> _existingKeys = const {};
@@ -154,7 +160,9 @@ class _BookSourcePickerPageState extends State<BookSourcePickerPage> {
     final query = _query.trim().toLowerCase();
     final out = <BookSource>[];
     for (final source in _sources) {
-      if (_onlyNoJs && _jsKeys.contains(source.key)) continue;
+      // 「能直接搜索」= 执行字段里没有 JS；只在发现页 / 登录页用了 JS 的源
+      // 照样能搜，所以留在这里（角标另行标注）
+      if (_onlySearchable && _jsKeys.contains(source.key)) continue;
       if (_onlyNew && _existingKeys.contains(source.key)) continue;
       if (query.isNotEmpty &&
           !source.name.toLowerCase().contains(query) &&
@@ -244,6 +252,7 @@ class _BookSourcePickerPageState extends State<BookSourcePickerPage> {
         _result = result;
         _sources = result.sources;
         _jsKeys = {...result.jsKeys};
+        _partialJsKeys = {...result.partialJsKeys};
         // 换了新的一批源，之前的勾选就作废（key 可能对不上新列表）
         _selected.clear();
         _recompute();
@@ -410,11 +419,13 @@ class _BookSourcePickerPageState extends State<BookSourcePickerPage> {
             crossAxisAlignment: WrapCrossAlignment.center,
             children: [
               _FilterCheck(
-                label: '只看不需要 JS 的',
-                value: _onlyNoJs,
+                // 文案跟着语义改（I1）：筛选的是「执行字段里没有 JS」的源，
+                // 「不需要 JS」会让用户以为连发现页的 JS 都算在内
+                label: '只看能直接搜索的',
+                value: _onlySearchable,
                 onChanged: (v) {
                   setState(() {
-                    _onlyNoJs = v;
+                    _onlySearchable = v;
                     _recompute();
                   });
                 },
@@ -503,6 +514,7 @@ class _BookSourcePickerPageState extends State<BookSourcePickerPage> {
 
   Widget _row(BookSource source) {
     final needsJs = _jsKeys.contains(source.key);
+    final partialJs = !needsJs && _partialJsKeys.contains(source.key);
     final imported = _existingKeys.contains(source.key);
     // 名字/地址在模型层已按单行清洗过（BookSource.fromJson），这里的
     // `maxLines + ellipsis + softWrap: false` 是第二道护栏：万一某条数据
@@ -526,7 +538,9 @@ class _BookSourcePickerPageState extends State<BookSourcePickerPage> {
         overflow: TextOverflow.ellipsis,
         style: kTypeBodyS.copyWith(color: kInkGray50),
       ),
-      // 角标让「为什么这个源被藏起来了 / 为什么导进去也搜不到」一眼可查
+      // 角标让「为什么这个源被藏起来了 / 为什么导进去也搜不到」一眼可查。
+      // 两个角标必须分开：`需 JS` 是执行字段里有 JS（导入也搜不到），
+      // `部分 JS` 只是发现页 / 登录页那些本版没有的能力，**能搜**。
       secondary: needsJs
           ? Text(
               '需 JS',
@@ -535,15 +549,23 @@ class _BookSourcePickerPageState extends State<BookSourcePickerPage> {
               overflow: TextOverflow.ellipsis,
               style: kTypeBodyS.copyWith(color: kError),
             )
-          : (imported
+          : (partialJs
               ? Text(
-                  '已导入',
+                  '部分 JS',
                   maxLines: 1,
                   softWrap: false,
                   overflow: TextOverflow.ellipsis,
-                  style: kTypeBodyS.copyWith(color: kInkGray50),
+                  style: kTypeBodyS.copyWith(color: context.palette.accent),
                 )
-              : null),
+              : (imported
+                  ? Text(
+                      '已导入',
+                      maxLines: 1,
+                      softWrap: false,
+                      overflow: TextOverflow.ellipsis,
+                      style: kTypeBodyS.copyWith(color: kInkGray50),
+                    )
+                  : null)),
     );
   }
 

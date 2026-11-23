@@ -629,6 +629,30 @@ void main() {
     expect(find.text('未检测'), findsNWidgets(2));
   });
 
+  testWidgets('只在发现页用 JS 的源：角标写「部分 JS」，照常参与检测', (tester) async {
+    final store = BookSourceStore();
+    await store.upsertAll([
+      BookSource(
+        name: '部分JS源',
+        baseUrl: 'https://partial.example',
+        search: const SearchRule(url: '/s?q={{key}}', list: '.item'),
+        toc: const TocRule(),
+        content: const ContentRule(),
+        // 发现页本版不执行 → 这条不该让源变成「需 JS」
+        raw: {'exploreUrl': '@js:java.ajax("/explore")'},
+      ),
+    ]);
+    final health = _FakeHealth();
+    await _pump(tester, store: store, health: health);
+
+    expect(find.text('部分 JS（不影响搜索）'), findsOneWidget);
+
+    await _openMenu(tester);
+    await tester.tap(find.text('检测全部书源（较慢）'));
+    await tester.pumpAndSettle();
+    expect(health.probed, ['部分JS源']);
+  });
+
   testWidgets('检测全部：没有可检测的源时明说跳过了几个（不假装测过）',
       (tester) async {
     final store = BookSourceStore();

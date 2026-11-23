@@ -45,7 +45,12 @@ class _RouteObserver extends NavigatorObserver {
   }
 }
 
-BookSource _source(String name, String host, {String nameRule = '.title'}) =>
+BookSource _source(
+  String name,
+  String host, {
+  String nameRule = '.title',
+  Map<String, dynamic>? raw,
+}) =>
     BookSource(
       name: name,
       baseUrl: 'https://$host',
@@ -58,6 +63,7 @@ BookSource _source(String name, String host, {String nameRule = '.title'}) =>
       ),
       toc: const TocRule(),
       content: const ContentRule(text: '#content'),
+      raw: raw,
     );
 
 /// 假引擎：A / B 两个源都搜到同一本书（合并视图应显示「2 个源」）。
@@ -108,6 +114,31 @@ Future<void> _pump(
 
 void main() {
   setUp(() => SharedPreferences.setMockInitialValues({}));
+
+  testWidgets('只在发现页用 JS 的源照常搜索（旧口径会整源跳过）', (tester) async {
+    final holder = RuleEngineHolder.withEngine(_engine());
+    await _pump(
+      tester,
+      store: _FakeSourceStore([
+        _source('源A', 'a.example'),
+        // 设计契约变更（I1）：exploreUrl 本版根本不执行，不该把源判死
+        _source('源D', 'd.example', raw: {
+          'exploreUrl': '@js:java.ajax("/explore")',
+          'loginUrl': 'https://d.example/login?<js>x</js>',
+        }),
+      ]),
+      holder: holder,
+    );
+
+    await tester.enterText(find.byType(TextField), '斗罗');
+    await tester.tap(find.widgetWithText(FilledButton, '搜索'));
+    await tester.pumpAndSettle();
+
+    final engine = holder.engine as FakeRuleEngine;
+    expect(engine.fetchedUrls.any((u) => u.contains('d.example')), isTrue);
+    expect(find.textContaining('已跳过'), findsNothing);
+    expect(find.textContaining('源D · '), findsOneWidget);
+  });
 
   testWidgets('分组视图 → 合并视图；需要 JS 的源被跳过并说明', (tester) async {
     final holder = RuleEngineHolder.withEngine(_engine());

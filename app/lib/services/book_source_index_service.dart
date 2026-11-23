@@ -96,24 +96,39 @@ class BookSourceIndexResult {
   /// 每个 URL 的下场（顺序与入参一致）。
   final List<IndexUrlOutcome> outcomes;
 
-  /// 需要 JS 的书源 key 集合（[usesJs] 在下载时算一次）。
+  /// 需要 JS 的书源 key 集合（[jsUsageOf] 在下载时算一次）。
   ///
-  /// 为什么预先算好而不是 UI 里现算：选择页要在 6000+ 条上做「只看不需要 JS
-  /// 的」过滤，而 [usesJs] 会递归扫整份 raw JSON —— 放进 build 里就是每帧
-  /// 几千次递归。下载时算一次，UI 只做 [Set.contains]。
+  /// 口径是**执行字段里真的有 JS**（`search.*` / `detail.*` / `toc.*` /
+  /// `content.*`）—— 只在发现页 / 登录页 / 校验词里用了 JS 的源能正常搜，
+  /// 落在 [partialJsKeys] 里。
+  ///
+  /// 为什么预先算好而不是 UI 里现算：[jsUsageOf] 会递归扫整份 raw JSON，
+  /// 放在 6000+ 条的 build 里就是每帧几千次递归。下载时算一次，UI 只做
+  /// [Set.contains]。
   final Set<String> jsKeys;
+
+  /// 只在**本版不执行**的字段里用了 JS 的源（能搜，只是发现页 / 登录页那些
+  /// 能力本版没有）。
+  final Set<String> partialJsKeys;
 
   const BookSourceIndexResult({
     this.sources = const [],
     this.outcomes = const [],
     this.jsKeys = const {},
+    this.partialJsKeys = const {},
   });
 
   /// 该源要不要 JS（本版跑不了）。
   bool needsJs(BookSource source) => jsKeys.contains(source.key);
 
+  /// 该源只是「部分 JS」（能直接搜）。
+  bool partialJs(BookSource source) => partialJsKeys.contains(source.key);
+
   /// 需要 JS 的源数量。
   int get jsCount => jsKeys.length;
+
+  /// 只有部分字段用 JS 的源数量。
+  int get partialJsCount => partialJsKeys.length;
 
   /// 失败的链接（含超限跳过），UI 逐条列原因。
   List<IndexUrlOutcome> get problems => [
@@ -129,6 +144,9 @@ class BookSourceIndexResult {
     final buffer = StringBuffer('共 ${sources.length} 个源');
     if (jsCount > 0) {
       buffer.write('（其中 $jsCount 个需 JS，本版跑不了）');
+    }
+    if (partialJsCount > 0) {
+      buffer.write('（另有 $partialJsCount 个只在发现页/登录页用了 JS，不影响搜索）');
     }
     final failed = [for (final o in outcomes) if (o.isFailed) o];
     if (failed.isNotEmpty) {
@@ -203,13 +221,22 @@ class BookSourceIndexService {
     onProgress?.call(targets.length, targets.length);
 
     final jsKeys = <String>{};
+    final partialJsKeys = <String>{};
     for (final source in merged) {
-      if (_safeNeedsJs(source)) jsKeys.add(source.key);
+      final usage = _safeJsUsage(source);
+      // 只有执行字段里真的有 JS 才算「跑不了」；只在发现页 / 登录页用了 JS 的
+      // 源能正常搜，单独记一份，UI 上标成「部分 JS」而不是「需 JS」。
+      if (usage.executedJs) {
+        jsKeys.add(source.key);
+      } else if (usage.unexecutedJs) {
+        partialJsKeys.add(source.key);
+      }
     }
     return BookSourceIndexResult(
       sources: merged,
       outcomes: outcomes,
       jsKeys: jsKeys,
+      partialJsKeys: partialJsKeys,
     );
   }
 
@@ -330,12 +357,13 @@ class BookSourceIndexService {
     }
   }
 
-  bool _safeNeedsJs(BookSource source) {
+  /// 判定失败时按「可能要 JS」处理（宁可少测一个源，也不要让整批崩掉）。
+  JsUsage _safeJsUsage(BookSource source) {
     try {
-      return usesJs(source);
+      return jsUsageOf(source);
     } catch (_) {
-      // raw 里有畸形结构之类：宁可当成「可能要 JS」，也不要让整批崩掉
-      return true;
+      // raw 里有畸形结构之类：退回最保守的结论
+      return const JsUsage(executedJs: true);
     }
   }
 }

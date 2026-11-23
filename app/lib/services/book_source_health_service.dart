@@ -23,7 +23,7 @@
 /// | `noResult` | HTTP 通、页面能解析，但列表规则命中 0 条 |
 /// | `blocked` | 401/403/407/412/429/451，或「HTTP 200 + 验证页」（Cloudflare / Turnstile） |
 /// | `networkError` | 超时、连不上、DNS、证书、其它 5xx |
-/// | `unsupportedJs` | [usesJs] 为真（`<js>` / `@js:` / 非占位符 `{{…}}`）—— 不发请求 |
+/// | `unsupportedJs` | [jsUsageOf] 里 `executedJs` 为真（执行字段里有 `<js>` / `@js:` / 非占位符 `{{…}}`）—— 不发请求 |
 /// | `badRule` | 规则本身跑不起来：地址拼不出、列表规则为空、JSONPath、`&&` 组合… |
 ///
 /// **验证页为什么要多抓一次**：Cloudflare 之类的挑战页通常回 **HTTP 200**，
@@ -271,12 +271,16 @@ class BookSourceHealthService {
     final key = source.name.trim().toLowerCase();
     final word = keyword.trim().isEmpty ? kHealthDefaultKeyword : keyword.trim();
 
-    if (usesJs(source)) {
+    final usage = jsUsageOf(source);
+    if (usage.executedJs) {
+      // 只报「哪个字段」：用户拿着这句话能直接去改源，比一句「需要 JS」有用
+      final fields = usage.executedFields.take(2).join('、');
+      final more = usage.executedFields.length > 2 ? ' 等' : '';
       final health = SourceHealth(
         sourceKey: key,
         status: SourceHealthStatus.unsupportedJs,
         at: DateTime.now(),
-        message: '该源需要 JS 规则（<js> / @js: / {{…}}），本版暂不支持',
+        message: '该源的 $fields$more 需要 JS 规则（<js> / @js: / {{…}}），本版暂不支持',
         keyword: word,
       );
       await _remember(health);
