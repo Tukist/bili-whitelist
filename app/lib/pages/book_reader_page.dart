@@ -35,13 +35,22 @@
 /// 内容高度 —— 换字号 / 换设备后内容会变高变矮）；分页模式存页号
 /// `ReadingProgress.pageIndex`，并按「占全文比例」在字号变化后回到相近位置。
 ///
-/// ## 本地书（E2，v2.74.0）
+/// ## 本地书（E2，v2.72.0）
 /// 本地 TXT 与网络书**共用这一个页面**，差别只有正文来源（[ChapterContentLoader]）
 /// 与「没有书源」：本地书不建 WebView 引擎、不查章节缓存、不显示缓存入口，
 /// 其余（目录、进度、翻页方式、字号、主题）与网络书完全一致。别复制页面。
+///
+/// ## 图片页（PDF，v2.74.0）
+/// PDF 的「一章」就是**一页渲染出来的图片**（`BookContentResult.imagePath` 非空）。
+/// 这时正文改用 `Image.file` 铺满可用宽、可以纵向拖（页比屏幕长时），点击照样
+/// 切换控制层；「上一章 / 下一章」的文案换成「上一页 / 下一页」。
+/// **左右翻页对 PDF 没有意义**（一页就是一屏，横滑与「拖着看长页」抢手势），
+/// 所以设置里存的是 `paged` 时也按逐页滚动显示，并提示一次「PDF 只能逐页浏览」；
+/// 开关本身不藏起来（与网络书保持一致，藏起来用户以为坏了）。
 library;
 
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 
@@ -114,6 +123,13 @@ class BookReaderPage extends StatefulWidget {
   /// 测试注入：本地书存储（默认 `LocalBookStore.instance`）。
   final LocalBookStore? localStore;
 
+  /// 这本书是「图片页」（PDF）：书架按 manifest 的 `format` 传进来。
+  ///
+  /// 为什么要传：不传的话第一页渲染完成前按钮还叫「上一章」，渲染失败时更是
+  /// 一直叫「上一章」；页面内部也会在拿到 imagePath 后自行置真（测试注入假
+  /// loader 时不必关心这个参数）。
+  final bool imageMode;
+
   final RuleEngineHolder? holder;
 
   /// 测试注入：正文服务。
@@ -138,6 +154,7 @@ class BookReaderPage extends StatefulWidget {
     this.localBookId,
     this.loader,
     this.localStore,
+    this.imageMode = false,
     this.holder,
     this.contentService,
     this.detailService,
@@ -209,6 +226,13 @@ class _BookReaderPageState extends State<BookReaderPage> {
   /// 当前停在第几页（0 起）。分页模式专用于页码显示与进度落盘。
   int _currentPage = 0;
 
+  /// 当前这本书是「图片页」（PDF）：一旦见过图片页就记住 —— 下一页加载中时
+  /// 按钮文案不该从「上一页」跳回「上一章」。
+  bool _imageMode = false;
+
+  /// 「PDF 只能逐页浏览」的提示是否已经给过（每次进阅读页只提示一次）。
+  bool _pdfHintShown = false;
+
   /// 「下一次分页完成后落到第几页」（恢复进度 / 跨章翻页用）。
   int? _pendingPage;
 
@@ -224,6 +248,13 @@ class _BookReaderPageState extends State<BookReaderPage> {
 
   /// 本地书模式：没有书源、没有缓存、也不该建 WebView 引擎。
   bool get _isLocal => widget.localBookId != null;
+
+  /// 实际是否按「左右翻页」渲染。
+  ///
+  /// PDF（图片页）**只能逐页滚动**：一页就是一屏，横滑还要和「拖长页」抢手势。
+  /// 设置里的 `pageMode` 不动（用户换回文字书仍然是他选的那一种），这里只在
+  /// 渲染与进度这两个地方按「有效模式」算。
+  bool get _pagedLayout => _settings.isPaged && !_imageMode;
 
   /// 网络书源。本地书模式下被访问说明调用方漏了分流（本地书的所有路径都
   /// 不碰它）；抛 StateError 比把 null 传进网络层更容易定位。
@@ -274,6 +305,8 @@ class _BookReaderPageState extends State<BookReaderPage> {
     super.initState();
     _chapters = List<TocChapter>.of(widget.chapters);
     _index = _clampIndex(widget.initialIndex);
+    // PDF：书架已经知道是图片页，不必等首页渲染完才切按钮文案
+    _imageMode = widget.imageMode;
     _scroll.addListener(_onScroll);
     unawaited(_bootstrap());
   }
@@ -414,7 +447,10 @@ class _BookReaderPageState extends State<BookReaderPage> {
       setState(() {
         _content = result;
         _loading = false;
+        // 一旦确认是图片页就记住（见 [_imageMode]）
+        if (result.isImagePage) _imageMode = true;
       });
+      if (result.isImagePage && _settings.isPaged) _hintPdfScrollOnly();
       // 内容布局完成后再还原位置（此时 maxScrollExtent 才是最终的）
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted || token != _loadToken) return;
@@ -472,7 +508,7 @@ class _BookReaderPageState extends State<BookReaderPage> {
   /// 分页模式没有滚动位置，章内比例由页号算（见 [_updatePageProgress]）。
   void _updateProgress() {
     if (!mounted) return;
-    if (_settings.isPaged) {
+    if (_pagedLayout) {
       _updatePageProgress(_pageControllerCount);
       return;
     }
@@ -504,7 +540,7 @@ class _BookReaderPageState extends State<BookReaderPage> {
     if (_chapters.isEmpty) return;
     final index = _clampIndex(_index);
     final chapter = _chapters[index];
-    final paged = _settings.isPaged;
+    final paged = _pagedLayout;
     final offset = _scroll.hasClients ? _scroll.offset : 0.0;
     await _store.saveProgress(
       widget.detailUrl,
@@ -567,6 +603,12 @@ class _BookReaderPageState extends State<BookReaderPage> {
   /// 切换时要**顺手把阅读位置带过去**：两边量纲不同（dp vs 页号），但都可以
   /// 换算成「本章读到百分之几」，按比例落位比回到章首友好得多。
   Future<void> _togglePageMode() async {
+    // PDF（图片页）只能逐页浏览：一页就是一屏，横滑还会和「拖长页」抢手势。
+    // 开关**不藏起来**（藏了用户以为坏了），点了给一句说明，模式不变。
+    if (_imageMode) {
+      AppSnack.show(context, 'PDF 只能逐页浏览');
+      return;
+    }
     final toPaged = !_settings.isPaged;
     double ratio;
     if (toPaged) {
@@ -624,7 +666,7 @@ class _BookReaderPageState extends State<BookReaderPage> {
                     Text('目录', style: kTypeTitleS.copyWith(color: kInkBlack)),
                     const Spacer(),
                     Text(
-                      '${_chapters.length} 章',
+                      _imageMode ? '${_chapters.length} 页' : '${_chapters.length} 章',
                       style: kTypeBodyS.copyWith(color: kInkGray50),
                     ),
                   ],
@@ -868,7 +910,7 @@ class _BookReaderPageState extends State<BookReaderPage> {
     // 否则「刚收起键盘那一帧」最后一行会被控制条压住。
     final insets = MediaQuery.viewPaddingOf(context);
     return SafeArea(
-      child: _settings.isPaged
+      child: _pagedLayout
           // 分页模式：**固定**内缩，不随控制层显隐做动画。高度一变分页就要
           // 重算，用户点一下屏幕（呼出控制条）就会看到同一段文字换页。
           // 代价是控制层收起时上下多出来的两条是页边距 —— 比「点一下跳页」好。
@@ -911,7 +953,7 @@ class _BookReaderPageState extends State<BookReaderPage> {
       );
     }
     final content = _content;
-    if (content == null || content.body.trim().isEmpty) {
+    if (content == null) {
       // 空正文不硬切页：给「这一章没取到正文 + 重试」比给一张空白页有用。
       // （分页算法对空串本身也有兜底：返回一页 [0]，不会崩也不会死循环。）
       return Container(
@@ -924,7 +966,23 @@ class _BookReaderPageState extends State<BookReaderPage> {
       );
     }
 
-    if (_settings.isPaged) return _pagedBody(context, foreground, content);
+    // 图片页（PDF）：正文是一张渲染好的 PNG，没有 text 可排版
+    if (content.isImagePage) {
+      return _imageBody(context, foreground, content);
+    }
+
+    if (content.body.trim().isEmpty) {
+      return Container(
+        color: kPaper,
+        child: AppErrorView(
+          message: '这一章没取到正文',
+          onRetry: _retry,
+          illustrationSeed: 'reader',
+        ),
+      );
+    }
+
+    if (_pagedLayout) return _pagedBody(context, foreground, content);
 
     return GestureDetector(
       // 点正文区域呼出/隐藏控制层。这是**兜底**：点在文字之间的空白、
@@ -976,6 +1034,95 @@ class _BookReaderPageState extends State<BookReaderPage> {
   }
 
   // ==================== 分页模式 ====================
+
+  // ==================== 图片页（PDF） ====================
+
+  /// 图片页正文：一张按可用宽铺满的图。
+  ///
+  /// - 纵向可滚：PDF 的页常常比手机屏长（A4 比例），「下拉式漫画」的阅读姿势
+  ///   就是往下拖；
+  /// - `gaplessPlayback: true`：翻页时先保留上一帧，避免「旧图消失 → 新图解码」
+  ///   之间闪一下背景色；
+  /// - 解码中按**原始页比例**占位（[BookContentResult.imageWidth] /
+  ///   [BookContentResult.imageHeight]），不会先给一块错误高度的白板再跳；
+  /// - 点击切控制层：图片自己不吃手势，`HitTestBehavior.opaque` 兜住整块。
+  Widget _imageBody(
+    BuildContext context,
+    Color foreground,
+    BookContentResult content,
+  ) {
+    final path = content.imagePath!;
+    final ratio = content.imageWidth > 0 && content.imageHeight > 0
+        ? content.imageWidth / content.imageHeight
+        : 0.0;
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: _toggleControls,
+      child: SingleChildScrollView(
+        controller: _scroll,
+        child: Image.file(
+          File(path),
+          width: double.infinity,
+          fit: BoxFit.fitWidth,
+          gaplessPlayback: true,
+          frameBuilder: (context, child, frame, wasSynchronouslyLoaded) {
+            if (wasSynchronouslyLoaded || frame != null) return child;
+            return _imagePlaceholder(context, foreground, ratio);
+          },
+          // 文件被清掉 / PNG 坏了：给一句人话 + 重试，不留黑屏
+          errorBuilder: (_, __, ___) => _imageError(foreground),
+        ),
+      ),
+    );
+  }
+
+  /// 解码中的占位：高度按原始比例算（不闪白、不跳动）。
+  Widget _imagePlaceholder(
+    BuildContext context,
+    Color foreground,
+    double ratio,
+  ) {
+    final size = MediaQuery.maybeSizeOf(context);
+    final width = size?.width ?? 360;
+    final height = ratio > 0 ? width / ratio : ((size?.height ?? 640) * .7);
+    // 底色用页面自己的背景色（夜墨 / 纸黄都自洽），不是固定的白
+    return Container(
+      width: double.infinity,
+      height: height,
+      color: _background(context),
+      alignment: Alignment.center,
+      child: Text(
+        '正在渲染这一页…',
+        style: kTypeBodyS.copyWith(color: foreground.withValues(alpha: .6)),
+      ),
+    );
+  }
+
+  Widget _imageError(Color foreground) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(
+        horizontal: kSectionPadH,
+        vertical: kSpace48,
+      ),
+      child: Column(
+        children: [
+          Text('这一页渲染失败', style: kTypeBody.copyWith(color: foreground)),
+          const SizedBox(height: kSpace8),
+          TextButton(onPressed: _retry, child: const Text('重试')),
+        ],
+      ),
+    );
+  }
+
+  /// 「PDF 只能逐页浏览」只提示一次（每次进阅读页）。
+  void _hintPdfScrollOnly() {
+    if (_pdfHintShown) return;
+    _pdfHintShown = true;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      AppSnack.show(context, 'PDF 只能逐页浏览，已按逐页显示');
+    });
+  }
 
   /// 分页正文：`PageView` 一页一张 `Text` + 底部居中页码。
   ///
@@ -1346,6 +1493,9 @@ class _BookReaderPageState extends State<BookReaderPage> {
     final hasPrev = _index > 0;
     final hasNext = _index < _chapters.length - 1;
     final disabled = foreground.withValues(alpha: .35);
+    // PDF 的「章」就是页：文案跟着换，否则用户会以为一次翻了好几页
+    final prevLabel = _imageMode ? '上一页' : '上一章';
+    final nextLabel = _imageMode ? '下一页' : '下一章';
     // 目标 API 35 起系统强制 edge-to-edge：页面会一直画到三键导航栏下面。
     // 这里**不能**用 SafeArea 包一层（那会把 Container 缩短，导航栏位置露出
     // Scaffold 底色，底部出现一条硬边）；正确做法是背景铺满整条底部（包括
@@ -1365,6 +1515,18 @@ class _BookReaderPageState extends State<BookReaderPage> {
         mainAxisSize: MainAxisSize.min,
         children: [
           _progressBar(context),
+          // 图片页额外给一行「第 N / M 页」：PDF 的进度条只是一条细线，用户
+          // 没法从它读出「现在第几页」（需求里的「页码 / 总页数」）。
+          if (_imageMode && _chapters.isNotEmpty)
+            Padding(
+              padding: const EdgeInsets.only(top: kSpace2),
+              child: Text(
+                '第 ${_clampIndex(_index) + 1} / ${_chapters.length} 页',
+                style: kTypeBodyS.copyWith(
+                  color: foreground.withValues(alpha: .6),
+                ),
+              ),
+            ),
           if (_caching) _cachingRow(context, foreground),
           Row(
             mainAxisAlignment: MainAxisAlignment.spaceEvenly,
@@ -1375,7 +1537,7 @@ class _BookReaderPageState extends State<BookReaderPage> {
                   foregroundColor: foreground,
                   disabledForegroundColor: disabled,
                 ),
-                child: const Text('上一章'),
+                child: Text(prevLabel),
               ),
               TextButton.icon(
                 onPressed: _showDirectory,
@@ -1389,7 +1551,7 @@ class _BookReaderPageState extends State<BookReaderPage> {
                   foregroundColor: foreground,
                   disabledForegroundColor: disabled,
                 ),
-                child: const Text('下一章'),
+                child: Text(nextLabel),
               ),
             ],
           ),

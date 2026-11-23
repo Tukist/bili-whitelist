@@ -1,8 +1,8 @@
-// 书源页「添加示例书源」入口测试。
+// 书源页「添加内置书源」入口测试。
 //
-// 入口在 AppBar 溢出菜单里（示例只是「先试一下」的顺手动作，不占主位）。
+// 入口在 AppBar 溢出菜单里（内置源只是「先试一下」的顺手动作，不占主位）。
 // 这里验三件事：点一下真的落库并出现在列表、重复点只提示「已存在」、
-// 用户自己改过的同名书源不会被示例覆盖。
+// 用户自己改过的同名书源不会被内置源覆盖。
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -28,18 +28,18 @@ Future<void> _pump(WidgetTester tester, BookSourceStore store) async {
   await tester.pumpAndSettle();
 }
 
-/// 打开溢出菜单并点「添加示例书源」。
+/// 打开溢出菜单并点「添加内置书源」。
 Future<void> _tapAddExamples(WidgetTester tester) async {
   await tester.tap(find.byIcon(Icons.more_vert));
   await tester.pumpAndSettle();
-  await tester.tap(find.text('添加示例书源'));
+  await tester.tap(find.text('添加内置书源'));
   await tester.pumpAndSettle();
 }
 
 void main() {
   setUp(() => SharedPreferences.setMockInitialValues({}));
 
-  testWidgets('溢出菜单里有「添加示例书源」，点一下落库并显示该源', (tester) async {
+  testWidgets('溢出菜单里有「添加内置书源」，点一下落库并显示该源', (tester) async {
     final store = BookSourceStore();
     await _pump(tester, store);
 
@@ -47,7 +47,7 @@ void main() {
 
     await _tapAddExamples(tester);
 
-    expect(find.text('已添加 1 个示例书源'), findsOneWidget);
+    expect(find.textContaining('已添加 ${kExampleBookSources.length} 个内置书源'), findsOneWidget);
     for (final s in kExampleBookSources) {
       expect(find.text(s.name), findsOneWidget);
     }
@@ -61,11 +61,12 @@ void main() {
     await _tapAddExamples(tester);
     await _tapAddExamples(tester);
 
-    expect(find.text('示例书源已存在'), findsOneWidget);
+    expect(find.text('内置书源已存在'), findsOneWidget);
     expect((await store.getAll()).length, kExampleBookSources.length);
   });
 
-  testWidgets('用户自己改过的同名书源不会被示例覆盖', (tester) async {
+  testWidgets('用户自己改过的同名书源不会被内置源覆盖（其余内置源照常补进来）',
+      (tester) async {
     final example = kExampleBookSources.first;
     final store = BookSourceStore();
     await store.upsertAll([_src(example.name, baseUrl: 'https://mine.example')]);
@@ -73,9 +74,13 @@ void main() {
 
     await _tapAddExamples(tester);
 
-    expect(find.text('示例书源已存在'), findsOneWidget);
     final all = await store.getAll();
-    expect(all.length, 1);
-    expect(all.first.baseUrl, 'https://mine.example');
+    // 自己那条还在、规则没被冲掉
+    final mine = all.firstWhere((s) => s.key == example.key);
+    expect(mine.baseUrl, 'https://mine.example');
+    // 其余内置源补进来了（F2 起内置源不止一条，跳过一条不等于跳过全部）
+    expect(all.length, kExampleBookSources.length);
+    // 提示里说明「有几个同名源没覆盖」，不假装全新增
+    expect(find.textContaining('没有覆盖'), findsOneWidget);
   });
 }

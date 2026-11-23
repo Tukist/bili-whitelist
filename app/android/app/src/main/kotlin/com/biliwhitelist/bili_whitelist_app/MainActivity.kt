@@ -80,6 +80,10 @@ class MainActivity : FlutterActivity() {
         // 读成 UTF-8 字符串回传。不需要任何权限（SAF 就是为这个设计的）。
         filePicker = FilePickerPlugin(this)
         filePicker.register(flutterEngine)
+        // PDF 页渲染（v2.74.0，本地书 PDF）：系统 PdfRenderer 把一页画成 PNG 落盘，
+        // 只回路径（位图走通道会超限 / OOM）。不持 Activity，也没有 onActivityResult，
+        // 注册即走；渲染队列是插件自己的单线程（PdfRenderer 不能并发）。
+        PdfRenderPlugin(filesDir).register(flutterEngine)
         // 流量计量（v2.53.0）：NetworkStatsManager + 「使用情况访问」引导。
         // 不需要持有实例（跳设置页不靠 onActivityResult 回传，Dart 侧在回到前台时
         // 自己重查权限）→ 与 ApkInstaller / MediaController 一样直接注册即走；

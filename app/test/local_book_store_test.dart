@@ -8,10 +8,12 @@
 // getBooks → 空，而不是挂住或抛异常（见 DEV_CONTEXT 第 6.2 条）。
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:bili_whitelist_app/services/bookshelf_store.dart';
+import 'package:bili_whitelist_app/services/local_book_parser.dart';
 import 'package:bili_whitelist_app/services/local_book_store.dart';
 
 const String _sample = '第一章 风起\n'
@@ -57,21 +59,36 @@ void main() {
       expect(book.chapterCount, 3);
       expect(book.chapters.map((c) => c.title), ['第一章 风起', '第二章 云涌', '第三章 雨落']);
 
-      // 落盘事实
+      // 落盘事实（schema 2：一章一个文件，不再有整本 book.txt）
       final dir = bookDir(book.id);
-      expect(File('${dir.path}/book.txt').existsSync(), isTrue);
       expect(File('${dir.path}/manifest.json').existsSync(), isTrue);
-      expect(File('${dir.path}/book.txt').readAsStringSync(), _sample);
-      expect(File('${dir.path}/book.txt.tmp').existsSync(), isFalse, reason: '不能留 .tmp 残片');
+      expect(File('${dir.path}/chapters/0.txt').existsSync(), isTrue);
+      expect(File('${dir.path}/chapters/2.txt').existsSync(), isTrue);
+      expect(
+        File('${dir.path}/chapters/0.txt').readAsStringSync(),
+        '第一章 风起\n这是第一章的正文。\n',
+      );
+      expect(
+        File('${dir.path}/book.txt').existsSync(),
+        isFalse,
+        reason: 'v2 不再留整本副本（章节文件就是正文）',
+      );
+      expect(
+        File('${dir.path}/manifest.json.tmp').existsSync(),
+        isFalse,
+        reason: '不能留 .tmp 残片',
+      );
 
       final manifest = jsonDecode(
         File('${dir.path}/manifest.json').readAsStringSync(),
       ) as Map<String, dynamic>;
+      expect(manifest['schema'], 2);
       expect(manifest['id'], book.id);
       expect(manifest['name'], '测试书');
       expect(manifest['format'], 'txt');
       expect(manifest['encoding'], 'gbk');
       expect((manifest['chapters'] as List).length, 3);
+      expect((manifest['chapters'] as List).first['file'], 'chapters/0.txt');
       expect(manifest['importedAt'], greaterThan(0));
     });
 
@@ -199,6 +216,9 @@ void main() {
     test('偏移被改坏（end 超长 / start > end）不崩、不读错', () async {
       final book = (await store.importTxt(name: '测试书', text: _sample))!;
       final dir = bookDir(book.id);
+      // 造一份 v1 旧布局：整本 book.txt + 带偏移的旧清单（没有 schema）
+      File('${dir.path}/book.txt').writeAsStringSync(_sample);
+      Directory('${dir.path}/chapters').deleteSync(recursive: true);
       File('${dir.path}/manifest.json').writeAsStringSync(
         jsonEncode({
           'id': book.id,
@@ -219,7 +239,7 @@ void main() {
 
     test('正文文件被外部删掉 → readChapter null', () async {
       final book = (await store.importTxt(name: '测试书', text: _sample))!;
-      File('${bookDir(book.id).path}/book.txt').deleteSync();
+      File('${bookDir(book.id).path}/chapters/0.txt').deleteSync();
       expect(await store.readChapter(book.id, 0), isNull);
     });
   });
@@ -247,6 +267,202 @@ void main() {
       expect(await naked.stats(), isA<LocalBookStats>());
       expect(await naked.readChapter('x', 0), isNull);
       expect(await naked.removeBook('x'), isFalse);
+    });
+  });
+
+  // ==================== E3：schema 2 与 v1 惰性迁移 ====================
+
+  group('schema 2：一章一个文件', () {
+    test('importParsedBook 往返：章节按序落盘，元信息进清单', () async {
+      final book = await store.importParsedBook(
+        name: '某 EPUB.epub',
+        author: '作者乙',
+        format: 'epub',
+        chapters: const [
+          ParsedChapter(title: '第一章', text: '第一段\n第二段'),
+          ParsedChapter(title: '第二章', text: '另一章正文'),
+        ],
+        sizeBytes: 4096,
+        idSeed: 'epub|某.epub|4096|head',
+      );
+      expect(book, isNotNull);
+      expect(book!.name, '某 EPUB', reason: '扩展名要去掉');
+      expect(book.format, 'epub');
+      expect(book.author, '作者乙');
+      expect(book.chapterCount, 2);
+
+      final dir = bookDir(book.id);
+      expect(File('${dir.path}/chapters/0.txt').readAsStringSync(), '第一段\n第二段');
+      expect(File('${dir.path}/chapters/1.txt').readAsStringSync(), '另一章正文');
+      expect(await store.readChapter(book.id, 0), '第一段\n第二段');
+      expect(await store.readChapter(book.id, 1), '另一章正文');
+      expect(await store.readChapter(book.id, 2), isNull);
+
+      final got = (await store.getBook(book.id))!;
+      expect(got.author, '作者乙');
+      expect(got.format, 'epub');
+      expect(got.sizeBytes, 4096);
+    });
+
+    test('封面按字节判断后缀并落盘，coverPath 指到真实文件', () async {
+      final book = await store.importParsedBook(
+        name: '有封面',
+        format: 'epub',
+        chapters: const [ParsedChapter(title: '第一章', text: '正文')],
+        coverBytes: Uint8List.fromList(const [
+          0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46,
+        ]),
+        idSeed: 'epub|a|1|x',
+      );
+      final dir = bookDir(book!.id);
+      expect(File('${dir.path}/cover.jpg').existsSync(), isTrue);
+      final got = (await store.getBook(book.id))!;
+      expect(got.coverFile, 'cover.jpg');
+      expect(got.coverPath, isNotNull);
+      expect(File(got.coverPath!).existsSync(), isTrue);
+    });
+
+    test('不是 jpg / png 的封面字节 → 不写封面（宁可不显示也不写坏文件）', () async {
+      final book = await store.importParsedBook(
+        name: '怪封面',
+        format: 'epub',
+        chapters: const [ParsedChapter(title: '第一章', text: '正文')],
+        coverBytes: Uint8List.fromList(const [1, 2, 3, 4, 5, 6]),
+        idSeed: 'epub|b|2|y',
+      );
+      final got = (await store.getBook(book!.id))!;
+      expect(got.coverFile, isEmpty);
+      expect(got.coverPath, isNull);
+      // 顶层只有 manifest（章节在 chapters/ 子目录里），没有任何封面文件
+      final top = bookDir(book.id)
+          .listSync()
+          .whereType<File>()
+          .map((f) => f.path.split(RegExp(r'[\\/]')).last)
+          .toList();
+      expect(top, ['manifest.json']);
+    });
+
+    test('同一 idSeed 重复导入 → 覆盖同一本，章节文件不叠加', () async {
+      Future<LocalBook?> imp(String text) => store.importParsedBook(
+            name: '同一本',
+            format: 'epub',
+            chapters: [ParsedChapter(title: '唯一章', text: text)],
+            idSeed: 'epub|same|1|z',
+          );
+      final a = await imp('第一版正文');
+      final b = await imp('第二版正文');
+      expect(b!.id, a!.id);
+      expect((await store.getBooks()).length, 1);
+      expect(await store.readChapter(a.id, 0), '第二版正文');
+      expect(File('${bookDir(a.id).path}/chapters/1.txt').existsSync(), isFalse,
+          reason: '旧版本的章节文件要清掉');
+    });
+
+    test('章文件路径含 .. → 拒绝读（防清单被手改后读别的文件）', () async {
+      final book = (await store.importTxt(name: '测试书', text: _sample))!;
+      final dir = bookDir(book.id);
+      File('${dir.path}/manifest.json').writeAsStringSync(jsonEncode({
+        'schema': 2,
+        'id': book.id,
+        'name': '测试书',
+        'chapters': [
+          {'title': '偷看', 'file': '../../secret.txt'},
+        ],
+        'importedAt': 1,
+      }));
+      expect(await store.readChapter(book.id, 0), isNull);
+    });
+  });
+
+  group('v1 → schema 2 惰性迁移', () {
+    // 一份 v2.72.0 时代的目录：整本 book.txt + 只记偏移的旧清单
+    const String v1Text = '第一章 甲\n第一章正文。\n第二章 乙\n第二章正文。\n';
+    final int a = v1Text.indexOf('第一章');
+    final int b = v1Text.indexOf('第二章');
+
+    String seedV1({String id = 'aaaaaaaaaaaaaaaa'}) {
+      final dir = Directory('${root.path}/reader/local/$id')
+        ..createSync(recursive: true);
+      File('${root.path}/reader/local/$id/book.txt').writeAsStringSync(v1Text);
+      File('${dir.path}/manifest.json').writeAsStringSync(jsonEncode({
+        'id': id,
+        'name': '旧书',
+        'format': 'txt',
+        'encoding': 'gbk',
+        'chapters': [
+          {'title': '第一章 甲', 'start': a, 'end': b},
+          {'title': '第二章 乙', 'start': b, 'end': v1Text.length},
+        ],
+        'sizeBytes': 777,
+        'importedAt': 5,
+      }));
+      return id;
+    }
+
+    test('旧书能读，读完变成 v2 布局（章节文件就位、book.txt 删掉）', () async {
+      final id = seedV1();
+      expect(await store.readChapter(id, 0), '第一章 甲\n第一章正文。\n');
+      expect(await store.readChapter(id, 1), '第二章 乙\n第二章正文。\n');
+
+      final dir = bookDir(id);
+      expect(File('${dir.path}/chapters/0.txt').existsSync(), isTrue);
+      expect(File('${dir.path}/chapters/1.txt').existsSync(), isTrue);
+      expect(File('${dir.path}/book.txt').existsSync(), isFalse,
+          reason: '迁移成功后不该再占一份整本副本');
+      final manifest = jsonDecode(
+        File('${dir.path}/manifest.json').readAsStringSync(),
+      ) as Map<String, dynamic>;
+      expect(manifest['schema'], 2);
+      expect((manifest['chapters'] as List).first['file'], 'chapters/0.txt');
+
+      // 迁移只做一次：再读一遍仍然是同一份内容
+      expect(await store.readChapter(id, 0), '第一章 甲\n第一章正文。\n');
+    });
+
+    test('getBooks 也会触发迁移，且字段（书名 / 编码 / 字节数）不丢', () async {
+      final id = seedV1();
+      final all = await store.getBooks();
+      expect(all.length, 1);
+      expect(all.single.id, id);
+      expect(all.single.name, '旧书');
+      expect(all.single.encoding, 'gbk');
+      expect(all.single.sizeBytes, 777);
+      expect(File('${bookDir(id).path}/chapters/0.txt').existsSync(), isTrue);
+    });
+
+    test('迁移中途失败 → 旧书**仍然能读**（不写坏清单，退回 v1 路径）', () async {
+      final id = seedV1();
+      // 制造失败：chapters 这个名字被一个**文件**占了，目录建不出来
+      File('${bookDir(id).path}/chapters').writeAsStringSync('占位');
+
+      final book = await store.getBook(id);
+      expect(book, isNotNull, reason: '迁移失败不能让书从书架消失');
+      expect(book!.chapterCount, 2);
+      expect(await store.readChapter(id, 0), '第一章 甲\n第一章正文。\n');
+      expect(await store.readChapter(id, 1), '第二章 乙\n第二章正文。\n');
+
+      // 清单仍是旧格式（没被半途写坏），book.txt 也还在
+      final manifest = jsonDecode(
+        File('${bookDir(id).path}/manifest.json').readAsStringSync(),
+      ) as Map<String, dynamic>;
+      expect(manifest['schema'], isNull);
+      expect(File('${bookDir(id).path}/book.txt').existsSync(), isTrue);
+    });
+
+    test('v1 目录里 book.txt 不在 → 迁移跳过、读取返回 null（不崩）', () async {
+      final id = seedV1();
+      File('${bookDir(id).path}/book.txt').deleteSync();
+      final book = await store.getBook(id);
+      expect(book, isNotNull);
+      expect(await store.readChapter(id, 0), isNull);
+      expect(Directory('${bookDir(id).path}/chapters').existsSync(), isFalse);
+    });
+
+    test('删掉旧书仍然连带清目录', () async {
+      final id = seedV1();
+      await store.getBook(id); // 触发迁移
+      expect(await store.removeBook(id), isTrue);
+      expect(bookDir(id).existsSync(), isFalse);
     });
   });
 }

@@ -6,6 +6,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:archive/archive.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -255,6 +256,130 @@ void main() {
       );
       expect(result.isOk, isTrue);
       expect(await books.readChapter(result.book!.id, 0), '你好');
+    });
+  });
+
+  // ==================== E3：EPUB ====================
+
+  group('EPUB', () {
+    /// 造一个最小 EPUB（container + OPF + nav + N 章 XHTML）。
+    ///
+    /// [brokenChapter] 章号从 1 开始：manifest 里声明了但包里没这个文件，
+    /// 用来验「缺一章跳过而不是整本失败」。
+    List<int> buildEpub({
+      List<String> titles = const ['第一章 风起', '第二章 云涌'],
+      int? brokenChapter,
+    }) {
+      final items = StringBuffer();
+      final nav = StringBuffer();
+      for (var i = 0; i < titles.length; i++) {
+        items.write('<item id="ch$i" href="ch${i + 1}.xhtml" '
+            'media-type="application/xhtml+xml"/>');
+        nav.write('<li><a href="ch${i + 1}.xhtml">${titles[i]}</a></li>');
+      }
+      items.write('<item id="nav" href="nav.xhtml" '
+          'media-type="application/xhtml+xml" properties="nav"/>');
+
+      final spine = StringBuffer();
+      for (var i = 0; i < titles.length; i++) {
+        spine.write('<itemref idref="ch$i"/>');
+      }
+
+      final files = <String, String>{
+        'META-INF/container.xml':
+            '<?xml version="1.0"?><container><rootfiles>'
+                '<rootfile full-path="content.opf" '
+                'media-type="application/oebps-package+xml"/></rootfiles></container>',
+        'content.opf': '<?xml version="1.0"?>'
+            '<package xmlns="http://www.idpf.org/2007/opf" version="3.0">'
+            '<metadata xmlns:dc="http://purl.org/dc/elements/1.1/">'
+            '<dc:title>测试 EPUB</dc:title>'
+            '<dc:creator>无名氏</dc:creator>'
+            '<dc:language>zh</dc:language></metadata>'
+            '<manifest>$items</manifest><spine>$spine</spine></package>',
+        'nav.xhtml': '<?xml version="1.0"?>'
+            '<html xmlns="http://www.w3.org/1999/xhtml" '
+            'xmlns:epub="http://www.idpf.org/2007/ops">'
+            '<body><nav epub:type="toc"><ol>$nav</ol></nav></body></html>',
+      };
+      for (var i = 0; i < titles.length; i++) {
+        if (brokenChapter == i + 1) continue;
+        files['ch${i + 1}.xhtml'] = '<?xml version="1.0"?>'
+            '<html><head><title>x</title></head><body>'
+            '<p>${titles[i]} 的正文。</p></body></html>';
+      }
+
+      final archive = Archive();
+      files.forEach((path, content) {
+        final bytes = utf8.encode(content);
+        archive.addFile(ArchiveFile(path, bytes.length, bytes));
+      });
+      return ZipEncoder().encode(archive)!;
+    }
+
+    test('导入成功：格式 epub、作者来自 dc:creator、正文能读', () async {
+      final bytes = buildEpub();
+      final file = await fakePicked('测试 EPUB.epub', bytes, ext: 'epub');
+      final result = await service.pickAndImport();
+
+      expect(result.isOk, isTrue);
+      expect(result.error, isNull);
+      expect(result.skippedChapters, 0);
+      final book = result.book!;
+      expect(book.format, 'epub');
+      expect(book.name, '测试 EPUB', reason: '书名取 dc:title');
+      expect(book.author, '无名氏');
+      expect(book.chapterCount, 2);
+      expect(book.sizeBytes, bytes.length);
+      expect(await books.readChapter(book.id, 1), '第二章 云涌 的正文。');
+
+      final shelved = await shelf.getBooks();
+      expect(shelved.single.detailUrl, 'local:${book.id}');
+      expect(shelved.single.author, '无名氏');
+      expect(file.existsSync(), isFalse, reason: '原生临时文件要清掉');
+    });
+
+    test('重复导入同一个文件 → 书架仍只有一本（id 由文件名 + 字节指纹决定）', () async {
+      final bytes = buildEpub();
+      await fakePicked('同一本.epub', bytes, ext: 'epub');
+      final first = await service.pickAndImport();
+      await fakePicked('同一本.epub', bytes, ext: 'epub');
+      final second = await service.pickAndImport();
+
+      expect(second.book!.id, first.book!.id);
+      expect((await shelf.getBooks()).length, 1);
+      expect((await books.getBooks()).length, 1);
+    });
+
+    test('缺一章 → 书照常落盘，skippedChapters 记一笔', () async {
+      final bytes = buildEpub(brokenChapter: 2);
+      await fakePicked('缺章.epub', bytes, ext: 'epub');
+      final result = await service.pickAndImport();
+
+      expect(result.isOk, isTrue, reason: '缺一章不该整本失败');
+      expect(result.skippedChapters, 1);
+      expect(result.book!.chapterCount, 1);
+    });
+
+    test('不支持的格式 → 一句「暂不支持 X 格式」，临时文件也清掉', () async {
+      // v2.74.0 起 PDF 已支持，这里换成还没有实现的 MOBI（语义词不变：
+      // 「不支持的格式要给出支持列表 + 清掉临时文件」）
+      final file = await fakePicked('论文.mobi', const [1, 2, 3], ext: 'mobi');
+      final result = await service.pickAndImport();
+
+      expect(result.isOk, isFalse);
+      expect(result.error, contains('暂不支持'));
+      expect(result.error, contains('MOBI'));
+      expect(file.existsSync(), isFalse);
+    });
+
+    test('坏 EPUB → 可读原因（不是异常堆栈）', () async {
+      await fakePicked('坏.epub', utf8.encode('这不是 zip'), ext: 'epub');
+      final result = await service.pickAndImport();
+
+      expect(result.isOk, isFalse);
+      expect(result.error, contains('打不开'));
+      expect(result.error, isNot(contains('Exception')));
     });
   });
 }

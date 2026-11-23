@@ -97,11 +97,25 @@ class BookSearchGroup {
 
   final List<BookSearchItem> items;
 
+  /// 失败时的 HTTP 状态码（连不上 / 超时 / 规则问题时为 null）。
+  ///
+  /// 为什么带到分组上：书源可用性检测（`book_source_health_service.dart`）
+  /// 要把 403 / 429 / 412 判成「被拦」，而它只拿得到分组、拿不到异常。
+  final int? httpStatus;
+
+  /// 失败的大类（[RuleErrorKind]；非异常路径为 null）。
+  ///
+  /// 搜索页也用得上：`timeout` 是「连不上」、`unsupported` 是「规则有问题」，
+  /// 两者在空结果文案里要分开说。
+  final RuleErrorKind? errorKind;
+
   const BookSearchGroup({
     required this.sourceName,
     required this.status,
     this.message,
     this.items = const [],
+    this.httpStatus,
+    this.errorKind,
   });
 
   bool get hasItems => items.isNotEmpty;
@@ -179,6 +193,7 @@ class BookSearchService {
         sourceName: source.name,
         status: BookSearchStatus.error,
         message: '搜索超时（${_durationText(perSourceTimeout)}未返回）',
+        errorKind: RuleErrorKind.timeout,
       );
     } catch (e) {
       // 引擎抛的东西理论上都被 _searchOne 收掉了，这里是最后一道
@@ -186,6 +201,7 @@ class BookSearchService {
         sourceName: source.name,
         status: BookSearchStatus.error,
         message: '搜索失败：${_describe(e)}',
+        errorKind: e is RuleEngineException ? e.kind : null,
       );
     }
   }
@@ -363,6 +379,8 @@ class BookSearchService {
       status:
           unsupported ? BookSearchStatus.unsupported : BookSearchStatus.error,
       message: _describe(error),
+      httpStatus: error is RuleEngineException ? error.statusCode : null,
+      errorKind: error is RuleEngineException ? error.kind : null,
     );
   }
 

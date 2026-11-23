@@ -11,6 +11,7 @@ import 'package:bili_whitelist_app/pages/book_detail_page.dart';
 import 'package:bili_whitelist_app/pages/book_search_page.dart';
 import 'package:bili_whitelist_app/services/book_rule/engine_holder.dart';
 import 'package:bili_whitelist_app/services/book_rule/rule_engine.dart';
+import 'package:bili_whitelist_app/services/book_source_health_service.dart';
 import 'package:bili_whitelist_app/services/book_source_store.dart';
 
 /// 只返回内存列表的书源存储（不碰 prefs）。
@@ -21,6 +22,16 @@ class _FakeSourceStore extends BookSourceStore {
 
   @override
   Future<List<BookSource>> getAll() async => sources;
+}
+
+/// 假检测结果（本页只读 `reader:source_health`，不需要引擎）。
+class _FakeHealth extends BookSourceHealthService {
+  _FakeHealth(this.store);
+
+  final Map<String, SourceHealth> store;
+
+  @override
+  Future<Map<String, SourceHealth>> loadAll() async => store;
 }
 
 /// 记录 push 过的路由（断言「点了会进详情页」）。
@@ -80,10 +91,15 @@ Future<void> _pump(
   required BookSourceStore store,
   required RuleEngineHolder holder,
   _RouteObserver? observer,
+  BookSourceHealthService? health,
 }) async {
   await tester.pumpWidget(
     MaterialApp(
-      home: BookSearchPage(sourceStore: store, holder: holder),
+      home: BookSearchPage(
+        sourceStore: store,
+        holder: holder,
+        healthService: health,
+      ),
       navigatorObservers: [if (observer != null) observer],
     ),
   );
@@ -170,5 +186,154 @@ void main() {
 
     expect((holder.engine as FakeRuleEngine).fetchedUrls, isEmpty);
     expect(find.text('搜一本书'), findsOneWidget);
+  });
+
+  // ==================== F2：健康状态 / 空结果文案 / 跳过源弹层 ====================
+
+  /// 一个只会「返回 0 条」的引擎（页面结构与规则不符）。
+  FakeRuleEngine emptyEngine() => FakeRuleEngine(
+        onFetch: (url) async => '<html><body>no result</body></html>',
+        onQueryMap: (html, list, fields) async => const {},
+      );
+
+  /// 一个「站点返回 403」的引擎。
+  FakeRuleEngine blockedEngine() => FakeRuleEngine(
+        onFetch: (url) async => throw const RuleEngineException(
+          RuleErrorKind.network,
+          '站点返回 403：https://blocked.example/search?q=x',
+          statusCode: 403,
+        ),
+      );
+
+  testWidgets('分组标题右侧显示该源上次检测的健康状态', (tester) async {
+    final holder = RuleEngineHolder.withEngine(_engine());
+    final health = _FakeHealth({
+      '源a': SourceHealth(
+        sourceKey: '源a',
+        status: SourceHealthStatus.ok,
+        at: DateTime(2026, 11, 23),
+        count: 12,
+      ),
+    });
+    await _pump(
+      tester,
+      store: _FakeSourceStore([_source('源A', 'a.example')]),
+      holder: holder,
+      health: health,
+    );
+
+    await tester.enterText(find.byType(TextField), '斗罗');
+    await tester.tap(find.widgetWithText(FilledButton, '搜索'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('检测：可用 12 条'), findsOneWidget);
+  });
+
+  testWidgets('某源 0 条且上次检测被拦 → 小字说「这个源可能已失效」', (tester) async {
+    // 源A 有结果（否则整页走空态，看不到分组），源B 0 条且上次被拦
+    final holder = RuleEngineHolder.withEngine(FakeRuleEngine(
+      onFetch: (url) async => url.contains('a.example') ? 'A' : 'B',
+      onQueryMap: (html, list, fields) async {
+        if (html == 'A') {
+          return {
+            'name': ['斗罗大陆'],
+            'author': ['唐家三少'],
+            'detailUrl': ['https://a.example/book/1'],
+          };
+        }
+        return const {};
+      },
+    ));
+    final health = _FakeHealth({
+      '源b': SourceHealth(
+        sourceKey: '源b',
+        status: SourceHealthStatus.blocked,
+        at: DateTime(2026, 11, 23),
+        message: '站点返回 403',
+      ),
+    });
+    await _pump(
+      tester,
+      store: _FakeSourceStore([
+        _source('源A', 'a.example'),
+        _source('源B', 'b.example'),
+      ]),
+      holder: holder,
+      health: health,
+    );
+
+    await tester.enterText(find.byType(TextField), '斗罗');
+    await tester.tap(find.widgetWithText(FilledButton, '搜索'));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('这个源可能已失效'), findsOneWidget);
+    expect(find.textContaining('上次检测：被拦'), findsOneWidget);
+  });
+
+  testWidgets('所有源都没结果 → 「没有找到」，而不是「都失败了」', (tester) async {
+    final holder = RuleEngineHolder.withEngine(emptyEngine());
+    await _pump(
+      tester,
+      store: _FakeSourceStore([
+        _source('源A', 'a.example'),
+        _source('源B', 'b.example'),
+      ]),
+      holder: holder,
+    );
+
+    await tester.enterText(find.byType(TextField), '不存在');
+    await tester.tap(find.widgetWithText(FilledButton, '搜索'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('没有找到「不存在」'), findsOneWidget);
+    expect(find.text('所有书源都失败了'), findsNothing);
+    expect(find.textContaining('2 个源没搜到'), findsOneWidget);
+  });
+
+  testWidgets('所有源都失败 → 「所有书源都失败了」+ 原因归类汇总', (tester) async {
+    final holder = RuleEngineHolder.withEngine(blockedEngine());
+    await _pump(
+      tester,
+      store: _FakeSourceStore([
+        _source('源A', 'a.example'),
+        _source('源B', 'b.example'),
+      ]),
+      holder: holder,
+    );
+
+    await tester.enterText(find.byType(TextField), '斗罗');
+    await tester.tap(find.widgetWithText(FilledButton, '搜索'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('所有书源都失败了'), findsOneWidget);
+    expect(find.text('没有找到「斗罗」'), findsNothing);
+    expect(find.textContaining('2 个源被拦'), findsOneWidget);
+  });
+
+  testWidgets('「已跳过 N 个需 JS 的源」可点开看名单（最多 20 个 + 还有 N 个）',
+      (tester) async {
+    final holder = RuleEngineHolder.withEngine(_engine());
+    final jsSources = [
+      for (var i = 1; i <= 25; i++) _source('JS源$i', 'js$i.example', nameRule: '<js>x</js>'),
+    ];
+    await _pump(
+      tester,
+      store: _FakeSourceStore([_source('源A', 'a.example'), ...jsSources]),
+      holder: holder,
+    );
+
+    await tester.enterText(find.byType(TextField), '斗罗');
+    await tester.tap(find.widgetWithText(FilledButton, '搜索'));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('已跳过 25 个需要 JS 规则的书源'), findsOneWidget);
+    await tester.tap(find.widgetWithText(TextButton, '查看'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('已跳过 25 个源'), findsOneWidget);
+    expect(find.text('· JS源1'), findsOneWidget);
+    expect(find.text('· JS源20'), findsOneWidget);
+    expect(find.text('· JS源21'), findsNothing); // 只列前 20 个
+    expect(find.text('还有 5 个'), findsOneWidget);
   });
 }

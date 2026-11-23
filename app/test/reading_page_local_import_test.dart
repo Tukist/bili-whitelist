@@ -136,10 +136,12 @@ void main() {
     int chapters = 2,
     String name = '风起',
     String id = '0123456789abcdef',
+    String format = 'txt',
   }) async {
     final book = LocalBook(
       id: id,
       name: name,
+      format: format,
       chapters: [
         for (var i = 0; i < chapters; i++)
           LocalChapter(
@@ -221,7 +223,7 @@ void main() {
     expect(find.text('书架还是空的'), findsNothing);
     expect(find.text('风起'), findsOneWidget, reason: '书架里应该有新导入的书');
     expect(find.text('还没开始读 · 共 2 章'), findsOneWidget);
-    expect(find.textContaining('已导入《风起》，共 2 章'), findsOneWidget);
+    expect(find.textContaining('已导入《风起》（TXT，共 2 章）'), findsOneWidget);
 
     // 书架存储里也真的有这本（键是 local:<id>）
     final shelved = await shelf.getBooks();
@@ -346,6 +348,20 @@ void main() {
 
     expect(await shelf.getBooks(), isEmpty);
     expect(find.text('书架还是空的'), findsOneWidget);
+  });
+
+  testWidgets('书架行的格式角标：TXT / EPUB 各显示自己的格式', (tester) async {
+    final txt = await seedLocalBook(format: 'txt');
+    await seedLocalBook(
+      id: 'fedcba9876543210',
+      name: '雨落',
+      format: 'epub',
+    );
+    await pumpPage(tester, _FakePicker(book: txt, shelfStore: shelf));
+
+    expect(find.text('本地'), findsNWidgets(2));
+    expect(find.text('TXT'), findsOneWidget);
+    expect(find.text('EPUB'), findsOneWidget);
   });
 
   // 纯 `test`（不在 FakeAsync 区里）：真 store + 真临时目录，验证「删书 =

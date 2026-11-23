@@ -47,6 +47,16 @@ class BookContentResult {
   /// 缓存里存的是当初清洗完的成品，没有「第几页」「站点怎么了」这些现场信息。
   final bool fromCache;
 
+  /// 「这一章是一张图片」时图片的**本地绝对路径**（PDF 页，v2.74.0）。
+  ///
+  /// 非空时 [body] 为空串，阅读页改成 `Image.file` 显示（不再渲染 `Text`）。
+  /// 网络书 / TXT / EPUB 恒为 null —— 既有路径的行为一个字都不变。
+  final String? imagePath;
+
+  /// 图片的像素尺寸（用于按比例占位，避免「先空白再跳高度」）。0 = 未知。
+  final int imageWidth;
+  final int imageHeight;
+
   const BookContentResult({
     required this.title,
     required this.body,
@@ -54,7 +64,13 @@ class BookContentResult {
     this.partial = false,
     this.warning,
     this.fromCache = false,
+    this.imagePath,
+    this.imageWidth = 0,
+    this.imageHeight = 0,
   });
+
+  /// 这一章是不是图片页（PDF 的一页）。
+  bool get isImagePage => imagePath != null && imagePath!.trim().isNotEmpty;
 
   bool get isEmpty => body.trim().isEmpty;
 }

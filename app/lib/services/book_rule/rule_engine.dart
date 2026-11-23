@@ -73,7 +73,14 @@ class RuleEngineException implements Exception {
   /// 给人看的一句话（可以直接塞进 SnackBar / 分组说明）。
   final String message;
 
-  const RuleEngineException(this.kind, this.message);
+  /// HTTP 状态码（只有「站点返回了非 2xx」时才有值，其余为 null）。
+  ///
+  /// 为什么单独带出来而不是只写在 [message] 里：书源可用性检测要把
+  /// 403 / 429 / 412 判成「被拦」、超时判成「连不上」—— 去 `message` 里
+  /// 用正则抠数字既脆又难测。空值时调用方按 [kind] 兜底。
+  final int? statusCode;
+
+  const RuleEngineException(this.kind, this.message, {this.statusCode});
 
   @override
   String toString() => message;
@@ -304,7 +311,12 @@ class WebViewRuleEngine extends BookRuleEngine {
         ),
       );
     } on DioException catch (e) {
-      throw RuleEngineException(RuleErrorKind.network, _humanDioError(e, url));
+      throw RuleEngineException(
+        RuleErrorKind.network,
+        _humanDioError(e, url),
+        // 4xx / 5xx 时 Dio 带上响应对象；连不上 / 超时没有状态码。
+        statusCode: e.response?.statusCode,
+      );
     } catch (e) {
       throw RuleEngineException(
         RuleErrorKind.network,

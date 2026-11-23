@@ -24,6 +24,7 @@ import '../models/book_source.dart';
 import '../services/book_rule/engine_holder.dart';
 import '../services/book_rule/legado_compat.dart';
 import '../services/book_search_service.dart';
+import '../services/book_source_health_service.dart';
 import '../services/book_source_store.dart';
 import '../services/search_history_store.dart';
 import '../theme/app_palette.dart';
@@ -46,11 +47,17 @@ class BookSearchPage extends StatefulWidget {
   /// 测试注入：规则引擎宿主（默认 [RuleEngineHolder.instance]）。
   final RuleEngineHolder? holder;
 
+  /// 测试注入：书源检测结果（默认 `reader:source_health` 那份）。
+  ///
+  /// 本页**只读**检测结果，不探测（探测在书源管理页），所以这里不需要引擎。
+  final BookSourceHealthService? healthService;
+
   const BookSearchPage({
     super.key,
     this.sourceStore,
     this.historyStore,
     this.holder,
+    this.healthService,
   });
 
   @override
@@ -74,6 +81,9 @@ class _BookSearchPageState extends State<BookSearchPage> {
   /// 本轮被跳过的「需要 JS」源名（只用于说明，不参与搜索）。
   List<String> _skippedJs = const [];
 
+  /// 书源检测结果（源名小写 → 结果）：分组标题与 0 结果提示用。
+  Map<String, SourceHealth> _health = const {};
+
   /// 搜索代次：回来时对不上就丢弃（取消 / 切页 / 重新搜）。
   int _token = 0;
 
@@ -82,11 +92,16 @@ class _BookSearchPageState extends State<BookSearchPage> {
       widget.historyStore ?? SearchHistoryStore.instance;
   RuleEngineHolder get _holder => widget.holder ?? RuleEngineHolder.instance;
 
+  /// 检测结果只读（探测在书源管理页），所以这里不需要引擎。
+  late final BookSourceHealthService _healthService =
+      widget.healthService ?? BookSourceHealthService();
+
   @override
   void initState() {
     super.initState();
     unawaited(_loadSources());
     unawaited(_loadHistory());
+    unawaited(_loadHealth());
   }
 
   @override
@@ -108,6 +123,12 @@ class _BookSearchPageState extends State<BookSearchPage> {
     final list = await _historyStore.getAll();
     if (!mounted) return;
     setState(() => _history = list);
+  }
+
+  Future<void> _loadHealth() async {
+    final map = await _healthService.loadAll();
+    if (!mounted) return;
+    setState(() => _health = map);
   }
 
   Future<void> _remember(String keyword) async {
@@ -213,6 +234,8 @@ class _BookSearchPageState extends State<BookSearchPage> {
       ),
     );
     await _loadSources();
+    // 管理页里可能刚跑过检测：回来顺手刷新状态，不然分组标题还是旧的
+    await _loadHealth();
   }
 
   // ==================== 构建 ====================
@@ -366,12 +389,29 @@ class _BookSearchPageState extends State<BookSearchPage> {
 
     final merged = mergeSearchGroups(groups);
     if (merged.isEmpty) {
+      // 空结果分两种：**都没搜到**（源是好的，没这本书）与**都失败了**
+      // （源连不上 / 被拦 / 规则坏）。混在一起说「没找到」会让用户以为
+      // 书源没问题，白折腾半天关键词。
+      final noResultCount = groups
+          .where((g) => g.status == BookSearchStatus.noResult)
+          .length;
+      final allFailed = groups.isNotEmpty &&
+          groups.every((g) =>
+              g.status != BookSearchStatus.ok &&
+              g.status != BookSearchStatus.noResult);
+      final failureSummary = summarizeSearchFailures(groups);
+      final parts = <String>[
+        if (noResultCount > 0) '$noResultCount 个源没搜到',
+        if (failureSummary.isNotEmpty) failureSummary,
+        if (_skippedJs.isNotEmpty)
+          '另有 ${_skippedJs.length} 个源需要 JS 规则，本版暂不支持',
+        if (noResultCount == 0 && failureSummary.isEmpty && _skippedJs.isEmpty)
+          '换个关键词，或去书源管理里启用更多源',
+      ];
       return AppStateView(
         kind: AppStateKind.empty,
-        title: '没有找到「$_keyword」',
-        subtitle: _skippedJs.isEmpty
-            ? '换个关键词，或去书源管理里启用更多源'
-            : '另有 ${_skippedJs.length} 个源需要 JS 规则，本版暂不支持',
+        title: allFailed ? '所有书源都失败了' : '没有找到「$_keyword」',
+        subtitle: parts.join('；'),
         actionLabel: '书源管理',
         onAction: _openSources,
         illustrationSeed: 'booksearch',
@@ -385,11 +425,26 @@ class _BookSearchPageState extends State<BookSearchPage> {
           SliverToBoxAdapter(
             child: Padding(
               padding: const EdgeInsets.fromLTRB(kPagePadH, 0, kPagePadH, kSpace8),
-              child: Text(
-                '已跳过 ${_skippedJs.length} 个需要 JS 规则的书源：'
-                '${_skippedJs.take(3).join('、')}'
-                '${_skippedJs.length > 3 ? '…' : ''}',
-                style: kTypeBodyS.copyWith(color: kInkGray50),
+              child: Row(
+                children: [
+                  Expanded(
+                    child: Text(
+                      '已跳过 ${_skippedJs.length} 个需要 JS 规则的书源：'
+                      '${_skippedJs.take(3).join('、')}'
+                      '${_skippedJs.length > 3 ? '…' : ''}',
+                      style: kTypeBodyS.copyWith(color: kInkGray50),
+                    ),
+                  ),
+                  // 只给前 3 个名字太抠了：给个「查看」，最多列 20 个 + 还有 N 个
+                  TextButton(
+                    onPressed: _showSkippedJs,
+                    style: TextButton.styleFrom(
+                      visualDensity: VisualDensity.compact,
+                      minimumSize: const Size(0, 32),
+                    ),
+                    child: const Text('查看'),
+                  ),
+                ],
               ),
             ),
           ),
@@ -470,6 +525,8 @@ class _BookSearchPageState extends State<BookSearchPage> {
   }
 
   Widget _groupHeader(BuildContext context, BookSearchGroup group) {
+    final palette = context.palette;
+    final health = _health[group.sourceName.trim().toLowerCase()];
     return Container(
       margin: const EdgeInsets.only(top: kSpace8),
       padding: const EdgeInsets.fromLTRB(kPagePadH, 6, kPagePadH, 6),
@@ -482,6 +539,18 @@ class _BookSearchPageState extends State<BookSearchPage> {
               style: kTypeTitleS.copyWith(color: kInkBlack),
             ),
           ),
+          // 上次检测的健康状态（没测过的源不显示 —— 空着比「未检测」更安静）
+          if (health != null)
+            Padding(
+              padding: const EdgeInsets.only(right: kSpace8),
+              child: Text(
+                '检测：${health.label}',
+                style: kTypeBodyS.copyWith(
+                  color: _healthColor(health.status, palette),
+                  fontSize: 11,
+                ),
+              ),
+            ),
           if (group.status != BookSearchStatus.ok)
             Text(
               _statusLabel(group.status),
@@ -496,18 +565,122 @@ class _BookSearchPageState extends State<BookSearchPage> {
     );
   }
 
+  /// 健康状态 → 文字颜色（与书源管理页的角标同口径）。
+  Color _healthColor(SourceHealthStatus status, AppPalette palette) {
+    return switch (status) {
+      SourceHealthStatus.ok => kSuccess,
+      SourceHealthStatus.noResult => kInkGray70,
+      SourceHealthStatus.blocked => kError,
+      SourceHealthStatus.networkError => kError,
+      SourceHealthStatus.unsupportedJs => palette.accent,
+      SourceHealthStatus.badRule => palette.accent,
+    };
+  }
+
   /// 该源没有可显示的条目时，把「为什么」写出来（不要让用户以为列表坏了）。
   Widget _groupStatus(BuildContext context, BookSearchGroup group) {
+    final palette = context.palette;
     final message = group.status == BookSearchStatus.unsupported
         ? '需要 JS 规则，暂不支持'
         : (group.message ?? '没有结果');
+    final hint = _zeroHint(group);
     return Padding(
       padding: const EdgeInsets.fromLTRB(kPagePadH, kSpace8, kPagePadH, kSpace8),
-      child: Text(
-        message,
-        style: kTypeBodyS.copyWith(
-          color: group.status == BookSearchStatus.error ? kError : kInkGray50,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            message,
+            style: kTypeBodyS.copyWith(
+              color:
+                  group.status == BookSearchStatus.error ? kError : kInkGray50,
+            ),
+          ),
+          if (hint != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text(
+                hint,
+                style: kTypeBodyS.copyWith(
+                  color: group.status == BookSearchStatus.noResult
+                      ? kInkGray50
+                      : palette.inkText,
+                  fontSize: 11,
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  /// 0 条结果时的一行小字：**「这个源没搜到」和「这个源已经废了」要分开**。
+  ///
+  /// 判据就是上次检测的结果（`reader:source_health`）：检测过且是失败状态，
+  /// 说明问题是源而不是关键词。没检测过就明说要先去测。
+  String? _zeroHint(BookSearchGroup group) {
+    if (group.items.isNotEmpty) return null;
+    if (group.status != BookSearchStatus.noResult) return null;
+    final health = _health[group.sourceName.trim().toLowerCase()];
+    if (health == null) {
+      return '这个源没搜到（可去书源管理「检测这个源」确认它还能不能用）';
+    }
+    if (health.status == SourceHealthStatus.ok) {
+      return '这个源没搜到（上次检测还能用，命中 ${health.count} 条）';
+    }
+    if (health.status == SourceHealthStatus.noResult) {
+      return '这个源没搜到（上次检测也没有结果）';
+    }
+    final when = '上次检测：${health.status.label}';
+    return '这个源可能已失效（$when）';
+  }
+
+  /// 「已跳过 N 个需要 JS 的源」的明细弹层（最多 20 个 + 还有 N 个）。
+  void _showSkippedJs() {
+    const limit = 20;
+    final rest = _skippedJs.length - limit;
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('已跳过 ${_skippedJs.length} 个源'),
+        content: SizedBox(
+          width: double.maxFinite,
+          // 用 SingleChildScrollView + Column 而不是 ListView：ListView 是懒建，
+          // 屏幕外的名字不会进 widget 树（用户滚下去才出现），而这里只有 ≤21 行，
+          // 一次性建出来更简单，也让「前 20 个 + 还有 N 个」这句话始终在。
+          child: SingleChildScrollView(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                for (final name in _skippedJs.take(limit))
+                  Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 2),
+                    child: Text('· $name', style: kTypeBodyS),
+                  ),
+                if (rest > 0)
+                  Padding(
+                    padding: const EdgeInsets.only(top: kSpace8),
+                    child: Text(
+                      '还有 $rest 个',
+                      style: kTypeBodyS.copyWith(color: kInkGray50),
+                    ),
+                  ),
+                const SizedBox(height: kSpace8),
+                Text(
+                  '这些源用了 <js> / @js: / {{…}} 规则，本版跑不了 —— 不是它们失效了。',
+                  style: kTypeBodyS.copyWith(color: kInkGray50, fontSize: 12),
+                ),
+              ],
+            ),
+          ),
         ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('关闭'),
+          ),
+        ],
       ),
     );
   }

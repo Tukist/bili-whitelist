@@ -15,6 +15,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 import 'package:bili_whitelist_app/models/book_source.dart';
 import 'package:bili_whitelist_app/pages/book_source_page.dart';
 import 'package:bili_whitelist_app/pages/book_source_picker_page.dart';
+import 'package:bili_whitelist_app/services/book_rule/engine_holder.dart';
+import 'package:bili_whitelist_app/services/book_rule/rule_engine.dart';
+import 'package:bili_whitelist_app/services/book_source_health_service.dart';
 import 'package:bili_whitelist_app/services/book_source_index_service.dart';
 import 'package:bili_whitelist_app/services/book_source_store.dart';
 import 'package:bili_whitelist_app/services/file_import_service.dart';
@@ -46,16 +49,61 @@ class _FakeIndexService extends BookSourceIndexService {
   }
 }
 
+/// 假检测服务：结果由测试给，不联网、不碰 prefs。
+///
+/// 只覆写 `probe` / `loadAll`：`probeAll` 用真实实现（并发池、进度、取消都在
+/// 那里），正好一起被测到。
+class _FakeHealth extends BookSourceHealthService {
+  _FakeHealth({this.statusFor});
+
+  /// 每个源返回什么状态（默认 ok）。
+  final SourceHealthStatus Function(BookSource source)? statusFor;
+
+  /// 「存储」：key = 源名小写。
+  final Map<String, SourceHealth> store = {};
+
+  /// 被真正探测过的源名（按调用顺序）。
+  final List<String> probed = [];
+
+  @override
+  Future<Map<String, SourceHealth>> loadAll() async => Map.of(store);
+
+  @override
+  Future<SourceHealth> probe(
+    BookSource source, {
+    String keyword = kHealthDefaultKeyword,
+  }) async {
+    probed.add(source.name);
+    final status = statusFor?.call(source) ?? SourceHealthStatus.ok;
+    final health = SourceHealth(
+      sourceKey: source.key,
+      status: status,
+      at: DateTime.now(),
+      count: status == SourceHealthStatus.ok ? 3 : 0,
+      message: status == SourceHealthStatus.blocked ? '站点返回 403' : '',
+      keyword: keyword,
+    );
+    store[source.key] = health;
+    return health;
+  }
+}
+
 Future<void> _pump(
   WidgetTester tester, {
   BookSourceStore? store,
   BookSourceIndexService? indexService,
+  BookSourceHealthService? health,
+  RuleEngineHolder? holder,
 }) async {
   await tester.pumpWidget(
     MaterialApp(
       home: BookSourcePage(
         store: store ?? BookSourceStore(),
         indexService: indexService,
+        healthService: health,
+        // 默认注入假引擎：检测会把隐藏的 WebView 宿主挂进树，真引擎在
+        // flutter test 里构造即抛（没有平台实现）。
+        holder: holder ?? RuleEngineHolder.withEngine(FakeRuleEngine()),
       ),
     ),
   );
@@ -248,7 +296,11 @@ void main() {
     ]);
     await _pump(tester, store: store);
 
+    // F2 起长按先出小菜单（看 JSON / 检测这个源），再点「查看原始 JSON」
     await tester.longPress(find.text('L源'));
+    await tester.pumpAndSettle();
+    expect(find.text('检测这个源'), findsOneWidget);
+    await tester.tap(find.text('查看原始 JSON'));
     await tester.pumpAndSettle();
 
     // 弹层标题 = 书源名；内容是格式化 JSON（含 raw 里的 legado 字段）
@@ -388,12 +440,13 @@ void main() {
 
   // ==================== R3：索引下载 / 清空 ====================
 
-  testWidgets('溢出菜单三项都在：下载索引书源 / 添加示例书源 / 清空书源', (tester) async {
+  testWidgets('溢出菜单四项都在：下载索引 / 添加内置书源 / 检测全部 / 清空', (tester) async {
     await _pump(tester);
     await _openMenu(tester);
 
     expect(find.text('下载索引书源…'), findsOneWidget);
-    expect(find.text('添加示例书源'), findsOneWidget);
+    expect(find.text('添加内置书源'), findsOneWidget);
+    expect(find.text('检测全部书源（较慢）'), findsOneWidget);
     expect(find.text('清空书源'), findsOneWidget);
   });
 
@@ -453,5 +506,120 @@ void main() {
     expect(await store.getAll(), isEmpty);
     expect(find.text('还没有书源'), findsOneWidget);
     expect(find.text('已清空 2 个书源'), findsOneWidget);
+  });
+
+  // ==================== F2：可用性检测 ====================
+
+  testWidgets('状态角标：没检测过显示「未检测」，有结果则显示可用条数 / 被拦 / 连不上',
+      (tester) async {
+    final store = BookSourceStore();
+    await store.upsertAll([_src('甲'), _src('乙'), _src('丙'), _src('丁')]);
+    final health = _FakeHealth();
+    health.store['甲'] = SourceHealth(
+      sourceKey: '甲',
+      status: SourceHealthStatus.ok,
+      at: DateTime(2026, 11, 23),
+      count: 7,
+    );
+    health.store['乙'] = SourceHealth(
+      sourceKey: '乙',
+      status: SourceHealthStatus.blocked,
+      at: DateTime(2026, 11, 23),
+    );
+    health.store['丙'] = SourceHealth(
+      sourceKey: '丙',
+      status: SourceHealthStatus.networkError,
+      at: DateTime(2026, 11, 23),
+    );
+    await _pump(tester, store: store, health: health);
+
+    expect(find.text('可用 7 条'), findsOneWidget);
+    expect(find.text('被拦'), findsOneWidget);
+    expect(find.text('连不上'), findsOneWidget);
+    expect(find.text('未检测'), findsOneWidget); // 丁
+  });
+
+  testWidgets('单源检测：长按 → 检测这个源 → 角标从「未检测」变「可用 3 条」',
+      (tester) async {
+    final store = BookSourceStore();
+    await store.upsertAll([_src('甲')]);
+    final health = _FakeHealth();
+    await _pump(tester, store: store, health: health);
+    expect(find.text('未检测'), findsOneWidget);
+
+    await tester.longPress(find.text('甲'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('检测这个源'));
+    await tester.pumpAndSettle();
+
+    expect(health.probed, ['甲']);
+    expect(find.text('可用 3 条'), findsOneWidget);
+    expect(find.text('未检测'), findsNothing);
+    // 结果也念给用户听（不用自己去列表里找角标）
+    expect(find.textContaining('「甲」'), findsOneWidget);
+  });
+
+  testWidgets('单源检测：被拦的源角标变红「被拦」，提示里带原因', (tester) async {
+    final store = BookSourceStore();
+    await store.upsertAll([_src('甲')]);
+    final health = _FakeHealth(
+      statusFor: (_) => SourceHealthStatus.blocked,
+    );
+    await _pump(tester, store: store, health: health);
+
+    await tester.longPress(find.text('甲'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('检测这个源'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('被拦'), findsOneWidget);
+    expect(find.textContaining('站点返回 403'), findsOneWidget);
+  });
+
+  testWidgets('检测全部：只测「启用且不需要 JS」的源，跳过的数量写清楚',
+      (tester) async {
+    final store = BookSourceStore();
+    await store.upsertAll([
+      _src('启用的'),
+      _src('停用的', enabled: false),
+      BookSource(
+        name: '需JS的',
+        baseUrl: 'https://js.example',
+        search: const SearchRule(
+          url: '/s?q={{key}}',
+          list: '.item',
+          name: '<js>x</js>',
+        ),
+        toc: const TocRule(),
+        content: const ContentRule(),
+      ),
+    ]);
+    final health = _FakeHealth();
+    await _pump(tester, store: store, health: health);
+
+    await _openMenu(tester);
+    await tester.tap(find.text('检测全部书源（较慢）'));
+    await tester.pumpAndSettle();
+
+    expect(health.probed, ['启用的']);
+    expect(find.textContaining('检测完成'), findsOneWidget);
+    expect(find.text('可用 3 条'), findsOneWidget);
+    // 停用 / 需 JS 的源没有角标变化，也不该被探测
+    expect(find.text('未检测'), findsNWidgets(2));
+  });
+
+  testWidgets('检测全部：没有可检测的源时明说跳过了几个（不假装测过）',
+      (tester) async {
+    final store = BookSourceStore();
+    await store.upsertAll([_src('停用的', enabled: false)]);
+    final health = _FakeHealth();
+    await _pump(tester, store: store, health: health);
+
+    await _openMenu(tester);
+    await tester.tap(find.text('检测全部书源（较慢）'));
+    await tester.pumpAndSettle();
+
+    expect(health.probed, isEmpty);
+    expect(find.textContaining('没有可检测的源'), findsOneWidget);
   });
 }

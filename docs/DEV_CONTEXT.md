@@ -4,7 +4,7 @@
 > 不是设计愿景。改完代码如果动了模块职责、红线、存储 key，**顺手改这里**
 > （这份文档随开发维护；`CHANGELOG.md` 归发布脚本，别手改）。
 >
-> 最近一次对齐：v2.72.0（2026-11-23）。
+> 最近一次对齐：v2.73.0（2026-11-23）。
 
 ---
 
@@ -38,7 +38,7 @@ bash app/tools/gate.sh --quick test/history_store_test.dart
 bash app/tools/gate.sh --quick history          # 简写：test/ 下找 *history*_test.dart
 bash app/tools/gate.sh --quick                  # 只有 analyze
 
-# 发版前全量门禁：analyze + 260 个测试文件分 6 批 + build apk --debug
+# 发版前全量门禁：analyze + 269 个测试文件分 6 批 + build apk --debug
 bash app/tools/gate.sh
 bash app/tools/gate.sh --no-build               # 不构建 APK
 
@@ -95,7 +95,7 @@ bash app/tools/release_all.sh 2.71.0 --notes C:/Users/HP/.kimi-tmp/v2710.md
 | UP 主 | `upowner_page.dart`（详情 / 合集 / 动态 / 专栏）、`followings_import_page.dart` |
 | 信箱 | `inbox_page.dart`（白名单 UP 的新视频，卡片堆 + 热度榜） |
 | 历史 / 统计 | `history_page.dart`、`daily_history_page.dart`、`watch_stats_page.dart`（**同时是个人页**：热力图 + 设置区） |
-| 阅读（书源 / 本地书） | `reading_page.dart`（阅读页签；v2.72.0 起顶部还有「导入本地书」，本地书点进直接读）、`book_search_page.dart`、`book_detail_page.dart`（**只服务网络书**：本地书不会出现在搜索里，书架点本地书也不经详情页）、`book_reader_page.dart`（网络书与本地书共用：正文来源走 `ChapterContentLoader`；**两种翻页方式**：滚动 `SingleChildScrollView`+`SelectableText` / 左右翻页 `PageView`+`book_paginator`）、`book_source_page.dart`、`book_source_picker_page.dart` |
+| 阅读（书源 / 本地书） | `reading_page.dart`（阅读页签；v2.72.0 起顶部还有「导入本地书」，本地书点进直接读）、`book_search_page.dart`、`book_detail_page.dart`（**只服务网络书**：本地书不会出现在搜索里，书架点本地书也不经详情页）、`book_reader_page.dart`（网络书与本地书共用：正文来源走 `ChapterContentLoader`；**三种呈现**：滚动 `SingleChildScrollView`+`SelectableText` / 左右翻页 `PageView`+`book_paginator` / **图片页** `Image.file`（PDF，v2.73.0，强制逐页滚动、按钮叫「上一页 / 下一页」））、`book_source_page.dart`、`book_source_picker_page.dart` |
 | 日程 | `schedule_screen.dart`（全屏页，入口在个人 → 设置 → 日程）、`schedule_page.dart`（日程本体） |
 | 杂项 | `comment_page.dart`、`article_page.dart`、`dynamic_detail_page.dart`、`image_viewer_page.dart`、`offline_page.dart`、`update_dialog.dart`、`login_page.dart`（**红线**）、`cmcc_page.dart`（移动掌厅流量抓取） |
 
@@ -108,7 +108,7 @@ bash app/tools/release_all.sh 2.71.0 --notes C:/Users/HP/.kimi-tmp/v2710.md
 | 信箱 | `inbox_service.dart`、`inbox_heat.dart`、`inbox_handled_store.dart`、`inbox_sort_store.dart`、`inbox_card_style_store.dart` |
 | 搜索 / 推荐 | `search_history_store.dart`、`recommend_service.dart`（兴趣标签 + 推荐池 + 30 分钟 TTL） |
 | 播放辅助 | `stream_status_store.dart`、`video_shot_service.dart`（进度条预览雪碧图）、`last_episode_store.dart`、`danmaku_settings_store.dart`、`float_window_store.dart`、`keep_screen_on.dart`、`pip_service.dart`、`live_danmaku_service.dart`、`realtime_transcriber.dart`、`device_media.dart` |
-| 阅读 / 书源 | `book_source_store.dart`（上限 200 个源）、`book_source_index_service.dart`、`book_search_service.dart`、`book_detail_service.dart`、`book_content_service.dart`、`bookshelf_store.dart`（书架 / 进度 / 阅读设置，`reader:*` 三个 key 都在这里）、`chapter_cache_store.dart`、`file_import_service.dart`、`book_paginator.dart`（**v2.72.0**：左右翻页的分页纯函数 `paginateText` + `pageText/pageStart/pageEnd`，不碰 Widget 树，可单测）、`chapter_content_loader.dart`（**v2.72.0**：`ChapterContentLoader.load(int)` 抽象 + `NetworkChapterLoader`，阅读页正文来源的唯一入口）、`local_chapter_loader.dart`（**v2.72.0**：`LocalChapterLoader` 读本地文件、`localBookToc` 把 manifest 拼成 `TocChapter`，不发网络）、`local_book_store.dart`（**v2.72.0**：本地 TXT 落盘 `<support>/reader/local/<id>/`，`local:<id>` 伪 URL 是全项目识别本地书的唯一键）、`local_book_import_service.dart`（**v2.72.0**：选文件 → 解码 → 切章 → 落盘 → 上书架的编排，错误文案只在这里） |
+| 阅读 / 书源 | `book_source_store.dart`（上限 200 个源）、`book_source_health_service.dart`（**v2.73.0 新建**：书源可用性检测 —— `probe` 对一个源**真搜一次**并归类成 `ok` / `noResult` / `blocked` / `networkError` / `unsupportedJs` / `badRule`，`probeAll` 并发 2 + 可取消 + 进度回调，结果存 `reader:source_health`；抓取逻辑**全部复用** `BookSearchService`，本文件只做编排与归类；`classifyGroup` / `summarizeSearchFailures` 是纯函数）、`book_source_index_service.dart`、`book_search_service.dart`、`book_detail_service.dart`、`book_content_service.dart`（`restoreParagraphs` 是正文清洗的**唯一**实现，EPUB 也复用它；v2.73.0 `BookContentResult` 加 `imagePath`，非空 = 图片页）、`bookshelf_store.dart`（书架 / 进度 / 阅读设置，`reader:*` 三个 key 都在这里）、`chapter_cache_store.dart`、`file_import_service.dart`、`book_paginator.dart`（**v2.72.0**：左右翻页的分页纯函数 `paginateText` + `pageText/pageStart/pageEnd`，不碰 Widget 树，可单测）、`chapter_content_loader.dart`（**v2.72.0**：`ChapterContentLoader.load(int)` 抽象 + `NetworkChapterLoader`，阅读页正文来源的唯一入口）、`local_chapter_loader.dart`（**v2.72.0**：`LocalChapterLoader` 读本地文件、`localBookToc` 把 manifest 拼成 `TocChapter`，不发网络；v2.73.0 起 PDF 书走 `pageImagePath` 返回图片页）、`local_book_parser.dart`（**v2.73.0**：`LocalBookParser` 抽象 + `TxtBookParser` / `EpubBookParser` + `LocalBookParsers.dispatcher`，统一产出 `ParsedLocalBook`；EPUB 用**手写极简 XML 扫描**，理由见文件头；加 `PdfBookParser`（实现 `FileBasedLocalBookParser`，只读页数、每页一章 `imagePage: true`）+ `ParsedChapter.imagePage` / `ParsedLocalBook.sourcePath` / `pageWidth` / `pageHeight`）、`pdf_renderer_bridge.dart`（**v2.73.0**：`PdfRendererBridge` 抽象 + `NativePdfRenderer` 包 `bili_whitelist/pdf` 通道，错误码→中文只在这里做；测试注入假实现）、`pdf_cache_policy.dart`（**v2.73.0**：纯函数 `planPdfCacheEviction`，300MB / 每本 500 页，按 mtime 最旧先删，`keepPath` 永不被删）、`local_book_store.dart`（**v2.72.0 新建 / v2.73.0 升 schema 2 + 支持 PDF**：本地书落盘 `<support>/reader/local/<id>/manifest.json` + `chapters/N.txt` + 可选封面 + `book.pdf`，含 v1 惰性迁移；`local:<id>` 伪 URL 是全项目识别本地书的唯一键；`pageImagePath(id,index)` 惰性渲染 + 缓存淘汰）、`local_book_import_service.dart`（**v2.72.0 新建 / v2.73.0 按格式分派 + 文件路径分派（PDF）**：选文件 → 读字节（PDF 直接给路径）→ dispatcher 解析 → 落盘 → 上书架的编排，错误文案只在这里） |
 | 存储 / 偏好 | `secure_store.dart`（flutter_secure_storage 统一封装）、`ui_prefs_store.dart`、`ui_copy_store.dart`、`theme_store.dart`、`collection_cover_store.dart`、`traffic_snapshot_store.dart`、`cmcc_session_store.dart` |
 | 基础设施 | `diag_log.dart`（环形日志落盘 + 导出）、`crash_guard.dart`、`loading_copy.dart`、`update_service.dart` + `update_storage.dart` + `apk_installer.dart`、`share_service.dart`、`xlsx_reader.dart`、`gallery_saver.dart`、`image_pick_service.dart`、`schedule_import.dart`、`traffic_stats_service.dart`、`cmcc_*.dart`（掌厅抓取：AES / 驱动 / 注入脚本 / 解析 / 轮询 / 会话） |
 
@@ -121,7 +121,7 @@ bash app/tools/release_all.sh 2.71.0 --notes C:/Users/HP/.kimi-tmp/v2710.md
 | `legado_compat.dart` | legado 字段名映射 + `isJsSource`（`<js>` / `@js:` / 非占位符 `{{…}}`） |
 | `rule_engine.dart` | 引擎接口 + WebView 实现；`_unwrapJsValue` 负责剥 `runJavaScriptReturningResult` 的多层返回值 |
 | `engine_holder.dart` | 全 App 唯一引擎单例（一个实例一个 WebView 页面），求值必须串行 |
-| `example_sources.dart` | 内置「标准电子书（示例）」书源 |
+| `example_sources.dart` | **内置书源清单**（常量名仍是 `kExampleBookSources`）：维基文库（中文经典）+ 标准电子书（英文经典）。每条的搜索 / 详情 / 目录 / 正文选择器都是**先 curl 真页、再写规则**（证据写在文件头注释里）；改动前必须重新抓页面 |
 
 ### 3.6 `widgets/` —— 通用组件
 
@@ -181,7 +181,8 @@ bash app/tools/release_all.sh 2.71.0 --notes C:/Users/HP/.kimi-tmp/v2710.md
 | `MainActivity.kt` | `configureFlutterEngine` 里逐个注册下面的插件；PIP 的 `onPictureInPictureModeChanged` 必须在这里接 |
 | `BiliDashPlayerPlugin.kt` / `DashExoPlayer.kt` / `MediaController.kt` / `DashMediaNotification.kt` | DASH 双流（video/audio 各一条 m4s）播放、倍速/字幕轨、音量与亮度、媒体通知卡片 |
 | `ApkInstaller.kt` | 应用内更新：触发系统 APK 安装 |
-| `GalleryController.kt` / `ImagePickPlugin.kt` / `FilePickerPlugin.kt` / `ScheduleImportPlugin.kt` | 系统相册保存、相册选图、SAF 选文件（`pickTextFile` 读成 UTF-8 字符串回传，8MB，v2.70 书源导入；`pickBookFile` **流式拷到 `<filesDir>/reader/incoming/` 只回路径**，100MB，v2.72 本地书导入，requestCode 9050/9051）、SAF 选 Excel |
+| `GalleryController.kt` / `ImagePickPlugin.kt` / `FilePickerPlugin.kt` / `ScheduleImportPlugin.kt` | 系统相册保存、相册选图、SAF 选文件（`pickTextFile` 读成 UTF-8 字符串回传，8MB，v2.70 书源导入；`pickBookFile` **流式拷到 `<filesDir>/reader/incoming/` 只回路径**，100MB，v2.72 本地书导入，v2.73.0 的 MIME 加 `application/pdf`，requestCode 9050/9051）、SAF 选 Excel |
+| `PdfRenderPlugin.kt` | **v2.73.0**：系统 `PdfRenderer` 把 PDF 一页渲染成 PNG 落盘（`<filesDir>/reader/pdfcache/<书id>/<页号>@<宽>.png`），通道 `bili_whitelist/pdf`；`openPdf` / `renderCover` / `renderPage` / `clearCache` / `cacheFiles` / `deleteCacheFiles`。**单线程串行**（PdfRenderer 不能并发）+ `openPage/close` 成对；位图不回传只回路径 |
 | `TrafficStatsPlugin.kt` | `NetworkStatsManager` 移动数据统计 + 使用情况访问引导 |
 | `KeepScreenOnPlugin.kt` | `FLAG_KEEP_SCREEN_ON`（不用 WakeLock） |
 | `SharePlugin.kt` | 系统分享面板（文本 + 文件） |
@@ -234,6 +235,7 @@ bash app/tools/release_all.sh 2.71.0 --notes C:/Users/HP/.kimi-tmp/v2710.md
 | `inbox:meta:total_unseen` / `last_check_at` / `checked_mids` / `rotate_cursor` / `known_mids` | 信箱扫描元数据 | — |
 | `inbox:handled_bvids` | 已滑过的 bvid | `maxEntries = 500` |
 | `reader:sources` | 书源列表（单 key 整份 JSON，**不进 Gist**） | 上限 200 个源 |
+| `reader:source_health` | 书源可用性检测结果：`{源名小写: {status, at, count, message, keyword}}`（**不进 Gist**） | `kSourceHealthMaxEntries = 200`，按 `at` 裁最旧 |
 | `reader:index_urls` | 索引下载地址（每行一个 .json） | — |
 | `reader:books` | 书架 | `maxBooks = 500` |
 | `reader:progress` | 阅读进度（`chapterIndex` / `chapterName` / `chapterUrl` / `scrollOffset`（滚动模式）/ `pageIndex`（分页模式，v2.72.0）/ `updatedAt`） | `maxProgress = 100` |
@@ -261,13 +263,90 @@ bash app/tools/release_all.sh 2.71.0 --notes C:/Users/HP/.kimi-tmp/v2710.md
 本地文件 / 其他：离线缓存走 `path_provider`（`DownloadManager`），诊断日志 `logs/diag-YYYYMMDD.log`
 （512KB × 4 轮转，目录上限 5MB），章节正文缓存、合集自定义封面等也在应用支持目录。
 
-**本地书（v2.72.0 导入与阅读）**：`<ApplicationSupport>/reader/local/<bookId>/book.txt` +
-`manifest.json`（`{id, name, author, format, encoding, chapters:[{title,start,end}], sizeBytes, importedAt}`）。
-- 正文只存**一份**，章节只存字符偏移；`bookId` = 文件名 + 内容长度 + 头/中/尾采样指纹的
-  64 位哈希（16 位十六进制），**不含导入时间** → 同一份内容重复导入是覆盖，不是多一本。
-- 书架里的本地书用伪 URL **`local:<bookId>`** 当唯一键（`normalizeUrl` 不动非 http(s)
-  地址，所以它原样进 `reader:books`）。全项目靠 `isLocalBookUrl()` / `localBookIdFromUrl()`
-  区分本地书与网络书；**改前缀等于让用户已导入的书全部从书架消失**。
+### 书源（网络书）：内置清单与可用性检测（v2.73.0）
+
+**内置书源**（`services/book_rule/example_sources.dart` 的 `kExampleBookSources`，
+书源管理页右上角「添加内置书源」一键导入；**同名源不覆盖**，只补缺的那几条）：
+
+| 源 | 站点 | 搜索 | 目录 | 正文 |
+|---|---|---|---|---|
+| 维基文库（中文经典） | `zh.wikisource.org` | `/w/index.php?search={{key}}&ns0=1&fulltext=1`；`ul.mw-search-results > li.mw-search-result`，书名/链接用 `div.mw-search-result-heading a:not([title*="/"])` 排掉章节子页面 | 目录就在图书页：`ul li a[title*="/"]`（子页面链接的 title 一定含 `/`） | `div.mw-content-ltr.mw-parser-output`（**不能只写 `.mw-parser-output`**，页顶指示器 div 也用这个 class），删 `.ws-header` / `.ws-footer` / `sup.reference` / `ol.references` / `div.licenseContainer` / `div.licensetpl` |
+| 标准电子书（示例） | `standardebooks.org` | `/ebooks?query={{key}}`；`ol.ebooks-list > li` | 详情页地址 + `/text` 的 `nav#toc a[href*="chapter"]` | `main section`，删章首 `hgroup` / `h2` |
+
+**评估过但没收录**：Project Gutenberg（实测整站 503 维护页）、ctext.org
+（Cloudflare Turnstile 验证页）、en.wikisource（版本页没有子页面目录，英文已有
+Standard Ebooks 覆盖）。盗版 / 聚合爬站一律不接。
+
+**本机实测记录（2026-11-23，模拟器 bili_test）**：标准电子书能搜、能读（`alice`
+→ 12 条 → 详情 → 正文，检测显示「可用 12 条」）；**维基文库在这台机器的网络上
+不可用** —— `nslookup zh.wikisource.org` 被解析到 `205.164.50.x`（校园网 DNS 劫持，
+`en.wikisource.org` / `wikisource.org` 同样），TLS 是中间人证书，App 侧报
+`HandshakeException`，检测结果「连不上」。这不是源写错了（`curl -k` 能拿到真实
+页面），换网络（手机流量 / 代理）就会好 —— 排查时先分清「站点挂了」与「本机网络拦了」。
+
+**检测状态**（`BookSourceHealthService`，结果存 `reader:source_health`）：
+
+| 状态 | 含义 | 判据 |
+|---|---|---|
+| `ok` | 可用，`count` = 命中条数 | 分组 ok |
+| `noResult` | 通了但 0 条 | 分组 noResult（或 `empty` 类错误） |
+| `blocked` | 被拦 | 401/403/407/412/429/451，或 HTTP 200 的验证页（Cloudflare / Turnstile 特征串；`noResult` 时**多抓一次**复核） |
+| `networkError` | 连不上 | 超时 / DNS / 连接失败 / 其它 5xx |
+| `unsupportedJs` | 需 JS，本版跑不了 | `usesJs` 判定，**不发请求** |
+| `badRule` | 规则本身跑不起来 | 地址拼不出、没配列表规则、JSONPath、`&&` 组合 |
+
+- 管理页每行有角标（绿「可用 N 条」/ 灰「没结果」/ 红「被拦」/ 红「连不上」/
+  黄「需 JS」/ 黄「规则坏」/ 灰「未检测」），长按菜单「检测这个源」；AppBar
+  溢出菜单「检测全部书源（较慢）」只测 `enabled && !usesJs`（其余在进度框里
+  说明跳过了几个），并发 **2**、可取消。
+- 搜索页分组标题右侧显示该源上次检测结果；某源 0 条时用一行小字区分
+  「这个源没搜到」与「这个源可能已失效（上次检测：被拦）」；整页 0 条时区分
+  「所有源都没搜到」与「所有源都失败」（后者把原因归类成「3 个源连不上、2 个被拦」）。
+- 检测结果**只在本机**，不进 Gist；「清空书源」会连带清掉（免得同名源复用时
+  带着旧状态）。
+- 探测复用 `BookSearchService`（不复制抓取代码）；为此 `RuleEngineException`
+  加了 `statusCode`、`BookSearchGroup` 加了 `httpStatus` / `errorKind` 两个
+  可空字段（纯增量，既有调用点不用改）。
+- `noResult` 时会**换一门语言的关键词再搜一次**（默认「历史」→ 备选 `love`）：
+  否则英文站点会稳定显示「没结果」，被当成坏源。仍 0 条才判 `noResult`，
+  之后才做验证页复核。
+
+**本地书（v2.72.0 导入与阅读；v2.73.0 起 parser 分派 + schema 2 + EPUB + PDF）**：
+`<ApplicationSupport>/reader/local/<bookId>/` 下 `manifest.json` +
+`chapters/<index>.txt`（一章一个 UTF-8 文本文件）+ 可选 `cover.jpg|png`
++ PDF 专有的 `book.pdf`（原文件，渲染时要它）。
+- **解析层按格式分派**（`services/local_book_parser.dart`）：一个格式一个
+  `LocalBookParser`（当前 `TxtBookParser` / `EpubBookParser` / `PdfBookParser`），
+  统一产出 `ParsedLocalBook{title, author, format, chapters[{title,text,imagePage}],
+  coverBytes, idSeed, warnings, meta, sourcePath, pageWidth, pageHeight}`。
+  需要**原文件路径**的格式（PDF）实现能力接口 `FileBasedLocalBookParser`
+  （`parseFile(path)`），导入服务用 `is FileBasedLocalBookParser` 分流，
+  TXT / EPUB 照旧走 `parse(bytes)`。加 MOBI / AZW3 / UMD 只需新增实现 + 在
+  `LocalBookParsers.parsers` 挂一行，存储 / 书架 / 阅读 / 删除全都不用动。
+- **schema 2 存储**：manifest 记 `{schema:2, id, name, author, format,
+  chapters:[{title,file} | {title,image:true}], coverFile?, sourceFile?,
+  pageWidth?, pageHeight?, sizeBytes, importedAt, encoding}`。
+  章节各自一个文件（不再「一份全文 + 字符偏移」）：EPUB 本来就是一章一个
+  XHTML，且独立文件没有偏移错位这种耦合，坏一章只坏一章。PDF 的章节是
+  **图片页**（`image: true`，没有 `.txt`），原文件另存 `book.pdf`。
+- **v1 惰性迁移**：读到 `schema` 缺失或 != 2 的旧 manifest（`book.txt` +
+  `start/end`）时就地切开写 `chapters/`，**最后**才写新 manifest；
+  任一步失败就原样返回 v1 书（继续读 `book.txt`）—— 迁移失败绝不能让
+  用户已导入的书变成打不开。迁移成功后删掉 `book.txt`。
+- **书 id**：`localBookIdFor(书名, idSeed)`（64 位哈希的 16 位小写十六进制）。
+  TXT 的 idSeed 是全文（与 v2.72.0 **完全一致**，老书重复导入仍命中同一个
+  目录）；EPUB 是 `epub|<文件名>|<zip 字节数>|<首 2KB>`（压缩包不适合按解压
+  后的正文算指纹）；PDF 是 `pdf|<文件名>|<字节数>`。**不含导入时间** →
+  同一份内容重复导入是覆盖，不是多一本。
+- 正文上限：单本按**章节文本累计字符数** ≤ `LocalBookStore.maxTextChars`
+  （20M 字）；TXT 原始文件 ≤ 32MB；EPUB 原始文件 ≤ 100MB 且解压后单章
+  ≤ 8MB / 全本 ≤ 200MB（`EpubLimits`，防 zip bomb）；PDF 原始文件 ≤ 100MB
+  且**页数 ≤ 3000**（`PdfBookParser.defaultMaxPages`）。
+- 书架里的本地书用伪 URL **`local:<bookId>`** 当唯一键（`normalizeUrl` 不动
+  非 http(s) 地址，所以它原样进 `reader:books`）。全项目靠 `isLocalBookUrl()` /
+  `localBookIdFromUrl()` 区分本地书与网络书；**改前缀等于让用户已导入的书
+  全部从书架消失**。书架行显示「本地」+ 格式角标（`TXT` / `EPUB` / `PDF`），
+  有封面显示 `Image.file`（失败回退占位）。
 - 原生选文件的临时副本在 `<filesDir>/reader/incoming/<uuid>.<ext>`，Dart 读完即删，
   超过 24 小时的残留会在下次选书时清掉。
 - **阅读链路（E2，v2.72.0）**：`book_reader_page.dart` 里抽了 `ChapterContentLoader`
@@ -286,10 +365,45 @@ bash app/tools/release_all.sh 2.71.0 --notes C:/Users/HP/.kimi-tmp/v2710.md
   （`url = local:<id>#<index>`，不用于请求）→ push 阅读页（带 `initialIndex` =
   `reader:progress` 的 `chapterIndex`，页内位置由阅读页按 offset / pageIndex 还原）。
   `getBook` 为空时弹「本地书籍文件已丢失」+「从书架移除」，不白屏。
+  同一份 `reload()` 还会把本地 manifest 收进 `_localBooksById`，供书架行显示
+  格式角标与封面（`ShelfBook` **故意**不加格式字段，那是本地书专属概念）。
 - **删除连带清理**：长按书架行 → 二次确认（本地书文案明确「文件与章节缓存一起删」）→
   `LocalBookStore.removeBook(id)` → `ChapterCacheStore.removeBook(bookKeyFor(detailUrl))`
   → `BookshelfStore.removeBook`。**先删文件**：文件删不掉就不动书架并提示，避免
-  「书不见了、几百 MB 还占着」。书架行有「本地」角标。
+  「书不见了、几百 MB 还占着」。
+- **导入提示**：`已导入《书名》（EPUB，共 N 章）`；EPUB 有章文件缺失时追加
+  「另有 N 章文件缺失已跳过」（`LocalBookImportResult.skippedChapters`）。
+- **PDF（v2.73.0）：下拉式漫画，一页一张图**
+  - **渲染方式**：Android 自带的 `android.graphics.pdf.PdfRenderer`（API 21+，
+    项目 minSdk 26），一页渲染成 PNG。**不引 pdfium / pdfx / mupdf**（体积十几 MB，
+    而这里只需要「把页面画成图」）。阅读页纵向滚动，图片按可用宽铺满
+    （`BoxFit.fitWidth`），页比屏幕长时继续往下拖。
+  - **为什么不解析文本**：PDF 的文字是内容流里的绘制指令，要还原阅读顺序需要
+    字体表 + 编码映射 + 位置启发式，纯 Dart 做不到；扫描版 PDF（漫画 / 老书）
+    根本没有文字层；而用户对 PDF 的期待本来就是「看得见的排版」。
+    代价明确：**PDF 里的文字选不中**（画面是像素），这是渲染路线的天花板。
+  - **目录与进度**：`chapters` 就是页，标题「第 N 页」，`LocalChapter.image = true`
+    （**没有** `chapters/N.txt`）；`reader:progress` 的 `chapterIndex` 即页号。
+    书架格式角标自动显示 `PDF`（`format.toUpperCase()`），封面是第一页 400 宽
+    的渲染图（`cover.png`）。
+  - **原文件必须留在书目录**：`<support>/reader/local/<id>/book.pdf`（manifest
+    的 `sourceFile`），导入时从原生临时副本拷进来（`LocalBook.importParsedBook`
+    的 `sourcePath`）；manifest 另记首页尺寸 `pageWidth` / `pageHeight` 供占位。
+  - **惰性渲染 + 磁盘缓存**：不预渲染全书，读到哪页渲染哪页。缓存不在书目录，
+    而在 `<filesDir>/reader/pdfcache/<书id>/<页号>@<宽>.png`（`cacheKey` = 书 id，
+    删书时同一个 key 清干净）。宽度固定 **1080**（同页同宽直接命中缓存；不按屏幕
+    宽算是因为旋转屏幕会让缓存翻倍），上限 2048；单页位图超 **8MB** 时自动缩窄。
+    **上限 300MB / 每本 500 页**，按文件 mtime 最旧先删，**当前正在看的那页
+    永不删**（`planPdfCacheEviction` 纯函数，2 分钟节流一次，见
+    `services/pdf_cache_policy.dart`）。
+  - **上限与错误**：PDF 原始文件 ≤ 100MB、页数 ≤ 3000（超了拒绝并说明）；密码
+    保护的 PDF 明确报「PDF 有密码保护，暂不支持」（原生 `SecurityException`）。
+  - **分页模式不适用**：`pageMode == 'paged'` 时 PDF 仍按逐页滚动渲染，并提示
+    「PDF 只能逐页浏览」；开关不藏（与网络书一致），点了给说明但不改设置。
+  - **删书连带清理**：`LocalBookStore.removeBook` 先删书目录，再按 id 清
+    `pdfcache/<id>/`（缓存可以重建，不该跟着书目录一起被当成「书」）。
+    **覆盖导入同一本 PDF 时也清一次**（书 id 相同 → 缓存 key 相同，不清会沿用
+    上一版页面的截图）。
 
 ---
 
@@ -341,19 +455,57 @@ bash app/tools/release_all.sh 2.71.0 --notes C:/Users/HP/.kimi-tmp/v2710.md
     （表现是整个测试进程不出结果）。凡是页面里会碰 `LocalBookStore` / `ChapterCacheStore`
     的用例，要么注入**内存假库**（`test/reading_page_local_import_test.dart` 的
     `_FakeLocalStore`），要么把「真目录删没删」这类断言放进纯 `test()` 里用真 store 跑。
+11. **EPUB 的章节顺序看 `spine`，不要按文件名 / manifest 顺序排**（v2.73.0）。
+    `manifest` 只是「包里有哪些文件」，顺序任意（实际文件里常按写入顺序甚至名字排序）；
+    **`spine` 里的 itemref 顺序才是作者声明的阅读顺序**。序章叫 `x9.xhtml`、第一章叫
+    `a1.xhtml` 的书写处都是，按文件名排会把整本读乱。同理：章节**标题**要去
+    `nav.xhtml`（EPUB3）或 `toc.ncx`（EPUB2）里按 href 找，找不到才退化成「第 N 章」。
+12. **不要 `import 'package:xml/xml.dart'`**（v2.73.0）。`xml` 在本项目只是
+    **间接依赖**（`pubspec.lock` 里 `dependency: transitive`），直接 import 会触发
+    `depend_on_referenced_packages`，而 `flutter analyze` 默认 `--fatal-infos` 是开的
+    → 门禁直接红；而 `pubspec.yaml` 归发布流程管（红线 2），不能随手加一行。
+    需要解析 XML 时沿用 `xlsx_reader.dart` / `local_book_parser.dart` 的做法：
+    **按标签名扫一遍的极简扫描器**，任何畸形输入都不抛到上层。
+13. **`PdfRenderer` 不能并发用，`openPage/close` 必须成对**（v2.73.0）。
+    同一个文档同时 `openPage` 两个页会抛异常，多个实例并发也容易在 native 崩溃。
+    `PdfRenderPlugin` 的做法是「单线程 executor + `synchronized(renderLock)`」两层；
+    `PdfRenderer` / `ParcelFileDescriptor` / `Page` 全部 `use` 或 `try-finally`。
+    **文件描述符泄漏的后果是「这本 PDF 后面再也打不开」**（实测），
+    所以别写「正常路径才 close」那种代码。
+14. **PDF 选不中文字是设计边界**（v2.73.0）。正文是渲染出来的位图，没有文本层；
+    滚动模式下的 `SelectableText` 只服务 TXT / EPUB。要在 PDF 上复制文字只能
+    换「抽文本」的方案，而那需要引 pdfium / mupdf（硬约束不许），别在 issue 里
+    当成 bug 修。
+15. **PDF 的 `parse(bytes)` 在测试宿主上会早退**（v2.73.0）。它要把字节落成临时
+    文件才能交给 `PdfRenderer`，而 `flutter test` 没有 `path_provider` 实现 ——
+    解析器用 `FLUTTER_TEST` 早退（同 `LocalBookStore.isTestHost`）。所以 PDF 的
+    单测一律走 `parseFile()` + 假 `PdfRendererBridge`，别在 widget 测试里等真文件。
+16. **内置书源的选择器会随站点改版失效 —— 改之前必须 `curl` 真实页面**
+    （v2.73.0）。`example_sources.dart` 里每条规则旁边都写了「这条对应页面里的
+    什么结构」，改规则时按同一套位置重新抓一遍、用 `python + bs4` 点数命中条数，
+    不要凭印象改。踩过的具体坑：
+    - 维基文库搜索 URL **必须带 `fulltext=1`**：不带时关键词恰好等于某个页面
+      标题，MediaWiki 会 302 直接跳到那个页面，我们拿到的是图书页而不是结果
+      列表 —— 表现是「搜得到却显示 0 条」。
+    - 正文容器 **不能只写 `.mw-parser-output`**：页顶还有一个只带这个 class 的
+      指示器 div，`querySelector` 先命中它，正文取出来是空的。要写
+      `div.mw-content-ltr.mw-parser-output`。
+    - 本机 `curl`（schannel）抓 `zh.wikisource.org` 会报
+      `SEC_E_UNTRUSTED_ROOT`，只能 `-k`；部分书名（如「史記」）会被中间设备
+      直接 403。抓页失败先分清「站点挂了」和「本机网络拦了」，别急着改规则。
 
 ---
 
 ## 7. 测试与门禁
 
-- 测试目录：`app/test/`，共 260 个 `*_test.dart`；`test/live_danmaku_fakes.dart` 是辅助文件
+- 测试目录：`app/test/`，共 269 个 `*_test.dart`；`test/live_danmaku_fakes.dart` 是辅助文件
   （没有 `main()`），门禁会自动跳过。
-- 当前基线：**260 个文件、6 批、通过用例数见下**（v2.72.0 实跑）：
+- 当前基线：**269 个文件、6 批、通过用例数见下**（v2.73.0 实跑）：
 
 | 项 | 结果 |
 |----|------|
-| `flutter analyze` | 0 issue（约 20s） |
-| `flutter test` 分批 | 6 批全部通过，合计 **3938** 个用例 |
+| `flutter analyze` | 0 issue（10–70s，冷启动更久） |
+| `flutter test` 分批 | 6 批全部通过，合计 **4066** 个用例 |
 | `flutter build apk --debug` | 通过 |
 
 - 分层策略：
@@ -370,12 +522,12 @@ bash app/tools/release_all.sh 2.71.0 --notes C:/Users/HP/.kimi-tmp/v2710.md
 
 | 版本 | 主题 | 关键文件 |
 |------|------|----------|
+| v2.73.0 | 一次发版覆盖三批：**EPUB + PDF 本地书** 与 **内置精选书源 + 可用性检测**。① **解析器按格式分派**：新抽象 `LocalBookParser`（`format` / `canParse` / `parse`）+ `TxtBookParser` / `EpubBookParser` / `PdfBookParser` + `LocalBookParsers.dispatcher`，统一产出 `ParsedLocalBook{title, author, format, chapters[{title,text,imagePage}], coverBytes, idSeed, warnings, meta, sourcePath, pageWidth, pageHeight}`；需要**原文件路径**的格式（PDF）实现能力接口 `FileBasedLocalBookParser.parseFile`，导入服务用 `is` 分流，TXT / EPUB 照旧 `parse(bytes)`；加 MOBI / AZW3 / UMD 只需新增实现并在 `parsers` 挂一行。② **EPUB**：`archive` 解 zip → `META-INF/container.xml` → OPF 的 `dc:title` / `dc:creator` / manifest / **spine 顺序**（章节顺序只看 spine，不看文件名）→ 标题取 EPUB3 `nav.xhtml`、退 EPUB2 `toc.ncx`、再退「第 N 章」→ 每章 XHTML 复用 `restoreParagraphs(html,'block')`（先删 `<head>`）→ 封面取 `<meta name="cover">` 或 `properties="cover-image"`；路径按 OPF / nav 各自目录解析（`%20` 解码、`..` 归一、大小写兜底）；**手写极简 XML 扫描器**（`xml` 只是间接依赖，直接 import 会红门禁）；防 zip bomb 按 entry 声明的 size 记账（单章 8MB / 全本 200MB，`EpubLimits` 可注入），解压后再校验一次。③ **存储 schema 2**：`manifest.json` + `chapters/N.txt`（一章一文件）+ 可选 `cover.jpg|png`，`LocalChapter` 从 `{start,end}` 变 `{file}`；**v1 惰性迁移**（读到旧 manifest 时按偏移切开写新章文件、**最后**才写新清单，任一步失败原样退回 v1 可读路径，成功后删 `book.txt`）；书 id 仍 `localBookIdFor(书名, idSeed)` —— TXT 的 seed 是全文（与 v2.72.0 逐字节一致），EPUB 是「文件名 + zip 字节数 + 首 2KB」，PDF 是「文件名 + 字节数」。④ **PDF（下拉式漫画）**：新 `PdfRenderPlugin.kt`（通道 `bili_whitelist/pdf`，`MainActivity` 手动注册）用系统 `PdfRenderer` 把一页渲染成 PNG 写进 `<filesDir>/reader/pdfcache/<书id>/<页号>@<宽>.png`，**只回路径**；单线程 executor + `synchronized` 串行，`PdfRenderer` / `ParcelFileDescriptor` / `Page` 全部成对关闭；`PdfBookParser` **不解析文字**，`chapters` = 每页一条 `{title: 第 N 页, imagePage: true}`（没有 `chapters/N.txt`），封面取第一页 400 宽，页数 ≤ 3000、原文件 ≤ 100MB，原文件另存 `book.pdf`（manifest 的 `sourceFile`）；`BookContentResult.imagePath` 非空即图片页 → `Image.file` 铺满可用宽、纵向可滚、失败可重试，按钮换「上一页 / 下一页」+「第 N / M 页」，`pageMode == paged` 强制逐页滚动并提示「PDF 只能逐页浏览」；`planPdfCacheEviction` 纯函数（300MB / 每本 500 页，mtime 最旧先删，`keepPath` 即当前页永不删，2 分钟节流）；删书按同一 cacheKey 清 `pdfcache/<id>/`，覆盖导入也清一次；`FilePickerPlugin` 的 MIME 加 `application/pdf`，导入提示「（PDF，共 N 页）」、书架角标 `PDF`。⑤ **内置书源**：`example_sources.dart`（常量名仍是 `kExampleBookSources`）从 1 条变 2 条 —— 新增 **维基文库（中文经典）**（搜索 `/w/index.php?search={{key}}&ns0=1&fulltext=1` + `ul.mw-search-results > li`，书名/链接用 `div.mw-search-result-heading a:not([title*="/"])` 排掉章节子页面；目录直接取图书页 `ul li a[title*="/"]`；正文 `div.mw-content-ltr.mw-parser-output` + 6 条清洗规则），**标准电子书**保留并复核；每条选择器都 `curl` 真页点数（维基：搜索 20 条 / 三國演義目录 123 条 / 正文 1 容器；SE：搜索 12 条 / 目录 12 章 / 正文 1 个 section），评估后排除 Gutenberg（503）/ ctext（Cloudflare）/ en.wikisource（版本页无目录）；管理页文案改「添加内置书源」，同名源不覆盖。⑥ **可用性检测**：`book_source_health_service.dart` 的 `probe` 复用 `BookSearchService` **真搜一次** → `ok` / `noResult` / `blocked`（401/403/407/412/429/451 或 HTTP 200 验证页，`noResult` 时**多抓一次**复核）/ `networkError` / `unsupportedJs`（`usesJs` 判定，不发请求）/ `badRule`；`probeAll` 并发 2、可取消、带进度；结果单 key `reader:source_health` 存 200 条（按 `at` 裁最旧，坏数据回空表，**不进 Gist**）；纯函数 `classifyGroup` / `summarizeSearchFailures`；管理页每行状态角标 + 长按「检测这个源」、AppBar「检测全部书源（较慢）」只测 `enabled && !usesJs`，清空书源连带清检测结果；搜索页分组标题显示上次检测结果、0 条时区分「没搜到」与「可能已失效（上次检测：被拦）」、整页 0 条给归类汇总；增量字段 `RuleEngineException.statusCode`、`BookSearchGroup.httpStatus` / `errorKind`（既有调用点零改动） | `services/local_book_parser`（新）、`services/local_book_store`（升 schema 2 + v1 惰性迁移 + PDF）、`services/local_book_import_service`、`services/local_chapter_loader`、`services/chapter_content_loader`、`services/book_content_service`、`services/pdf_renderer_bridge`（新）、`services/pdf_cache_policy`（新）、`services/book_source_health_service`（新）、`services/book_rule/example_sources`、`services/book_search_service`、`services/book_rule/rule_engine`、`pages/book_reader_page`、`pages/reading_page`、`pages/book_source_page`、`pages/book_search_page`、`android/.../PdfRenderPlugin.kt`（新）、`MainActivity.kt`、`FilePickerPlugin.kt`、`test/txt_book_parser_test`（新）、`test/epub_book_parser_test`（新）、`test/local_book_parser_test`（新）、`test/local_book_store_test`、`test/book_local_import_test`、`test/reading_page_local_import_test`、`test/pdf_book_parser_test`（新）、`test/pdf_cache_policy_test`（新）、`test/pdf_local_book_test`（新）、`test/pdf_book_import_test`（新）、`test/book_source_health_service_test`（新）、`test/example_book_source_test`、`test/book_source_page_test`、`test/book_search_page_test`、`docs/DEV_CONTEXT.md` |
 | v2.72.0 | 一次发版覆盖三批：左右翻页 + 本地 TXT 导入 + 本地书阅读与删除。① **左右翻页**：`reader:settings` 加 `pageMode`（`scroll` 默认 / `paged`），正文按可用宽高用 `TextPainter` 二分切页、`PageView` 承载，前后哨兵页实现「末页再滑 = 下一章 / 首页前滑 = 上一章」，页码 `3 / 12`；分页模式不可选中（横滑与选字抢手势，取舍写进注释）；`ReadingProgress.pageIndex` 存页内位置，字号变化按比例落回相近页；顶栏加「翻页方式」切换并落盘。② **本地 TXT 导入**：纯 Dart GBK 解码（码表由 Python 生成）+ 自动编码判定（BOM / UTF-16 嗅探 / 严格 UTF-8 / GBK）、中文网文章节切分（第X章·回·节·卷·集 / 楔子番外 / Chapter N；无标题按 3000 字分「第 N 节」）、本地书落盘 `reader/local/<id>/`（正文一份 + 章节偏移）+ 书架伪 URL `local:<id>`、原生 `pickBookFile`（流式拷到私有目录，100MB，requestCode 9051）、阅读页「导入本地书」（Wrap 防溢出、导入中禁用）。③ **本地书阅读与删除**：阅读页抽 `ChapterContentLoader`（网络 / 本地两种实现），本地书与网络书共用同一页（不建 WebView 引擎、不查章节缓存、不请求网络、不显示缓存入口），`source` 改为可空但既有调用点零改动；书架点本地书按 `getBook(id).chapters` 拼目录直接进阅读页并按 `reader:progress` 续读，文件丢失弹「本地书籍文件已丢失」+「从书架移除」；长按删除连带清 `reader/local/<id>/` + 章节缓存 + 书架项（先删文件，删不掉不动书架）；书架行加「本地」角标 | `services/book_paginator`（新）、`services/chapter_content_loader`（新）、`services/local_chapter_loader`（新）、`services/local_book_store`（新）、`services/local_book_import_service`（新）、`utils/text_decoding`（新）、`utils/gbk_table`（生成物）、`utils/txt_chapter_splitter`（新）、`app/tools/gen_gbk_table.py`（新）、`book_reader_page`、`reading_page`、`bookshelf_store`、`FilePickerPlugin.kt`、`test/book_paginator_test`（新）、`test/local_chapter_loader_test`（新）、`test/book_reader_page_local_test`（新）、`test/reading_page_local_import_test`（新）、`test/book_reader_page_test`、`test/bookshelf_store_test` |
 | v2.71.0 | 离线缓存（章节级 / 原子写 / 双校验）+ 阅读进度条 + 4 处实机修复；首版工程文档与本机门禁脚本 | `book_content_service`、`chapter_cache_store`、`book_reader_page`、`app/tools/gate.sh`、`AGENTS.md`、`docs/DEV_CONTEXT.md` |
 | v2.70.0 | 阅读模块收尾：底栏 edge-to-edge 修复（`viewPadding` 内缩，不是只包 SafeArea）；书源从本地文件导入（SAF，8MB 上限，BOM 处理）；书源索引下载 + 选择页（2486 个去重源，上限 200，标出 `@js` 不支持）；书源名清洗；「清空书源」 | `reading_page` / `book_detail_page` / `book_search_page` / `book_source_page` / `book_source_picker_page`、`file_import_service`、`book_source_index_service`、`FilePickerPlugin.kt` |
 | v2.69.0 | 底栏「日程」换成「阅读」（书源驱动阅读器）；多源搜索（并发 4、单源 20s）、分组/合并视图；详情目录、正文阅读、书架；规则四段 + 选择器语法；示例书源；修 `runJavaScriptReturningResult` 多层剥壳 | `models/book_source`、`services/book_rule/*`、`book_*_service`、`book_*_page`、`bookshelf_store`、`chapter_cache_store`、`playlist_page`（页签下标） |
 | v2.68.0 | 底栏「UP 主」换成「推荐」：从最近 20 个看过的视频拉标签，14 天半衰 × 完播率打分，取前 5 标签；热力球（黄金角螺旋）；交叉区；推荐池 60 条，已看剔除；30 分钟 TTL；UP 主管理迁到个人 → 设置 | `recommend_service`、`recommend_page`、`playlist_page`、`watch_stats_page` |
-| v2.67.0 | 诊断基础设施：`debugPrint` 接管 + 环形落盘（512KB×4，目录 5MB，攒批 64 条/2s，去重）；崩溃四入口；原生崩溃碎片；一键导出 zip；落盘前脱敏（SESSDATA / token / 手机号 / 搜索词） | `diag_log`、`crash_guard`、`main.dart`、`NativeCrashRecorder.kt`、`DiagInfoPlugin.kt` |
 
 更早的版本看 `CHANGELOG.md`（只读，不要手改）。
 

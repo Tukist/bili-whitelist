@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io';
 
 import 'package:flutter/material.dart';
 
@@ -30,10 +31,15 @@ import 'book_source_page.dart';
 /// 3. **书架** —— 真读 [BookshelfStore]：封面 + 书名 + 作者 +「读到 第 N 章」，
 ///    点击直接进阅读页（有进度就定位），长按移除（二次确认）。
 ///
-/// ## E1（v2.73.0）新增「导入本地书」
-/// 手机里的 `.txt` 不用书源也能读：拉起系统选择器 → 解码（UTF-8 / GBK /
-/// UTF-16 自动判定）→ 切章 → 落盘 → 上书架。整条链路在
+/// ## E1（v2.72.0）新增「导入本地书」/ E3（v2.73.0）支持 EPUB / F1（v2.74.0）支持 PDF
+/// 手机里的 `.txt` / `.epub` / `.pdf` 不用书源也能读：拉起系统选择器 → 按扩展名选
+/// 解析器（`LocalBookParsers.dispatcher`：TXT 解码切章 / EPUB 解压取 spine /
+/// PDF 读页数、每页一张图）→ 落盘 → 上书架。整条链路在
 /// [LocalBookImportService] 里，页面只负责「转圈 + 说一句话」。
+///
+/// 书架行的「本地」角标之外还有**格式角标**（`TXT` / `EPUB`）与本地封面：
+/// 这两样只在 manifest 里（`ShelfBook` 是为网络书设计的，不加格式字段），
+/// 所以 [reload] 里顺手把本地 manifest 收进 `_localBooksById`。
 ///
 /// 书架为空时保留 R1 的空态文案（「导入书源后，在搜索里找书加入书架」）：
 /// 那句话至今仍是用户唯一需要知道的事。
@@ -85,6 +91,11 @@ class ReadingPageState extends State<ReadingPage> {
   /// 每本书的离线缓存统计（没有缓存的书不会进这张表）。
   Map<String, CacheStats> _cacheStatsByKey = const {};
 
+  /// 本地书的 manifest（key = `local:<id>` 里那个 id）。
+  ///
+  /// 只用来给书架行补两样书架记录里没有的东西：格式角标与封面文件路径。
+  Map<String, LocalBook> _localBooksById = const {};
+
   /// 本地书导入是否在进行（大文件解码要几秒，按钮必须给反馈并防重复点）。
   bool _importing = false;
 
@@ -111,6 +122,7 @@ class ReadingPageState extends State<ReadingPage> {
     final books = await _shelf.getBooks();
     final progress = <String, ReadingProgress>{};
     final cacheStats = <String, CacheStats>{};
+    final localBooks = <String, LocalBook>{};
     for (final book in books) {
       final p = await _shelf.getProgress(book.detailUrl);
       if (p != null) progress[book.key] = p;
@@ -118,6 +130,14 @@ class ReadingPageState extends State<ReadingPage> {
       // 那只会让每一行都变长、还什么都说明不了。
       final c = await _cache.stats(book.key);
       if (c.hasCache) cacheStats[book.key] = c;
+      // 本地书的行要显示格式角标（TXT / EPUB）与封面，这些只在 manifest 里，
+      // 书架记录（`ShelfBook`）是为网络书设计的，**故意**不往里加格式字段
+      // ——那会让每次书架解析都多背一个本地概念。
+      final id = localBookIdFromUrl(book.detailUrl);
+      if (id != null) {
+        final lb = await _local.getBook(id);
+        if (lb != null) localBooks[id] = lb;
+      }
     }
     if (!mounted) return;
     setState(() {
@@ -125,6 +145,7 @@ class ReadingPageState extends State<ReadingPage> {
       _books = books;
       _progressByKey = progress;
       _cacheStatsByKey = cacheStats;
+      _localBooksById = localBooks;
     });
   }
 
@@ -187,9 +208,19 @@ class ReadingPageState extends State<ReadingPage> {
       await reload();
       if (!mounted) return;
       final book = result.book!;
+      // 提示里带格式与章数：一次导入两本书时，用户要能看出「哪本是 EPUB」。
+      // 缺章（EPUB 里某个 XHTML 找不到）也要说，否则用户会以为目录被解析漏了。
+      // PDF 的「章」其实是页，文案里改成「共 N 页」更贴合用户对 PDF 的认知。
+      final isPdf = book.format.trim().toLowerCase() == 'pdf';
+      final unit = isPdf ? '页' : '章';
+      final base = result.warning ??
+          '已导入《${book.name}》（${book.format.toUpperCase()}，'
+              '共 ${book.chapterCount} $unit）';
       AppSnack.show(
         context,
-        result.warning ?? '已导入《${book.name}》，共 ${book.chapterCount} 章',
+        result.skippedChapters > 0
+            ? '$base，另有 ${result.skippedChapters} 章文件缺失已跳过'
+            : base,
         kind: result.warning == null ? SnackKind.info : SnackKind.error,
       );
     } finally {
@@ -267,6 +298,8 @@ class ReadingPageState extends State<ReadingPage> {
           shelfStore: widget.shelfStore,
           // 页面只负责转发注入项；不传时阅读页用 `LocalBookStore.instance`
           localStore: widget.localBookStore,
+          // PDF：按钮直接叫「上一页 / 下一页」，且第一帧就按逐页滚动布局
+          imageMode: local.format.trim().toLowerCase() == 'pdf',
         ),
       ),
     );
@@ -383,7 +416,7 @@ class ReadingPageState extends State<ReadingPage> {
           Text('阅读', style: theme.textTheme.titleSmall),
           const SizedBox(height: 2),
           Text(
-            '书源式阅读：导入书源找书，或直接导入本地 TXT',
+            '书源式阅读：导入书源找书，或直接导入本地 TXT / EPUB / PDF',
             style: theme.textTheme.bodySmall?.copyWith(
               color: theme.colorScheme.onSurfaceVariant,
             ),
@@ -515,10 +548,14 @@ class ReadingPageState extends State<ReadingPage> {
   Widget _bookTile(BuildContext context, ShelfBook book) {
     final theme = Theme.of(context);
     final progress = _progressByKey[book.key];
+    final localId = localBookIdFromUrl(book.detailUrl);
+    final local = localId == null ? null : _localBooksById[localId];
+    // PDF 的「章」其实是页（与阅读页的「上一页 / 下一页」一致）
+    final unit = (local?.format ?? '').trim().toLowerCase() == 'pdf' ? '页' : '章';
     final progressText = progress != null && progress.chapterName.isNotEmpty
         ? '读到 ${progress.chapterName}'
         : (book.chapterCount > 0
-            ? '还没开始读 · 共 ${book.chapterCount} 章'
+            ? '还没开始读 · 共 ${book.chapterCount} $unit'
             : '还没开始读');
     return InkWell(
       onTap: () => _openBook(book),
@@ -533,14 +570,7 @@ class ReadingPageState extends State<ReadingPage> {
           children: [
             ClipRRect(
               borderRadius: BorderRadius.circular(kRadiusSm),
-              child: book.cover.trim().isEmpty
-                  ? Container(
-                      width: 48,
-                      height: 64,
-                      color: kPaperCool,
-                      child: const Icon(Icons.menu_book_outlined, size: 20),
-                    )
-                  : CoverImage(cover: book.cover, width: 48, height: 64),
+              child: _bookCover(theme, book, local),
             ),
             const SizedBox(width: kSpace12),
             Expanded(
@@ -558,28 +588,18 @@ class ReadingPageState extends State<ReadingPage> {
                           style: theme.textTheme.titleSmall,
                         ),
                       ),
-                      // 「本地」角标：本地书没有封面 / 书源，混在网络书里只看
-                      // 书名分不清（导入时文件名就是书名）。一个小标签比
-                      // 单独开一节书架更轻，也不用改列表结构。
-                      if (isLocalBookUrl(book.detailUrl)) ...[
+                      // 「本地」角标：本地书没有书源，混在网络书里只看书名
+                      // 分不清（导入时文件名就是书名）。一个小标签比单独开
+                      // 一节书架更轻，也不用改列表结构。
+                      if (localId != null) ...[
                         const SizedBox(width: kSpace4),
-                        Container(
-                          margin: const EdgeInsets.only(top: 2),
-                          padding: const EdgeInsets.symmetric(
-                            horizontal: kSpace4,
-                            vertical: 1,
-                          ),
-                          decoration: BoxDecoration(
-                            border: Border.all(
-                              color: kInkGray50.withValues(alpha: .55),
-                            ),
-                            borderRadius: BorderRadius.circular(kRadiusSm),
-                          ),
-                          child: Text(
-                            '本地',
-                            style: kTypeBodyS.copyWith(color: kInkGray50),
-                          ),
-                        ),
+                        _rowBadge('本地'),
+                      ],
+                      // 格式角标：同一次导入可能既有 TXT 又有 EPUB，点进去
+                      // 才知道是哪一种太晚（排版与章数差别就在这）。
+                      if (local != null && local.format.trim().isNotEmpty) ...[
+                        const SizedBox(width: kSpace4),
+                        _rowBadge(local.format.toUpperCase()),
                       ],
                     ],
                   ),
@@ -626,4 +646,43 @@ class ReadingPageState extends State<ReadingPage> {
       ),
     );
   }
+
+  /// 书架行的封面：本地书有封面文件就用 `Image.file`，否则沿用网络书那套
+  /// （`CoverImage` 带防盗链 Referer）/ 占位图标。
+  ///
+  /// 为什么本地封面不走 `CoverImage`：它按 URL 加载、带 B 站防盗链头，喂一个
+  /// 本地路径只会在日志里刷一堆加载失败。
+  Widget _bookCover(ThemeData theme, ShelfBook book, LocalBook? local) {
+    final localCover = local?.coverPath;
+    if (localCover != null) {
+      return Image.file(
+        File(localCover),
+        width: 48,
+        height: 64,
+        fit: BoxFit.cover,
+        // 封面文件可能被外部删了 / 系统清了缓存：回退占位，不炸整个列表
+        errorBuilder: (_, __, ___) => _coverPlaceholder(),
+      );
+    }
+    if (book.cover.trim().isEmpty) return _coverPlaceholder();
+    return CoverImage(cover: book.cover, width: 48, height: 64);
+  }
+
+  Widget _coverPlaceholder() => Container(
+        width: 48,
+        height: 64,
+        color: kPaperCool,
+        child: const Icon(Icons.menu_book_outlined, size: 20),
+      );
+
+  /// 书架行的小角标（「本地」/「TXT」/「EPUB」），样式沿用原来的「本地」标签。
+  Widget _rowBadge(String label) => Container(
+        margin: const EdgeInsets.only(top: 2),
+        padding: const EdgeInsets.symmetric(horizontal: kSpace4, vertical: 1),
+        decoration: BoxDecoration(
+          border: Border.all(color: kInkGray50.withValues(alpha: .55)),
+          borderRadius: BorderRadius.circular(kRadiusSm),
+        ),
+        child: Text(label, style: kTypeBodyS.copyWith(color: kInkGray50)),
+      );
 }

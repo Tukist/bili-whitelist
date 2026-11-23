@@ -2,7 +2,7 @@
 //
 // 在**临时目录**里真跑文件读写（`rootDirOverride`）：这一层的职责就是「按章
 // 下标切正文」，mock 掉 IO 等于没测。覆盖四件事：
-// 1. 逐章正文与章名（章名来自 manifest，正文是字符偏移切片）；
+// 1. 逐章正文与章名（章名来自 manifest，正文由 store 按章取）；
 // 2. 目录拼装（`local:<id>#<index>`，本地阅读不发请求）；
 // 3. 越界 → 可读异常（不是 RangeError）；
 // 4. 文件缺失 / 整本被删 → 「已丢失」，阅读页据此显示错误而不是白屏。
@@ -96,8 +96,9 @@ void main() {
     }
   });
 
-  test('book.txt 被外部删掉 → 「已丢失」（阅读页给错误 + 重试）', () async {
-    File('${root.path}/reader/local/${book.id}/book.txt').deleteSync();
+  test('章节文件被外部删掉 → 「已丢失」（阅读页给错误 + 重试）', () async {
+    // schema 2（v2.73 起）的正文在 chapters/N.txt，不再有整本 book.txt
+    File('${root.path}/reader/local/${book.id}/chapters/0.txt').deleteSync();
 
     await expectLater(
       loader.load(0),

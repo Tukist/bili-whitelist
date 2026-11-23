@@ -5,10 +5,14 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
 import '../models/book_source.dart';
+import '../services/book_rule/engine_holder.dart';
 import '../services/book_rule/example_sources.dart';
+import '../services/book_rule/legado_compat.dart';
+import '../services/book_source_health_service.dart';
 import '../services/book_source_index_service.dart';
 import '../services/book_source_store.dart';
 import '../services/file_import_service.dart';
+import '../theme/app_palette.dart';
 import '../theme/app_tokens.dart';
 import '../utils/book_source_import.dart';
 import '../widgets/app_snack.dart';
@@ -21,9 +25,10 @@ import 'book_source_picker_page.dart';
 /// 能：**从剪贴板 / 本地文件 / 链接导入**（支持单对象 / 数组 / 混着说明文字 /
 /// legado 格式；三条入口共用同一个 `parseBookSourceText`）、
 /// **从索引链接批量下载后挑选导入**（R3，见 `book_source_picker_page.dart`）、
-/// 逐条启用开关、删除（二次确认）、清空全部、长按看原始 JSON。
-/// 不能：**执行书源规则**（搜索/详情/目录/正文在 R2/R3 的阅读侧，本页只管
-/// 书源的进与出）。
+/// 逐条启用开关、删除（二次确认）、清空全部、长按看原始 JSON、
+/// **一键添加内置书源**、**单源 / 全量可用性检测**（F2，见
+/// `book_source_health_service.dart`）。
+/// 不能：在这里执行搜索/正文规则（那些在阅读侧）。
 ///
 /// ## 为什么删源要二次确认
 /// 书源是用户从别处抄来、可能一行行手改过的数据，没有云端备份（本存储
@@ -35,7 +40,21 @@ class BookSourcePage extends StatefulWidget {
   /// 测试注入：索引下载服务（透传给选择页；默认真 Dio）。
   final BookSourceIndexService? indexService;
 
-  const BookSourcePage({super.key, this.store, this.indexService});
+  /// 测试注入：规则引擎宿主（默认 [RuleEngineHolder.instance]）。
+  ///
+  /// 只有「检测」需要引擎（要在真实 DOM 上跑选择器）；不检测就不碰它。
+  final RuleEngineHolder? holder;
+
+  /// 测试注入：可用性检测服务（默认用 [holder] 的引擎现建一个）。
+  final BookSourceHealthService? healthService;
+
+  const BookSourcePage({
+    super.key,
+    this.store,
+    this.indexService,
+    this.holder,
+    this.healthService,
+  });
 
   @override
   State<BookSourcePage> createState() => _BookSourcePageState();
@@ -48,12 +67,28 @@ class _BookSourcePageState extends State<BookSourcePage> {
   /// 读盘失败的原因（非 null 且 [_sources] 为 null 时展示错误态）。
   String? _error;
 
+  /// 检测结果（源名小写 → 结果）。没检测过的源不在表里。
+  Map<String, SourceHealth> _health = const {};
+
+  /// 是否已经把隐藏的 WebView 宿主挂进树（**用到才建**：见 [_ensureEngineMounted]）。
+  bool _engineMounted = false;
+
+  /// 正在检测的源名（小写）；null = 没有单源检测在跑。
+  String? _probingKey;
+
   BookSourceStore get _store => widget.store ?? BookSourceStore.instance;
+  RuleEngineHolder get _holder => widget.holder ?? RuleEngineHolder.instance;
+
+  /// 检测服务：**懒建**，构造时不碰引擎（读角标只需要 prefs）。
+  late final BookSourceHealthService _healthService =
+      widget.healthService ??
+          BookSourceHealthService(engineProvider: () => _holder.engine);
 
   @override
   void initState() {
     super.initState();
     unawaited(_load());
+    unawaited(_loadHealth());
   }
 
   Future<void> _load() async {
@@ -66,6 +101,12 @@ class _BookSourcePageState extends State<BookSourcePage> {
       if (!mounted) return;
       setState(() => _error = '读取书源失败：$e');
     }
+  }
+
+  Future<void> _loadHealth() async {
+    final map = await _healthService.loadAll();
+    if (!mounted) return;
+    setState(() => _health = map);
   }
 
   // ==================== 导入 ====================
@@ -277,9 +318,9 @@ class _BookSourcePageState extends State<BookSourcePage> {
     );
   }
 
-  // ==================== 内置示例书源 ====================
+  // ==================== 内置书源 ====================
 
-  /// 一键添加内置示例书源（规则见 `services/book_rule/example_sources.dart`）。
+  /// 一键添加内置书源（规则见 `services/book_rule/example_sources.dart`）。
   ///
   /// 只写**还不在列表里**的那几条：`upsertAll` 是同名覆盖，直接整批塞进去会
   /// 把用户改过的同源规则冲掉。同名判定与存储一致（[BookSource.key]，大小写
@@ -293,7 +334,7 @@ class _BookSourcePageState extends State<BookSourcePage> {
         if (!existing.contains(s.key)) s,
     ];
     if (added.isEmpty) {
-      AppSnack.show(context, '示例书源已存在');
+      AppSnack.show(context, '内置书源已存在');
       return;
     }
     final ok = await _store.upsertAll(added);
@@ -308,7 +349,144 @@ class _BookSourcePageState extends State<BookSourcePage> {
     }
     await _load();
     if (!mounted) return;
-    AppSnack.show(context, '已添加 ${added.length} 个示例书源');
+    // 有同名源被跳过时说清楚：用户可能自己改过那条，不该以为「没导进来」
+    final skipped = kExampleBookSources.length - added.length;
+    AppSnack.show(
+      context,
+      '已添加 ${added.length} 个内置书源'
+      '${skipped > 0 ? '（$skipped 个同名源已存在，没有覆盖）' : ''}',
+    );
+  }
+
+  // ==================== 可用性检测（F2） ====================
+
+  /// 检测前把隐藏的 WebView 宿主挂进树。
+  ///
+  /// **用到才挂**：这一页平时只是在读写书源，为了看一眼角标就建一个 WebView
+  /// 太亏；而且 `flutter test` 里没有 WebView 平台实现，页面一打开就挂宿主会
+  /// 让所有管理页测试直接抛。挂上之后等一帧再求值：WebView 要先完成布局，
+  /// 否则 `loadHtmlString` 的回调不会来（见 DEV_CONTEXT 的「尺寸不能为 0」）。
+  Future<void> _ensureEngineMounted() async {
+    if (_engineMounted) return;
+    setState(() => _engineMounted = true);
+    await WidgetsBinding.instance.endOfFrame;
+  }
+
+  /// 检测一个源（长按菜单「检测这个源」）。
+  Future<void> _probeOne(BookSource source) async {
+    if (_probingKey != null) return; // 已经在测别的源，别叠着打
+    setState(() => _probingKey = source.key);
+    try {
+      await _ensureEngineMounted();
+      final health = await _healthService.probe(source);
+      if (!mounted) return;
+      await _loadHealth();
+      if (!mounted) return;
+      AppSnack.show(context, '「${source.name}」${health.describe}');
+    } finally {
+      if (mounted) setState(() => _probingKey = null);
+    }
+  }
+
+  /// 检测全部书源（AppBar 溢出菜单，**较慢**）。
+  ///
+  /// 只测「启用 且 不需要 JS」的：停用的源用户已经不想用了，需要 JS 的本版
+  /// 根本跑不了（发请求也只会得空结果）。跳过的数量写在进度框里，不假装
+  /// 「全测完了」。
+  Future<void> _probeAll() async {
+    final all = _sources ?? const <BookSource>[];
+    final targets = [
+      for (final s in all)
+        if (s.enabled && !usesJs(s)) s,
+    ];
+    final disabled = all.where((s) => !s.enabled).length;
+    final jsOnly = all.where((s) => s.enabled && usesJs(s)).length;
+    if (targets.isEmpty) {
+      AppSnack.show(
+        context,
+        '没有可检测的源（停用 $disabled 个、需 JS $jsOnly 个，都已跳过）',
+      );
+      return;
+    }
+
+    final progress = ValueNotifier<(int, int)>((0, targets.length));
+    var cancelled = false;
+    var dialogOpen = true;
+    void closeDialog() {
+      if (!dialogOpen) return;
+      dialogOpen = false;
+      if (mounted) Navigator.of(context, rootNavigator: true).pop();
+    }
+
+    final dialogFuture = showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => AlertDialog(
+        title: const Text('正在检测书源'),
+        content: ValueListenableBuilder<(int, int)>(
+          valueListenable: progress,
+          builder: (context, value, _) => Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              LinearProgressIndicator(
+                value: value.$2 == 0 ? null : value.$1 / value.$2,
+              ),
+              const SizedBox(height: kSpace12),
+              Text('已检测 ${value.$1} / ${value.$2}'),
+              const SizedBox(height: kSpace4),
+              Text(
+                '停用 $disabled 个、需 JS $jsOnly 个，不在本次检测范围',
+                style: kTypeBodyS.copyWith(color: kInkGray50),
+              ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              cancelled = true;
+              dialogOpen = false;
+              Navigator.of(ctx).pop();
+            },
+            child: const Text('取消'),
+          ),
+        ],
+      ),
+    );
+    // 用户也可能是按系统返回键把对话框关掉的（barrierDismissible 只挡点击）。
+    // 用 future 完成来回收「对话框还开着吗」，否则后面 closeDialog() 会误把
+    // 书源页自己也 pop 掉。
+    dialogFuture.whenComplete(() => dialogOpen = false);
+
+    List<SourceHealth> results;
+    try {
+      await _ensureEngineMounted();
+      results = await _healthService.probeAll(
+        targets,
+        onProgress: (done, total) => progress.value = (done, total),
+        isCancelled: () => cancelled,
+      );
+    } finally {
+      closeDialog();
+      progress.dispose();
+    }
+    if (!mounted) return;
+    await _loadHealth();
+    if (!mounted) return;
+
+    final counts = <SourceHealthStatus, int>{};
+    for (final h in results) {
+      counts[h.status] = (counts[h.status] ?? 0) + 1;
+    }
+    final parts = [
+      for (final status in SourceHealthStatus.values)
+        if ((counts[status] ?? 0) > 0) '${status.label} ${counts[status]}',
+    ];
+    final tail = cancelled
+        ? '（已取消，测了 ${results.length} / ${targets.length} 个）'
+        : '';
+    AppSnack.show(context, '检测完成：${parts.join('、')}$tail');
   }
 
   // ==================== 索引下载 / 清空（R3） ====================
@@ -367,6 +545,12 @@ class _BookSourcePageState extends State<BookSourcePage> {
     }
     await _load();
     if (!mounted) return;
+    // 书源没了，检测结果也要跟着清 —— 否则下次导入同名源时会带着一条
+    // 别人的旧状态显示出来（「刚导进来就显示被拦」最容易被当成 bug）。
+    await _healthService.clear();
+    if (!mounted) return;
+    await _loadHealth();
+    if (!mounted) return;
     AppSnack.show(context, '已清空 $count 个书源');
   }
 
@@ -377,14 +561,15 @@ class _BookSourcePageState extends State<BookSourcePage> {
     return Scaffold(
       appBar: AppBar(
         title: const Text('书源'),
-        // 溢出菜单：都不占主位。导入才是这一页的主要动作，这三项分别是
-        // 「批量找源」「先试一下」「推倒重来」。
+        // 溢出菜单：都不占主位。导入才是这一页的主要动作，这四项分别是
+        // 「批量找源」「先试一下」「测一下能不能用」「推倒重来」。
         actions: [
           PopupMenuButton<String>(
             tooltip: '更多',
             onSelected: (value) {
               if (value == 'index') unawaited(_openIndexPicker());
               if (value == 'examples') unawaited(_addExamples());
+              if (value == 'probe_all') unawaited(_probeAll());
               if (value == 'clear') unawaited(_clearAll());
             },
             itemBuilder: (_) => const [
@@ -394,7 +579,11 @@ class _BookSourcePageState extends State<BookSourcePage> {
               ),
               PopupMenuItem<String>(
                 value: 'examples',
-                child: Text('添加示例书源'),
+                child: Text('添加内置书源'),
+              ),
+              PopupMenuItem<String>(
+                value: 'probe_all',
+                child: Text('检测全部书源（较慢）'),
               ),
               PopupMenuItem<String>(
                 value: 'clear',
@@ -404,15 +593,28 @@ class _BookSourcePageState extends State<BookSourcePage> {
           ),
         ],
       ),
-      body: Column(
+      body: Stack(
         children: [
-          _actionBar(),
-          const Divider(height: 1),
-          Expanded(child: _body()),
+          Column(
+            children: [
+              _actionBar(),
+              const Divider(height: 1),
+              Expanded(child: _body()),
+            ],
+          ),
+          // 隐藏的 WebView 宿主：只在开始检测后才挂（见 _ensureEngineMounted）
+          if (_engineMounted)
+            Positioned(left: 0, top: 0, child: _hiddenHost()),
         ],
       ),
     );
   }
+
+  Widget _hiddenHost() => SizedBox(
+        width: 1,
+        height: 1,
+        child: Offstage(offstage: true, child: _holder.buildHost()),
+      );
 
   /// 三个导入入口：剪贴板 / 本地文件 / 链接。
   ///
@@ -492,17 +694,27 @@ class _BookSourcePageState extends State<BookSourcePage> {
 
   Widget _sourceTile(BookSource source) {
     final theme = Theme.of(context);
+    final probing = _probingKey == source.key;
     return ListTile(
-      // 长按 = 看原始 JSON（导出 / 核对字段都靠它）
-      onLongPress: () => _showRaw(source),
-      title: Text(
-        source.name,
-        maxLines: 1,
-        overflow: TextOverflow.ellipsis,
-        style: TextStyle(
-          // 停用的源压暗：一眼能看出它不是搜索范围
-          color: source.enabled ? null : theme.colorScheme.outline,
-        ),
+      // 长按 = 小菜单（看原始 JSON / 检测这个源）。原来长按直接弹 JSON，
+      // F2 起多了一个动作，用菜单比再塞一个图标按钮稳妥（窄屏 trailing 已满）。
+      onLongPress: () => _showSourceActions(source),
+      title: Row(
+        children: [
+          Expanded(
+            child: Text(
+              source.name,
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                // 停用的源压暗：一眼能看出它不是搜索范围
+                color: source.enabled ? null : theme.colorScheme.outline,
+              ),
+            ),
+          ),
+          const SizedBox(width: kSpace8),
+          _healthBadge(source, probing: probing),
+        ],
       ),
       subtitle: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -537,6 +749,83 @@ class _BookSourcePageState extends State<BookSourcePage> {
         ],
       ),
     );
+  }
+
+  /// 状态角标：绿「可用 N 条」/ 灰「没结果」/ 红「被拦」/ 黄「需 JS」/ 灰「未检测」。
+  ///
+  /// 颜色只用主题里的语义色（[kSuccess] / [kError] / [kInkGray50] / accent），
+  /// 不写字面量 —— 换配色配方时角标会自己跟着变。
+  Widget _healthBadge(BookSource source, {required bool probing}) {
+    final palette = context.palette;
+    final health = _health[source.key];
+    if (probing) {
+      return Text(
+        '检测中…',
+        style: kTypeBodyS.copyWith(color: kInkGray50, fontSize: 11),
+      );
+    }
+    final (label, color) = switch (health?.status) {
+      null => ('未检测', kInkGray50),
+      SourceHealthStatus.ok => (health!.label, kSuccess),
+      SourceHealthStatus.noResult => ('没结果', kInkGray70),
+      SourceHealthStatus.blocked => ('被拦', kError),
+      SourceHealthStatus.networkError => ('连不上', kError),
+      SourceHealthStatus.unsupportedJs => ('需 JS', palette.accent),
+      SourceHealthStatus.badRule => ('规则坏', palette.accent),
+    };
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(kRadiusSm),
+        border: Border.all(color: color.withValues(alpha: .45)),
+        color: color.withValues(alpha: .08),
+      ),
+      child: Text(
+        label,
+        style: kTypeBodyS.copyWith(color: color, fontSize: 11),
+      ),
+    );
+  }
+
+  /// 长按菜单：看原始 JSON / 检测这个源。
+  Future<void> _showSourceActions(BookSource source) async {
+    final action = await showModalBottomSheet<String>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(kPagePadH, kSpace12, kPagePadH, kSpace4),
+              child: Align(
+                alignment: Alignment.centerLeft,
+                child: Text(
+                  source.name,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: kTypeTitleS.copyWith(color: kInkBlack),
+                ),
+              ),
+            ),
+            ListTile(
+              leading: const Icon(Icons.description_outlined),
+              title: const Text('查看原始 JSON'),
+              onTap: () => Navigator.of(ctx).pop('raw'),
+            ),
+            ListTile(
+              leading: const Icon(Icons.network_check),
+              title: const Text('检测这个源'),
+              subtitle: const Text('真发一次搜索，看能不能搜到书'),
+              onTap: () => Navigator.of(ctx).pop('probe'),
+            ),
+            const SizedBox(height: kSpace8),
+          ],
+        ),
+      ),
+    );
+    if (!mounted || action == null) return;
+    if (action == 'raw') _showRaw(source);
+    if (action == 'probe') await _probeOne(source);
   }
 }
 

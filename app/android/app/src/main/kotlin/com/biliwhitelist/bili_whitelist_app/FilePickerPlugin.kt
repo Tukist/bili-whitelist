@@ -101,9 +101,14 @@ class FilePickerPlugin(private val activity: Activity) {
     /**
      * 导入本地书：选文件 → **流式拷进私有目录** → 回路径（见文件头）。
      *
-     * MIME 收窄到 txt / epub / octet-stream：不限定的话某些 ROM 的选择器会把
+     * MIME 收窄到 txt / epub / pdf / octet-stream：不限定的话某些 ROM 的选择器会把
      * 「文档」以外的类型全隐藏，用户找不到自己的书；收得太窄又会把网盘
-     * provider 报成 octet-stream 的 txt 变灰，所以这三个都留着。
+     * provider 报成 octet-stream 的 txt 变灰，所以这几个都留着。
+     *
+     * **PDF（v2.74.0）**：`application/pdf` 必须显式列进来 —— 部分 ROM 的
+     * DocumentsUI 会按 EXTRA_MIME_TYPES 严格过滤，只写 `text/plain` +
+     * `application/epub+zip` 时 .pdf 是灰的、点不动。通配的 `type` 只是兜底，
+     * 真正决定哪些能点的是这一行。
      */
     private fun pickBookFile(result: MethodChannel.Result) {
         if (pendingResult != null) {
@@ -114,7 +119,10 @@ class FilePickerPlugin(private val activity: Activity) {
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = MIME_ANY
-            putExtra(Intent.EXTRA_MIME_TYPES, arrayOf(MIME_TEXT, MIME_EPUB, MIME_BINARY))
+            putExtra(
+                Intent.EXTRA_MIME_TYPES,
+                arrayOf(MIME_TEXT, MIME_EPUB, MIME_PDF, MIME_BINARY)
+            )
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
         pendingResult = result
@@ -329,6 +337,9 @@ class FilePickerPlugin(private val activity: Activity) {
         return when (mime?.lowercase()) {
             "text/plain" -> "txt"
             "application/epub+zip" -> "epub"
+            // 有的 provider 报 application/pdf，有的报 octet-stream；文件名没扩展名
+            // 时只能靠 MIME，至少让 .pdf 能落到 pdf 分支（v2.74.0）
+            "application/pdf" -> "pdf"
             else -> "bin"
         }
     }
@@ -359,6 +370,7 @@ class FilePickerPlugin(private val activity: Activity) {
         private const val MIME_JSON = "application/json"
         private const val MIME_TEXT = "text/plain"
         private const val MIME_EPUB = "application/epub+zip"
+        private const val MIME_PDF = "application/pdf"
         private const val MIME_BINARY = "application/octet-stream"
 
         private const val BOM = '\uFEFF'
