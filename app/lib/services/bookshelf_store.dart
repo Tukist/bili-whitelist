@@ -117,8 +117,15 @@ class ReadingProgress {
   final String chapterName;
   final String chapterUrl;
 
-  /// 页内滚动位置（重进时按它还原，越界会夹取）。
+  /// 页内滚动位置（重进时按它还原，越界会夹取）。**滚动模式**用它。
   final double scrollOffset;
+
+  /// 页内页码（从 0 起）。**分页模式**用它；旧数据没有这个字段就是 0。
+  ///
+  /// 为什么另开字段而不是复用 [scrollOffset]：两种模式的「页内位置」量纲
+  /// 完全不同（dp vs 页号），混用一个字段迟早会把 900dp 当成第 900 页。
+  /// 旧字段语义保持不变，滚动模式继续只认 [scrollOffset]。
+  final int pageIndex;
 
   /// 更新时间（epoch 毫秒）—— 裁剪「只保留最近 100 本」按它排序。
   final int updatedAt;
@@ -128,6 +135,7 @@ class ReadingProgress {
     this.chapterName = '',
     this.chapterUrl = '',
     this.scrollOffset = 0,
+    this.pageIndex = 0,
     this.updatedAt = 0,
   });
 
@@ -136,6 +144,7 @@ class ReadingProgress {
     String? chapterName,
     String? chapterUrl,
     double? scrollOffset,
+    int? pageIndex,
     int? updatedAt,
   }) =>
       ReadingProgress(
@@ -143,6 +152,7 @@ class ReadingProgress {
         chapterName: chapterName ?? this.chapterName,
         chapterUrl: chapterUrl ?? this.chapterUrl,
         scrollOffset: scrollOffset ?? this.scrollOffset,
+        pageIndex: pageIndex ?? this.pageIndex,
         updatedAt: updatedAt ?? this.updatedAt,
       );
 
@@ -151,6 +161,7 @@ class ReadingProgress {
         'chapterName': chapterName,
         'chapterUrl': chapterUrl,
         'scrollOffset': scrollOffset,
+        'pageIndex': pageIndex,
         'updatedAt': updatedAt,
       };
 
@@ -160,6 +171,8 @@ class ReadingProgress {
         chapterName: _asString(json['chapterName']),
         chapterUrl: _asString(json['chapterUrl']),
         scrollOffset: _asDouble(json['scrollOffset']),
+        // 负数 / 脏数据夹到 0：页码为负只会在 pageIndex - 1 之类的算术里炸
+        pageIndex: _asInt(json['pageIndex']).clamp(0, 1 << 30),
         updatedAt: _asInt(json['updatedAt']),
       );
 }
@@ -172,29 +185,46 @@ class ReaderSettings {
   /// 底色：`auto`（跟随 App）/ `paper`（纸黄）/ `dark`（夜墨）。
   final String theme;
 
+  /// 翻页方式：`scroll`（上下滚动，默认）/ `paged`（左右翻页）。
+  ///
+  /// 只认这两个值；读到别的（手改坏的 JSON、未来版本的新模式）一律回
+  /// `scroll` —— 回落方向必须选「老用户熟悉的那一种」，否则升级后页面
+  /// 突然换了翻页方式，用户会以为坏了。
+  final String pageMode;
+
   const ReaderSettings({
     this.fontSize = 18,
     this.lineHeight = 1.8,
     this.theme = 'auto',
+    this.pageMode = 'scroll',
   });
 
   static const ReaderSettings defaults = ReaderSettings();
+
+  /// 分页模式（左右翻页）。
+  bool get isPaged => pageMode == 'paged';
+
+  /// 合法翻页方式集合（读写共用一份，避免写进非法值）。
+  static const Set<String> pageModes = {'scroll', 'paged'};
 
   ReaderSettings copyWith({
     double? fontSize,
     double? lineHeight,
     String? theme,
+    String? pageMode,
   }) =>
       ReaderSettings(
         fontSize: fontSize ?? this.fontSize,
         lineHeight: lineHeight ?? this.lineHeight,
         theme: theme ?? this.theme,
+        pageMode: pageMode ?? this.pageMode,
       );
 
   Map<String, dynamic> toJson() => {
         'fontSize': fontSize,
         'lineHeight': lineHeight,
         'theme': theme,
+        'pageMode': pageMode,
       };
 
   /// 宽容解析 + 夹取：手改坏的设置（比如 `fontSize: 999`）不该让阅读页
@@ -203,10 +233,13 @@ class ReaderSettings {
     final size = _asDouble(json['fontSize'], 18).clamp(12.0, 32.0);
     final height = _asDouble(json['lineHeight'], 1.8).clamp(1.2, 2.6);
     final theme = _asString(json['theme'], 'auto');
+    // 旧数据没有 pageMode（v2.71 及更早）→ 空串 → 回落 scroll
+    final mode = _asString(json['pageMode'], 'scroll');
     return ReaderSettings(
       fontSize: size,
       lineHeight: height,
       theme: const {'auto', 'paper', 'dark'}.contains(theme) ? theme : 'auto',
+      pageMode: pageModes.contains(mode) ? mode : 'scroll',
     );
   }
 }
@@ -361,10 +394,15 @@ class BookshelfStore {
     }
   }
 
+  /// 写设置。`pageMode` 非法值写盘前就归一成 `scroll` —— 读侧虽然也会回落，
+  /// 但不该把脏值先写进 prefs 再指望下一次读去修（读写的契约要一致）。
   Future<bool> saveSettings(ReaderSettings settings) async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      return prefs.setString(settingsKey, jsonEncode(settings.toJson()));
+      final safe = ReaderSettings.pageModes.contains(settings.pageMode)
+          ? settings
+          : settings.copyWith(pageMode: 'scroll');
+      return prefs.setString(settingsKey, jsonEncode(safe.toJson()));
     } catch (_) {
       return false;
     }

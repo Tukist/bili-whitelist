@@ -212,5 +212,90 @@ void main() {
       expect(s.fontSize, ReaderSettings.defaults.fontSize);
       expect(s.theme, 'auto');
     });
+
+    // ==================== v2.72.0 翻页方式 ====================
+
+    test('pageMode 默认 scroll；写 paged 能读回', () async {
+      final store = BookshelfStore();
+      expect((await store.getSettings()).pageMode, 'scroll');
+      expect(ReaderSettings.defaults.isPaged, isFalse);
+
+      expect(
+        await store.saveSettings(const ReaderSettings(pageMode: 'paged')),
+        isTrue,
+      );
+      final loaded = await store.getSettings();
+      expect(loaded.pageMode, 'paged');
+      expect(loaded.isPaged, isTrue);
+
+      // 切回滚动也要能存住
+      await store.saveSettings(loaded.copyWith(pageMode: 'scroll'));
+      expect((await store.getSettings()).pageMode, 'scroll');
+    });
+
+    test('旧数据没有 pageMode（v2.71 及更早）→ 回落 scroll', () async {
+      SharedPreferences.setMockInitialValues({
+        BookshelfStore.settingsKey: jsonEncode({
+          'fontSize': 20,
+          'lineHeight': 1.6,
+          'theme': 'paper',
+        }),
+      });
+      final s = await BookshelfStore().getSettings();
+      expect(s.pageMode, 'scroll');
+      // 其它字段不能被连带改坏
+      expect(s.fontSize, 20);
+      expect(s.theme, 'paper');
+    });
+
+    test('pageMode 非法值：读时回落 scroll，写时归一成 scroll', () async {
+      SharedPreferences.setMockInitialValues({
+        BookshelfStore.settingsKey: jsonEncode({'pageMode': 'flip'}),
+      });
+      expect((await BookshelfStore().getSettings()).pageMode, 'scroll');
+
+      // 写侧也不许把脏值落盘（读侧回落是兜底，不是纵容）
+      final store = BookshelfStore();
+      await store.saveSettings(const ReaderSettings(pageMode: 'flip'));
+      final prefs = await SharedPreferences.getInstance();
+      final raw = jsonDecode(prefs.getString(BookshelfStore.settingsKey)!) as Map;
+      expect(raw['pageMode'], 'scroll');
+    });
+  });
+
+  group('进度：分页模式的 pageIndex（v2.72.0）', () {
+    test('pageIndex 写读往返；默认 0', () async {
+      final store = BookshelfStore();
+      const progress = ReadingProgress(chapterIndex: 2, pageIndex: 7);
+      expect(progress.pageIndex, 7);
+      expect(await store.saveProgress('https://x.example/book/1', progress), isTrue);
+
+      final loaded = await store.getProgress('https://x.example/book/1');
+      expect(loaded!.pageIndex, 7);
+      // 旧字段语义不变：没给就不存滚动位置
+      expect(loaded.scrollOffset, 0);
+    });
+
+    test('旧数据没有 pageIndex / 负数 → 0', () async {
+      SharedPreferences.setMockInitialValues({
+        BookshelfStore.progressKey: jsonEncode({
+          'https://x.example/book/1': {
+            'chapterIndex': 3,
+            'scrollOffset': 512.5,
+            'updatedAt': 1,
+          },
+          'https://x.example/book/2': {
+            'chapterIndex': 0,
+            'pageIndex': -9,
+          },
+        }),
+      });
+      final store = BookshelfStore();
+      final a = await store.getProgress('https://x.example/book/1');
+      expect(a!.pageIndex, 0);
+      expect(a.scrollOffset, 512.5); // 滚动模式的老字段照旧
+      final b = await store.getProgress('https://x.example/book/2');
+      expect(b!.pageIndex, 0);
+    });
   });
 }

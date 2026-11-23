@@ -158,6 +158,29 @@ class _LongContentService extends BookContentService {
       );
 }
 
+/// 多页正文（分页模式测试用）：40 段、每段 41 个「字」。
+///
+/// 41 是挑出来的：测试字体每字宽 = 字号，默认可用宽 752dp —— 字号 18 时
+/// 一段正好一行（41×18 = 738），字号 19 时放不下（41×19 = 779）折成两行。
+/// 于是「A+ 一下」就能真的改变页数，而不是假测一遍。
+class _PagedContentService extends BookContentService {
+  _PagedContentService() : super(engine: FakeRuleEngine());
+
+  @override
+  Future<BookContentResult> loadContent({
+    required BookSource source,
+    required TocChapter chapter,
+    bool preferCache = true,
+    ChapterCacheStore? cache,
+    String? bookKey,
+    int? chapterIndex,
+  }) async =>
+      BookContentResult(
+        title: chapter.name,
+        body: List<String>.filled(40, '字' * 41).join('\n'),
+      );
+}
+
 /// 缓存批次卡在中途（验「正在缓存 x/y」与取消）。
 class _GatedCacheService extends BookContentService {
   _GatedCacheService() : super(engine: FakeRuleEngine());
@@ -610,4 +633,233 @@ void main() {
     expect(bar.color, isNotNull);
     expect(bar.color!.a, 1.0); // 完全不透明
   });
+
+  // ==================== v2.72.0：左右翻页模式 ====================
+
+  group('分页模式', () {
+    testWidgets('渲染 PageView + 页码；没有 SelectableText（长按不抢横滑手势）',
+        (tester) async {
+      await _pump(tester, content: _PagedContentService(), store: _pagedStore());
+
+      expect(find.byType(PageView), findsOneWidget);
+      // 手势取舍：分页模式不可选中，正文是普通 Text
+      expect(find.byType(SelectableText), findsNothing);
+
+      final number = _pageNumber(tester);
+      expect(number, isNotNull);
+      expect(number, startsWith('1 / '));
+      final total = int.parse(number!.split('/')[1].trim());
+      expect(total, greaterThan(1)); // 40 段正文在 800x600 下必须不止一页
+    });
+
+    testWidgets('页码在底部控制条上方（控制层展开时不重叠）', (tester) async {
+      await _pump(tester, content: _PagedContentService(), store: _pagedStore());
+
+      final numberRect = tester.getRect(_pageNumberFinder());
+      final barTop = tester
+          .getRect(
+            find
+                .ancestor(of: find.text('下一章'), matching: find.byType(Container))
+                .first,
+          )
+          .top;
+      expect(numberRect.bottom, lessThanOrEqualTo(barTop));
+    });
+
+    testWidgets('横滑翻页：页码跟着走，进度落盘写 pageIndex', (tester) async {
+      final store = _pagedStore();
+      await _pump(tester, content: _PagedContentService(), store: store);
+
+      await tester.fling(find.byType(PageView), const Offset(-400, 0), 1000);
+      await tester.pumpAndSettle();
+
+      expect(_pageNumber(tester), startsWith('2 / '));
+
+      // 翻页后停 1.5 秒才落盘
+      await tester.pump(const Duration(seconds: 2));
+      await tester.pumpAndSettle();
+      expect(store.saved.last.pageIndex, 1);
+      expect(store.saved.last.scrollOffset, 0); // 分页模式不存滚动位置
+    });
+
+    testWidgets('滑到本章最后一页再往后滑 → 下一章第 1 页', (tester) async {
+      await _pump(tester, content: _PagedContentService(), store: _pagedStore());
+
+      final total = int.parse(_pageNumber(tester)!.split('/')[1].trim());
+      for (var i = 1; i < total; i++) {
+        await tester.fling(find.byType(PageView), const Offset(-400, 0), 1000);
+        await tester.pumpAndSettle();
+      }
+      expect(_pageNumber(tester), '$total / $total');
+
+      // 再往后滑一次 = 跨章
+      await tester.fling(find.byType(PageView), const Offset(-400, 0), 1000);
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('第2章'), findsOneWidget);
+      expect(_pageNumber(tester), startsWith('1 / '));
+    });
+
+    testWidgets('第一页往前滑 → 上一章最后一页', (tester) async {
+      await _pump(
+        tester,
+        content: _PagedContentService(),
+        store: _pagedStore(),
+        initialIndex: 1,
+      );
+
+      expect(find.textContaining('第2章'), findsOneWidget);
+      expect(_pageNumber(tester), startsWith('1 / '));
+
+      await tester.fling(find.byType(PageView), const Offset(400, 0), 1000);
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('第1章'), findsOneWidget);
+      final number = _pageNumber(tester)!;
+      final parts = number.split('/');
+      expect(parts[0].trim(), parts[1].trim()); // 落在上一章的最后一页
+    });
+
+    testWidgets('A+ 重新分页后保住阅读位置（不跳回第 1 页）', (tester) async {
+      final store = _pagedStore();
+      await _pump(tester, content: _PagedContentService(), store: store);
+
+      // 先翻到第 2 页（约 1/3 处）
+      await tester.fling(find.byType(PageView), const Offset(-400, 0), 1000);
+      await tester.pumpAndSettle();
+      final before = _pageNumber(tester)!;
+      final beforeRatio = _ratio(before);
+      expect(beforeRatio, greaterThan(0));
+
+      await tester.tap(find.text('A+'));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(PageView), findsOneWidget);
+      final after = _pageNumber(tester)!;
+      // 页数变了（字号大了放不下同样多字），页号也重建了
+      expect(after.split('/')[1].trim(), isNot(before.split('/')[1].trim()));
+      // 但位置还在 1/3 附近，不是第 1 页
+      expect(int.parse(after.split('/')[0].trim()), greaterThan(1));
+      expect((_ratio(after) - beforeRatio).abs(), lessThan(0.25));
+    });
+
+    testWidgets('点正文仍能隐藏 / 呼出控制层（分页模式）', (tester) async {
+      await _pump(tester, content: _PagedContentService(), store: _pagedStore());
+
+      double bottomBarOpacity() => tester
+          .widget<AnimatedOpacity>(
+            find
+                .ancestor(
+                  of: find.text('下一章'),
+                  matching: find.byType(AnimatedOpacity),
+                )
+                .first,
+          )
+          .opacity;
+
+      expect(bottomBarOpacity(), 1);
+
+      // 点在页区中间（页区 = 顶 52 到 底 124 之间）
+      await tester.tapAt(const Offset(400, 200));
+      await tester.pumpAndSettle();
+      expect(bottomBarOpacity(), 0);
+
+      await tester.tapAt(const Offset(400, 200));
+      await tester.pumpAndSettle();
+      expect(bottomBarOpacity(), 1);
+    });
+
+    testWidgets('长按正文不会翻页、也不会误收控制层', (tester) async {
+      await _pump(tester, content: _PagedContentService(), store: _pagedStore());
+
+      await tester.longPressAt(const Offset(400, 200));
+      await tester.pumpAndSettle();
+
+      expect(_pageNumber(tester), startsWith('1 / '));
+      final opacity = tester
+          .widget<AnimatedOpacity>(
+            find
+                .ancestor(
+                  of: find.text('下一章'),
+                  matching: find.byType(AnimatedOpacity),
+                )
+                .first,
+          )
+          .opacity;
+      expect(opacity, 1);
+    });
+  });
+
+  group('翻页方式切换', () {
+    testWidgets('点顶栏「翻页方式」→ 变分页并落盘；再点回滚动', (tester) async {
+      final store = _RecordingStore();
+      await _pump(tester, content: _PagedContentService(), store: store);
+
+      // 默认滚动模式
+      expect(find.byType(PageView), findsNothing);
+      expect(find.byType(SelectableText), findsOneWidget);
+
+      await tester.tap(find.byTooltip('翻页方式'));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(PageView), findsOneWidget);
+      expect(store.settings.pageMode, 'paged');
+      expect(find.text('已切换为左右翻页'), findsOneWidget);
+
+      await tester.tap(find.byTooltip('翻页方式'));
+      await tester.pumpAndSettle();
+
+      expect(find.byType(PageView), findsNothing);
+      expect(find.byType(SelectableText), findsOneWidget);
+      expect(store.settings.pageMode, 'scroll');
+    });
+
+    testWidgets('分页模式进来：按进度 pageIndex 还原页号', (tester) async {
+      final store = _RestoringStore(pageIndex: 2);
+      await _pump(tester, content: _PagedContentService(), store: store);
+
+      expect(_pageNumber(tester), startsWith('3 / '));
+    });
+  });
+}
+
+/// 分页模式的存储：默认设置就是 `pageMode: paged`。
+_RecordingStore _pagedStore() =>
+    _RecordingStore()..settings = const ReaderSettings(pageMode: 'paged');
+
+/// 页号文案的 finder（「3 / 12」）。
+Finder _pageNumberFinder() => find.byWidgetPredicate(
+      (w) =>
+          w is Text &&
+          w.data != null &&
+          RegExp(r'^\d+ / \d+$').hasMatch(w.data!),
+    );
+
+/// 当前显示的页码文案（没有返回 null）。
+String? _pageNumber(WidgetTester tester) {
+  final finder = _pageNumberFinder();
+  if (finder.evaluate().isEmpty) return null;
+  return tester.widget<Text>(finder.first).data;
+}
+
+/// 「3 / 12」→ 3/11（0 起的相对位置）。
+double _ratio(String label) {
+  final parts = label.split('/');
+  final page = int.parse(parts[0].trim()) - 1;
+  final total = int.parse(parts[1].trim());
+  return total <= 1 ? 0 : page / (total - 1);
+}
+
+/// 带一条分页进度的存储（验「按 pageIndex 还原」）。
+class _RestoringStore extends _RecordingStore {
+  _RestoringStore({required this.pageIndex}) {
+    // 分页模式才认 pageIndex
+    settings = const ReaderSettings(pageMode: 'paged');
+  }
+
+  final int pageIndex;
+
+  @override
+  Future<ReadingProgress?> getProgress(String detailUrl) async =>
+      ReadingProgress(chapterIndex: 0, pageIndex: pageIndex);
 }

@@ -7,6 +7,9 @@ import '../services/book_rule/engine_holder.dart';
 import '../services/book_source_store.dart';
 import '../services/bookshelf_store.dart';
 import '../services/chapter_cache_store.dart';
+import '../services/local_book_import_service.dart';
+import '../services/local_book_store.dart';
+import '../services/local_chapter_loader.dart';
 import '../theme/app_palette.dart';
 import '../theme/app_tokens.dart';
 import '../widgets/app_snack.dart';
@@ -27,6 +30,11 @@ import 'book_source_page.dart';
 /// 3. **书架** —— 真读 [BookshelfStore]：封面 + 书名 + 作者 +「读到 第 N 章」，
 ///    点击直接进阅读页（有进度就定位），长按移除（二次确认）。
 ///
+/// ## E1（v2.73.0）新增「导入本地书」
+/// 手机里的 `.txt` 不用书源也能读：拉起系统选择器 → 解码（UTF-8 / GBK /
+/// UTF-16 自动判定）→ 切章 → 落盘 → 上书架。整条链路在
+/// [LocalBookImportService] 里，页面只负责「转圈 + 说一句话」。
+///
 /// 书架为空时保留 R1 的空态文案（「导入书源后，在搜索里找书加入书架」）：
 /// 那句话至今仍是用户唯一需要知道的事。
 class ReadingPage extends StatefulWidget {
@@ -42,12 +50,22 @@ class ReadingPage extends StatefulWidget {
   /// 测试注入：章节离线缓存（默认 [ChapterCacheStore.instance]）。
   final ChapterCacheStore? cacheStore;
 
+  /// 测试注入：本地书导入编排（默认 [LocalBookImportService]）。
+  final LocalBookImportService? importService;
+
+  /// 测试注入：本地书存储（默认 [LocalBookStore.instance]）。
+  ///
+  /// 阅读页读它两处：点本地书时取目录（manifest），删书时删正文目录。
+  final LocalBookStore? localBookStore;
+
   const ReadingPage({
     super.key,
     this.store,
     this.shelfStore,
     this.holder,
     this.cacheStore,
+    this.importService,
+    this.localBookStore,
   });
 
   @override
@@ -67,9 +85,15 @@ class ReadingPageState extends State<ReadingPage> {
   /// 每本书的离线缓存统计（没有缓存的书不会进这张表）。
   Map<String, CacheStats> _cacheStatsByKey = const {};
 
+  /// 本地书导入是否在进行（大文件解码要几秒，按钮必须给反馈并防重复点）。
+  bool _importing = false;
+
   BookSourceStore get _store => widget.store ?? BookSourceStore.instance;
   BookshelfStore get _shelf => widget.shelfStore ?? BookshelfStore.instance;
   ChapterCacheStore get _cache => widget.cacheStore ?? ChapterCacheStore.instance;
+  LocalBookImportService get _importer =>
+      widget.importService ?? const LocalBookImportService();
+  LocalBookStore get _local => widget.localBookStore ?? LocalBookStore.instance;
 
   @override
   void initState() {
@@ -139,11 +163,51 @@ class ReadingPageState extends State<ReadingPage> {
     return null;
   }
 
+  /// 导入本地书（E1）：选文件 → 解码 → 切章 → 落盘 → 上书架。
+  ///
+  /// 大文件（几 MB 的 GBK 小说）解码 + 切章要几秒，所以：
+  /// - 立刻把 [_importing] 置真：按钮变「导入中…」并禁用，防重复点；
+  /// - 结果只在这里转成一句话，页面不认识任何原生错误码。
+  Future<void> _importLocalBook() async {
+    if (_importing) return;
+    setState(() => _importing = true);
+    try {
+      final result = await _importer.pickAndImport();
+      if (!mounted) return;
+      if (result.cancelled) return;
+      if (!result.isOk) {
+        AppSnack.show(
+          context,
+          result.error ?? '导入失败',
+          kind: SnackKind.error,
+        );
+        return;
+      }
+      // 书架是信源：落盘成功就先重读一次，用户马上能看到新书
+      await reload();
+      if (!mounted) return;
+      final book = result.book!;
+      AppSnack.show(
+        context,
+        result.warning ?? '已导入《${book.name}》，共 ${book.chapterCount} 章',
+        kind: result.warning == null ? SnackKind.info : SnackKind.error,
+      );
+    } finally {
+      if (mounted) setState(() => _importing = false);
+    }
+  }
+
   /// 点书 → 直接进阅读页（有进度就定位）。
   ///
-  /// 书架不存目录（目录可能上万章，不该复制进书架 JSON），所以阅读页拿到的
-  /// chapters 为空；它会自己补一次目录再跳到进度章（见 [BookReaderPage]）。
+  /// 书架不存目录（目录可能上万章，不该复制进书架 JSON），所以网络书给阅读页
+  /// 的 chapters 为空，它会自己补一次目录再跳到进度章（见 [BookReaderPage]）。
+  /// 本地书的目录只有几 KB 且就在 manifest 里，直接拼好带进去，省一次 IO。
   Future<void> _openBook(ShelfBook book) async {
+    final localId = localBookIdFromUrl(book.detailUrl);
+    if (localId != null) {
+      await _openLocalBook(book, localId);
+      return;
+    }
     final source = _sourceOf(book.sourceName);
     if (source == null) {
       AppSnack.show(
@@ -171,13 +235,83 @@ class ReadingPageState extends State<ReadingPage> {
     await reload();
   }
 
+  /// 打开一本本地书（E2）：目录来自 manifest，正文来自 [LocalChapterLoader]。
+  ///
+  /// 文件可能不在（用户清了数据 / 在文件管理器里删了目录 / 换了手机）：
+  /// 此时**不**白屏，说清楚并给一条出路（从书架移除）。
+  Future<void> _openLocalBook(ShelfBook book, String id) async {
+    final local = await _local.getBook(id);
+    if (!mounted) return;
+    if (local == null || local.chapters.isEmpty) {
+      await _showLocalMissing(book);
+      return;
+    }
+    final chapters = localBookToc(local);
+    final progress = await _shelf.getProgress(book.detailUrl);
+    if (!mounted) return;
+    await Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => BookReaderPage(
+          // 本地书没有书源：不传 source（阅读页据此不建 WebView 引擎）
+          detailUrl: book.detailUrl,
+          bookName: local.name.trim().isEmpty ? book.name : local.name,
+          chapters: chapters,
+          initialIndex: progress?.chapterIndex ?? 0,
+          localBookId: id,
+          loader: LocalChapterLoader(
+            bookId: id,
+            chapters: chapters,
+            // 与 `_local` 同一实例：测试注入的库和页面读 / 删的库必须是一个
+            store: _local,
+          ),
+          shelfStore: widget.shelfStore,
+          // 页面只负责转发注入项；不传时阅读页用 `LocalBookStore.instance`
+          localStore: widget.localBookStore,
+        ),
+      ),
+    );
+    if (!mounted) return;
+    // 阅读页会写进度 → 回来刷新「读到 第 N 章」
+    await reload();
+  }
+
+  /// 本地书的正文文件不见了：给可读说明 + 一条出路。
+  Future<void> _showLocalMissing(ShelfBook book) async {
+    final remove = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('本地书籍文件已丢失'),
+        content: Text(
+          '《${book.name}》的正文不在本机了（可能被清理或换过手机）。'
+          '可以重新导入同一个文件，或先把它从书架移除。',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('知道了'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('从书架移除'),
+          ),
+        ],
+      ),
+    );
+    if (remove == true) await _removeBook(book);
+  }
+
   /// 长按移除（二次确认）：书是用户自己加的，误删就找不回来。
   Future<void> _confirmRemove(ShelfBook book) async {
+    final isLocal = isLocalBookUrl(book.detailUrl);
     final ok = await showDialog<bool>(
       context: context,
       builder: (context) => AlertDialog(
         title: const Text('从书架移除'),
-        content: Text('《${book.name}》会从书架移除，阅读进度保留。'),
+        content: Text(
+          isLocal
+              ? '《${book.name}》会从书架移除，本机上的书籍文件与章节缓存也会一起删除。'
+              : '《${book.name}》会从书架移除，阅读进度保留。',
+        ),
         actions: [
           TextButton(
             onPressed: () => Navigator.of(context).pop(false),
@@ -191,6 +325,32 @@ class ReadingPageState extends State<ReadingPage> {
       ),
     );
     if (ok != true) return;
+    await _removeBook(book);
+  }
+
+  /// 真正执行删除（长按确认后，或本地文件丢失时点「从书架移除」）。
+  ///
+  /// 本地书必须**连带清理**：正文目录（`reader/local/<id>/`）+ 章节缓存 +
+  /// 书架项。顺序上先删文件：文件删不掉时**不**动书架 —— 否则书架上那本书
+  /// 没了、几百 MB 文件还占着，用户既看不见也没法再删。
+  Future<void> _removeBook(ShelfBook book) async {
+    final localId = localBookIdFromUrl(book.detailUrl);
+    if (localId != null) {
+      final fileOk = await _local.removeBook(localId);
+      if (!mounted) return;
+      if (!fileOk) {
+        AppSnack.show(
+          context,
+          '删除失败：本机文件删不掉（存储不可用），书架上这本书没有动',
+          kind: SnackKind.error,
+        );
+        return;
+      }
+      // 缓存的删除是尽力而为：`ChapterCacheStore.removeBook` 自己吞异常，
+      // 删不掉最多多占一点空间，不该因此拦住「从书架移除」。
+      await _cache.removeBook(bookKeyFor(book.detailUrl));
+      if (!mounted) return;
+    }
     final done = await _shelf.removeBook(book.detailUrl);
     if (!mounted) return;
     if (!done) {
@@ -223,28 +383,40 @@ class ReadingPageState extends State<ReadingPage> {
           Text('阅读', style: theme.textTheme.titleSmall),
           const SizedBox(height: 2),
           Text(
-            '书源式阅读：导入书源 → 搜索找书 → 加入书架',
+            '书源式阅读：导入书源找书，或直接导入本地 TXT',
             style: theme.textTheme.bodySmall?.copyWith(
               color: theme.colorScheme.onSurfaceVariant,
             ),
           ),
           const SizedBox(height: 10),
-          Row(
+          // 用 Wrap 而不是 Row：360dp 的三星 / 红米上三个按钮一行放不下，
+          // Row + Expanded 会把文字挤成省略号或直接溢出（黄黑条）。
+          // Wrap 放不下就自动换行，窄屏最多两行。（项目里已有多处先例）
+          Wrap(
+            spacing: 8,
+            runSpacing: 8,
             children: [
-              Expanded(
-                child: OutlinedButton.icon(
-                  onPressed: _openSources,
-                  icon: const Icon(Icons.auto_stories_outlined, size: 18),
-                  label: const Text('书源管理'),
-                ),
+              OutlinedButton.icon(
+                onPressed: _openSources,
+                icon: const Icon(Icons.auto_stories_outlined, size: 18),
+                label: const Text('书源管理'),
               ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: OutlinedButton.icon(
-                  onPressed: _openSearch,
-                  icon: const Icon(Icons.search, size: 18),
-                  label: const Text('搜索'),
-                ),
+              OutlinedButton.icon(
+                onPressed: _openSearch,
+                icon: const Icon(Icons.search, size: 18),
+                label: const Text('搜索'),
+              ),
+              OutlinedButton.icon(
+                // 导入中禁用：解码一个大文件要几秒，连点会并发导入同一本书
+                onPressed: _importing ? null : _importLocalBook,
+                icon: _importing
+                    ? const SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(strokeWidth: 2),
+                      )
+                    : const Icon(Icons.file_open_outlined, size: 18),
+                label: Text(_importing ? '导入中…' : '导入本地书'),
               ),
             ],
           ),
@@ -375,11 +547,41 @@ class ReadingPageState extends State<ReadingPage> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Text(
-                    book.name,
-                    maxLines: 2,
-                    overflow: TextOverflow.ellipsis,
-                    style: theme.textTheme.titleSmall,
+                  Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Flexible(
+                        child: Text(
+                          book.name,
+                          maxLines: 2,
+                          overflow: TextOverflow.ellipsis,
+                          style: theme.textTheme.titleSmall,
+                        ),
+                      ),
+                      // 「本地」角标：本地书没有封面 / 书源，混在网络书里只看
+                      // 书名分不清（导入时文件名就是书名）。一个小标签比
+                      // 单独开一节书架更轻，也不用改列表结构。
+                      if (isLocalBookUrl(book.detailUrl)) ...[
+                        const SizedBox(width: kSpace4),
+                        Container(
+                          margin: const EdgeInsets.only(top: 2),
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: kSpace4,
+                            vertical: 1,
+                          ),
+                          decoration: BoxDecoration(
+                            border: Border.all(
+                              color: kInkGray50.withValues(alpha: .55),
+                            ),
+                            borderRadius: BorderRadius.circular(kRadiusSm),
+                          ),
+                          child: Text(
+                            '本地',
+                            style: kTypeBodyS.copyWith(color: kInkGray50),
+                          ),
+                        ),
+                      ],
+                    ],
                   ),
                   const SizedBox(height: kSpace4),
                   Text(

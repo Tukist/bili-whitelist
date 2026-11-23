@@ -4,7 +4,7 @@
 > 不是设计愿景。改完代码如果动了模块职责、红线、存储 key，**顺手改这里**
 > （这份文档随开发维护；`CHANGELOG.md` 归发布脚本，别手改）。
 >
-> 最近一次对齐：v2.70.0（2026-11-23）。
+> 最近一次对齐：v2.72.0（2026-11-23）。
 
 ---
 
@@ -38,7 +38,7 @@ bash app/tools/gate.sh --quick test/history_store_test.dart
 bash app/tools/gate.sh --quick history          # 简写：test/ 下找 *history*_test.dart
 bash app/tools/gate.sh --quick                  # 只有 analyze
 
-# 发版前全量门禁：analyze + 252 个测试文件分 6 批 + build apk --debug
+# 发版前全量门禁：analyze + 260 个测试文件分 6 批 + build apk --debug
 bash app/tools/gate.sh
 bash app/tools/gate.sh --no-build               # 不构建 APK
 
@@ -95,7 +95,7 @@ bash app/tools/release_all.sh 2.71.0 --notes C:/Users/HP/.kimi-tmp/v2710.md
 | UP 主 | `upowner_page.dart`（详情 / 合集 / 动态 / 专栏）、`followings_import_page.dart` |
 | 信箱 | `inbox_page.dart`（白名单 UP 的新视频，卡片堆 + 热度榜） |
 | 历史 / 统计 | `history_page.dart`、`daily_history_page.dart`、`watch_stats_page.dart`（**同时是个人页**：热力图 + 设置区） |
-| 阅读（书源） | `reading_page.dart`（阅读页签）、`book_search_page.dart`、`book_detail_page.dart`、`book_reader_page.dart`、`book_source_page.dart`、`book_source_picker_page.dart` |
+| 阅读（书源 / 本地书） | `reading_page.dart`（阅读页签；v2.72.0 起顶部还有「导入本地书」，本地书点进直接读）、`book_search_page.dart`、`book_detail_page.dart`（**只服务网络书**：本地书不会出现在搜索里，书架点本地书也不经详情页）、`book_reader_page.dart`（网络书与本地书共用：正文来源走 `ChapterContentLoader`；**两种翻页方式**：滚动 `SingleChildScrollView`+`SelectableText` / 左右翻页 `PageView`+`book_paginator`）、`book_source_page.dart`、`book_source_picker_page.dart` |
 | 日程 | `schedule_screen.dart`（全屏页，入口在个人 → 设置 → 日程）、`schedule_page.dart`（日程本体） |
 | 杂项 | `comment_page.dart`、`article_page.dart`、`dynamic_detail_page.dart`、`image_viewer_page.dart`、`offline_page.dart`、`update_dialog.dart`、`login_page.dart`（**红线**）、`cmcc_page.dart`（移动掌厅流量抓取） |
 
@@ -108,7 +108,7 @@ bash app/tools/release_all.sh 2.71.0 --notes C:/Users/HP/.kimi-tmp/v2710.md
 | 信箱 | `inbox_service.dart`、`inbox_heat.dart`、`inbox_handled_store.dart`、`inbox_sort_store.dart`、`inbox_card_style_store.dart` |
 | 搜索 / 推荐 | `search_history_store.dart`、`recommend_service.dart`（兴趣标签 + 推荐池 + 30 分钟 TTL） |
 | 播放辅助 | `stream_status_store.dart`、`video_shot_service.dart`（进度条预览雪碧图）、`last_episode_store.dart`、`danmaku_settings_store.dart`、`float_window_store.dart`、`keep_screen_on.dart`、`pip_service.dart`、`live_danmaku_service.dart`、`realtime_transcriber.dart`、`device_media.dart` |
-| 阅读 / 书源 | `book_source_store.dart`（上限 200 个源）、`book_source_index_service.dart`、`book_search_service.dart`、`book_detail_service.dart`、`book_content_service.dart`、`bookshelf_store.dart`、`chapter_cache_store.dart`、`file_import_service.dart` |
+| 阅读 / 书源 | `book_source_store.dart`（上限 200 个源）、`book_source_index_service.dart`、`book_search_service.dart`、`book_detail_service.dart`、`book_content_service.dart`、`bookshelf_store.dart`（书架 / 进度 / 阅读设置，`reader:*` 三个 key 都在这里）、`chapter_cache_store.dart`、`file_import_service.dart`、`book_paginator.dart`（**v2.72.0**：左右翻页的分页纯函数 `paginateText` + `pageText/pageStart/pageEnd`，不碰 Widget 树，可单测）、`chapter_content_loader.dart`（**v2.72.0**：`ChapterContentLoader.load(int)` 抽象 + `NetworkChapterLoader`，阅读页正文来源的唯一入口）、`local_chapter_loader.dart`（**v2.72.0**：`LocalChapterLoader` 读本地文件、`localBookToc` 把 manifest 拼成 `TocChapter`，不发网络）、`local_book_store.dart`（**v2.72.0**：本地 TXT 落盘 `<support>/reader/local/<id>/`，`local:<id>` 伪 URL 是全项目识别本地书的唯一键）、`local_book_import_service.dart`（**v2.72.0**：选文件 → 解码 → 切章 → 落盘 → 上书架的编排，错误文案只在这里） |
 | 存储 / 偏好 | `secure_store.dart`（flutter_secure_storage 统一封装）、`ui_prefs_store.dart`、`ui_copy_store.dart`、`theme_store.dart`、`collection_cover_store.dart`、`traffic_snapshot_store.dart`、`cmcc_session_store.dart` |
 | 基础设施 | `diag_log.dart`（环形日志落盘 + 导出）、`crash_guard.dart`、`loading_copy.dart`、`update_service.dart` + `update_storage.dart` + `apk_installer.dart`、`share_service.dart`、`xlsx_reader.dart`、`gallery_saver.dart`、`image_pick_service.dart`、`schedule_import.dart`、`traffic_stats_service.dart`、`cmcc_*.dart`（掌厅抓取：AES / 驱动 / 注入脚本 / 解析 / 轮询 / 会话） |
 
@@ -157,6 +157,18 @@ bash app/tools/release_all.sh 2.71.0 --notes C:/Users/HP/.kimi-tmp/v2710.md
 - `sync/whitelist_freshness.dart`：数据新鲜度门禁（v2.43.0）
 - `cache/download_manager.dart`：离线缓存下载 / 索引 / 占用统计；`cache/playback_progress.dart`：按 `(bvid,page)` 存播放位置
 - `utils/`：`bili_html.dart`、`import_parser.dart`（BV 号解析）、`book_source_import.dart`、`log_redact.dart`（日志脱敏）、`share_text.dart`、`relative_time.dart`、`sentence_splitter.dart`、`comment_links.dart`、`clipboard_link.dart`
+- `utils/` 里的**纯函数**（v2.72.0，本地书导入）：
+  - `text_decoding.dart`：`decodeBytes` / `decodeTextBytes` / `looksLikeGbk` / `replacementRatio`。
+    判定顺序 BOM → 无 BOM UTF-16 嗅探 → 严格 UTF-8 → GBK 码表 → 兜底
+    （UTF-8 宽松 vs GBK 取坏字符少的那个）。GBK 解码用 `Uint16List` +
+    `String.fromCharCodes`，5MB 文本不到 1 秒。
+  - `gbk_table.dart`：**生成物，勿手改**（`app/tools/gen_gbk_table.py` 生成，
+    `python tools/gen_gbk_table.py --check` 可校验是否最新）。24066 = 126×191 项，
+    索引 `(lead-0x81)*191 + (trail-0x40)`，未映射位置是 U+FFFD。
+  - `txt_chapter_splitter.dart`：`splitTxtChapters` / `isChapterTitleLine`。
+    逐行认「第X章/回/节/卷/集」「楔子/序章/…/番外」「Chapter N」「CHAPTER 罗马数字」
+    （行首允许空白，行 ≤ 40 字）；一个标题都没有时按 3000 字分块（「第 N 节」）；
+    返回的偏移**连续覆盖全文、没有空段**，超过 5000 章就合并相邻章。
 
 ### 3.9 原生（Android）
 
@@ -169,7 +181,7 @@ bash app/tools/release_all.sh 2.71.0 --notes C:/Users/HP/.kimi-tmp/v2710.md
 | `MainActivity.kt` | `configureFlutterEngine` 里逐个注册下面的插件；PIP 的 `onPictureInPictureModeChanged` 必须在这里接 |
 | `BiliDashPlayerPlugin.kt` / `DashExoPlayer.kt` / `MediaController.kt` / `DashMediaNotification.kt` | DASH 双流（video/audio 各一条 m4s）播放、倍速/字幕轨、音量与亮度、媒体通知卡片 |
 | `ApkInstaller.kt` | 应用内更新：触发系统 APK 安装 |
-| `GalleryController.kt` / `ImagePickPlugin.kt` / `FilePickerPlugin.kt` / `ScheduleImportPlugin.kt` | 系统相册保存、相册选图、SAF 选文本文件（v2.70 书源导入）、SAF 选 Excel |
+| `GalleryController.kt` / `ImagePickPlugin.kt` / `FilePickerPlugin.kt` / `ScheduleImportPlugin.kt` | 系统相册保存、相册选图、SAF 选文件（`pickTextFile` 读成 UTF-8 字符串回传，8MB，v2.70 书源导入；`pickBookFile` **流式拷到 `<filesDir>/reader/incoming/` 只回路径**，100MB，v2.72 本地书导入，requestCode 9050/9051）、SAF 选 Excel |
 | `TrafficStatsPlugin.kt` | `NetworkStatsManager` 移动数据统计 + 使用情况访问引导 |
 | `KeepScreenOnPlugin.kt` | `FLAG_KEEP_SCREEN_ON`（不用 WakeLock） |
 | `SharePlugin.kt` | 系统分享面板（文本 + 文件） |
@@ -224,8 +236,8 @@ bash app/tools/release_all.sh 2.71.0 --notes C:/Users/HP/.kimi-tmp/v2710.md
 | `reader:sources` | 书源列表（单 key 整份 JSON，**不进 Gist**） | 上限 200 个源 |
 | `reader:index_urls` | 索引下载地址（每行一个 .json） | — |
 | `reader:books` | 书架 | `maxBooks = 500` |
-| `reader:progress` | 阅读进度 | `maxProgress = 100` |
-| `reader:settings` | 阅读设置（字号 / 行高 / 底色） | — |
+| `reader:progress` | 阅读进度（`chapterIndex` / `chapterName` / `chapterUrl` / `scrollOffset`（滚动模式）/ `pageIndex`（分页模式，v2.72.0）/ `updatedAt`） | `maxProgress = 100` |
+| `reader:settings` | 阅读设置：`fontSize`（12–32，默认 18）/ `lineHeight`（1.2–2.6，默认 1.8）/ `theme`（`auto`/`paper`/`dark`，默认 `auto`）/ `pageMode`（`scroll` 默认 / `paged`，v2.72.0；非法值与缺失一律回落 `scroll`） | — |
 | `schedule:data_v1` | 日程整表 | — |
 | `ui:theme_id` / `ui:theme_mode` | 配色配方 id / 明暗模式 | 只存 id，色值在 `ink_recipes.dart` |
 | `ui:inbox_card_style_id` / `ui:inbox_sort_mode` | 信箱卡片样式 / 排序偏好 | 只存 id |
@@ -249,6 +261,36 @@ bash app/tools/release_all.sh 2.71.0 --notes C:/Users/HP/.kimi-tmp/v2710.md
 本地文件 / 其他：离线缓存走 `path_provider`（`DownloadManager`），诊断日志 `logs/diag-YYYYMMDD.log`
 （512KB × 4 轮转，目录上限 5MB），章节正文缓存、合集自定义封面等也在应用支持目录。
 
+**本地书（v2.72.0 导入与阅读）**：`<ApplicationSupport>/reader/local/<bookId>/book.txt` +
+`manifest.json`（`{id, name, author, format, encoding, chapters:[{title,start,end}], sizeBytes, importedAt}`）。
+- 正文只存**一份**，章节只存字符偏移；`bookId` = 文件名 + 内容长度 + 头/中/尾采样指纹的
+  64 位哈希（16 位十六进制），**不含导入时间** → 同一份内容重复导入是覆盖，不是多一本。
+- 书架里的本地书用伪 URL **`local:<bookId>`** 当唯一键（`normalizeUrl` 不动非 http(s)
+  地址，所以它原样进 `reader:books`）。全项目靠 `isLocalBookUrl()` / `localBookIdFromUrl()`
+  区分本地书与网络书；**改前缀等于让用户已导入的书全部从书架消失**。
+- 原生选文件的临时副本在 `<filesDir>/reader/incoming/<uuid>.<ext>`，Dart 读完即删，
+  超过 24 小时的残留会在下次选书时清掉。
+- **阅读链路（E2，v2.72.0）**：`book_reader_page.dart` 里抽了 `ChapterContentLoader`
+  （`services/chapter_content_loader.dart`）——`load(int chapterIndex)` 一个方法：
+  - `NetworkChapterLoader`：原样包 `BookContentService.loadContent`（含离线缓存），
+    行为与改动前一致；不传 loader 时阅读页自己构造它，**既有调用点一个字都不用改**。
+  - `LocalChapterLoader`（`services/local_chapter_loader.dart`）：读
+    `LocalBookStore.readChapter(id, index)`，章名取 manifest，`pageCount: 1`、
+    `partial: false`、`warning: null`，**不发网络请求**；越界 / 文件缺失折成
+    `RuleEngineException`（「不在目录里」/「本地书籍文件已丢失」）。
+  - 阅读页新增可选参数 `localBookId` / `loader` / `localStore`，`source` 改为可空
+    （本地书没有书源）。本地书模式：不建 WebView 引擎、不查 `ChapterCacheStore`、
+    不显示缓存入口，其余（目录 / 进度 / 翻页方式 / 字号 / 主题）与网络书完全一致。
+- **书架分流**：`reading_page._openBook` 先看 `localBookIdFromUrl`，为真走
+  `_openLocalBook`：`getBook(id)` 取 manifest → `localBookToc(book)` 拼 `TocChapter`
+  （`url = local:<id>#<index>`，不用于请求）→ push 阅读页（带 `initialIndex` =
+  `reader:progress` 的 `chapterIndex`，页内位置由阅读页按 offset / pageIndex 还原）。
+  `getBook` 为空时弹「本地书籍文件已丢失」+「从书架移除」，不白屏。
+- **删除连带清理**：长按书架行 → 二次确认（本地书文案明确「文件与章节缓存一起删」）→
+  `LocalBookStore.removeBook(id)` → `ChapterCacheStore.removeBook(bookKeyFor(detailUrl))`
+  → `BookshelfStore.removeBook`。**先删文件**：文件删不掉就不动书架并提示，避免
+  「书不见了、几百 MB 还占着」。书架行有「本地」角标。
+
 ---
 
 ## 6. 已知坑（踩过的，别再踩）
@@ -259,7 +301,8 @@ bash app/tools/release_all.sh 2.71.0 --notes C:/Users/HP/.kimi-tmp/v2710.md
 2. **`flutter test` 宿主没有 `path_provider` 实现，通道会永不返回**。
    任何碰 `getApplicationSupportDirectory()` 的代码必须有超时或测试早退
    （范例：`diag_log.dart` 的 2s `.timeout(...)`、`chapter_cache_store.dart` 的 `rootTimeout`
-   与 `rootDirOverride`）。写新的落盘逻辑时先想「测试环境怎么走」。
+   与 `rootDirOverride`、v2.72.0 的 `local_book_store.dart`（同款 `rootTimeout` +
+   `isTestHost` 早退 + `rootDirOverride`））。写新的落盘逻辑时先想「测试环境怎么走」。
 3. **推荐页 TTL 30 分钟内直接返回内存结果**，所以「刚看完的视频要等 TTL 过期才消失」，
    这是设计行为。`force`（下拉刷新 / 换一批）才绕过。
 4. **书源规则引擎一个实例一个 WebView 页面，求值必须串行**。宿主用
@@ -274,19 +317,43 @@ bash app/tools/release_all.sh 2.71.0 --notes C:/Users/HP/.kimi-tmp/v2710.md
    `MotionControl.enabled = true`，用完 `reset()`；否则 `pumpAndSettle` 超时。
 8. **不要用 `adb shell input` 做不可逆操作**（滑删 / 拖拽），坐标会随列表滚动漂移。
    模拟器上覆盖安装用 `adb install -r`，绝不 `uninstall`——登录态在 secure storage 里。
+9. **分页（`book_paginator.dart`）的四条红线**（v2.72.0，踩过就整页错位）：
+   - **测量用的 style 必须和 `Text` 真实渲染的 style 逐字段一致**，这是本批最贵的坑：
+     `Text` 默认会把 `DefaultTextStyle`（主题 bodyMedium）合并进来，带上
+     `letterSpacing: 0.3` / `fontFamily: Roboto` / `leadingDistribution: even`。
+     只拿「字号 + 行高」的裸 `TextStyle` 去 `TextPainter` 量，字宽/行高都对不上，
+     实机表现是**页尾多折一行、被裁掉半行字**（字宽偏窄）或**一页只塞 14 行、
+     底下留一大片空白**（行高偏大）。做法：`book_reader_page` 里用
+     `TextStyle(inherit: false, fontSize, height, color, letterSpacing: base.letterSpacing,
+     wordSpacing: base.wordSpacing)` 把样式写全，**字体留空**（显式写 `Roboto`
+     在某些 ROM 上会落到另一套字体，行高字宽全变），同一个 style 对象同时喂
+     `paginateText` 和 `Text`。
+   - `TextScaler` 也要同口径（`MediaQuery.textScalerOf(context)`）；系统字号放到 1.3×
+     而测量按 1.0 算，同样会溢出一行。
+   - 宽 / 高 ≤ 0、或可用高度不足一行时**必须**整章一页：二分里没有「一个字符都
+     放不下」的解，不兜底就是死循环（真机上出现在旋转中途、可用高被算成 0 的那一帧）。
+   - `PageView` 的 item 下标**不是**页号：前后各有一张「哨兵页」（滑过去 = 切章），
+     `PageController(initialPage:)` 要传 `页号 + lead`，否则进章先停在哨兵上。
+   - 分页模式的页面几何**固定**（不随控制层显隐内缩），因为高度变一点就要重新分页，
+     用户点一下屏幕就会看到文字换页。
+10. **widget 测试里不要 `await` 真文件 IO**（v2.72.0 踩到并挂死）。
+    `testWidgets` 跑在 FakeAsync 区里，dart:io 的 Future 不会自己推进，`await` 会一直挂着
+    （表现是整个测试进程不出结果）。凡是页面里会碰 `LocalBookStore` / `ChapterCacheStore`
+    的用例，要么注入**内存假库**（`test/reading_page_local_import_test.dart` 的
+    `_FakeLocalStore`），要么把「真目录删没删」这类断言放进纯 `test()` 里用真 store 跑。
 
 ---
 
 ## 7. 测试与门禁
 
-- 测试目录：`app/test/`，共 252 个 `*_test.dart`；`test/live_danmaku_fakes.dart` 是辅助文件
+- 测试目录：`app/test/`，共 260 个 `*_test.dart`；`test/live_danmaku_fakes.dart` 是辅助文件
   （没有 `main()`），门禁会自动跳过。
-- 当前基线：**252 个文件、6 批、通过用例数见下**（v2.70.0 实跑）：
+- 当前基线：**260 个文件、6 批、通过用例数见下**（v2.72.0 实跑）：
 
 | 项 | 结果 |
 |----|------|
-| `flutter analyze` | 0 issue（约 30s） |
-| `flutter test` 分批 | 6 批全部通过，合计 **3816** 个用例 |
+| `flutter analyze` | 0 issue（约 20s） |
+| `flutter test` 分批 | 6 批全部通过，合计 **3938** 个用例 |
 | `flutter build apk --debug` | 通过 |
 
 - 分层策略：
@@ -299,10 +366,12 @@ bash app/tools/release_all.sh 2.71.0 --notes C:/Users/HP/.kimi-tmp/v2710.md
 
 ---
 
-## 8. 版本变更记录（最近 4 个版本）
+## 8. 版本变更记录（最近 6 个版本）
 
 | 版本 | 主题 | 关键文件 |
 |------|------|----------|
+| v2.72.0 | 一次发版覆盖三批：左右翻页 + 本地 TXT 导入 + 本地书阅读与删除。① **左右翻页**：`reader:settings` 加 `pageMode`（`scroll` 默认 / `paged`），正文按可用宽高用 `TextPainter` 二分切页、`PageView` 承载，前后哨兵页实现「末页再滑 = 下一章 / 首页前滑 = 上一章」，页码 `3 / 12`；分页模式不可选中（横滑与选字抢手势，取舍写进注释）；`ReadingProgress.pageIndex` 存页内位置，字号变化按比例落回相近页；顶栏加「翻页方式」切换并落盘。② **本地 TXT 导入**：纯 Dart GBK 解码（码表由 Python 生成）+ 自动编码判定（BOM / UTF-16 嗅探 / 严格 UTF-8 / GBK）、中文网文章节切分（第X章·回·节·卷·集 / 楔子番外 / Chapter N；无标题按 3000 字分「第 N 节」）、本地书落盘 `reader/local/<id>/`（正文一份 + 章节偏移）+ 书架伪 URL `local:<id>`、原生 `pickBookFile`（流式拷到私有目录，100MB，requestCode 9051）、阅读页「导入本地书」（Wrap 防溢出、导入中禁用）。③ **本地书阅读与删除**：阅读页抽 `ChapterContentLoader`（网络 / 本地两种实现），本地书与网络书共用同一页（不建 WebView 引擎、不查章节缓存、不请求网络、不显示缓存入口），`source` 改为可空但既有调用点零改动；书架点本地书按 `getBook(id).chapters` 拼目录直接进阅读页并按 `reader:progress` 续读，文件丢失弹「本地书籍文件已丢失」+「从书架移除」；长按删除连带清 `reader/local/<id>/` + 章节缓存 + 书架项（先删文件，删不掉不动书架）；书架行加「本地」角标 | `services/book_paginator`（新）、`services/chapter_content_loader`（新）、`services/local_chapter_loader`（新）、`services/local_book_store`（新）、`services/local_book_import_service`（新）、`utils/text_decoding`（新）、`utils/gbk_table`（生成物）、`utils/txt_chapter_splitter`（新）、`app/tools/gen_gbk_table.py`（新）、`book_reader_page`、`reading_page`、`bookshelf_store`、`FilePickerPlugin.kt`、`test/book_paginator_test`（新）、`test/local_chapter_loader_test`（新）、`test/book_reader_page_local_test`（新）、`test/reading_page_local_import_test`（新）、`test/book_reader_page_test`、`test/bookshelf_store_test` |
+| v2.71.0 | 离线缓存（章节级 / 原子写 / 双校验）+ 阅读进度条 + 4 处实机修复；首版工程文档与本机门禁脚本 | `book_content_service`、`chapter_cache_store`、`book_reader_page`、`app/tools/gate.sh`、`AGENTS.md`、`docs/DEV_CONTEXT.md` |
 | v2.70.0 | 阅读模块收尾：底栏 edge-to-edge 修复（`viewPadding` 内缩，不是只包 SafeArea）；书源从本地文件导入（SAF，8MB 上限，BOM 处理）；书源索引下载 + 选择页（2486 个去重源，上限 200，标出 `@js` 不支持）；书源名清洗；「清空书源」 | `reading_page` / `book_detail_page` / `book_search_page` / `book_source_page` / `book_source_picker_page`、`file_import_service`、`book_source_index_service`、`FilePickerPlugin.kt` |
 | v2.69.0 | 底栏「日程」换成「阅读」（书源驱动阅读器）；多源搜索（并发 4、单源 20s）、分组/合并视图；详情目录、正文阅读、书架；规则四段 + 选择器语法；示例书源；修 `runJavaScriptReturningResult` 多层剥壳 | `models/book_source`、`services/book_rule/*`、`book_*_service`、`book_*_page`、`bookshelf_store`、`chapter_cache_store`、`playlist_page`（页签下标） |
 | v2.68.0 | 底栏「UP 主」换成「推荐」：从最近 20 个看过的视频拉标签，14 天半衰 × 完播率打分，取前 5 标签；热力球（黄金角螺旋）；交叉区；推荐池 60 条，已看剔除；30 分钟 TTL；UP 主管理迁到个人 → 设置 | `recommend_service`、`recommend_page`、`playlist_page`、`watch_stats_page` |

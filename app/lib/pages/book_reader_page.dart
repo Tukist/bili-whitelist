@@ -1,25 +1,44 @@
 /// 正文阅读页（R3 新增）：全屏、点屏幕中央呼出/隐藏控制层。
 ///
-/// ## 为什么正文用 `SelectableText` + `SingleChildScrollView`
+/// 两种翻页方式（v2.72.0 起，`reader:settings` 的 `pageMode`）：
+/// - `scroll`（默认，上下滚动）：正文是一个连续文本块；
+/// - `paged`（左右翻页）：正文按可用高度切页，`PageView` 承载。
+///
+/// ## 滚动模式：`SelectableText` + `SingleChildScrollView`
 /// - `SelectableText`：长按可选中、可复制（阅读器最基本的诉求）；
 /// - `SingleChildScrollView`：整章是一个连续文本块，不需要懒加载（一章几万字
 ///   对 Flutter 的文本排版毫无压力），换来「选中文本可跨段拖动」。
 ///
-/// ## 「点正文呼出控制层」为什么要两条路
+/// ## 分页模式：`Text` + `PageView`（**故意不可选中**）
+/// 横滑翻页和「长按选字后拖动手柄」抢的是同一套水平拖拽手势：分页模式下
+/// 保留选中，用户拖右边手柄扩选，`PageView` 会同时把页面翻走，看起来像
+/// 「选中范围乱跳」。取舍：**分页模式用不可选中的 `Text`，长按无反应；
+/// 要复制就切回滚动模式**。所以分页正文的点击由每页自己的 `GestureDetector`
+/// 接（`Text` 没有选择识别器，`onTap` 必定触发）。
+///
+/// ## 「点正文呼出控制层」为什么要两条路（滚动模式）
 /// 外层 `GestureDetector.onTap` 只兜得住「点在空白 / 行尾」——点在字形上时
 /// 手势竞技场里 `SelectableText` 的选择识别器先赢，外层根本收不到点击。
 /// 所以正文的 `SelectableText` 自己挂了 `onTap: _toggleControls`（Flutter 给
 /// 它留的官方钩子，在 `onSingleTapUp` 里回调）；长按选中走的是另一条识别器，
-/// 不冲突。**不要**为了省事把正文换成不可选中的 `Text`。
+/// 不冲突。**不要**为了省事把滚动模式的正文换成不可选中的 `Text`。
 ///
-/// ## 为什么不支持左右滑动切换章节
-/// 横滑手势会和「长按选中文本后拖动选择区」冲突（拖动选择手柄时页面跟着
-/// 翻章，用户会以为选中范围乱了）。所以本页**不做**横滑翻章，只给按钮。
+/// ## 分页模式的页面几何为什么**不随控制层显隐变化**
+/// 页面高度只要变一点，分页结果就得重算，用户点一下屏幕（呼出控制条）就会
+/// 看到「同一段文字跑到上一页去了」。所以分页模式下不给正文做随控制层的
+/// 内缩动画，而是**固定**预留顶栏 / 底栏两条带（[_kPagedTopInset] /
+/// [_kPagedBottomInset]）；控制层收起时多出来的是页边距，不是另一套分页。
 ///
-/// ## 进度保存的三个时机
-/// 离开页面（dispose）、切章（`_goTo`）、滚动停止 1.5 秒（debuonce）。
-/// 存的是 `ScrollController.offset`；重进时按它还原并**夹取**到当前内容高度
-/// —— 换字号 / 换设备后内容高度会变，直接 `jumpTo` 旧 offset 可能越界。
+/// ## 进度保存
+/// 三个时机：离开页面（dispose）、切章（`_goTo`）、停止翻页 / 滚动 1.5 秒
+/// （debounce）。滚动模式存 `ScrollController.offset`（重进时夹取到当前
+/// 内容高度 —— 换字号 / 换设备后内容会变高变矮）；分页模式存页号
+/// `ReadingProgress.pageIndex`，并按「占全文比例」在字号变化后回到相近位置。
+///
+/// ## 本地书（E2，v2.74.0）
+/// 本地 TXT 与网络书**共用这一个页面**，差别只有正文来源（[ChapterContentLoader]）
+/// 与「没有书源」：本地书不建 WebView 引擎、不查章节缓存、不显示缓存入口，
+/// 其余（目录、进度、翻页方式、字号、主题）与网络书完全一致。别复制页面。
 library;
 
 import 'dart:async';
@@ -29,10 +48,14 @@ import 'package:flutter/material.dart';
 import '../models/book_source.dart';
 import '../services/book_content_service.dart';
 import '../services/book_detail_service.dart';
+import '../services/book_paginator.dart';
 import '../services/book_rule/engine_holder.dart';
 import '../services/book_rule/rule_engine.dart';
 import '../services/bookshelf_store.dart';
 import '../services/chapter_cache_store.dart';
+import '../services/chapter_content_loader.dart';
+import '../services/local_book_store.dart';
+import '../services/local_chapter_loader.dart';
 import '../theme/app_palette.dart';
 import '../theme/app_tokens.dart';
 import '../widgets/app_snack.dart';
@@ -44,8 +67,26 @@ import '../widgets/app_state_view.dart';
 /// 光断言语义标签或 `widthFactor` 都抓不到，必须能量到一个真实尺寸的盒子。
 const Key kReaderProgressFillKey = ValueKey<String>('reader-progress-fill');
 
+/// 分页模式下正文上方固定留白（顶栏高度 + 一点呼吸）。
+///
+/// 52 = 顶栏自身「viewPadding.top + kSpace4 + IconButton(48)」里除状态栏
+/// 之外的部分，与 [_contentArea] 滚动模式用的数字一致，两种模式切换时
+/// 第一行文字的位置不会跳。
+const double _kPagedTopInset = 52.0;
+
+/// 分页模式下正文下方固定留白：底部控制条（进度线 2 + 两行按钮 ≈ 118）
+/// 再留一点，保证页码行不会被控制条压住。
+///
+/// 这个数是**估**的（控制条高度随文字缩放变），和滚动模式用 96 是同一个
+/// 取舍：宁可多留一点空白，也不要页码被盖住。控制条收起时它就是页边距。
+const double _kPagedBottomInset = 124.0;
+
+/// 页码行（「3 / 12」）占的高度。分页时要从可用高度里扣掉它。
+const double _kPageNumberHeight = 22.0;
+
 class BookReaderPage extends StatefulWidget {
-  final BookSource source;
+  /// 网络书源。**本地书为 null**（见 [localBookId]）。
+  final BookSource? source;
 
   /// 详情页地址（进度 / 书架的键）。
   final String detailUrl;
@@ -59,6 +100,19 @@ class BookReaderPage extends StatefulWidget {
 
   /// 起始章下标（越界会夹取）。
   final int initialIndex;
+
+  /// 本地书 id（`local:<id>` 里冒号后面那段）。非空 = 本地书模式：
+  /// 不建 WebView 引擎、不查离线缓存、不请求网络。
+  ///
+  /// 只传它也能读（页面自己造 `LocalChapterLoader`），但书架那边是
+  /// [localBookId] + [loader] 一起传（loader 带着目录，省一次 manifest 读）。
+  final String? localBookId;
+
+  /// 正文加载器（本地书 / 测试注入）。不传则按 [source] 走网络书源。
+  final ChapterContentLoader? loader;
+
+  /// 测试注入：本地书存储（默认 `LocalBookStore.instance`）。
+  final LocalBookStore? localStore;
 
   final RuleEngineHolder? holder;
 
@@ -76,11 +130,14 @@ class BookReaderPage extends StatefulWidget {
 
   const BookReaderPage({
     super.key,
-    required this.source,
+    this.source,
     required this.detailUrl,
     required this.bookName,
     this.chapters = const [],
     this.initialIndex = 0,
+    this.localBookId,
+    this.loader,
+    this.localStore,
     this.holder,
     this.contentService,
     this.detailService,
@@ -128,9 +185,77 @@ class _BookReaderPageState extends State<BookReaderPage> {
   /// 回 [CacheStats.empty]，这里不需要再兜一层 try。
   CacheStats _cacheStats = CacheStats.empty;
 
+  // ==================== 分页模式 ====================
+
+  /// 当前章的分页结果缓存：`章|字号|行高|宽|高|全文指纹 → 每页起点`。
+  ///
+  /// 为什么要缓存：`LayoutBuilder` 每帧都会重建，分页是几十次 `TextPainter`
+  /// 布局，算一遍要几十毫秒；字号 / 宽度没变时必须直接命中，否则翻页会掉帧。
+  /// 键里带上宽高，**尺寸一变（旋转 / 字号 / 行高）自然落空重算**，不需要手动清。
+  final Map<String, List<int>> _pageCache = <String, List<int>>{};
+
+  /// 分页结果缓存最多留几章（翻回去时还能命中；再多就没意义了）。
+  static const int _maxPageCache = 12;
+
+  PageController? _pageController;
+
+  /// 当前 [_pageController] 是按哪一章、多少页创建的。
+  ///
+  /// 章节或页数一变就必须换一个新控制器（`initialPage` 只在创建时生效），
+  /// 否则切章后会停在上一章留下的页号上。
+  int _pageControllerChapter = -1;
+  int _pageControllerCount = -1;
+
+  /// 当前停在第几页（0 起）。分页模式专用于页码显示与进度落盘。
+  int _currentPage = 0;
+
+  /// 「下一次分页完成后落到第几页」（恢复进度 / 跨章翻页用）。
+  int? _pendingPage;
+
+  /// 「下一次分页完成后落到最后一页」（往前翻到上一章时用）。
+  bool _wantsLastPage = false;
+
+  /// 「下一次分页完成后按比例落页」（字号 / 行高变化时用来保住位置）。
+  double? _pendingPageRatio;
+
   RuleEngineHolder get _holder => widget.holder ?? RuleEngineHolder.instance;
   BookshelfStore get _store => widget.shelfStore ?? BookshelfStore.instance;
   ChapterCacheStore get _cache => widget.cacheStore ?? ChapterCacheStore.instance;
+
+  /// 本地书模式：没有书源、没有缓存、也不该建 WebView 引擎。
+  bool get _isLocal => widget.localBookId != null;
+
+  /// 网络书源。本地书模式下被访问说明调用方漏了分流（本地书的所有路径都
+  /// 不碰它）；抛 StateError 比把 null 传进网络层更容易定位。
+  BookSource get _source {
+    final source = widget.source;
+    if (source == null) {
+      throw StateError('网络书必须传 source（本地书请传 localBookId / loader）');
+    }
+    return source;
+  }
+
+  /// 正文来源：注入的 loader 优先；本地书自造 [LocalChapterLoader]；
+  /// 其余走网络（构造时把当前目录一起带上，见 `NetworkChapterLoader`）。
+  ChapterContentLoader get _loader {
+    final custom = widget.loader;
+    if (custom != null) return custom;
+    final localId = widget.localBookId;
+    if (localId != null) {
+      return LocalChapterLoader(
+        bookId: localId,
+        chapters: _chapters,
+        store: widget.localStore,
+      );
+    }
+    return NetworkChapterLoader(
+      service: _service,
+      source: _source,
+      chapters: _chapters,
+      cache: _cache,
+      bookKey: _bookKey,
+    );
+  }
 
   /// 这本书在缓存里的唯一键（与书架同一套归一化规则）。
   String get _bookKey => bookKeyFor(widget.detailUrl);
@@ -159,8 +284,11 @@ class _BookReaderPageState extends State<BookReaderPage> {
     _saveTimer?.cancel();
     // 离开页面必须存一次（滚动停止的保存可能还没触发）
     unawaited(_saveProgress());
-    _holder.reset();
+    // 本地书没建过引擎，别去碰单例（测试宿主上访问 engine 会构造 WebView）
+    if (!_isLocal) _holder.reset();
     _scroll.dispose();
+    _pageController?.dispose();
+    _pageController = null;
     _readingProgress.dispose();
     super.dispose();
   }
@@ -179,6 +307,15 @@ class _BookReaderPageState extends State<BookReaderPage> {
 
     // 从书架进来：只有进度、没有目录 → 先补目录
     if (_chapters.isEmpty) {
+      if (_isLocal) {
+        // 本地书的目录随书一起落盘（manifest），拿不到就说明书没了：
+        // 去补目录（网络）没有意义，直接给可读错误。
+        setState(() {
+          _error = '本地书的章节信息不见了，可以在书架里删掉后重新导入';
+          _loading = false;
+        });
+        return;
+      }
       await _bootstrapFromShelf();
       return;
     }
@@ -186,10 +323,15 @@ class _BookReaderPageState extends State<BookReaderPage> {
     final progress = await _store.getProgress(widget.detailUrl);
     if (!mounted) return;
     // 只有进度章与当前章一致时才还原页内位置，否则从章首开始
-    final restore = progress != null && progress.chapterIndex == _index
-        ? progress.scrollOffset
-        : null;
-    await _load(_index, restoreOffset: restore);
+    final sameChapter = progress != null && progress.chapterIndex == _index;
+    await _load(
+      _index,
+      // 恢复口径按**当前翻页方式**选：滚动模式认 offset，分页模式认页号。
+      // 另一种模式留下的那个字段就当作 0（旧数据没有 pageIndex 也是 0）。
+      restoreOffset:
+          sameChapter && !_settings.isPaged ? progress.scrollOffset : null,
+      restorePage: sameChapter && _settings.isPaged ? progress.pageIndex : null,
+    );
   }
 
   Future<void> _bootstrapFromShelf() async {
@@ -199,7 +341,7 @@ class _BookReaderPageState extends State<BookReaderPage> {
     });
     try {
       final result = await _detail.loadDetail(
-        source: widget.source,
+        source: _source,
         detailUrl: widget.detailUrl,
       );
       final progress = await _store.getProgress(widget.detailUrl);
@@ -219,10 +361,16 @@ class _BookReaderPageState extends State<BookReaderPage> {
       });
       await _load(
         target,
-        restoreOffset:
-            progress != null && progress.chapterIndex == target
-                ? progress.scrollOffset
-                : null,
+        restoreOffset: progress != null &&
+                progress.chapterIndex == target &&
+                !_settings.isPaged
+            ? progress.scrollOffset
+            : null,
+        restorePage: progress != null &&
+                progress.chapterIndex == target &&
+                _settings.isPaged
+            ? progress.pageIndex
+            : null,
       );
     } catch (e) {
       if (!mounted) return;
@@ -240,23 +388,28 @@ class _BookReaderPageState extends State<BookReaderPage> {
 
   // ==================== 正文 ====================
 
-  Future<void> _load(int index, {double? restoreOffset}) async {
+  Future<void> _load(
+    int index, {
+    double? restoreOffset,
+    int? restorePage,
+    bool toLastPage = false,
+  }) async {
     if (_chapters.isEmpty) return;
-    final chapter = _chapters[_clampIndex(index)];
     final token = ++_loadToken;
+    // 分页要等布局出来才知道总页数，所以这里只登记「落哪一页」的意图，
+    // 真正创建 PageController 是在 [_ensurePageController] 里消费它。
+    _pendingPage = restorePage ?? 0;
+    _wantsLastPage = toLastPage;
+    _pendingPageRatio = null;
     setState(() {
       _loading = true;
       _error = null;
       _content = null;
     });
     try {
-      final result = await _service.loadContent(
-        source: widget.source,
-        chapter: chapter,
-        cache: _cache,
-        bookKey: _bookKey,
-        chapterIndex: _clampIndex(index),
-      );
+      // 正文来源统一走 loader：网络书是 `NetworkChapterLoader`（行为与之前
+      // 一字不差），本地书是 `LocalChapterLoader`（只读本机文件）。
+      final result = await _loader.load(_clampIndex(index));
       if (!mounted || token != _loadToken) return;
       setState(() {
         _content = result;
@@ -265,13 +418,14 @@ class _BookReaderPageState extends State<BookReaderPage> {
       // 内容布局完成后再还原位置（此时 maxScrollExtent 才是最终的）
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (!mounted || token != _loadToken) return;
-        _applyOffset(restoreOffset ?? 0);
+        if (!_settings.isPaged) _applyOffset(restoreOffset ?? 0);
         _updateProgress();
         unawaited(_saveProgress());
       });
       // 顺手刷一次缓存统计：章节可能是刚写进缓存的（正文服务命中缓存后
       // 回填），也可能用户在别的页面清过，每次进章都重新问一遍最省心。
-      unawaited(_refreshCacheStats());
+      // 本地书没有「缓存」这回事（正文就在本机），跳过这次 IO。
+      if (!_isLocal) unawaited(_refreshCacheStats());
     } catch (e) {
       if (!mounted || token != _loadToken) return;
       setState(() {
@@ -314,8 +468,14 @@ class _BookReaderPageState extends State<BookReaderPage> {
   ///
   /// `maxScrollExtent <= 0`（内容不满一屏 / 还没布局）时章内比例记 0 —— 除以 0
   /// 会得到 NaN，`LinearProgress` 类的组件拿到 NaN 会直接画崩。
+  ///
+  /// 分页模式没有滚动位置，章内比例由页号算（见 [_updatePageProgress]）。
   void _updateProgress() {
     if (!mounted) return;
+    if (_settings.isPaged) {
+      _updatePageProgress(_pageControllerCount);
+      return;
+    }
     final offset = _scroll.hasClients ? _scroll.offset : 0.0;
     final max = _scroll.hasClients ? _scroll.position.maxScrollExtent : 0.0;
     _readingProgress.value = computeReadingProgress(
@@ -326,10 +486,25 @@ class _BookReaderPageState extends State<BookReaderPage> {
     );
   }
 
+  /// 分页模式下的进度条：章内比例 = 页号 / (总页数 - 1)。
+  ///
+  /// 单页章（总页数 1）时分母为 0 —— 直接调 [computeReadingProgress] 传 0 会让
+  /// 它走「maxScrollExtent <= 0」分支记 0，正好是想要的结果。
+  void _updatePageProgress(int totalPages) {
+    if (!mounted || totalPages <= 0) return;
+    _readingProgress.value = computeReadingProgress(
+      _clampIndex(_index),
+      _chapters.length,
+      _currentPage.toDouble(),
+      (totalPages - 1).toDouble(),
+    );
+  }
+
   Future<void> _saveProgress() async {
     if (_chapters.isEmpty) return;
     final index = _clampIndex(_index);
     final chapter = _chapters[index];
+    final paged = _settings.isPaged;
     final offset = _scroll.hasClients ? _scroll.offset : 0.0;
     await _store.saveProgress(
       widget.detailUrl,
@@ -337,7 +512,10 @@ class _BookReaderPageState extends State<BookReaderPage> {
         chapterIndex: index,
         chapterName: chapter.name,
         chapterUrl: chapter.url,
-        scrollOffset: offset.isFinite && offset > 0 ? offset : 0,
+        // 两种模式各存各的：分页模式没有滚动位置，滚动模式不认页号。
+        // 旧字段语义不放宽，只是因为「另一种模式的那个字段」本来就该是 0。
+        scrollOffset: !paged && offset.isFinite && offset > 0 ? offset : 0,
+        pageIndex: paged ? _currentPage : 0,
         updatedAt: DateTime.now().millisecondsSinceEpoch,
       ),
     );
@@ -345,14 +523,14 @@ class _BookReaderPageState extends State<BookReaderPage> {
 
   // ==================== 章节切换 / 设置 ====================
 
-  Future<void> _goTo(int index) async {
+  Future<void> _goTo(int index, {bool toLastPage = false}) async {
     if (index < 0 || index >= _chapters.length || index == _index) return;
-    // 先存旧章的页内位置，再切（切完 offset 会重置为 0）
+    // 先存旧章的页内位置，再切（切完 offset / 页号都会重置）
     await _saveProgress();
     if (!mounted) return;
     setState(() => _index = index);
     _updateProgress();
-    await _load(index);
+    await _load(index, toLastPage: toLastPage);
     if (!mounted) return;
     setState(() => _controlsVisible = true);
   }
@@ -360,6 +538,13 @@ class _BookReaderPageState extends State<BookReaderPage> {
   Future<void> _changeFont(double delta) async {
     final size = (_settings.fontSize + delta).clamp(12.0, 32.0);
     if (size == _settings.fontSize) return;
+    // 分页模式：字号一变，分页结果必然重算，页号会漂。按「当前页占全文比例」
+    // 记下位置，重新分页后落回相近的那一页，而不是粗暴跳回第 1 页。
+    if (_settings.isPaged && _pageControllerCount > 0) {
+      _pendingPageRatio = _pageControllerCount > 1
+          ? (_currentPage / (_pageControllerCount - 1)).clamp(0.0, 1.0)
+          : 0.0;
+    }
     final next = _settings.copyWith(fontSize: size);
     setState(() => _settings = next);
     await _store.saveSettings(next);
@@ -374,6 +559,48 @@ class _BookReaderPageState extends State<BookReaderPage> {
   }
 
   void _toggleControls() => setState(() => _controlsVisible = !_controlsVisible);
+
+  // ==================== 翻页方式切换 ====================
+
+  /// 在「上下滚动」和「左右翻页」之间切换，立即生效并落盘。
+  ///
+  /// 切换时要**顺手把阅读位置带过去**：两边量纲不同（dp vs 页号），但都可以
+  /// 换算成「本章读到百分之几」，按比例落位比回到章首友好得多。
+  Future<void> _togglePageMode() async {
+    final toPaged = !_settings.isPaged;
+    double ratio;
+    if (toPaged) {
+      // 滚动 → 分页：offset / maxScrollExtent
+      final hasScroll = _scroll.hasClients;
+      final max = hasScroll ? _scroll.position.maxScrollExtent : 0.0;
+      ratio = hasScroll && max > 0
+          ? (_scroll.offset / max).clamp(0.0, 1.0)
+          : 0.0;
+      _pendingPageRatio = ratio;
+      // 让 [_ensurePageController] 一定重建（同一章同一页数时它本来会复用）
+      _pageControllerChapter = -1;
+    } else {
+      // 分页 → 滚动：页号 / (总页数 - 1)
+      ratio = _pageControllerCount > 1
+          ? (_currentPage / (_pageControllerCount - 1)).clamp(0.0, 1.0)
+          : 0.0;
+    }
+    final next = _settings.copyWith(pageMode: toPaged ? 'paged' : 'scroll');
+    setState(() => _settings = next);
+    if (!toPaged) {
+      // 切回滚动：等 SingleChildScrollView 布局完再按比例跳（此时 max 才准）
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted || !_scroll.hasClients) return;
+        final max = _scroll.position.maxScrollExtent;
+        if (!max.isFinite || max <= 0) return;
+        _scroll.jumpTo((ratio * max).clamp(0.0, max));
+        _updateProgress();
+      });
+    }
+    await _store.saveSettings(next);
+    if (!mounted) return;
+    AppSnack.show(context, toPaged ? '已切换为左右翻页' : '已切换为上下滚动');
+  }
 
   Future<void> _showDirectory() async {
     final height = MediaQuery.of(context).size.height * 0.62;
@@ -449,6 +676,9 @@ class _BookReaderPageState extends State<BookReaderPage> {
 
   /// 缓存菜单：本章 / 从本章到最后一章。
   Future<void> _showCacheMenu() async {
+    // 本地书不需要缓存（正文就在本机），入口也不显示；这里再兜一次，
+    // 防止将来有人把按钮加回来却忘了分流。
+    if (_isLocal) return;
     if (_chapters.isEmpty) {
       AppSnack.show(context, '目录还没加载出来，暂时无法缓存');
       return;
@@ -505,13 +735,13 @@ class _BookReaderPageState extends State<BookReaderPage> {
     CacheBatchResult result;
     try {
       result = await _service.cacheChapters(
-        source: widget.source,
+        source: _source,
         chapters: _chapters,
         bookKey: _bookKey,
         fromIndex: from,
         toIndex: to,
         bookName: widget.bookName,
-        sourceName: widget.source.name,
+        sourceName: _source.name,
         detailUrl: widget.detailUrl,
         cache: _cache,
         onProgress: (done, total) {
@@ -604,15 +834,18 @@ class _BookReaderPageState extends State<BookReaderPage> {
               child: _bottomBar(context, background, foreground),
             ),
           ),
-          Positioned(
-            left: 0,
-            top: 0,
-            child: SizedBox(
-              width: 1,
-              height: 1,
-              child: Offstage(offstage: true, child: _holder.buildHost()),
+          // 本地书不需要 WebView 引擎宿主：省掉「建 WebView」的几百毫秒，
+          // 也让「零引擎 / 零请求」这条断言干净。
+          if (!_isLocal)
+            Positioned(
+              left: 0,
+              top: 0,
+              child: SizedBox(
+                width: 1,
+                height: 1,
+                child: Offstage(offstage: true, child: _holder.buildHost()),
+              ),
             ),
-          ),
         ],
       ),
     );
@@ -635,15 +868,26 @@ class _BookReaderPageState extends State<BookReaderPage> {
     // 否则「刚收起键盘那一帧」最后一行会被控制条压住。
     final insets = MediaQuery.viewPaddingOf(context);
     return SafeArea(
-      child: AnimatedPadding(
-        duration: kDurBase,
-        curve: kCurveOut,
-        padding: EdgeInsets.only(
-          top: _controlsVisible ? 52 : 0,
-          bottom: _controlsVisible ? 96 + insets.bottom : 0,
-        ),
-        child: _contentBody(context, foreground),
-      ),
+      child: _settings.isPaged
+          // 分页模式：**固定**内缩，不随控制层显隐做动画。高度一变分页就要
+          // 重算，用户点一下屏幕（呼出控制条）就会看到同一段文字换页。
+          // 代价是控制层收起时上下多出来的两条是页边距 —— 比「点一下跳页」好。
+          ? Padding(
+              padding: const EdgeInsets.only(
+                top: _kPagedTopInset,
+                bottom: _kPagedBottomInset,
+              ),
+              child: _contentBody(context, foreground),
+            )
+          : AnimatedPadding(
+              duration: kDurBase,
+              curve: kCurveOut,
+              padding: EdgeInsets.only(
+                top: _controlsVisible ? 52 : 0,
+                bottom: _controlsVisible ? 96 + insets.bottom : 0,
+              ),
+              child: _contentBody(context, foreground),
+            ),
     );
   }
 
@@ -668,6 +912,8 @@ class _BookReaderPageState extends State<BookReaderPage> {
     }
     final content = _content;
     if (content == null || content.body.trim().isEmpty) {
+      // 空正文不硬切页：给「这一章没取到正文 + 重试」比给一张空白页有用。
+      // （分页算法对空串本身也有兜底：返回一页 [0]，不会崩也不会死循环。）
       return Container(
         color: kPaper,
         child: AppErrorView(
@@ -677,6 +923,8 @@ class _BookReaderPageState extends State<BookReaderPage> {
         ),
       );
     }
+
+    if (_settings.isPaged) return _pagedBody(context, foreground, content);
 
     return GestureDetector(
       // 点正文区域呼出/隐藏控制层。这是**兜底**：点在文字之间的空白、
@@ -727,6 +975,298 @@ class _BookReaderPageState extends State<BookReaderPage> {
     );
   }
 
+  // ==================== 分页模式 ====================
+
+  /// 分页正文：`PageView` 一页一张 `Text` + 底部居中页码。
+  ///
+  /// 页数来自 [paginateText]（纯函数），宽度取 `LayoutBuilder` 的可用宽、
+  /// 高度扣掉上下留白与页码行 —— 所以「旋转屏幕 / 换字号 / 换行高」都会
+  /// 自然重算，不需要额外的失效逻辑。
+  Widget _pagedBody(
+    BuildContext context,
+    Color foreground,
+    BookContentResult content,
+  ) {
+    // **测量与渲染必须吃同一个 style 对象**（v2.72.0 实机踩坑）。
+    // `Text` 默认会把 `DefaultTextStyle` 合并进来，而主题 bodyMedium 带
+    // `letterSpacing: 0.3`、`fontFamily: Roboto`、`leadingDistribution: even`。
+    // 只拿「字号 + 行高」的裸 style 去 `TextPainter` 量，量出来的行宽/行高
+    // 都和实际渲染对不上（实测：页尾多折一行被裁掉半行字，或一页只塞进
+    // 14 行留一大片空白）。这里用 `inherit: false` 把样式**写全**：显式抄上
+    // 主题的 `letterSpacing` / `wordSpacing`（真正影响折行的那两个），
+    // 字体留空走平台默认（和滚动模式一致，不写死 Roboto —— 写了会在某些
+    // ROM 上落到另一套字体，行高和字宽全变）。`inherit: false` 也让 `Text`
+    // 原样使用它，不再二次合并。
+    final base = DefaultTextStyle.of(context).style;
+    final style = TextStyle(
+      inherit: false,
+      fontSize: _settings.fontSize,
+      height: _settings.lineHeight,
+      color: foreground,
+      letterSpacing: base.letterSpacing,
+      wordSpacing: base.wordSpacing,
+    );
+    final scaler = MediaQuery.textScalerOf(context);
+    // 正文末尾提示「有部分内容没取到」：直接并进分页文本（会落在最后一页），
+    // 免得在页面里再叠一层浮层跟页码抢位置。
+    final text = content.partial
+        ? '${content.body}\n\n本章有部分内容没取到'
+        : content.body;
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final textWidth = constraints.maxWidth - kSectionPadH * 2;
+        // 扣掉页码行再留 1px 余量：测量与真实渲染理论上同口径，但不同平台
+        // 的字形高度偶尔差半个逻辑像素，宁可少放一行也不要在页尾露出一截。
+        final textHeight =
+            constraints.maxHeight - kSpace16 - _kPageNumberHeight - 1;
+        final pages = _pagesFor(text, style, textWidth, textHeight, scaler);
+        final hasPrev = _index > 0;
+        final hasNext = _index < _chapters.length - 1;
+        // 前后各加一张「哨兵页」：滑到哨兵就等于「翻到上一章 / 下一章」。
+        // 比监听 overscroll 可靠（ClampingScrollPhysics 下 overscroll 的
+        // 通知时机和惯性有关，测试里很难稳定复现），也不会出现空白页
+        // ——哨兵页有自己的文案。
+        final lead = hasPrev ? 1 : 0;
+        // **注意 lead**：控制器的页码是 PageView 的 item 下标，不是「第几页」。
+        // 有上一章时前面多一张哨兵，页码要整体右移一位，否则首帧就停在
+        // 哨兵页上（看起来像「进书先看到正在翻到上一章」）。
+        _ensurePageController(pages.length, lead);
+        final controller = _pageController!;
+        final count = pages.length;
+        final itemCount = count + lead + (hasNext ? 1 : 0);
+
+        _schedulePageProgress(count);
+
+        return Stack(
+          children: [
+            Positioned.fill(
+              child: PageView.builder(
+                controller: controller,
+                itemCount: itemCount,
+                onPageChanged: (item) => _onPageChanged(
+                  item,
+                  lead: lead,
+                  count: count,
+                  hasPrev: hasPrev,
+                  hasNext: hasNext,
+                ),
+                itemBuilder: (context, item) {
+                  if (item < lead) {
+                    return _chapterSwipeHint('正在翻到上一章…', foreground);
+                  }
+                  if (item >= lead + count) {
+                    return _chapterSwipeHint('正在翻到下一章…', foreground);
+                  }
+                  return _pagedText(
+                    pageText(text, pages, item - lead),
+                    style,
+                    scaler,
+                  );
+                },
+              ),
+            ),
+            // 页码：贴在页区最底部居中。控制条收起时它就是「书页页脚」；
+            // 收起控制层也不会变位置（页区几何是固定的）。
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: 0,
+              height: _kPageNumberHeight,
+              child: IgnorePointer(
+                child: Center(
+                  child: Text(
+                    '${_currentPage + 1} / $count',
+                    style: kTypeBodyS.copyWith(
+                      color: foreground.withValues(alpha: .5),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  /// 单页正文：**不可选中**（见文件头「手势取舍」），点击切换控制层。
+  ///
+  /// 为什么这里不用 `SelectableText`：它的长按选中 + 拖动手柄和 `PageView`
+  /// 的横滑抢同一套水平拖拽。真机上用户拖右手柄扩选，页面会同时被翻走。
+  /// 取舍是「分页模式不可选，要复制切回滚动模式」。
+  ///
+  /// `HitTestBehavior.opaque` 让点击落在整块页区（含段间空白）都能命中，
+  /// 不必点在字形上 —— 这与滚动模式的行为一致（都是点哪都能切控制层）。
+  Widget _pagedText(
+    String pageContent,
+    TextStyle style,
+    TextScaler scaler,
+  ) {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: _toggleControls,
+      // **故意挂一个空的长按**：`GestureDetector` 只挂了 `onTap` 时，长按后
+      // 松手仍然算一次 tap（识别器没有时长上限），用户长按想看看有没有菜单
+      // 就会把控制层切出来。挂上空的长按识别器后，长按在竞技场里赢下 tap，
+      // 行为与滚动模式（长按 = 选字）对齐：长按什么也不发生。
+      onLongPress: () {},
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(
+          kSectionPadH,
+          kSpace16,
+          kSectionPadH,
+          _kPageNumberHeight,
+        ),
+        child: ClipRect(
+          child: Align(
+            alignment: Alignment.topLeft,
+            child: Text(
+              pageContent,
+              // 与测量用的是**同一个 style 对象**（`inherit: false`，Text 不会
+              // 再合并），所以折行与行高和分页结果严格一致。
+              style: style,
+              textScaler: scaler,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// 跨章翻转时的哨兵页：不留白屏，明确告诉用户「正在去下一章」。
+  ///
+  /// 故意不用 `CircularProgressIndicator`：它是无限动画，`pumpAndSettle`
+  /// 会一直等到超时（和底部缓存按钮同一个坑）。
+  Widget _chapterSwipeHint(String label, Color foreground) {
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: _toggleControls,
+      child: Center(
+        child: Text(
+          label,
+          style: kTypeBodyS.copyWith(color: foreground.withValues(alpha: .5)),
+        ),
+      ),
+    );
+  }
+
+  /// 取当前章的分页结果（同一章 + 同字号 / 行高 / 宽高直接复用）。
+  ///
+  /// 键里带上 `style.hashCode`：字形口径由**合并后的 style** 决定（主题的
+  /// `letterSpacing` 也算），只按字号 / 行高记账会在换主题后复用错的分页。
+  List<int> _pagesFor(
+    String text,
+    TextStyle style,
+    double width,
+    double height,
+    TextScaler scaler,
+  ) {
+    final key = '$_index|${_settings.fontSize}|${_settings.lineHeight}'
+        '|${style.hashCode}|${scaler.scale(10)}'
+        '|${width.round()}|${height.round()}|${text.hashCode}';
+    final hit = _pageCache[key];
+    if (hit != null) return hit;
+    final pages = paginateText(
+      text,
+      style: style,
+      width: width,
+      height: height,
+      textScaler: scaler,
+    );
+    if (_pageCache.length >= _maxPageCache) _pageCache.clear();
+    _pageCache[key] = pages;
+    return pages;
+  }
+
+  /// 页数 / 章节变了就换一个 [PageController]。
+  ///
+  /// [lead] 是「前面有几张哨兵页」（有上一章时 = 1）。控制器页码 = 真实页号
+  /// + lead，两者混用会出现「进章先停在哨兵页」这种 bug。
+  ///
+  /// 为什么不在 `didUpdateWidget` 里做：页数只有布局之后才知道（`LayoutBuilder`），
+  /// 而 `initialPage` 只在控制器创建时生效，所以只能在拿到页数的这一帧重建。
+  /// 旧控制器要等这一帧结束再 dispose —— 它可能还挂在上一帧的 `PageView` 上。
+  void _ensurePageController(int count, int lead) {
+    if (_pageController != null &&
+        _pageControllerChapter == _index &&
+        _pageControllerCount == count) {
+      // 页数没变说明分页没重算，之前记的「按比例落页」已经用不上了，
+      // 留着反而会在下次无关的重建里把用户送偏。
+      _pendingPageRatio = null;
+      return;
+    }
+    int target;
+    if (_wantsLastPage) {
+      target = count - 1;
+    } else if (_pendingPageRatio != null) {
+      // 字号 / 行高变了：按占全文比例落回相近的位置，不跳回第 1 页
+      target = (_pendingPageRatio! * (count - 1)).round();
+    } else {
+      // 用户没做任何导航动作（没点上一章 / 没恢复进度），页数却变了 ——
+      // 只可能是**尺寸变了**（旋转屏幕、系统字号放大）。同样按比例落位，
+      // 否则横过来一次就回章首了。
+      if (_pendingPage == null && _pageControllerCount > 0) {
+        final ratio = _pageControllerCount > 1
+            ? (_currentPage / (_pageControllerCount - 1)).clamp(0.0, 1.0)
+            : 0.0;
+        target = (ratio * (count - 1)).round();
+      } else {
+        target = _pendingPage ?? 0;
+      }
+    }
+    target = target.clamp(0, count - 1);
+    _wantsLastPage = false;
+    _pendingPageRatio = null;
+    _pendingPage = null;
+    _pageControllerChapter = _index;
+    _pageControllerCount = count;
+    _currentPage = target;
+    final old = _pageController;
+    _pageController = PageController(initialPage: target + lead);
+    if (old != null) {
+      WidgetsBinding.instance.addPostFrameCallback((_) => old.dispose());
+    }
+  }
+
+  /// 页码变化：更新页码 / 进度条 / 延迟落盘；落在哨兵页就跨章。
+  void _onPageChanged(
+    int item, {
+    required int lead,
+    required int count,
+    required bool hasPrev,
+    required bool hasNext,
+  }) {
+    if (item < lead) {
+      // 第一页往前滑 → 上一章的**最后一页**
+      if (hasPrev) unawaited(_goTo(_index - 1, toLastPage: true));
+      return;
+    }
+    if (item >= lead + count) {
+      // 最后一页往后滑 → 下一章的**第一页**
+      if (hasNext) unawaited(_goTo(_index + 1));
+      return;
+    }
+    final page = item - lead;
+    if (page == _currentPage) return;
+    setState(() => _currentPage = page);
+    _updatePageProgress(count);
+    // 翻页停 1.5 秒后落盘（连翻几页只在最后一页写一次）
+    _saveTimer?.cancel();
+    _saveTimer = Timer(const Duration(milliseconds: 1500), () {
+      unawaited(_saveProgress());
+    });
+  }
+
+  /// 分页完成后刷新进度条。放在帧后是因为它写 [ValueNotifier]，
+  /// build 期间改会触发「setState during build」。
+  void _schedulePageProgress(int count) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _updatePageProgress(count);
+    });
+  }
+
   Widget _topBar(BuildContext context, Color background, Color foreground) {
     final chapterName = _currentChapter?.name ?? '';
     // 顶栏是「浮在正文上的」一块底色：背景必须一直铺到屏幕最上沿（状态栏 /
@@ -770,16 +1310,33 @@ class _BookReaderPageState extends State<BookReaderPage> {
                 ),
               ),
             ),
+          // 翻页方式切换（v2.72.0）。**放在顶栏而不是底部第二行**：
+          // 底部那一行已经有 A- / 字号 / A+ / 缓存 / 主题，360dp 下 Wrap 已经
+          // 快贴到边界，再加一个按钮会折到第三行、把底栏顶高，正好压住页码；
+          // 顶栏这一行有 Expanded 标题可以压缩，加一个 48dp 图标绝不会溢出，
+          // 也不会把「缓存」挤掉。
+          IconButton(
+            tooltip: '翻页方式',
+            icon: Icon(
+              _settings.isPaged
+                  ? Icons.chrome_reader_mode_outlined
+                  : Icons.swap_vert,
+              color: foreground,
+            ),
+            onPressed: () => unawaited(_togglePageMode()),
+          ),
           IconButton(
             tooltip: '目录',
             icon: Icon(Icons.list, color: foreground),
             onPressed: _showDirectory,
           ),
-          IconButton(
-            tooltip: '缓存',
-            icon: Icon(Icons.cloud_download_outlined, color: foreground),
-            onPressed: _showCacheMenu,
-          ),
+          // 本地书没有「下载到本机」这回事，入口不显示（见 `_isLocal`）
+          if (!_isLocal)
+            IconButton(
+              tooltip: '缓存',
+              icon: Icon(Icons.cloud_download_outlined, color: foreground),
+              onPressed: _showCacheMenu,
+            ),
         ],
       ),
     );
@@ -863,7 +1420,7 @@ class _BookReaderPageState extends State<BookReaderPage> {
                   style: TextStyle(fontSize: 18, color: foreground),
                 ),
               ),
-              _cacheButton(foreground),
+              if (!_isLocal) _cacheButton(foreground),
               IconButton(
                 tooltip: '阅读主题：${_themeLabel(_settings.theme)}',
                 icon: Icon(_themeIcon(_settings.theme), color: foreground),
