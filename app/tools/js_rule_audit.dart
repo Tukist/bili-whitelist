@@ -20,8 +20,8 @@
 ///    `java.post` / `java.startBrowserAwait` / `Packages.` / `org.jsoup`）。
 ///    WebView 里同步 XHR 会被 CORS 拦，不是「补个函数」能解决的。
 /// 2. `jsNeedsJsonPath` —— 执行字段的规则是 `@json:` / `$.` 形态（本版未接）。
-/// 3. `jsUnsupportedApi` —— 执行字段里的 JS 用了 [kP1SupportedApis] 之外的
-///    `java.*` 函数（白名单是**规划中的 P1 静态变换子集**，不是当前能力）。
+/// 3. `jsUnsupportedApi` —— 执行字段里的 JS 用了 [kSupportedJavaApis] 之外的
+///    `java.*` 函数（白名单在 `js_rule.dart`，与引擎实际能跑的那份是同一个）。
 /// 4. `jsTransformOnly` —— 执行字段里有 JS，但只做纯字符串变换（无网络调用）。
 ///    这一类是 P1 能吃下的目标。
 /// 5. `jsInUnexecutedField` —— JS 只出现在不执行的字段里（能正常搜）。
@@ -62,6 +62,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:bili_whitelist_app/services/book_rule/js_rule.dart';
 import 'package:bili_whitelist_app/services/book_rule/legado_compat.dart';
 import 'package:bili_whitelist_app/services/book_rule/selector.dart';
 
@@ -125,20 +126,12 @@ const Set<String> kDisplayOnlyFields = {
   'bookUrlPattern',
 };
 
-/// 规划中的 P1「静态 JS 变换」白名单（纯函数，可在 Dart 侧照实现）。
+/// P1「静态 JS 变换」白名单 —— **直接引用引擎的那一份**（I3a 起）。
 ///
-/// **不是当前能力**：现在任何 JS 都不执行。列在这里只为把「补几个纯函数
-/// 就能跑」与「怎么补也跑不了」分开，免得把两类混成一个数字。
-const Set<String> kP1SupportedApis = {
-  'base64Decode',
-  'base64Encode',
-  'md5Encode',
-  'md5Encode16',
-  'timeFormat',
-  'htmlFormat',
-  'strToBytes',
-  'bytesToStr',
-};
+/// 以前这里是一份「规划中的子集」，与 `js_rule.dart` 实际能跑的函数各写一遍，
+/// 迟早分叉（I2 批的教训：判定逻辑写两处，两边都不准）。现在只有一个来源：
+/// `lib/services/book_rule/js_rule.dart` 的 [kSupportedJavaApis]。
+const Set<String> kP1SupportedApis = kSupportedJavaApis;
 
 /// 网络调用特征（出现即判 `jsNeedsAjax`）。
 const List<String> kNetworkMarkers = [
@@ -176,6 +169,8 @@ class SourceAudit {
     required this.hasJsonPath,
     required this.javaApis,
     required this.jsStyles,
+    this.unrunnableJsFields = const [],
+    this.jsBlockReasons = const {},
   });
 
   final String name;
@@ -202,7 +197,20 @@ class SourceAudit {
   /// JS 写法（`angle` = `<js>` / `at` = `@js:` / `brace` = `{{…}}`）。
   final Set<String> jsStyles;
 
+  /// 执行字段里**本版跑不了**的 JS 字段（v2.78.0）。
+  ///
+  /// 判据是 `selector.dart` 的 `SelectorValue.isStaticJsRunnable` —— 与引擎
+  /// 执行时用的那一份判定同源，不在这里另写一套。
+  final List<String> unrunnableJsFields;
+
+  /// 上一条里每个字段的原因码（`ajax` / `api` / `variables` / `templateRule`
+  /// / `list` / `url` / `base` / `empty`）。
+  final Map<String, String> jsBlockReasons;
+
   bool get hasExecutedJs => executedJsFields.isNotEmpty;
+
+  /// 执行字段里的 JS**全部**静态可跑（I3b 的接线口径）。
+  bool get jsAllRunnable => hasExecutedJs && unrunnableJsFields.isEmpty;
 
   /// `jsUnsupportedApi` 的判据：用了白名单外的 `java.*`。
   bool get hasUnsupportedApi =>
@@ -213,6 +221,8 @@ class SourceAudit {
     if (hasAjax) return 'jsNeedsAjax';
     if (hasJsonPath) return 'jsNeedsJsonPath';
     if (hasUnsupportedApi) return 'jsUnsupportedApi';
+    // v2.78.0：全部静态可跑的 JS 单列一档 —— 这批源本版**真的能搜**
+    if (hasExecutedJs && jsAllRunnable) return 'jsStaticRunnable';
     if (hasExecutedJs) return 'jsTransformOnly';
     if (unexecutedJsFields.isNotEmpty || displayJsFields.isNotEmpty) {
       return 'jsInUnexecutedField';
@@ -227,6 +237,8 @@ class SourceAudit {
         'executedJsFields': executedJsFields,
         'unexecutedJsFields': unexecutedJsFields,
         'displayJsFields': displayJsFields,
+        'unrunnableJsFields': unrunnableJsFields,
+        'jsBlockReasons': jsBlockReasons,
         'ajax': hasAjax,
         'jsonPath': hasJsonPath,
         'javaApis': javaApis.toList()..sort(),
@@ -237,6 +249,9 @@ class SourceAudit {
 const List<String> _kCategories = [
   'noJs',
   'jsInUnexecutedField',
+  // v2.78.0：执行字段的 JS 全是静态可跑的（本版能搜）
+  'jsStaticRunnable',
+  // 执行字段有 JS 但不是「纯字符串变换」（模板里套规则 / DOM 桥 / 变量表…）
   'jsTransformOnly',
   'jsUnsupportedApi',
   'jsNeedsJsonPath',
@@ -421,6 +436,8 @@ SourceAudit auditSource(Map<String, dynamic> raw, String indexUrl) {
   final displayJs = <String>[];
   final javaApis = <String>{};
   final styles = <String>{};
+  final unrunnable = <String>[];
+  final blockReasons = <String, String>{};
   var hasAjax = false;
   var hasJsonPath = false;
 
@@ -443,6 +460,13 @@ SourceAudit auditSource(Map<String, dynamic> raw, String indexUrl) {
     if (executed) {
       executedJs.add(path);
       if (kNetworkMarkers.any(text.contains)) hasAjax = true;
+      // 能不能跑问真的解析器（v2.78.0）：URL 字段的 JS 一律跑不了，
+      // 列表位置的 JS 也跑不了（沙箱返回字符串，列表要元素集合）。
+      final reason = _jsBlockReason(path, text);
+      if (reason != null) {
+        unrunnable.add(path);
+        blockReasons[path] = reason;
+      }
     } else {
       unexecutedJs.add(path);
     }
@@ -489,7 +513,31 @@ SourceAudit auditSource(Map<String, dynamic> raw, String indexUrl) {
     hasJsonPath: hasJsonPath,
     javaApis: javaApis,
     jsStyles: styles,
+    unrunnableJsFields: unrunnable,
+    jsBlockReasons: blockReasons,
   );
+}
+
+/// 列表位置（要元素集合）的执行字段：静态 JS 跑不了。
+const Set<String> _kListJsFields = {'ruleSearch.bookList', 'ruleToc.chapterList'};
+
+/// 一条执行字段的 JS **本版跑不了**的原因码；跑得了返回 null。
+///
+/// 判定全部交给 `selector.dart` / `js_rule.dart`（与引擎执行时同一份），
+/// 这里只做「URL / 列表位置」两条位置上的加判。
+String? _jsBlockReason(String path, String text) {
+  if (kUrlExecutedFields.contains(path)) return 'url';
+  if (_kListJsFields.contains(path)) return 'list';
+  final parsed = legadoSelector(text);
+  final info = parsed.jsInfo;
+  if (info == null) return 'unknown';
+  final code = info.blockReason;
+  if (code == null) return null;
+  // `api` 再细分：网络调用与其它 API 对用户意义完全不同
+  if (code == 'api' && kNetworkJsApis.any(info.blockedApis.contains)) {
+    return 'ajax';
+  }
+  return code;
 }
 
 /// 取 `a.b.c` 形态的值（不存在返回 null）。
@@ -543,6 +591,18 @@ const Set<String> kUrlExecutedFields = {
   'ruleContent.nextContentUrl',
 };
 
+/// 判定「被 JS 挡」的原因码（v2.78.0）。
+const Set<String> _kJsReasons = {
+  'ajax',
+  'api',
+  'variables',
+  'templateRule',
+  'deadLoop',
+  'base',
+  'list',
+  'url',
+};
+
 /// 「不支持」的原因码 → 给人看的名字。
 String _reasonLabel(String reason) => switch (reason) {
       'js' => '需要 JS',
@@ -550,8 +610,16 @@ String _reasonLabel(String reason) => switch (reason) {
       'syntax' => '语法不认识',
       'empty' => '空规则',
       'parse' => '解析异常',
-      'text' => 'text. 按文字筛选',
-      'interleave' => '%% 交叉合并',
+      'text' => 'text. 按文字筛选（v2.78.0 已支持）',
+      'interleave' => '%% 交叉合并（v2.78.0 已支持）',
+      'ajax' => 'JS 里要发网络请求（ajax）',
+      'api' => 'JS 里用了不支持的接口',
+      'variables' => 'JS 用了 java.put/get 变量表',
+      'templateRule' => '{{…}} 里套选择器规则',
+      'deadLoop' => '脚本里有死循环',
+      'base' => 'JS 与 || / && 混写',
+      'list' => '列表规则本身是 JS',
+      'url' => '地址模板里是 JS',
       _ => '其它（$reason）',
     };
 
@@ -578,6 +646,9 @@ class _SelectorReport {
   var missingSearchRule = 0;
   var total = 0;
 
+  /// 执行字段的 JS **全是静态可跑**的源数（不管选择器有没有问题）。
+  var jsStaticRunnable = 0;
+
   /// 被选择器语法挡住的源里，**只差这一条**就能跑的（实现优先级用）。
   final Map<String, int> soleBlocker = {};
 
@@ -590,15 +661,27 @@ class _SelectorReport {
       final raw = raws[i];
       final audit = audits[i];
 
-      // ---- 特征统计（去重：一个源一个特征只记一次）----
+      // ---- 特征统计 + 这个源的问题码（去重）----
       final features = <String>{};
-      final problems = <String>{}; // 这个源的选择器问题（原因码去重）
+      final problems = <String>{};
       for (final path in kExecutedFields) {
-        if (kUrlExecutedFields.contains(path)) continue;
         final v = _lookup(raw, path);
         if (v is! String || v.trim().isEmpty) continue;
-        // JS 规则不是「语法不认识」，它走 JS 那条线（见 I1 分类）
-        if (_jsStylesIn(v).isNotEmpty) continue;
+        if (kUrlExecutedFields.contains(path)) {
+          // 地址模板：`{{key}}` 之类的占位符不算 JS；真的 JS 就是跑不了
+          if (_jsStylesIn(v).isNotEmpty) problems.add('url');
+          continue;
+        }
+        // JS 规则不是「语法不认识」：走 JS 那条线（能不能跑问真的解析器）
+        if (_jsStylesIn(v).isNotEmpty) {
+          final reason = _jsBlockReason(path, v);
+          if (reason != null) {
+            problems.add(reason);
+            final key = _truncate(v.trim().replaceAll(RegExp(r'\s+'), ' '), 80);
+            unrecognized.update(key, (n) => n + 1, ifAbsent: () => 1);
+          }
+          continue;
+        }
         features.addAll(_featuresOf(v));
         final parsed = legadoSelector(v);
         if (!parsed.isRunnable && !parsed.isEmpty) {
@@ -610,9 +693,10 @@ class _SelectorReport {
       for (final f in features) {
         featureSources.update(f, (n) => n + 1, ifAbsent: () => 1);
       }
+      if (audit.jsAllRunnable) jsStaticRunnable++;
 
       // ---- 可搜索判定 ----
-      final usesJs = audit.executedJsFields.isNotEmpty;
+      // v2.78.0：选择器全可解析 **且** 执行字段的 JS 全静态可跑。
       final hasSearchRule = ((_lookup(raw, 'searchUrl') as String?) ?? '')
                   .trim()
                   .isNotEmpty &&
@@ -626,32 +710,38 @@ class _SelectorReport {
         missingSearchRule++;
         continue;
       }
-      if (usesJs) {
-        blockedByJs++;
-        continue;
-      }
       if (problems.isEmpty) {
         runnable++;
+        continue;
+      }
+      // 只要有一条「JS 能力不够」，这个源就算被 JS 挡（哪怕选择器也有毛病）：
+      // 两个原因对用户的意义不同，报最硬的那个。
+      final jsReasons = problems.where(_kJsReasons.contains);
+      if (jsReasons.isNotEmpty) {
+        blockedByJs++;
       } else {
         blockedBySelector++;
-        if (problems.length == 1) {
-          final p = problems.first;
-          soleBlocker.update(p, (n) => n + 1, ifAbsent: () => 1);
-          // 同一个源可能有多条坏规则；只记第一条就够看优先级
-          final bad = <String>[];
-          for (final path in kExecutedFields) {
-            if (kUrlExecutedFields.contains(path)) continue;
-            final v = _lookup(raw, path);
-            if (v is! String || v.trim().isEmpty) continue;
-            if (_jsStylesIn(v).isNotEmpty) continue;
-            final parsed = legadoSelector(v);
-            if (!parsed.isRunnable && !parsed.isEmpty) {
-              bad.add(_truncate(v.trim().replaceAll(RegExp(r'\s+'), ' '), 80));
-            }
+      }
+      if (problems.length == 1) {
+        final p = problems.first;
+        soleBlocker.update(p, (n) => n + 1, ifAbsent: () => 1);
+        // 同一个源可能有多条坏规则；只记第一条就够看优先级
+        final bad = <String>[];
+        for (final path in kExecutedFields) {
+          if (kUrlExecutedFields.contains(path)) continue;
+          final v = _lookup(raw, path);
+          if (v is! String || v.trim().isEmpty) continue;
+          if (_jsStylesIn(v).isNotEmpty) {
+            bad.add(_truncate(v.trim().replaceAll(RegExp(r'\s+'), ' '), 80));
+            continue;
           }
-          if (bad.isNotEmpty) {
-            soleBlockerRules.update(bad.first, (n) => n + 1, ifAbsent: () => 1);
+          final parsed = legadoSelector(v);
+          if (!parsed.isRunnable && !parsed.isEmpty) {
+            bad.add(_truncate(v.trim().replaceAll(RegExp(r'\s+'), ' '), 80));
           }
+        }
+        if (bad.isNotEmpty) {
+          soleBlockerRules.update(bad.first, (n) => n + 1, ifAbsent: () => 1);
         }
       }
     }
@@ -659,7 +749,9 @@ class _SelectorReport {
 
   /// 把 [SelectorValue] 归一成原因码（可读性交给 [_reasonLabel]）。
   String _problemCode(SelectorValue v) {
-    if (v.needsJs) return 'js';
+    // `@get:` / `@put:` 不写成 `<js>`，但确实是 JS 语义（变量表）：
+    // 用 jsInfo 的 blockReason 才能报出「变量表」而不是笼统的「需要 JS」。
+    if (v.needsJs) return v.jsInfo?.blockReason ?? 'js';
     if (v.kind == SelectorKind.jsonPath) return 'jsonPath';
     return v.reason ?? 'syntax';
   }
@@ -670,6 +762,7 @@ class _SelectorReport {
         'blockedByJs': blockedByJs,
         'blockedBySelector': blockedBySelector,
         'missingSearchRule': missingSearchRule,
+        'jsStaticRunnable': jsStaticRunnable,
         'features': {for (final e in _sortedFeatures()) e.key: e.value},
         'reasons': reasonSources,
         'soleBlocker': soleBlocker,
@@ -724,17 +817,18 @@ class _SelectorReport {
     }
 
     stdout.writeln('');
-    stdout.writeln('════════ 表⑧ 真正可搜索的源（不靠 JS + 选择器全可解析） ════════');
-    final pct = total == 0 ? 0.0 : runnable * 100 / total;
-    stdout.writeln('  去重源            ${_pad('$total', 6)}');
-    stdout.writeln('  可搜索            ${_pad('$runnable', 6)}'
-        '${pct.toStringAsFixed(1)}%');
-    stdout.writeln('  被 JS 挡          ${_pad('$blockedByJs', 6)}'
-        '${(blockedByJs * 100 / total).toStringAsFixed(1)}%');
-    stdout.writeln('  被选择器语法挡    ${_pad('$blockedBySelector', 6)}'
-        '${(blockedBySelector * 100 / total).toStringAsFixed(1)}%');
-    stdout.writeln('  缺搜索规则        ${_pad('$missingSearchRule', 6)}'
-        '${(missingSearchRule * 100 / total).toStringAsFixed(1)}%');
+    stdout.writeln('════════ 表⑧ 真正可搜索的源（选择器全可解析 + JS 全静态可跑） ════════');
+    String line(String label, int n) =>
+        '  ${_pad(label, 18)}${_pad('$n', 6)}${(n * 100 / total).toStringAsFixed(1)}%';
+    stdout.writeln(line('去重源', total));
+    stdout.writeln('${line('可搜索', runnable)}  ← v2.78.0（I3b）');
+    stdout.writeln('  （对照）v2.77.0（I2）时点 754 个 = 30.4%；'
+        'v2.76.0（I1）时点 495 个 = 19.9%');
+    stdout.writeln(line('被 JS 能力挡', blockedByJs));
+    stdout.writeln(line('被选择器语法挡', blockedBySelector));
+    stdout.writeln(line('缺搜索规则', missingSearchRule));
+    stdout.writeln('  （附）执行字段的 JS 全静态可跑的源：$jsStaticRunnable 个'
+        '（这批就是 I3b 能真搜的 JS 源，不含选择器 / 搜索规则的额外门槛）');
 
     if (reasonSources.isNotEmpty) {
       final reasons = reasonSources.entries.toList()

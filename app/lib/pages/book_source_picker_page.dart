@@ -73,6 +73,9 @@ class _BookSourcePickerPageState extends State<BookSourcePickerPage> {
   /// 只有部分字段用 JS 的源 key（能搜，只标角标）。
   Set<String> _partialJsKeys = const {};
 
+  /// 执行字段里是**静态 JS**（纯字符串变换）的源 key（v2.78.0：能搜）。
+  Set<String> _staticJsKeys = const {};
+
   /// 当前已导入的源 key（「只看没导入的」与剩余额度都靠它）。
   Set<String> _existingKeys = const {};
 
@@ -253,6 +256,7 @@ class _BookSourcePickerPageState extends State<BookSourcePickerPage> {
         _sources = result.sources;
         _jsKeys = {...result.jsKeys};
         _partialJsKeys = {...result.partialJsKeys};
+        _staticJsKeys = {...result.staticJsKeys};
         // 换了新的一批源，之前的勾选就作废（key 可能对不上新列表）
         _selected.clear();
         _recompute();
@@ -512,9 +516,41 @@ class _BookSourcePickerPageState extends State<BookSourcePickerPage> {
     );
   }
 
+  /// 右侧角标：需 JS（红）/ 静态 JS（accent）/ 部分 JS（accent）/ 已导入（灰）。
+  ///
+  /// 四档分开是 v2.78.0 的重点：`需 JS` 是**本版跑不了**，`静态 JS` 与
+  /// `部分 JS` 都是**能搜**（一个脚本能跑、一个脚本在不执行的字段里）。
+  /// 合成一句会让人白跳过一堆其实好用的源。
+  Widget? _jsBadge({
+    required bool needsJs,
+    required bool staticJs,
+    required bool partialJs,
+    required bool imported,
+  }) {
+    final (label, color) = needsJs
+        ? ('需 JS', kError)
+        : staticJs
+            ? ('静态 JS', context.palette.accent)
+            : partialJs
+                ? ('部分 JS', context.palette.accent)
+                : imported
+                    ? ('已导入', kInkGray50)
+                    : ('', kInkGray50);
+    if (label.isEmpty) return null;
+    return Text(
+      label,
+      maxLines: 1,
+      softWrap: false,
+      overflow: TextOverflow.ellipsis,
+      style: kTypeBodyS.copyWith(color: color),
+    );
+  }
+
   Widget _row(BookSource source) {
     final needsJs = _jsKeys.contains(source.key);
-    final partialJs = !needsJs && _partialJsKeys.contains(source.key);
+    final staticJs = !needsJs && _staticJsKeys.contains(source.key);
+    final partialJs =
+        !needsJs && !staticJs && _partialJsKeys.contains(source.key);
     final imported = _existingKeys.contains(source.key);
     // 名字/地址在模型层已按单行清洗过（BookSource.fromJson），这里的
     // `maxLines + ellipsis + softWrap: false` 是第二道护栏：万一某条数据
@@ -541,31 +577,12 @@ class _BookSourcePickerPageState extends State<BookSourcePickerPage> {
       // 角标让「为什么这个源被藏起来了 / 为什么导进去也搜不到」一眼可查。
       // 两个角标必须分开：`需 JS` 是执行字段里有 JS（导入也搜不到），
       // `部分 JS` 只是发现页 / 登录页那些本版没有的能力，**能搜**。
-      secondary: needsJs
-          ? Text(
-              '需 JS',
-              maxLines: 1,
-              softWrap: false,
-              overflow: TextOverflow.ellipsis,
-              style: kTypeBodyS.copyWith(color: kError),
-            )
-          : (partialJs
-              ? Text(
-                  '部分 JS',
-                  maxLines: 1,
-                  softWrap: false,
-                  overflow: TextOverflow.ellipsis,
-                  style: kTypeBodyS.copyWith(color: context.palette.accent),
-                )
-              : (imported
-                  ? Text(
-                      '已导入',
-                      maxLines: 1,
-                      softWrap: false,
-                      overflow: TextOverflow.ellipsis,
-                      style: kTypeBodyS.copyWith(color: kInkGray50),
-                    )
-                  : null)),
+      secondary: _jsBadge(
+        needsJs: needsJs,
+        staticJs: staticJs,
+        partialJs: partialJs,
+        imported: imported,
+      ),
     );
   }
 

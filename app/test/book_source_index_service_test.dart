@@ -276,21 +276,32 @@ void main() {
   });
 
   group('usesJs 标注', () {
-    test('JS 源进 jsKeys，普通源不进；汇总里报个数', () async {
+    test('跑不了的 JS 进 jsKeys、静态 JS 单独一档、普通源都不进', () async {
+      // 设计契约变更（v2.78.0）：v2.77.0 及以前任何执行字段有 JS 的源都进
+      // jsKeys（UI 标「需 JS」）。I3b 起静态 JS 能跑，再这么标会让人白跳过
+      // 一堆能搜的源 —— 拆成 jsKeys（跑不了）/ staticJsKeys（能跑）两档。
       final adapter = _FakeAdapter({
         _u1: (_) => _json([
           _legado('普通源'),
-          _legado('JS源', ruleSearch: {'bookList': '.item', 'name': '@js:...'}),
+          _legado('JS源',
+              ruleSearch: {'bookList': '.item', 'name': '@js:java.ajax("/x")'}),
+          _legado('静态JS源',
+              ruleSearch: {'bookList': '.item', 'name': '@js:result.trim()'}),
         ]),
       });
       final result = await _service(adapter).fetchIndexes(urls: [_u1]);
 
       final plain = result.sources.firstWhere((s) => s.name == '普通源');
       final js = result.sources.firstWhere((s) => s.name == 'JS源');
+      final staticJs = result.sources.firstWhere((s) => s.name == '静态JS源');
       expect(result.needsJs(plain), isFalse);
       expect(result.needsJs(js), isTrue);
+      expect(result.needsJs(staticJs), isFalse);
+      expect(result.staticJs(staticJs), isTrue);
       expect(result.jsCount, 1);
+      expect(result.staticJsCount, 1);
       expect(result.summary, contains('1 个需 JS'));
+      expect(result.summary, contains('1 个用静态 JS'));
     });
 
     test('只在发现页用了 JS 的源：进 partialJsKeys，不算「需 JS」', () async {

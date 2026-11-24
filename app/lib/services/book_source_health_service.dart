@@ -67,8 +67,15 @@ enum SourceHealthStatus {
   /// 连不上：超时、DNS、连接被重置、证书。
   networkError,
 
-  /// 依赖 JS 规则，本版跑不了（**不发请求**）。
+  /// 依赖 JS 规则，本版跑不了（**不发请求**）。语义已收窄（v2.78.0）：
+  /// 只指「缺本版没有的 JS 能力」，纯静态 JS 的源会**真的去探测**。
   unsupportedJs,
+
+  /// 需要 `java.ajax` / `Packages.` 这类**发网络请求**的 JS（v2.78.0 新增）。
+  ///
+  /// 为什么与 [unsupportedJs] 分开：用户看到「需 JS」不知道是「本版能救」
+  /// 还是「缺个网络桥」；分开之后一眼能判断值不值得等后续版本。
+  needsAjax,
 
   /// 规则本身有问题（地址拼不出、列表规则为空、JSONPath、`&&` 组合…）。
   badRule,
@@ -83,6 +90,7 @@ extension SourceHealthStatusLabel on SourceHealthStatus {
         SourceHealthStatus.blocked => '被拦',
         SourceHealthStatus.networkError => '连不上',
         SourceHealthStatus.unsupportedJs => '需 JS',
+        SourceHealthStatus.needsAjax => '需 ajax',
         SourceHealthStatus.badRule => '规则坏',
       };
 
@@ -93,6 +101,7 @@ extension SourceHealthStatusLabel on SourceHealthStatus {
         SourceHealthStatus.blocked => '被拦',
         SourceHealthStatus.networkError => '连不上',
         SourceHealthStatus.unsupportedJs => '需要 JS',
+        SourceHealthStatus.needsAjax => '需要 JS（ajax）',
         SourceHealthStatus.badRule => '规则有问题',
       };
 }
@@ -271,16 +280,23 @@ class BookSourceHealthService {
     final key = source.name.trim().toLowerCase();
     final word = keyword.trim().isEmpty ? kHealthDefaultKeyword : keyword.trim();
 
-    final usage = jsUsageOf(source);
-    if (usage.executedJs) {
-      // 只报「哪个字段」：用户拿着这句话能直接去改源，比一句「需要 JS」有用
+    final usage = jsUsageOf(source, stage: SourceStage.search);
+    if (usage.executedJs && !usage.runnableJs) {
+      // 只报「哪个字段 + 缺什么」：用户拿着这句话能直接去改源。
+      // 纯静态 JS 的源**不在这里判死**（v2.78.0）：它会真的被探测。
       final fields = usage.executedFields.take(2).join('、');
       final more = usage.executedFields.length > 2 ? ' 等' : '';
+      final apis = usage.blockedApis;
+      final detail = apis.isEmpty
+          ? '需要本版不支持的 JS 能力'
+          : '需要本版不支持的接口：${apis.take(3).join('、')}';
       final health = SourceHealth(
         sourceKey: key,
-        status: SourceHealthStatus.unsupportedJs,
+        status: jsNeedsAjax(usage)
+            ? SourceHealthStatus.needsAjax
+            : SourceHealthStatus.unsupportedJs,
         at: DateTime.now(),
-        message: '该源的 $fields$more 需要 JS 规则（<js> / @js: / {{…}}），本版暂不支持',
+        message: '该源的 $fields$more 里的 JS 规则$detail',
         keyword: word,
       );
       await _remember(health);
@@ -519,7 +535,10 @@ SourceHealthStatus classifyGroup(BookSearchGroup group) {
     case BookSearchStatus.noResult:
       return SourceHealthStatus.noResult;
     case BookSearchStatus.unsupported:
-      return SourceHealthStatus.badRule;
+      // 搜索服务判死时已经知道「缺的是不是网络 API」，分组上带着这个事实
+      return group.needsAjax
+          ? SourceHealthStatus.needsAjax
+          : SourceHealthStatus.badRule;
     case BookSearchStatus.error:
       final code = group.httpStatus;
       if (code != null) {
@@ -570,6 +589,7 @@ String summarizeSearchFailures(List<BookSearchGroup> groups) {
     SourceHealthStatus.blocked,
     SourceHealthStatus.networkError,
     SourceHealthStatus.badRule,
+    SourceHealthStatus.needsAjax,
     SourceHealthStatus.unsupportedJs,
   ];
   final parts = <String>[];

@@ -148,7 +148,8 @@ void main() {
         _source('源A', 'a.example'),
         _source('源B', 'b.example'),
         // 需要 JS：不该发请求，只应在「已跳过」里出现
-        _source('源C', 'c.example', nameRule: '<js>x</js>'),
+        // （v2.78.0 起必须是**本版跑不了**的 JS：纯静态 `<js>x</js>` 现在真跑）
+        _source('源C', 'c.example', nameRule: '<js>java.ajax("/x")</js>'),
       ]),
       holder: holder,
     );
@@ -161,7 +162,7 @@ void main() {
     expect(find.text('源A · 1 条'), findsOneWidget);
     expect(find.text('源B · 1 条'), findsOneWidget);
     // JS 源没发请求，但用户能看到「被跳过了」
-    expect(find.textContaining('已跳过 1 个需要 JS 规则的书源'), findsOneWidget);
+    expect(find.textContaining('已跳过 1 个需要 JS 的书源'), findsOneWidget);
     final engine = holder.engine as FakeRuleEngine;
     expect(engine.fetchedUrls.any((u) => u.contains('c.example')), isFalse);
 
@@ -345,7 +346,8 @@ void main() {
       (tester) async {
     final holder = RuleEngineHolder.withEngine(_engine());
     final jsSources = [
-      for (var i = 1; i <= 25; i++) _source('JS源$i', 'js$i.example', nameRule: '<js>x</js>'),
+      for (var i = 1; i <= 25; i++)
+        _source('JS源$i', 'js$i.example', nameRule: '<js>java.ajax("/x")</js>'),
     ];
     await _pump(
       tester,
@@ -357,7 +359,7 @@ void main() {
     await tester.tap(find.widgetWithText(FilledButton, '搜索'));
     await tester.pumpAndSettle();
 
-    expect(find.textContaining('已跳过 25 个需要 JS 规则的书源'), findsOneWidget);
+    expect(find.textContaining('已跳过 25 个需要 JS 的书源'), findsOneWidget);
     await tester.tap(find.widgetWithText(TextButton, '查看'));
     await tester.pumpAndSettle();
 

@@ -21,6 +21,7 @@
 library;
 
 import '../models/book_source.dart';
+import 'book_rule/js_rule.dart';
 import 'book_rule/legado_compat.dart';
 import 'book_rule/rule_engine.dart';
 import 'book_rule/selector.dart';
@@ -190,6 +191,16 @@ class BookDetailService {
           // 以 document 为根也能跑，但以 body 为根更贴近 legado 的语义。
           listSelector: parseSelector('@css:body'),
           fields: detailFields,
+          // 静态 JS 字段的绑定：详情页拿得到书名 / 作者，能喂给脚本
+          bindings: jsBindings(
+            baseUrl: detailUrl,
+            bookName: info.name,
+            bookAuthor: info.author,
+            bookUrl: detailUrl,
+            sourceName: source.name,
+            sourceUrl: source.baseUrl,
+            sourceComment: _sourceComment(source),
+          ),
         );
         info = _mergeInfo(info, columns);
       } catch (e) {
@@ -204,9 +215,15 @@ class BookDetailService {
 
     if (tocRule.list.trim().isEmpty) {
       warnings.add('书源没有配置目录规则（toc.list）');
+    } else if (urlTemplateUsesJs(tocRule.url ?? '')) {
+      // 目录地址是 JS 模板（`@js:baseUrl+'/toc'`）：本版没有「按表达式拼地址」
+      // 的接线，硬拼出来是一串脚本源码。明说，别让用户以为目录坏了。
+      warnings.add('目录地址是 JS 模板（toc.url），本版不支持');
+    } else if (listSelector.kind == SelectorKind.js) {
+      warnings.add('目录列表规则是 JS（${listSelector.raw}），'
+          '本版只能执行「取到值之后做变换」的 JS');
     } else if (!listSelector.isRunnable) {
-      warnings.add('目录规则暂不支持：'
-          '${listSelector.needsJs ? '需要 JS 规则' : '写法不认识'}（${listSelector.raw}）');
+      warnings.add('目录规则暂不支持：写法不认识（${listSelector.raw}）');
     } else {
       // 目录页与详情页同一个地址时复用详情页那份 HTML：省一次抓取，
       // 也省掉一次被站点拦的风险。地址不同就只传 null，避免拿错文档解析。
@@ -218,6 +235,7 @@ class BookDetailService {
         listSelector: listSelector,
         tocUrl: tocUrl,
         firstPageHtml: tocHtmlHint,
+        bookName: info.name,
       );
       chapters = tocLoad.chapters;
       partial = tocLoad.partial;
@@ -275,6 +293,7 @@ class BookDetailService {
     required SelectorValue listSelector,
     required String tocUrl,
     required String? firstPageHtml,
+    String bookName = '',
   }) async {
     final warnings = <String>[];
     final chapters = <TocChapter>[];
@@ -298,6 +317,25 @@ class BookDetailService {
       if (tocRule.urlSel.trim().isNotEmpty)
         'url': legadoSelector(tocRule.urlSel),
     };
+    // 章名 / 章节地址的 JS 变换（`a@href@js:'https://m.x'+result` 很常见）：
+    // 逐行由引擎执行。跑不了的字段在这里就点名（别等整页抓完才报）。
+    for (final entry in fields.entries) {
+      final selector = entry.value;
+      if (selector == null || selector.isEmpty) continue;
+      if (selector.needsJs && !selector.isStaticJsRunnable) {
+        final blocked = selector.blockedApis;
+        warnings.add(blocked.isEmpty
+            ? '目录的 ${entry.key} 规则用了本版不支持的 JS（${selector.raw}）'
+            : '目录的 ${entry.key} 规则用了本版不支持的接口：'
+                '${blocked.join('、')}（${selector.raw}）');
+        return _TocLoad(
+          chapters: const [],
+          partial: false,
+          warnings: warnings,
+          firstPageHtml: firstPageHtmlOut,
+        );
+      }
+    }
 
     var partial = false;
     for (var page = 1; page <= pageCount; page++) {
@@ -353,6 +391,14 @@ class BookDetailService {
           baseUrl: pageUrl,
           listSelector: listSelector,
           fields: fields,
+          bindings: jsBindings(
+            baseUrl: pageUrl,
+            bookName: bookName,
+            bookUrl: tocUrl,
+            sourceName: source.name,
+            sourceUrl: source.baseUrl,
+            sourceComment: _sourceComment(source),
+          ),
         );
       } catch (e) {
         if (page == 1) {
@@ -452,6 +498,12 @@ class BookDetailService {
             'name': null,
             'url': parseSelector('@href'),
           },
+          bindings: jsBindings(
+            baseUrl: tocUrl,
+            sourceName: source.name,
+            sourceUrl: source.baseUrl,
+            sourceComment: _sourceComment(source),
+          ),
         );
         final chapterNames = columns['name'] ?? const <String?>[];
         final chapterUrls = columns['url'] ?? const <String?>[];
@@ -577,6 +629,14 @@ class _TocLoad {
 String? _at(List<String?>? list, int index) {
   if (list == null || index < 0 || index >= list.length) return null;
   return list[index];
+}
+
+/// 书源备注（legado 的 `bookSourceComment`）：少数脚本拿它当配置表。
+String _sourceComment(BookSource source) {
+  final raw = source.raw;
+  if (raw == null) return '';
+  final value = raw['bookSourceComment'];
+  return value is String ? value : '';
 }
 
 /// 两个地址是不是同一个页面（比较归一化后的形式，容忍尾斜杠差异）。

@@ -19,6 +19,7 @@ library;
 
 import '../models/book_source.dart';
 import 'book_detail_service.dart' show TocChapter;
+import 'book_rule/js_rule.dart';
 import 'book_rule/legado_compat.dart';
 import 'book_rule/rule_engine.dart';
 import 'book_rule/selector.dart';
@@ -151,6 +152,17 @@ class BookContentService {
 
     var pageCount = rule.maxPages < 1 ? 1 : rule.maxPages;
     if (pageCount > maxContentPages) pageCount = maxContentPages;
+    // 地址里是 JS（`@js:'/p'+page`）：本版没有「按表达式拼地址」的接线
+    if (urlTemplateUsesJs(rule.url ?? '')) {
+      throw const RuleEngineException(
+        RuleErrorKind.unsupported,
+        '正文地址是 JS 模板（content.url），本版不支持',
+      );
+    }
+    if (urlTemplateUsesJs(nextTemplate)) {
+      if (pageCount > 1) warnings.add('正文分页地址是 JS 模板（content.nextPage），只取了第一页');
+      pageCount = 1;
+    }
     // 分页模板必须是「能拼出不同地址」的：没有页码占位符时翻下去还是同一页
     // （有的站点连 `{{page}}` 都没写），这时只取第一页并说清楚。
     final hasPageToken = nextTemplate.contains('{{page}}') ||
@@ -210,6 +222,16 @@ class BookContentService {
           baseUrl: pageUrl,
           removeSelectors: rule.remove,
           textSelector: parseSelector(rule.text),
+          // 正文规则本身是静态 JS（`div.content@html@js:…`）时脚本可见的绑定：
+          // `chapter.title` / `title` 是 legado 脚本里最常见的两个
+          bindings: jsBindings(
+            baseUrl: pageUrl,
+            bookName: (bookKey ?? '').trim(),
+            chapterTitle: title,
+            sourceName: source.name,
+            sourceUrl: source.baseUrl,
+            sourceComment: _sourceComment(source),
+          ),
         );
       } catch (e) {
         if (page == 1) throw _asRuleError(e);
@@ -570,6 +592,14 @@ RuleEngineException _asRuleError(Object error) {
     RuleErrorKind.network,
     '正文加载失败（${error.runtimeType}）',
   );
+}
+
+/// 书源备注（legado 的 `bookSourceComment`）：少数脚本拿它当配置表。
+String _sourceComment(BookSource source) {
+  final raw = source.raw;
+  if (raw == null) return '';
+  final value = raw['bookSourceComment'];
+  return value is String ? value : '';
 }
 
 String _describe(Object error) {

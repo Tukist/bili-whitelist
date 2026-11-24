@@ -18,6 +18,7 @@ library;
 import 'dart:async';
 
 import '../models/book_source.dart';
+import 'book_rule/js_rule.dart';
 import 'book_rule/legado_compat.dart';
 import 'book_rule/rule_engine.dart';
 import 'book_rule/selector.dart';
@@ -116,6 +117,12 @@ class BookSearchGroup {
   /// `lastDecodeEncoding` 早就被别的源覆盖了）。归到分组才是按源的事实。
   final String? decodeNote;
 
+  /// 判死的原因是「需要发网络请求的 JS」（`java.ajax` / `Packages.` …）。
+  ///
+  /// 只有 `unsupported` 分组会为真：健康检测据此把状态归到 `needsAjax`
+  /// 而不是「规则坏」—— 两者对用户的意义完全不同（一个等版本，一个要改源）。
+  final bool needsAjax;
+
   const BookSearchGroup({
     required this.sourceName,
     required this.status,
@@ -124,6 +131,7 @@ class BookSearchGroup {
     this.httpStatus,
     this.errorKind,
     this.decodeNote,
+    this.needsAjax = false,
   });
 
   bool get hasItems => items.isNotEmpty;
@@ -150,8 +158,9 @@ class BookSearchService {
   /// 搜索所有启用中的源，返回**与入参顺序一致**的分组列表。
   ///
   /// 已停用（`enabled == false`）的源直接跳过：**连分组都不生成**（用户停用
-  /// 了它，就不该在搜索结果里看到它的空分组）。需要 JS 的源会生成
-  /// `unsupported` 分组，但**不发请求**。
+  /// 了它，就不该在搜索结果里看到它的空分组）。确实缺 JS 能力的源（ajax /
+  /// 变量表 / 列表规则 / URL 模板）会生成 `unsupported` 分组，但**不发请求**；
+  /// 静态 JS（纯字符串变换）的源照常抓取，脚本由引擎逐行执行。
   Future<List<BookSearchGroup>> search({
     required List<BookSource> sources,
     required String keyword,
@@ -220,15 +229,39 @@ class BookSearchService {
     int pages,
   ) async {
     // 执行字段里有 JS 的源：**先判、后发请求**（省一次注定失败的抓取）。
-    // 只在发现页 / 登录页用了 JS 的源不受影响（旧版会整源判死，见 JsUsage）。
-    final usage = jsUsageOf(source);
-    if (usage.executedJs) {
+    // v2.78.0 起口径是「静态 JS 能跑就真的跑」：只有确实缺能力的
+    // （ajax / 变量表 / DOM 桥 / 列表规则 / URL 模板 / 嵌套规则模板）才判死，
+    // 并且文案点名到底缺哪个 API。
+    final usage = jsUsageOf(source, stage: SourceStage.search);
+    if (usage.executedJs && !usage.runnableJs) {
+      // 「位置」问题优先说具体原因：列表规则要的是一批元素、地址模板要的是
+      // 一次表达式拼接，两者都不是「换个 API」能解决的，说笼统反而误导。
+      if (usage.executedFields.contains('search.list')) {
+        return BookSearchGroup(
+          sourceName: source.name,
+          status: BookSearchStatus.unsupported,
+          message: '搜索结果列表规则是 JS（search.list），'
+              '本版只能执行「取到值之后做变换」的 JS',
+        );
+      }
+      if (usage.executedFields.contains('search.url')) {
+        return BookSearchGroup(
+          sourceName: source.name,
+          status: BookSearchStatus.unsupported,
+          message: '搜索地址是 JS 模板（search.url），本版不支持按表达式拼地址',
+        );
+      }
       final fields = usage.executedFields.take(2).join('、');
       final more = usage.executedFields.length > 2 ? ' 等' : '';
+      final apis = usage.blockedApis;
+      final detail = apis.isEmpty
+          ? '需要本版不支持的 JS 能力'
+          : '需要本版不支持的接口：${apis.take(3).join('、')}';
       return BookSearchGroup(
         sourceName: source.name,
         status: BookSearchStatus.unsupported,
-        message: '该源的 $fields$more 需要 JS 规则（<js> / @js: / {{…}}），本版暂不支持',
+        message: '该源的 $fields$more 里的 JS 规则$detail',
+        needsAjax: jsNeedsAjax(usage),
       );
     }
     if (source.search.url.trim().isEmpty) {
@@ -256,7 +289,17 @@ class BookSearchService {
         message: '书源没有配置搜索结果列表规则（search.list）',
       );
     }
-    final listProblem = _runnableProblem(listSelector, '搜索结果列表规则');
+    if (listSelector.kind == SelectorKind.js) {
+      // 列表规则要的是**元素列表**，静态沙箱只返回字符串 —— 这条不是
+      // 「换个写法」能解决的，明确说不支持（别让用户以为规则写错了）。
+      return BookSearchGroup(
+        sourceName: source.name,
+        status: BookSearchStatus.unsupported,
+        message: '搜索结果列表规则是 JS（${listSelector.raw}），'
+            '本版只能执行「取到值之后做变换」的 JS',
+      );
+    }
+    final listProblem = _ruleProblem(listSelector, '搜索结果列表规则');
     if (listProblem != null) {
       return BookSearchGroup(
         sourceName: source.name,
@@ -280,7 +323,7 @@ class BookSearchService {
     }.entries) {
       if (entry.value.trim().isEmpty) continue;
       final selector = legadoSelector(entry.value);
-      final problem = _runnableProblem(selector, '${entry.key} 规则');
+      final problem = _ruleProblem(selector, '${entry.key} 规则');
       if (problem != null) {
         return BookSearchGroup(
           sourceName: source.name,
@@ -339,6 +382,16 @@ class BookSearchService {
           baseUrl: pageUrl,
           listSelector: listSelector,
           fields: fields,
+          // 静态 JS 字段的脚本绑定（`book.origin` 要站点根，`key` 要关键词）
+          bindings: jsBindings(
+            baseUrl: pageUrl,
+            keyword: keyword,
+            page: '$page',
+            bookName: keyword,
+            sourceName: source.name,
+            sourceUrl: source.baseUrl,
+            sourceComment: _sourceComment(source),
+          ),
         );
       } catch (e) {
         if (page == 1) return _errorGroup(source, e, decodeNote: notes());
@@ -527,21 +580,36 @@ String _normalizeKeyPart(String text) {
 // ==================== 内部小工具 ====================
 
 /// 规则能不能执行；不能则给一句带原文的说明。
-String? _runnableProblem(SelectorValue selector, String what) {
+///
+/// v2.78.0 起三条变化：
+/// - **静态可跑的 JS 字段返回 null**（引擎会真的执行它）；
+/// - `text.` / `%%` 已支持，不再报「暂不支持」；
+/// - 跑不了的 JS 点名缺哪个 API（`java.ajax` / `result.select` …）。
+String? _ruleProblem(SelectorValue selector, String what) {
+  if (selector.isEmpty) return null;
   if (selector.kind == SelectorKind.jsonPath) {
     return '$what是 JSONPath（${selector.raw}），JSON 接口书源本版暂不支持';
   }
-  if (selector.isRunnable) return null;
+  if (selector.isStaticJsRunnable) return null;
   if (selector.needsJs) {
-    return '$what需要 JS（${selector.raw}），本版暂不支持';
+    final blocked = selector.blockedApis;
+    if (blocked.isNotEmpty) {
+      return '$what的 JS 规则用了本版不支持的接口：'
+          '${blocked.join('、')}（${selector.raw}）';
+    }
+    final why = selector.jsInfo?.summary ?? '本版暂不支持';
+    return '$what的 JS 规则跑不了：$why（${selector.raw}）';
   }
-  if (selector.reason == kSelectorReasonTextFilter) {
-    return '$what用了 text. 按文字筛元素（${selector.raw}），本版暂不支持';
-  }
-  if (selector.reason == kSelectorReasonInterleave) {
-    return '$what用了 %% 交叉合并（${selector.raw}），本版暂不支持';
-  }
+  if (selector.isRunnable) return null;
   return '$what写法暂不支持（${selector.raw}）';
+}
+
+/// 书源的备注（legado 的 `bookSourceComment`）：少数脚本拿它当配置表。
+String _sourceComment(BookSource source) {
+  final raw = source.raw;
+  if (raw == null) return '';
+  final value = raw['bookSourceComment'];
+  return value is String ? value : '';
 }
 
 String? _at(List<String?>? list, int index) {

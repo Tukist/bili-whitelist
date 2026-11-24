@@ -1,4 +1,4 @@
-// 正文服务测试（R3）。
+// 正文服务测试（R3；v2.78.0 加「正文规则是静态 JS」）。
 //
 // 两件事分开验：
 // 1. 段落还原 / 正则替换是**纯函数**，逐条钉死（br / block / none 三种策略、
@@ -11,6 +11,7 @@ import 'package:bili_whitelist_app/models/book_source.dart';
 import 'package:bili_whitelist_app/services/book_content_service.dart';
 import 'package:bili_whitelist_app/services/book_detail_service.dart';
 import 'package:bili_whitelist_app/services/book_rule/rule_engine.dart';
+import 'package:bili_whitelist_app/services/book_rule/selector.dart';
 
 BookSource _source({ContentRule content = const ContentRule(text: '#content')}) =>
     BookSource(
@@ -213,6 +214,78 @@ void main() {
         ),
         throwsA(isA<RuleEngineException>()),
       );
+    });
+  });
+
+  group('正文规则是静态 JS（I3b）', () {
+    test('JS 正文规则交给引擎（连 base 选择器一起）', () async {
+      SelectorValue? seen;
+      final engine = FakeRuleEngine(
+        onFetch: (_) async => '<html>page</html>',
+        onExtractHtml: (html, removes, selector) async {
+          seen = selector;
+          return '正文第一段\n正文第二段';
+        },
+      );
+      final source = _source(
+        content: const ContentRule(
+          text: r'#content@html@js:result.replace(/广告/g, "")',
+        ),
+      );
+
+      final result = await BookContentService(engine: engine).loadContent(
+        source: source,
+        chapter: const TocChapter(name: '第1章', url: 'https://x.example/1'),
+      );
+
+      expect(seen!.kind, SelectorKind.js);
+      expect(seen!.script, contains('replace'));
+      expect(seen!.baseSelector!.query, '#content');
+      expect(seen!.isStaticJsRunnable, isTrue);
+      expect(result.body, '正文第一段\n正文第二段');
+    });
+
+    test('正文地址是 JS 模板 → 明确报不支持（不硬拼出一串脚本源码）', () async {
+      final engine = FakeRuleEngine(onFetch: (_) async => '<html>p</html>');
+      final source = _source(
+        content: const ContentRule(
+          text: '#content',
+          url: r'@js:baseUrl + "/c/" + chapter.title',
+        ),
+      );
+      expect(
+        BookContentService(engine: engine).loadContent(
+          source: source,
+          chapter: const TocChapter(name: '第1章', url: 'https://x.example/1'),
+        ),
+        throwsA(isA<RuleEngineException>()),
+      );
+    });
+
+    test('分页地址是 JS 模板 → 只取第一页并说明', () async {
+      var fetches = 0;
+      final engine = FakeRuleEngine(
+        onFetch: (_) async {
+          fetches++;
+          return '<html>p</html>';
+        },
+        onExtractHtml: (_, __, ___) async => '正文',
+      );
+      final source = _source(
+        content: const ContentRule(
+          text: '#content',
+          nextPage: r'@js:baseUrl + "/next"',
+          maxPages: 3,
+        ),
+      );
+
+      final result = await BookContentService(engine: engine).loadContent(
+        source: source,
+        chapter: const TocChapter(name: '第1章', url: 'https://x.example/1'),
+      );
+
+      expect(fetches, 1);
+      expect(result.warning, contains('JS 模板'));
     });
   });
 }

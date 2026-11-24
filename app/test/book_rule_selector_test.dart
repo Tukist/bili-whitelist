@@ -193,29 +193,52 @@ void main() {
     });
   });
 
-  group('JS 规则判 unsupported', () {
+  group('JS 规则判 js（I3a 起单独一个 kind）', () {
+    // 设计契约变更（I3a）：`kind` 从 `unsupported` 改为 `js` —— JS 规则是
+    // **认得**的，只是执行方式不同（要进静态沙箱）。派生语义一个字没变：
+    // `isUnsupported` / `needsJs` 对 js 仍然为真，所以服务层行为不变。
     test('<js>…</js>', () {
       final v = parseSelector('<js>java.getString("abc")</js>');
-      expect(v.kind, SelectorKind.unsupported);
+      expect(v.kind, SelectorKind.js);
       expect(v.reason, kSelectorReasonJs);
+      expect(v.isUnsupported, isTrue);
       expect(v.needsJs, isTrue);
+      // 脚本正文与拦路石都带出来了（能力判定看 jsInfo，不在这里）
+      expect(v.script, 'java.getString("abc")');
+      expect(v.blockedApis, contains('java.getString'));
+      expect(v.isStaticJsRunnable, isFalse);
     });
 
     test('@js:', () {
       final v = parseSelector('@js:result.split("##")[0]');
       expect(v.needsJs, isTrue);
+      expect(v.kind, SelectorKind.js);
+      expect(v.script, 'result.split("##")[0]');
+      expect(v.isStaticJsRunnable, isTrue);
     });
 
     test('{{…}} 模板', () {
       final v = parseSelector('{{book.name}}');
-      expect(v.kind, SelectorKind.unsupported);
+      expect(v.kind, SelectorKind.js);
       expect(v.reason, kSelectorReasonJs);
+      expect(v.script, 'book.name');
+    });
+
+    test('带前置选择器：baseSelector 能在原页面上取值', () {
+      final v = parseSelector('@css:.item@href@js:result.split("#")[0]');
+      expect(v.kind, SelectorKind.js);
+      expect(v.script, 'result.split("#")[0]');
+      expect(v.baseSelector, isNotNull);
+      expect(v.baseSelector!.kind, SelectorKind.css);
+      expect(v.baseSelector!.attr, 'href');
     });
 
     test('回退链里只要有一段是 JS，整条都不跑', () {
       // 跑半条等于给出半真半假的结果，不如明确说不支持
       final v = parseSelector('@css:.a || <js>x</js>');
       expect(v.needsJs, isTrue);
+      expect(v.kind, SelectorKind.js);
+      expect(v.isStaticJsRunnable, isFalse);
     });
   });
 
@@ -333,9 +356,18 @@ void main() {
     });
 
     test('链上任一段不支持 → 整条不支持（不给半真半假的结果）', () {
-      final v = parseSelector('class.a@text.作者');
+      // v2.78.0 契约变更：`text.作者` 这一段现在**支持**了（textFilter），
+      // 所以改用一段真正不可解析的（`regex:` 后面没有正则源）验证同一条铁律。
+      final v = parseSelector('class.a@regex:@text');
       expect(v.kind, SelectorKind.unsupported);
-      expect(v.reason, kSelectorReasonTextFilter);
+      expect(v.isRunnable, isFalse);
+
+      // `text.` 作为链式段时是 textFilter（不再整条判死）
+      final filtered = parseSelector('class.a@text.作者');
+      expect(filtered.kind, SelectorKind.css);
+      expect(filtered.steps.single.kind, SelectorKind.textFilter);
+      expect(filtered.steps.single.query, '作者');
+      expect(filtered.isRunnable, isTrue);
     });
   });
 
@@ -470,18 +502,34 @@ void main() {
     });
   });
 
-  group('明确不支持的写法（v2.77.0）', () {
-    test('text.xxx 按文字筛元素：reason=text（36 个源）', () {
+  group('text. / %%：v2.78.0 起真支持', () {
+    // 设计契约变更（v2.78.0）：v2.77.0 这里断言的是「kind=unsupported +
+    // reason=text/interleave」。I3b 按 legado 源码把两者实现出来
+    // （`getElementsContainingOwnText` / 按行交错），断言随之改成「能跑」
+    // 并钉住解析结果 —— 是改写，不是删掉。
+    test('text.xxx 按自身文字筛元素（36 个源）', () {
       final v = parseSelector('text.作者：@text');
-      expect(v.kind, SelectorKind.unsupported);
-      expect(v.reason, kSelectorReasonTextFilter);
+      expect(v.kind, SelectorKind.textFilter);
+      expect(v.query, '作者：');
+      expect(v.isRunnable, isTrue);
       expect(v.needsJs, isFalse);
+      // 只取第一个 `.` 之后的那一段：legado 是 `beforeRule.split(".")[1]`
+      expect(parseSelector('text.a.b').query, 'a');
+      // 空的 needle 是语法错，不当「筛任意文字」
+      expect(parseSelector('text.').kind, SelectorKind.unsupported);
     });
 
-    test('%% 交叉合并：reason=interleave（5 个源）', () {
+    test('%% 交叉合并：其余各支挂在 interleave 上（5 个源）', () {
       final v = parseSelector('tag.td.2@tag.a@text%%tag.td.4@text');
-      expect(v.kind, SelectorKind.unsupported);
-      expect(v.reason, kSelectorReasonInterleave);
+      expect(v.kind, SelectorKind.css);
+      expect(v.interleave.length, 1);
+      expect(v.interleave.single.query, 'td');
+      expect(v.interleave.single.indexes, [4]);
+      expect(v.isRunnable, isTrue);
+      // `%%` 与 `&&` 同时出现时按「先出现的那个」切（legado elementsType 口径）
+      final andFirst = parseSelector('a && b %% c');
+      expect(andFirst.concat.length, 1);
+      expect(andFirst.interleave, isEmpty);
     });
 
     test('@get:{x} 依赖 java.put 的变量表 → 算「需要 JS」', () {

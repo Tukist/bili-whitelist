@@ -597,7 +597,7 @@ void main() {
     expect(find.textContaining('站点返回 403'), findsOneWidget);
   });
 
-  testWidgets('检测全部：只测「启用且不需要 JS」的源，跳过的数量写清楚',
+  testWidgets('检测全部：只测「启用且本版能跑」的源，跳过的数量写清楚',
       (tester) async {
     final store = BookSourceStore();
     await store.upsertAll([
@@ -609,7 +609,20 @@ void main() {
         search: const SearchRule(
           url: '/s?q={{key}}',
           list: '.item',
-          name: '<js>x</js>',
+          // v2.78.0 契约变更：纯静态 `<js>x</js>` 现在会真的去探测（本版能跑），
+          // 这里要的是**跑不了**的源，所以用 java.ajax。
+          name: '<js>java.ajax("/x")</js>',
+        ),
+        toc: const TocRule(),
+        content: const ContentRule(),
+      ),
+      BookSource(
+        name: '静态JS的',
+        baseUrl: 'https://staticjs.example',
+        search: const SearchRule(
+          url: '/s?q={{key}}',
+          list: '.item',
+          name: '<js>result.trim()</js>',
         ),
         toc: const TocRule(),
         content: const ContentRule(),
@@ -622,11 +635,60 @@ void main() {
     await tester.tap(find.text('检测全部书源（较慢）'));
     await tester.pumpAndSettle();
 
-    expect(health.probed, ['启用的']);
+    // 静态 JS 的源照常探测（I3b：它真的能搜）
+    expect(health.probed, ['启用的', '静态JS的']);
     expect(find.textContaining('检测完成'), findsOneWidget);
-    expect(find.text('可用 3 条'), findsOneWidget);
+    expect(find.text('可用 3 条'), findsNWidgets(2));
     // 停用 / 需 JS 的源没有角标变化，也不该被探测
     expect(find.text('未检测'), findsNWidgets(2));
+  });
+
+  testWidgets('能力角标三态：可搜索 / 静态 JS / 需 JS（ajax）', (tester) async {
+    final store = BookSourceStore();
+    await store.upsertAll([
+      _src('普通源'),
+      BookSource(
+        name: '静态JS源',
+        baseUrl: 'https://s.example',
+        search: const SearchRule(
+          url: '/s?q={{key}}',
+          list: '.item',
+          name: '<js>result.trim()</js>',
+        ),
+        toc: const TocRule(),
+        content: const ContentRule(),
+      ),
+      BookSource(
+        name: 'ajax源',
+        baseUrl: 'https://a.example',
+        search: const SearchRule(
+          url: '/s?q={{key}}',
+          list: '.item',
+          name: '<js>java.ajax("/x")</js>',
+        ),
+        toc: const TocRule(),
+        content: const ContentRule(),
+      ),
+    ]);
+    await _pump(tester, store: store, health: _FakeHealth());
+
+    expect(find.text('可搜索'), findsOneWidget);
+    expect(find.text('静态 JS'), findsOneWidget);
+    expect(find.text('需 JS（ajax）'), findsOneWidget);
+  });
+
+  testWidgets('needsAjax：检测结果角标写「需 ajax」', (tester) async {
+    final store = BookSourceStore();
+    await store.upsertAll([_src('甲')]);
+    final health = _FakeHealth(statusFor: (_) => SourceHealthStatus.needsAjax);
+    await _pump(tester, store: store, health: health);
+
+    await tester.longPress(find.text('甲'));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('检测这个源'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('需 ajax'), findsOneWidget);
   });
 
   testWidgets('只在发现页用 JS 的源：角标写「部分 JS」，照常参与检测', (tester) async {

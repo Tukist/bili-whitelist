@@ -4,7 +4,7 @@
 > 不是设计愿景。改完代码如果动了模块职责、红线、存储 key，**顺手改这里**
 > （这份文档随开发维护；`CHANGELOG.md` 归发布脚本，别手改）。
 >
-> 最近一次对齐：v2.77.0（2026-11-23，书源选择器补语法：链式 / 索引 / `&&`）。
+> 最近一次对齐：v2.78.0（2026-11-24，书源静态 JS 接线 + `text.`/`%%`）。
 
 ---
 
@@ -121,10 +121,11 @@ bash app/tools/release_all.sh 2.71.0 --notes C:/Users/HP/.kimi-tmp/v2710.md
 
 | 文件 | 职责 |
 |------|------|
-| `selector.dart` | 选择器语法解析：`css:` / `xpath:` / `class.xxx` / `text.`（**明确不支持**，报 `text`）/ `@text` / `@html` / `@href` / `@src` / `@ownText` / `@textNodes` / `@all` / `@attr:` / **`@属性名`**（`@content`）/ `regex:` / `##正则##替换`（含 `###` = 只替换第一个）/ `\|\|` 回退链 / **`&&` 并列** / **`@` 链式** / **`.N` 选索引** / **`!N` 排除索引** / `children` |
-| `js_builder.dart` | 选择器 → 待求值 JS 表达式（纯函数，可单测）。v2.77.0 起 `queryAll` 自己走链式 + 索引（`applyIndex`），`firstValue` 处理 `&&` 并列，`rawOf` 多认 `ownText` / `textNodes` / `all` |
-| `legado_compat.dart` | legado 字段名映射 + `jsUsageOf`（**v2.76.0**：`JsUsage{executedJs, unexecutedJs, executedFields, blockedApis}`，只把 `search/detail/toc/content` 里会执行的字段计入判定；`usesJs` 是它的薄视图）+ `normalizeUrl`。**v2.77.0 起 `legadoSelector` 是 `parseSelector` 的薄别名**（`&&` 不再单独判死） |
-| `rule_engine.dart` | 引擎接口 + WebView 实现；`_unwrapJsValue` 负责剥 `runJavaScriptReturningResult` 的多层返回值；**v2.75.0 起 `fetchHtml` 的字节解码交给 `utils/text_decoding.dart`**（响应头 charset > 书源声明 > 自动判定），结果带出 `lastDecodeEncoding`（实际编码）与 `lastDecodeWarning`（人话告警）；`parseHeaderCharset` / `decodeWarningFor` / `decodeNoteFor` 是这段判定的纯函数入口。**controller 懒建**（`fetchHtml` 不需要 WebView），所以单测能注入假 Dio 直接验 GBK 字节；`loadHtmlString` 求值仍走同一个串行队列 |
+| `selector.dart` | 选择器语法解析：`css:` / `xpath:` / `class.xxx` / **`text.xxx`（v2.78.0 起真支持）** / `@text` / `@html` / `@href` / `@src` / `@ownText` / `@textNodes` / `@all` / `@attr:` / **`@属性名`**（`@content`）/ `regex:` / `##正则##替换`（含 `###` = 只替换第一个）/ `\|\|` 回退链 / **`&&` 并列** / **`%%` 交叉合并（v2.78.0）** / **`@` 链式** / **`.N` 选索引** / **`!N` 排除索引** / `children`。JS 规则单独 `kind: js`（`<js>` / `@js:` / `{{…}}` / `@get:`），脚本正文、前置选择器与被拦 API 挂在 `jsInfo` 上 |
+| `js_rule.dart` | **I3a 新增 / I3b 收紧**，静态 JS 内核（纯函数，不碰 WebView）：`classifyJsRule` 认三种写法并列出白名单外的 API、`kSupportedJavaApis`（base64 / md5 / timeFormat / htmlFormat / strToBytes / bytesToStr / log，**不含** ajax / put / get / getString）、`buildJsRunnerScript` / **`buildJsRunnerFactory`（跑一行的函数工厂）** / **`jsRuleRuntimePrelude`** / **`jsBindings`（四个服务共用的绑定拼装）**、`parseJsRunOutput`。**v2.78.0 新增三类拦路判定**：`result.select()/attr()/parentNode()` 这类 DOM 桥、`book.xxx`/`source.xxx`/`chapter.xxx` 里**没绑定**的属性（避免拼出 `xundefined` 这种静默错值）、`cookie.`/`cache.`/`eval(`；`{{…}}` 内层是**嵌套选择器规则**（`{{@@id.intro@text}}`）时 `templateIsRule`；`while(true)`/`for(;;)` 这类**可见死循环** `hasDeadLoop`（执行会把整个 WebView 卡死，只能静态拦）。`blockReason` 给审计工具分档 |
+| `js_builder.dart` | 选择器 → 待求值 JS 表达式（纯函数，可单测）。v2.77.0 起 `queryAll` 自己走链式 + 索引（`applyIndex`），`firstValue` 处理 `&&` 并列；**v2.78.0**：`textFilter`（按 ownText 筛）、`%%` 按行交错（`pickNodes`）、`buildQueryFieldsMixedJs`（选择器 + **逐行**静态 JS 一次求值）、`buildExtractHtmlWithJsJs`（正文规则本身是 JS 时的「删节点 → 取值 → 跑脚本」）。**书源 JS 的 `result` 初值不转绝对**（语料里 `'https://x'+result` 的 result 是页面里的相对 href） |
+| `legado_compat.dart` | legado 字段名映射 + `jsUsageOf(source, {stage})`（**v2.76.0 建，v2.78.0 分阶段**：`SourceStage.search/detail/toc/content` 各管自己那一段，JS 目录地址不再挡住搜索）；`JsUsage{executedJs, unexecutedJs, runnableJs, executedFields, blockedApis}`（`runnableJs` = 执行字段的 JS **全部**静态可跑；列表规则 / URL 字段的 JS 一定不可跑）+ `kNetworkJsApis` / `jsNeedsAjax` / **`sourceCapabilityOf`（书源管理页三态角标：可搜索 / 静态 JS / 需 JS）** + `urlTemplateUsesJs` + `normalizeUrl`。**v2.77.0 起 `legadoSelector` 是 `parseSelector` 的薄别名** |
+| `rule_engine.dart` | 引擎接口 + WebView 实现；**I3a 加 `evalJsRule`**（复用当前页面、`base` 前置选择器取值当 `result` 初值、`checkJsRuleAllowed` 纯函数安全门、3 秒超时 + 超时重载空白页终止脚本、执行期禁止导航）；**I3b**：`queryFieldMap` 支持**选择器 + 逐行 JS 混在一次求值**（`bindings` 为新增可选参数）、`extractHtml` 支持 JS 正文规则、`_loadPage`/`_runJsRaw` 拆开；**载页不再死等 `onPageFinished`**（v2.78.0：轮询 `document.readyState` + `amotv-load` 标记，见「已知坑 20」）。**v2.75.0 起 `fetchHtml` 的字节解码交给 `utils/text_decoding.dart`**，结果带出 `lastDecodeEncoding` / `lastDecodeWarning`。**controller 懒建**（`fetchHtml` 不需要 WebView），单测能注入假 Dio 直接验 GBK 字节；`loadHtmlString` 求值仍走同一个串行队列 |
 | `engine_holder.dart` | 全 App 唯一引擎单例（一个实例一个 WebView 页面），求值必须串行 |
 | `example_sources.dart` | **内置书源清单**（常量名仍是 `kExampleBookSources`）：维基文库（中文经典）+ 标准电子书（英文经典）。每条的搜索 / 详情 / 目录 / 正文选择器都是**先 curl 真页、再写规则**（证据写在文件头注释里）；改动前必须重新抓页面 |
 
@@ -307,16 +308,19 @@ Standard Ebooks 覆盖）。盗版 / 聚合爬站一律不接。
 | `noResult` | 通了但 0 条 | 分组 noResult（或 `empty` 类错误） |
 | `blocked` | 被拦 | 401/403/407/412/429/451，或 HTTP 200 的验证页（Cloudflare / Turnstile 特征串；`noResult` 时**多抓一次**复核） |
 | `networkError` | 连不上 | 超时 / DNS / 连接失败 / 其它 5xx |
-| `unsupportedJs` | 需 JS，本版跑不了 | `usesJs` 判定，**不发请求** |
-| `badRule` | 规则本身跑不起来 | 地址拼不出、没配列表规则、JSONPath、`%%` 交叉合并、`text.` 按文字筛选中 |
+| `unsupportedJs` | 缺本版没有的 JS 能力，**不发请求** | v2.78.0 语义收窄：只指「补个函数也补不出来」的（变量表 / 嵌套规则模板 / DOM 桥 / 死循环）。**纯静态 JS 的源不再判死，会真去探测** |
+| `needsAjax`（v2.78.0 新增） | 需要 `java.ajax` / `Packages.` 这类**发网络请求**的 JS | `jsNeedsAjax(usage)`：`blockedApis` 命中 `kNetworkJsApis` |
+| `badRule` | 规则本身跑不起来 | 地址拼不出、没配列表规则、JSONPath |
 
-- 管理页每行有角标（绿「可用 N 条」/ 灰「没结果」/ 红「被拦」/ 红「连不上」/
-  黄「需 JS」/ 黄「规则坏」/ 灰「未检测」），长按菜单「检测这个源」；AppBar
-  溢出菜单「检测全部书源（较慢）」只测 `enabled && !usesJs`（其余在进度框里
-  说明跳过了几个），并发 **2**、可取消。
+- 管理页每行两个角标：**能力档**（绿「可搜索」/ 橙「静态 JS」/ 红「需 JS（ajax）」，
+  `sourceCapabilityOf` 只看**搜索**那一段）+ **检测结果**（绿「可用 N 条」/ 灰「没结果」/
+  红「被拦」/ 红「连不上」/ 黄「需 JS」/ 黄「需 ajax」/ 黄「规则坏」/ 灰「未检测」），
+  长按菜单「检测这个源」；AppBar 溢出菜单「检测全部书源（较慢）」只测
+  `enabled && 能力档 != needsJs`（**静态 JS 的源照常检测**），并发 **2**、可取消。
 - 搜索页分组标题右侧显示该源上次检测结果；某源 0 条时用一行小字区分
   「这个源没搜到」与「这个源可能已失效（上次检测：被拦）」；整页 0 条时区分
   「所有源都没搜到」与「所有源都失败」（后者把原因归类成「3 个源连不上、2 个被拦」）。
+  跳过列表脚注写「已跳过 N 个需要 JS 的书源（ajax / 变量表）」，点「查看」看名单。
 - 检测结果**只在本机**，不进 Gist；「清空书源」会连带清掉（免得同名源复用时
   带着旧状态）。
 - 探测复用 `BookSearchService`（不复制抓取代码）；为此 `RuleEngineException`
@@ -471,6 +475,76 @@ v2.77.0 起只有一处。
 `tr!0` 跳过第一行、`#info → p.2` 选中第 3 个、`&&` 两属性按 `\n` 拼、
 `@textNodes`、`children` 只取直接子元素、`###` 只替换第一个匹配。
 这一步不进仓库（脚本在仓外临时目录），但它比文本断言可信得多。
+
+**静态 JS 接线与 `text.` / `%%`（v2.78.0，I3b 批）**
+
+I3a 只做了内核（判定 + 沙箱），用户可见行为没变。这一批把静态 JS 真的接进了
+搜索 / 详情 / 目录 / 正文，并按 legado 源码补了 `text.xxx` 与 `%%`：
+
+| 能力 | 口径 | 依据 |
+|---|---|---|
+| 静态 JS（**能跑**） | 三种写法（`<js>` / `@js:` / `{{…}}`）+ 白名单 `java.*` + 前置选择器简单 + 模板里是 JS 表达式 + 没有可见死循环 | `JsRuleInfo.runnable` |
+| 静态 JS（**跑不了**） | `java.ajax` 等网络调用 / 变量表（`java.put`/`get`/`getString`）/ `result.select()` 这类 DOM 桥 / `book.`·`source.`·`chapter.` 上没绑定的属性 / `cookie.`·`cache.`·`eval(` / `{{@@a@text}}` 这种**嵌套规则模板** / `while(true)`·`for(;;)` 死循环 / 前置选择器里带 `\|\|`·`&&` | 上面几条都是真实语料里见过的形态，逐条对照过 |
+| `text.xxx` | 按「**自身文字**包含 xxx」筛元素（legado `ElementsSingle` 的 `"text" -> getElementsContainingOwnText`）；needle 只取到第一个 `.`（`beforeRule.split(".")[1]`） | 语料 36 源；v2.77.0 判死 → v2.78.0 真支持 |
+| `%%` | 各支结果按**行**交错，外层长度取**第一支**（后面的支多出来的行丢掉）；`%%` 与 `&&` 同时出现时按**先出现的那个**切 | `AnalyzeByJSoup.getStringList` / `getElements` 的原码；语料 5 源 |
+
+- **一次查询只载一次页**：`queryFieldMap` 把「选择器列 + 逐行 JS 列」合成一段
+  脚本（`buildQueryFieldsMixedJs`）：列表节点只查一遍，JS 字段**每个节点各跑一次**
+  （`buildJsRunnerFactory` 编一次、调 N 次）。逐字段载页是 6 倍等待，逐行
+  `evalJsRule` 是 N 倍往返，两条都不走。
+- **`result` 初值是「页面里的原值」**：`h2@a@href@js:'https://www.x.com'+result`
+  里作者期望 result 是 `/book/123/`，所以 JS 字段的 result **不做相对转绝对**
+  （选择器字段照旧转）。先转绝对再拼会得到 `https://www.x.comhttps://m.x.../book/123/`
+  —— 整列详情页打不开。
+- **裸表达式脚本也能跑**：语料里 `'https://m.x'+result`、`result.match(...)[1]`
+  这类没有赋值语句的脚本很多，`new Function` 会把它们当语句丢掉（返回 undefined）。
+  工厂先用 `eval(__src)` 取**完成值**（Rhino `script.eval` 的语义），取不到再退回
+  `new Function`（那条路支持顶层 `return`）。
+- **绑定**（`jsBindings`，四个服务共用一份）：`result` / `baseUrl` / `key` / `page` /
+  `book{name, author, origin, bookUrl}` / `source{bookSourceUrl, name, bookSourceComment, getKey()}` /
+  `chapter{title}` / `title` / `java`（白名单）。
+- **阶段判定**：`jsUsageOf(source, stage: …)` 只看那一段。一个源可能只有
+  **目录地址**是 JS（`toc.url`），搜索完全正常 —— 用整源口径判死会白丢能搜的源。
+  能力角标、健康检测、搜索页筛选都用 `SourceSearch` 那一段。
+
+**审计重算（同一份 2483 个去重源，三组数字）**
+
+| | I1 时点（v2.76.0） | I2 后（v2.77.0） | **I3b 后（v2.78.0）** |
+|---|---|---|---|
+| 可搜索 | 495（19.9%） | 754（30.4%） | **1079（43.5%）** |
+| 被 JS 能力挡 | 1176（47.4%） | 1176（47.4%） | **889（35.8%）** |
+| 被选择器语法挡 | 302（12.2%） | 43（1.7%） | **5（0.2%）** |
+| 缺搜索规则 | 510（20.5%） | 510（20.5%） | 510（20.5%） |
+
+- 分类表：`jsStaticRunnable` **252**（执行字段的 JS 全静态可跑，单列一档）、
+  `jsTransformOnly` 从 503 降到 252（剩下的不是「纯字符串变换」：模板套规则 /
+  DOM 桥 / 变量表）、`noJs` 1212、`jsInUnexecutedField` 60。
+- 净增 **+325 个源（+13.1pp，相对提升 43%）**；其中 `text.`/`%%` 让「被选择器
+  挡」从 43 收到 5。
+- 剩余不可搜的构成（一个源可命中多个原因）：地址模板里是 JS 504、变量表 358、
+  JS 与 `||`/`&&` 混写 329、列表规则本身是 JS 192、`{{…}}` 套规则 153、
+  ajax 148、其它不支持接口 145、JSONPath 27。
+- **审计数字的口径边界**（写清楚，免得被当成「实测能搜」）：不算站点可达性、
+  不算「搜索地址带请求选项」（`,{ "method":"POST", ... }` 这种 legado 写法本版
+  没接，语料里 745 个源这么写）、也不区分「少一个字段」与「整源不可用」。
+
+**本机实测（2026-11-24，模拟器 `bili_test`，`adb install -r`）**
+
+- 真实语料源 **零零小说**（`https://www.00shu.la`，`jsStaticRunnable`，`coverUrl`
+  是 `<js>` 算封面地址）：导入后搜「凡人」→ **100 条**，封面全部是
+  `@js:` 逐行算出来的（`/files/article/image/41/41151/41151s.jpg`）。
+- 自建源 `search.name = <js>while(true){}</js>` → **静态拦下**，搜索页脚注
+  「已跳过 1 个需要 JS 的书源（ajax / 变量表）：死循环测试源」。为什么不是
+  「跑 3 秒然后报超时」：**WebView 里的同步死循环没法被打断**（实测：引擎
+  超时后 `loadHtmlString('')` 排在一个永不空闲的渲染线程后面，整个 App 的
+  书源搜索全部卡死，只能重启 App）。所以死循环改成解析阶段判死。
+- 自建源 `search.name = <js>var t=Date.now(); while(Date.now()-t<6000){}; …</js>`
+  → 报 **「JS 规则执行超过 3 秒，已终止（脚本里可能有死循环）」**，同一次搜索里
+  零零小说**照常返回 100 条** —— 证明超时之后引擎还能继续干活。
+- 取证图（`docs/screenshots/v*/*.png` 默认不入库）：
+  `i3b_capability_badges.png`（可搜索 / 静态 JS 三态）、
+  `i3b_real_source_100.png`（真实语料 100 条 + 封面）、
+  `i3b_js_timeout_and_results.png`（超时文案 + 同批其它源正常）。
 
 **网络抓取的编码判定（v2.75.0）**
 
@@ -679,12 +753,15 @@ v2.74.0 加 MOBI）**：
 4. **书源规则引擎一个实例一个 WebView 页面，求值必须串行**。宿主用
    `Offstage(offstage: true)` 包在 `SizedBox(width: 1, height: 1)` 里——尺寸不能为 0，
    否则 WebView 不布局、JS 不执行（见 `book_search_page.dart` 的 `_hiddenHost`）。
-5. **`@js` 书源不支持**：legado 的 `java.ajax` 是同步调用，浏览器里同步 XHR 被 CORS 拦。
-   `legado_compat.jsUsageOf` 会判定并在 UI 标「需要 JS 规则，暂不支持」。
-   **v2.76.0 起口径收紧**：只有 `search/detail/toc/content` 里**会执行**的字段
-   有 JS 才判死；`exploreUrl` / `loginUrl` / `checkKeyWord` / `init` /
-   `preUpdateJs` / `ruleExplore.*` 里的 JS 本版根本不跑，这类源能正常搜
-   （`JsUsage.unexecutedJs`，UI 标「部分 JS（不影响搜索）」）。
+5. **`@js` 书源：静态子集能跑，其余仍然不支持**（v2.78.0 接线后）。
+   `legado_compat.jsUsageOf(source, stage)` 判定，服务层按「能跑就真跑」执行。
+   **能跑**：白名单内的纯字符串变换（base64 / md5 / timeFormat / htmlFormat /
+   strToBytes / bytesToStr / log）+ 逐行（每个列表节点各跑一次）。
+   **不行**：`java.ajax` / `java.connect` / `java.post`（同步 XHR 被 CORS 拦）、
+   变量表 `java.put`/`get`/`getString`、`result.select()` 这类 DOM 桥、
+   `{{@@a@text}}` 这种「模板里套选择器规则」、列表规则本身是 JS、URL 模板里是 JS、
+   `while(true)`/`for(;;)`。UI 上分别标「静态 JS」/「需 JS」/「需 ajax」。
+   只在发现页 / 登录页 / init 里用 JS 的源照旧能搜（`JsUsage.unexecutedJs`）。
 6. **发布脚本的 push 必须走 SSH over 443**（v2.74.0 起）：https remote 会走本机 Clash
    代理 `127.0.0.1:7897`，代理没起时 push 直接连不上。脚本现在 push 用
    `AMOTV_PUSH_REMOTE`（默认 `ssh://git@ssh.github.com:443/Tukist/bili-whitelist.git`），
@@ -810,23 +887,52 @@ v2.74.0 加 MOBI）**：
       `rule.split("##")` 的第 4 段 → `replaceFirst`）。按全局替换处理会把
       `#` / `##` 拼进 URL 尾巴 —— 语料里用 `###` 结尾的规则很多，而且大半是
       在改 URL。
-    - 另外：`text.xxx`（按自身文字筛元素）、`%%`（交叉合并）、`@get:{x}`
-      （读 `java.put` 的变量）**明确不支持**，解析器分别报 `text` /
-      `interleave` / `js`。绝不「当 CSS 硬跑」—— 那只会静默返回空值。
+    - 另外：`@get:{x}`（读 `java.put` 的变量）**明确不支持**，解析器报 `js`
+      （算「需要 JS」）。`text.xxx` 与 `%%` **v2.78.0 起已支持**（见下一条）。
+      绝不「当 CSS 硬跑」—— 那只会静默返回空值。
+
+20. **`text.` 与 `%%` 的语义是查 legado 源码定的，别凭直觉改**（v2.78.0）：
+    - `%%` 是**按行交错**：`for (i in results[0].indices) for (temp in results) if (i < temp.size) add(temp[i])`
+      —— 外层长度是**第一支**，后面的支更长时多出来的行被丢掉。当成 `&&` 那样
+      `addAll` 会把「目录左右两栏」排成「左栏全部、再右栏全部」，整本目录顺序全错。
+    - `%%` 与 `&&` 同时出现时，legado `RuleAnalyzer.splitRule("&&","||","%%")` 取
+      **先出现**的那个当分隔符（`elementsType`），本版照抄。
+    - `text.xxx` 筛的是**自身文字**（jsoup `ownText`），不是子树 text；needle 只取
+      第一个 `.` 之前那段（legado 是 `beforeRule.split(".")[1]`）。
+    - `text.` 作为**链式段**（`class.a@text.作者`）同样生效，不再整条判死 ——
+      v2.77.0 把它当「不支持」的断言已按契约变更加注释改写。
+
+21. **WebView 载页不能死等 `onPageFinished`，JS 字段的 `result` 也不能先转绝对**（v2.78.0）：
+    - **死等 `onPageFinished` 会被真实书站拖死**：它要等**全部子资源**（外链 jQuery、
+      封面图、统计脚本）。实机实测：阅友小说 / 零零小说的搜索页都因此报
+      「页面在 8 秒内没有加载完成」。现在的做法是轮询 `document.readyState`：
+      `complete` 立刻放行；2.5 秒后是 `interactive` 也放行（我们只要 DOM）。
+    - **轮询必须认「哪一页」**：`loadHtmlString` 的 Future 在平台调用返回时就完成，
+      新文档还没 commit —— 直接读 `document.readyState` 可能读到**上一页**
+      （尤其是超时后那张空白页）的 `complete`。所以每次载页注入
+      `<meta name="amotv-load" content="<token>">`，标记对不上就继续等。
+    - **JS 字段的 `result` 不做相对转绝对**：语料里 `h2@a@href@js:'https://x'+result`
+      期望 result 是 `/book/123/`；先转绝对再拼会得到 `https://xhttps://m…`。
+    - **同步死循环没法打断**：`while(true)` 会把渲染线程占死，超时后
+      `loadHtmlString('')` 排不进去，整个 WebView（全 App 共用一个）从此不可用，
+      只能重启 App。所以死循环在**解析阶段**就拦（`hasDeadLoop`），不要幻想
+      「超时 + 空白页」能救回来。
+    - **裸表达式脚本**（`'https://m.x'+result`、`result.match(...)[1]`）要用
+      `eval` 取完成值；`new Function` 会把它们当语句丢掉、返回 undefined。
 
 ---
 
 ## 7. 测试与门禁
 
-- 测试目录：`app/test/`，共 271 个 `*_test.dart`；`test/live_danmaku_fakes.dart` 与
+- 测试目录：`app/test/`，共 272 个 `*_test.dart`；`test/live_danmaku_fakes.dart` 与
   `test/mobi_test_builder.dart` 是辅助文件（没有 `main()`；后者文件名不匹配
   `*_test.dart`，门禁根本不会把它当测试文件）。
-- 当前基线：**271 个文件、7 批、通过用例数见下**（v2.77.0 实跑）：
+- 当前基线：**272 个文件、7 批、通过用例数见下**（v2.78.0 / I3b 批实跑）：
 
 | 项 | 结果 |
 |----|------|
 | `flutter analyze` | 0 issue（10–70s，冷启动更久） |
-| `flutter test` 分批 | 7 批全部通过，合计 **4185** 个用例（v2.76.0 是 4153，I2 批 +32） |
+| `flutter test` 分批 | 7 批全部通过，合计 **4269** 个用例（v2.76.0 是 4153，I2 批 +32，I3a 批 +53，I3b 批 +31） |
 | `flutter build apk --debug` | 通过 |
 
 - 分层策略：
@@ -843,6 +949,7 @@ v2.74.0 加 MOBI）**：
 
 | 版本 | 主题 | 关键文件 |
 |------|------|----------|
+| v2.78.0 | **书源静态 JS 接线 + `text.` / `%%`（I3b 批）**。I3a 的内核（分类器 / 白名单 / 沙箱）此前只产判定、不接线，用户可见行为为零；这一批把它接进搜索 / 详情 / 目录 / 正文，并按 legado 源码补两种语法。① **一次查询只载一次页**：`queryFieldMap` 新增可选 `bindings`，选择器列与**逐行** JS 列合成一段脚本（`js_builder.buildQueryFieldsMixedJs`）—— 节点只查一遍，JS 字段**每个节点各跑一次**（`js_rule.buildJsRunnerFactory` 编一次调 N 次）；逐字段载页是 6 倍等待，逐行 `evalJsRule` 是 N 倍往返。② **两种脚本形态都能跑**：语料里大量脚本是裸表达式（`'https://m.x'+result`、`result.match(/(\d+)\/)[1]`），`new Function` 会把它们当语句丢掉（返回 undefined）→ 工厂先用 `eval(__src)` 取**完成值**（Rhino `script.eval` 语义），取不到再退回 `new Function`（那条路支持顶层 `return`）。③ **`result` 初值不转绝对**：`h2@a@href@js:'https://x'+result` 的 result 应是页面里的 `/book/123/`；先转绝对会拼出 `https://xhttps://m…`（整列详情页打不开，实测踩到）。④ **`text.` / `%%` 按 legado 源码实现**：`text` = `getElementsContainingOwnText`（ownText、needle 只取到第一个 `.`）；`%%` = **按行交错**、外层取第一支长度、后面的支多出来的行丢掉；`%%` 与 `&&` 同时出现按**先出现的**切（`elementsType`）。⑤ **收紧判定**（避免静默错值）：`result.select()/attr()/parentNode()` 这类 DOM 桥、`book.`/`source.`/`chapter.` 上**没绑定**的属性（`'x'+book.tocUrl` 会得到 `xundefined`）、`cookie.`/`cache.`/`eval(`、`{{@@a@text}}` 这种**嵌套规则模板**、**可见死循环**（`while(true)`/`for(;;)`，实测会把整个 WebView 卡死、只能重启 App）；`blockReason` 给审计工具分档。⑥ **阶段判定**：`jsUsageOf(source, stage)` 只看那一段（只有 `toc.url` 是 JS 的源不再被搜索判死）；能力档 `sourceCapabilityOf` = 可搜索 / 静态 JS / 需 JS。⑦ **健康状态**加 `needsAjax`（与「需 JS」分开：一个等版本、一个要改源），`unsupportedJs` 语义收窄成「补个函数也补不出来」；**静态 JS 的源真的去探测**，「检测全部」不再跳过它；书源页每行加能力角标，搜索页脚注改成「需要 JS 的书源（ajax / 变量表）」。⑧ **载页不再死等 `onPageFinished`**：真实书站挂外链 jQuery / 封面图，8 秒都等不到（阅友小说、零零小说实测都卡这一步）→ 改成轮询 `document.readyState`（`complete` 立刻放行，2.5 秒后 `interactive` 也放行），并用注入的 `<meta name="amotv-load" content="token">` 确认「是这一页」（`loadHtmlString` 的 Future 早于 commit，否则会读到上一页的 `complete`）。⑨ **审计重算**（同一份 2483 源）：可搜索 **754（30.4%）→ 1079（43.5%）**，被 JS 挡 1176→889，被选择器语法挡 43→**5**；分类表新增 `jsStaticRunnable` **252**、`jsTransformOnly` 503→252。剩余不可搜：地址模板是 JS 504、变量表 358、与 `\|\|`/`&&` 混写 329、列表规则是 JS 192、`{{…}}` 套规则 153、ajax 148、其它接口 145、JSONPath 27。⑩ **实机（模拟器 bili_test，`adb install -r`）**：真实语料源 **零零小说**（`jsStaticRunnable`，封面地址是 `<js>` 算的）搜「凡人」→ **100 条 + 封面**；`while(true)` 源被静态拦下（脚注点名）；`var t=Date.now(); while(Date.now()-t<6000){}` 源报「JS 规则执行超过 3 秒，已终止」而**同批的零零小说照常 100 条**。⑫ **索引选择页**同样分三档：`BookSourceIndexResult` 加 `staticJsKeys`（`staticJs` / `staticJsCount`），行角标「静态 JS」不再被「只看能直接搜索的」筛掉，汇总写「另有 N 个用静态 JS，本版能搜」。⑬ 契约变更（既有断言改写，不是删）：`text.` / `%%` 从 `unsupported` 改为可执行；`book_rule_selector_test` 的「链上任一段不支持」改用 `regex:` 空源验证同一铁律；页面 / 健康测试里「静态 JS 源被判死」的夹具换成 `java.ajax` | `services/book_rule/selector.dart`、`js_rule.dart`、`js_builder.dart`、`legado_compat.dart`、`rule_engine.dart`、`services/book_search_service.dart`、`book_detail_service.dart`、`book_content_service.dart`、`book_source_health_service.dart`、`pages/book_search_page.dart`、`pages/book_source_page.dart`、`app/tools/js_rule_audit.dart`、`test/js_rule_test.dart`、`test/book_rule_selector_test.dart`、`test/book_rule_js_builder_test.dart`、`test/legado_compat_test.dart`、`test/book_search_service_test.dart`、`test/book_detail_service_test.dart`、`test/book_content_service_test.dart`、`test/book_source_health_service_test.dart`、`test/book_search_page_test.dart`、`test/book_source_page_test.dart` |
 | v2.77.0 | **书源选择器补语法（I2 批）：链式 / 索引 / `&&` 并列 / 扩展取值**。先量后做 —— `app/tools/js_rule_audit.dart` 加 `--selectors` 模式（**import 真的 `selector.dart`**，不再维护第二份判定；参数可以是 URL 也可以是本地文件），对同一份 2483 个去重源、27175 条非 JS 执行字段规则串统计出语法特征：链式 58.6%、`.N` 59.4%、`!N` 15.7%、`&&` 25.1%、`@属性名` 42.0%、`@textNodes` 18.2%、`text.` 1.4%、`%%` 0.2%。按这张表只做高频且语义能从 legado 源码确认的：① **`@` 链式**（`p.1@a.0@text` / `class.grid@tag.tr!0`）：`selector.dart` 按 `@` 切段逐段收窄（引号 / 括号 / `##` 内不切，XPath 属性轴 `/@content` 不切），`js_builder` 的 `queryAll` 递归展开；② **索引**：`.N` = **选**、`!N` = **排除**（legado `ElementsSingle` 两个分支的原义，`.0:1:2` 是索引列表，负数从末尾数），`applyIndex` 在每一段上生效；③ **`&&` 并列**：各支取一遍后按 `\n` 拼（`getStringList` 的 `addAll` + `getString` 的 `join("\n")`），`legadoSelector` 不再把 `&&` 判死；④ **取值后缀扩展**：最后一段裸词当属性名（`@content` / `@data-original`，语料 1044 源）、`@ownText` / `@textNodes` / `@all`、`children`、只有 `##正则##替换` 的规则退化成「取自身」、`##…##替换###` 按 legado 的第 4 段切「只替换第一个」；⑤ 段尾裸标签名（`@li` / `@a` / `@tr`，660 源）当**链式段**而不是属性名 —— 那些规则在 legado 里是 `attr("li")` 恒空，当链式只多跑通不会弄坏（`kLegadoChainTags` 故意不收 `title` / `style` / `value`）。**明确不做**：`text.xxx`（1.4%，报 `text`）、`%%`（0.2%，报 `interleave`）、`@get:` / `@put:`（改判「需要 JS」，原来错报「语法不认识」）。⑥ **效果**：真正可搜索的源 **495（19.9%）→ 754（30.4%）**，被选择器语法挡的源 302（12.2%）→ **43（1.7%）**；剩下 43 个里 `@get:` 31、`text.` 9、`%%` 3。⑦ 验证：新增 34 个用例（真实语料规则串做夹具，不是理想形态）；`flutter test` 没有 JS 引擎，所以另用 `node` + 几十行假 DOM 跑生成的脚本，验了「`!0` 跳过第一行 / `.2` 选中第 3 个 / `&&` 按 `\n` 拼 / `@textNodes` / `children` / `###` 只替换一次」六件事。⑧ 契约变更（一条既有断言）：`legadoSelector('… && …')` 从 `unsupported` 改为可执行（`&&` 真支持），断言改成「两支都在 `concat` 里」并补 `%%` 仍不支持的断言 | `services/book_rule/selector.dart`、`services/book_rule/js_builder.dart`、`services/book_rule/legado_compat.dart`、`app/tools/js_rule_audit.dart`、`test/book_rule_selector_test.dart`、`test/book_rule_js_builder_test.dart`、`test/legado_compat_test.dart` |
 | v2.76.0 | **书源 JS 判定精确化（P0）+ 真实语料抽样审计（I1 批）**。① 新工具 `app/tools/js_rule_audit.dart`（纯 `dart:` 标准库，`dart run app/tools/js_rule_audit.dart` 直接跑，可选 `--json <仓外路径>`）：拉 4 个公开索引、按**本 App 实际执行的字段**把每个源分成 `noJs` / `jsInUnexecutedField` / `jsTransformOnly` / `jsUnsupportedApi` / `jsNeedsJsonPath` / `jsNeedsAjax`，打五张表（总量、各分类 top10、`java.*` 频次、三种 JS 写法占比、需 ajax 的源里同时需 JSONPath 的比例）。**语料与产物不入库**。② 真实数字（2483 个去重源，2026-11-23）：`noJs` 48.8%、`jsInUnexecutedField` 2.4%、`jsTransformOnly` 20.3%、`jsUnsupportedApi` 2.8%、`jsNeedsJsonPath` 14.4%、`jsNeedsAjax` 11.3%。旧口径（扫整份 raw）判死 50.6% ≈ 流传的「51%」；新口径 48.2%，P0 净救回 **60 个（2.4%）**。门槛：P0+P1 覆盖 22.7% ≥ 20% → 值得做；ajax+jsonPath 25.7% < 60% → P2 不是唯一路径。`jsTransformOnly` 里 496/503 不调任何 `java.*`。③ `legado_compat.dart` 新增 `JsUsage{executedJs, unexecutedJs, executedFields, blockedApis}` 与 `jsUsageOf(source)`：只有 `search.*` / `detail.*` / `toc.*` / `content.*` 里会执行的字段有 JS 才判死；`exploreUrl` / `loginUrl` / `checkKeyWord` / `init` / `preUpdateJs` / `ruleExplore.*` / `ruleContent.replaceRegex` 里的 JS 不算（`raw` 里已映射字段仍扫一遍并按模型字段名去重，手搓源也不漏判）。`usesJs` 变成 `jsUsageOf(...).executedJs` 的**薄视图**（签名不变，5 处调用点零改动）。④ UI 口径统一：书源管理页每行加「部分 JS（不影响搜索）」小字（这类源照常被「检测全部」探测）；索引选择页筛选文案改「只看能直接搜索的」，`BookSourceIndexResult` 加纯增量 `partialJsKeys` / `partialJs(s)` / `partialJsCount`，行角标分「需 JS」（红）与「部分 JS」（accent）；健康检测与搜索失败文案改成点名具体字段（`search.list 等需要 JS 规则…`）。⑤ 契约变更（两条既有断言）：`checkKeyWord` 里的 JS 从「判死」改为「不判死 + 记 `unexecutedJs`」；并补 `ruleSearch.bookList` 用 JS 仍判死的断言。原以为会冲突的 `detail.wordCount` 断言**保持原样**——`book_detail_service._detailFields` 确实会执行它，属于执行字段。⑥ 端到端：抽样里的 `手机小说下载网`（`ruleBookInfo.init` 里 `org.jsoup` + `java.ajax`，搜索/目录/正文全是普通 CSS）作为真实语料 fixture 进单测；真实页面 `curl` 验证 `search.php?...searchkey=凡人` 200、`.listBox ul li` 命中 100 条（书名可读）。**已知边界**：不少源在不依赖 JS 的同时还用了 `@tag.` / `@a.0` / `p.1@a.0@text` 这类本版不认的选择器写法，P0/P1 不解决这些 | `services/book_rule/legado_compat.dart`、`app/tools/js_rule_audit.dart`（新）、`services/book_source_index_service.dart`、`services/book_source_health_service.dart`、`services/book_search_service.dart`、`pages/book_source_page.dart`、`pages/book_source_picker_page.dart`、`pages/book_search_page.dart`、`test/legado_compat_test.dart`、`test/book_source_index_service_test.dart`、`test/book_source_picker_page_test.dart`、`test/book_source_page_test.dart`、`test/book_search_page_test.dart`、`docs/DEV_CONTEXT.md` |
 | v2.75.0 | **网络书源接 GBK 解码 + 自动判定**（H 批）。① `WebViewRuleEngine.fetchHtml` 不再 `utf8.decode(allowMalformed: true)` 一把梭，字节交给 `utils/text_decoding.dart` 的 `decodeTextBytes`（与本地 TXT 导入**同一套判定**，不写第二份）：BOM → UTF-16 → **严格 UTF-8** → UTF-8 只坏 ≤1% 字节 → GBK（先信提示、再自动）→ 兜底；关键改动是**严格 UTF-8 排在「声明 gbk」之前**（站点改版只改输出不改声明，「声明 gbk 实际 utf-8」比反过来常见，硬解 GBK 得到的是「能解但全是生僻字」——乱码比例兜不住这种错）。hint 优先级 **HTTP 响应头 charset > 书源 `charset` 字段**（响应头是站点这次响应自己说的），`parseHeaderCharset` 解析 `content-type` 的 `charset=`（引号 / 大小写 / 多余参数都容忍）。② 判定事实带出两个字段：`lastDecodeEncoding`（实际编码）与 `lastDecodeWarning`（两句人话：「这个书源疑似 GBK，已按 GBK 解码」/「解码后仍有乱码，正文可能不完整」；站点自己声明了 GBK 不提示）；两者都只记**最近一次**抓取，所以正文 / 目录服务改成**每页抓完当场收下**（后一页成功不会盖掉前一页的告警；正文服务还顺手去掉了循环外那次重复收集）。③ UI：`BookSearchGroup` 加纯增量字段 `decodeNote`（`decodeNoteFor` 压成「编码：GBK」/「解码有乱码」/「编码：GBK（仍有乱码）」，正常 UTF-8 为 null），搜索页只在**分组标题下**显示一行小字；阅读页滚动模式在正文末尾加一段小字、分页模式并进最后一页（原来只显示 `partial`，`warning` 根本没渲染）；详情页复用既有 `warning` 链路。④ 书源管理页每行加一行「编码：GBK / 编码：自动」（`charsetLabelOf`：GBK 家族别名统一显示 GBK，utf-8 与没写都显示「自动」——模型默认值就是 utf-8，两者在判定上行为一致）；`fromLegado` 加注释说明 legado 的 BookSource 没有 charset 字段（它自己嗅探），正常 legado 源一律自动判定，读 `bookSourceCharset` 只为兼容少数第三方导出。⑤ 可测性：`WebViewController` 在 `flutter test` 里构造即抛，所以引擎的 controller 改成**懒建**（`fetchHtml` 只走 Dio），单测能注入假 Dio 适配器直接断言「GBK 字节 → 正确中文」。⑥ 实机（模拟器 `bili_test`，2026-11-23，`adb install -r`）：宿主机起一个只吐 GBK 字节、不带 charset 的页面 → 搜索得到 2 条中文书名（斗罗大陆 / 吞噬星空），分组标题下显示「编码：GBK」；实机上发现「疑似 GBK」被压成「仍有乱码」，于是把两句告警抽成 `kDecodeGbkGuessWarning` / `kDecodeGarbledWarning` 常量分开处理。新增 21 个用例（`text_decoding` 5 / `book_rule_engine` 9 / `book_search_service` 4 / `book_search_page` 1 / `book_source_page` 1 / `book_source_import` 1），既有断言一条没删没放宽 | `services/book_rule/rule_engine.dart`、`utils/text_decoding.dart`、`services/book_search_service.dart`、`services/book_content_service.dart`、`services/book_detail_service.dart`、`models/book_source.dart`、`pages/book_search_page.dart`、`pages/book_source_page.dart`、`pages/book_reader_page.dart`、`test/book_rule_engine_test`、`test/text_decoding_test`、`test/book_search_service_test`、`test/book_search_page_test`、`test/book_source_page_test`、`test/book_source_import_test` |

@@ -27,6 +27,8 @@
 /// | 只有后缀、没有查询串（`@text` / `##正则##替换`） | 取**节点自身** |
 /// | `A \|\| B` | 回退链：A 取不到再试 B（依次尝试，不是布尔或） |
 /// | `A && B` | **并列**：两个结果各自取值后按 `\n` 拼起来（legado 同义） |
+/// | `A %% B` | **交叉合并**：各支的结果按行交错（v2.78.0；语义见下） |
+/// | `text.xxx` | 按「自身文字包含 xxx」筛元素（v2.78.0；legado `getElementsContainingOwnText`） |
 /// | `A@B@C` | **链式**：在 A 的结果上继续收窄，最后一段照常取值（`p.1@a.0@text`） |
 /// | `.N` / `.0:2:4` | **选**索引（0 基，负数从末尾数），作用在该段选出的元素列表上 |
 /// | `!N` / `!0:1:2` | **排除**索引（`class.grid@tag.tr!0` = 跳过表头那一行） |
@@ -38,11 +40,19 @@
 /// 语料（2483 个去重源）里 `!N` 出现在 389 个源、`.N` 出现在 1475 个源，两者
 /// 语义相反，猜错一个就是整列数据错位。
 ///
+/// ## `%%` 与 `text.`（v2.78.0 补上，语义都查过 legado 源码）
+/// - `A %% B`：legado `AnalyzeByJSoup.getStringList` / `getElements` 里，各支结果
+///   **按行交错**：`for (i in results[0].indices) for (temp in results) if (i < temp.size) add(temp[i])`
+///   —— 外层长度取**第一支**的长度，后面的支多出来的行会被丢掉。典型用途是
+///   「目录分左右两栏」，直接 `addAll` 会变成「左栏全部、再右栏全部」，整本目录顺序全错。
+/// - `text.xxx`：legado `ElementsSingle.getElementsSingle` 的 `"text" -> temp.getElementsContainingOwnText(rules[1])`
+///   —— 按「**自身**文字包含 xxx」筛元素（ownText，不是整棵子树的 text）。
+///
 /// ## 明确**不支持**
-/// - `<js>…</js>` / `@js:` / `{{…}}` / `@get:` / `@put:` → `reason: 'js'`
-///   （`@get:{x}` 取的是 `java.put` 写进去的变量，没有 JS 就没有那个变量）
-/// - `text.xxx`（按「自身文字包含」筛元素）→ `reason: 'text'`
-/// - `A %% B`（交叉合并）→ `reason: 'interleave'`
+/// - `<js>…</js>` / `@js:` / `{{…}}` / `@get:` / `@put:` → `kind: js` +
+///   `reason: 'js'`。能不能真的跑由 [SelectorValue.jsInfo] 判（见 `js_rule.dart`）：
+///   I3b 起「静态可跑」的 JS 字段由引擎真的执行，跑不了的仍按
+///   [SelectorValue.needsJs] 判死并点名缺哪个 API。
 /// - 其余语法错误 → `reason: 'syntax'` / `'empty'`
 ///
 /// 不认识的写法**一律**判 unsupported 并带上原因，绝不「当 CSS 硬跑」——
@@ -53,6 +63,8 @@
 /// 书源是用户手抄的，任何一条规则写错都不该让整次搜索崩掉 —— 所以
 /// [parseSelector] 全程 try/catch，最坏结果是「这一条不支持」，其它规则照跑。
 library;
+
+import 'js_rule.dart';
 
 /// 选择器类型。
 enum SelectorKind {
@@ -78,8 +90,26 @@ enum SelectorKind {
   /// 当前节点的**直接子元素**（legado 的 `children`）。
   children,
 
+  /// 按「自身文字包含 [SelectorValue.query]」筛元素（legado 的 `text.xxx`）。
+  ///
+  /// v2.78.0 补上。语义查的是 legado `ElementsSingle.getElementsSingle` 的
+  /// `"text" -> temp.getElementsContainingOwnText(rules[1])`：筛的是**自身**
+  /// 文字（ownText）包含该串的元素，不是「整棵子树的 text 包含」。
+  /// 语料里 36 个源用这条，`text.temp` 之类的写法多是配合索引/链式再收窄。
+  textFilter,
+
   /// JSONPath（`@json:`）。只解析、不执行；接 JSON 接口源时才用得上。
   jsonPath,
+
+  /// JS 规则（`<js>…</js>` / `@js:` / 规则位置上的 `{{…}}` / `@get:` / `@put:`）。
+  ///
+  /// 为什么从 `unsupported` 里拆出来（I3a）：这类规则**是认得**的，只是执行
+  /// 方式不同（要进 JS 沙箱，见 `js_rule.dart`）。拆出来之后 [SelectorValue.jsInfo]
+  /// 能带出脚本正文、前置选择器、被拦的 API，UI 才说得出「是缺 JS 能力」
+  /// 还是「这条 JS 用了 ajax」。**派生语义不变**：[SelectorValue.isUnsupported] /
+  /// [SelectorValue.needsJs] 对 js 仍然为真；I3b 起「静态可跑」（[SelectorValue.isStaticJsRunnable]）
+  /// 的由引擎真的执行，其余仍判死。
+  js,
 
   /// 语法不认识 / 本版不支持的写法（见 [SelectorValue.reason]）。
   unsupported,
@@ -94,12 +124,16 @@ const String kSelectorReasonEmpty = 'empty';
 const String kSelectorReasonSyntax = 'syntax';
 const String kSelectorReasonParse = 'parse';
 
-/// `text.xxx`：按「自身文字包含 xxx」筛元素。语义清楚但语料里只占 1.4%
-/// （36 个源），本批不做 —— 但**必须**明确报出来，不能当 CSS 硬跑。
+/// `text.xxx`：按「自身文字包含 xxx」筛元素。
+///
+/// **v2.78.0 起已支持**（`kind: textFilter`）。常量留着是为了「老版本报过的
+/// 原因码」还能被认出来（历史检测结果 / 旧日志里存的是这个字符串）。
 const String kSelectorReasonTextFilter = 'text';
 
-/// `A %% B`：按列交叉合并。语料里只有 5 个源，且合并语义（谁在外层循环）
-/// 一旦记错就是整列表错位，不值得为 5 个源冒这个风险。
+/// `A %% B`：按行交叉合并。
+///
+/// **v2.78.0 起已支持**（[SelectorValue.interleave]）。常量同样只为兼容
+/// 旧版报出的原因码而保留。
 const String kSelectorReasonInterleave = 'interleave';
 
 /// legado 明确定义为「取值」的后缀名（小写比较）。
@@ -225,6 +259,13 @@ class SelectorValue {
   /// `&&` 并列分支（不含自己）。取值时各自取一遍再按 `\n` 拼起来。
   final List<SelectorValue> concat;
 
+  /// `%%` 交叉合并的**其余**支（不含自己）。
+  ///
+  /// 语义（legado `AnalyzeByJSoup`）：各支结果按行交错 —— 外层循环是**第一支**
+  /// 的长度，内层依次取每支的同一下标；后面的支更长时多出来的行会被丢掉。
+  /// 空 = 没写 `%%`。
+  final List<SelectorValue> interleave;
+
   /// `@` 链式：在**自己**的结果上依次收窄的后续段（`p.1@a.0@text` 的两段）。
   final List<SelectorValue> steps;
 
@@ -237,6 +278,13 @@ class SelectorValue {
   /// 不支持时的原因码（见 [kSelectorReasonJs] 等）。
   final String? reason;
 
+  /// JS 规则的静态结论（脚本正文 / 前置选择器 / 被拦的 API）。
+  ///
+  /// 只有 `kind == SelectorKind.js` 时非空；其余为 null。为什么把整份
+  /// [JsRuleInfo] 挂在这里而不是拆成四五个字段：解析层只做「认出来」，
+  /// 「能不能跑 / 为什么不能跑」这一套判定只该有一份（`js_rule.dart`）。
+  final JsRuleInfo? jsInfo;
+
   const SelectorValue({
     required this.raw,
     required this.kind,
@@ -247,20 +295,44 @@ class SelectorValue {
     this.suffixReplaceFirst = false,
     this.fallbacks = const [],
     this.concat = const [],
+    this.interleave = const [],
     this.steps = const [],
     this.indexes = const [],
     this.indexExclude = false,
     this.reason,
+    this.jsInfo,
   });
 
   /// 空规则（「不取」）。
   bool get isEmpty => kind == SelectorKind.none;
 
-  /// 语法层面不认。
-  bool get isUnsupported => kind == SelectorKind.unsupported;
+  /// 语法层面不认（JS 规则也算：它们确实不能当选择器跑）。
+  bool get isUnsupported =>
+      kind == SelectorKind.unsupported || kind == SelectorKind.js;
 
-  /// 需要 JS 才能跑（本版不支持）。
+  /// 需要 JS 才能跑（本版只做静态子集，见 `js_rule.dart`）。
   bool get needsJs => isUnsupported && reason == kSelectorReasonJs;
+
+  /// 脚本正文（只有 js 规则有）；没有为 null。
+  String? get script => jsInfo?.script;
+
+  /// 「先取再变换」的前置选择器（解析结果，可能是 null）。
+  ///
+  /// 为什么现解析而不是在构造时存一个 [SelectorValue]：解析层是纯函数、
+  /// 每次都从头来（规则串本来就要重新解析），多存一个嵌套结构只会让
+  /// `copyWith` / `toString` 更难对齐。前置选择器**不会**是 JS（
+  /// `classifyJsRule` 在切分时就把 JS 痕迹剥掉了），所以不会无限递归。
+  SelectorValue? get baseSelector {
+    final rawBase = jsInfo?.baseSelectorRaw;
+    if (rawBase == null || rawBase.isEmpty) return null;
+    return parseSelector(rawBase);
+  }
+
+  /// 这条 JS 规则里本版跑不了的 API（空 = 全在白名单内）。
+  List<String> get blockedApis => jsInfo?.blockedApis ?? const [];
+
+  /// 这条 JS 规则能不能交给静态沙箱跑（见 [JsRuleInfo.runnable]）。
+  bool get isStaticJsRunnable => jsInfo?.runnable ?? false;
 
   /// 能否交给执行层跑（jsonPath 要等 JSON 接口源，但它是「认识」的）。
   bool get isRunnable =>
@@ -268,7 +340,8 @@ class SelectorValue {
       kind == SelectorKind.xpath ||
       kind == SelectorKind.regex ||
       kind == SelectorKind.self ||
-      kind == SelectorKind.children;
+      kind == SelectorKind.children ||
+      kind == SelectorKind.textFilter;
 
   /// 取值方式的字符串形式（`text` / `html` / `href` / `src` / 属性名）。
   String get getter => attr ?? 'text';
@@ -277,6 +350,7 @@ class SelectorValue {
   SelectorValue copyWith({
     List<SelectorValue>? fallbacks,
     List<SelectorValue>? concat,
+    List<SelectorValue>? interleave,
     List<SelectorValue>? steps,
     List<int>? indexes,
     bool? indexExclude,
@@ -297,10 +371,12 @@ class SelectorValue {
         suffixReplaceFirst: suffixReplaceFirst ?? this.suffixReplaceFirst,
         fallbacks: fallbacks ?? this.fallbacks,
         concat: concat ?? this.concat,
+        interleave: interleave ?? this.interleave,
         steps: steps ?? this.steps,
         indexes: indexes ?? this.indexes,
         indexExclude: indexExclude ?? this.indexExclude,
         reason: reason,
+        jsInfo: jsInfo,
       );
 
   /// 复制并设置回退链（内部解析用）。
@@ -353,10 +429,15 @@ SelectorValue _parseChain(String text, String display) {
   // 链上的（`@css:.a || <js>...</js>`），跑一半等于给出半真半假的结果，
   // 不如明确告诉用户「这个源需要 JS」。
   if (_looksLikeJs(text)) {
+    // JS 规则单独一个 kind，并把「脚本正文 / 前置选择器 / 被拦的 API」
+    // 一起带出去。reason 仍然是 `js`、`needsJs` 仍为真（「不能当选择器跑」），
+    // 能不能**真的执行**由 `jsInfo.runnable` 判 —— I3b 起静态可跑的字段
+    // 由引擎逐行执行，其余在服务层点名「缺哪个 API」。
     return SelectorValue(
       raw: display,
-      kind: SelectorKind.unsupported,
+      kind: SelectorKind.js,
       reason: kSelectorReasonJs,
+      jsInfo: classifyJsRule(text),
     );
   }
 
@@ -380,22 +461,21 @@ SelectorValue _parseChain(String text, String display) {
   ]);
 }
 
-/// 解析单条（已拆掉 `||`）规则：先拆 `&&` 并列，再解析每一支。
+/// 解析单条（已拆掉 `||`）规则：再拆 `%%`（交叉）/ `&&`（并列），解析每一支。
+///
+/// `%%` 与 `&&` 谁先生效：legado `RuleAnalyzer.splitRule("&&", "||", "%%")` 是
+/// **先遇到哪个运算符就按哪个切**（`elementsType` 记的是首次命中的那个），
+/// 这里照同口径：取两者中**最先出现**的那个当分隔符。
 SelectorValue _parseBranch(String branch, String raw) {
   final text = branch.trimLeft();
 
-  // `%%` 交叉合并：本版不做，但必须说清楚（当 CSS 硬跑 = 静默空结果）
-  if (_splitTopLevel(text, '%%').length > 1) {
-    return SelectorValue(
-      raw: raw,
-      kind: SelectorKind.unsupported,
-      query: text,
-      reason: kSelectorReasonInterleave,
-    );
-  }
+  final pctAt = _firstTopLevelIndexOf(text, '%%');
+  final andAt = _firstTopLevelIndexOf(text, '&&');
+  final useInterleave = pctAt >= 0 && (andAt < 0 || pctAt < andAt);
+  final separator = useInterleave ? '%%' : '&&';
 
   final parts = [
-    for (final p in _splitTopLevel(text, '&&'))
+    for (final p in _splitTopLevel(text, separator))
       if (p.trim().isNotEmpty) p,
   ];
   if (parts.isEmpty) {
@@ -407,10 +487,45 @@ SelectorValue _parseBranch(String branch, String raw) {
   }
   final head = _parseSingle(parts.first, raw);
   if (parts.length == 1) return head;
-  // `&&` 的第二段及之后挂在 concat 上：取值时各自取一遍再拼
-  return head.copyWith(concat: [
-    for (final p in parts.skip(1)) _parseSingle(p, raw),
-  ]);
+  final rest = [for (final p in parts.skip(1)) _parseSingle(p, raw)];
+  // `%%`：按行交错合并（见 [SelectorValue.interleave]）；
+  // `&&`：各自取一遍再按 `\n` 拼
+  return useInterleave
+      ? head.copyWith(interleave: rest)
+      : head.copyWith(concat: rest);
+}
+
+/// 顶层（不在引号 / 括号 / `##` 里）第一次出现 [delimiter] 的位置；没有返回 -1。
+///
+/// 只为「`%%` 和 `&&` 谁先」这一个判断服务，所以不返回切分结果，避免与
+/// [_splitTopLevel] 的切分口径走样。
+int _firstTopLevelIndexOf(String text, String delimiter) {
+  var depth = 0;
+  var quote = '';
+  var inHash = false;
+  var i = 0;
+  while (i < text.length) {
+    final ch = text[i];
+    if (quote.isNotEmpty) {
+      if (ch == quote) quote = '';
+    } else if (ch == '"' || ch == "'") {
+      quote = ch;
+    } else if (ch == '#' && i + 1 < text.length && text[i + 1] == '#') {
+      inHash = !inHash;
+      i += 2;
+      continue;
+    } else if (!inHash) {
+      if (ch == '[' || ch == '(') {
+        depth++;
+      } else if (ch == ']' || ch == ')') {
+        if (depth > 0) depth--;
+      } else if (depth == 0 && text.startsWith(delimiter, i)) {
+        return i;
+      }
+    }
+    i++;
+  }
+  return -1;
 }
 
 /// 解析单支规则：[##正则##替换] → [@取值] → 前缀 → `@` 链。
@@ -727,14 +842,24 @@ _PrefixResult _parsePrefix(String body) {
     return const _PrefixResult(SelectorKind.children, '');
   }
 
-  // `text.xxx`：按「自身文字包含」筛元素。语料 1.4%（36 个源），本批不做，
-  // 但**明确报不支持** —— 当 CSS 硬跑只会静默取不到值。
+  // `text.xxx`：按「自身文字包含 xxx」筛元素（legado `getElementsContainingOwnText`）。
+  // v2.78.0 起真支持。语料里 36 个源用这条，写法多是 `text.最新章节@text`
+  // 或链式里的 `class.a@text.作者`。
+  //
+  // 为什么只取到第一个 `.`：legado 是 `beforeRule.split(".")[1]`，
+  // `text.a.b` 在它那里 needle 只有 `a`。照抄，别自作聪明取整段后缀 ——
+  // 那会筛出 legado 筛不到的元素（多出来的往往是「卷名」「最新章节」这类噪声行）。
   if (lower.startsWith('text.')) {
-    return const _PrefixResult(
-      SelectorKind.unsupported,
-      '',
-      kSelectorReasonTextFilter,
-    );
+    final rest = body.substring(5);
+    final needle = rest.split('.').first.trim();
+    if (needle.isEmpty) {
+      return const _PrefixResult(
+        SelectorKind.unsupported,
+        '',
+        kSelectorReasonSyntax,
+      );
+    }
+    return _PrefixResult(SelectorKind.textFilter, needle);
   }
 
   // 无前缀：以 `//` 或 `(//` 开头当 XPath（legado 常见写法），其余按 CSS。

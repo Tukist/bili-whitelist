@@ -111,11 +111,16 @@ class BookSourceIndexResult {
   /// 能力本版没有）。
   final Set<String> partialJsKeys;
 
+  /// 执行字段里的 JS **全是静态可跑**的源（v2.78.0）。它们**能搜** ——
+  /// 以前和后两类一起标「需 JS」，导进来才发现其实好用。
+  final Set<String> staticJsKeys;
+
   const BookSourceIndexResult({
     this.sources = const [],
     this.outcomes = const [],
     this.jsKeys = const {},
     this.partialJsKeys = const {},
+    this.staticJsKeys = const {},
   });
 
   /// 该源要不要 JS（本版跑不了）。
@@ -123,6 +128,12 @@ class BookSourceIndexResult {
 
   /// 该源只是「部分 JS」（能直接搜）。
   bool partialJs(BookSource source) => partialJsKeys.contains(source.key);
+
+  /// 该源的 JS 是静态可跑的（能搜，脚本由引擎执行）。
+  bool staticJs(BookSource source) => staticJsKeys.contains(source.key);
+
+  /// 静态 JS（能搜）的源数量。
+  int get staticJsCount => staticJsKeys.length;
 
   /// 需要 JS 的源数量。
   int get jsCount => jsKeys.length;
@@ -144,6 +155,9 @@ class BookSourceIndexResult {
     final buffer = StringBuffer('共 ${sources.length} 个源');
     if (jsCount > 0) {
       buffer.write('（其中 $jsCount 个需 JS，本版跑不了）');
+    }
+    if (staticJsCount > 0) {
+      buffer.write('（另有 $staticJsCount 个用静态 JS，本版能搜）');
     }
     if (partialJsCount > 0) {
       buffer.write('（另有 $partialJsCount 个只在发现页/登录页用了 JS，不影响搜索）');
@@ -222,11 +236,15 @@ class BookSourceIndexService {
 
     final jsKeys = <String>{};
     final partialJsKeys = <String>{};
+    final staticJsKeys = <String>{};
     for (final source in merged) {
       final usage = _safeJsUsage(source);
-      // 只有执行字段里真的有 JS 才算「跑不了」；只在发现页 / 登录页用了 JS 的
-      // 源能正常搜，单独记一份，UI 上标成「部分 JS」而不是「需 JS」。
-      if (usage.executedJs) {
+      // 三档分开（v2.78.0）：**跑不了**（缺能力）/ **静态 JS 能跑** / 只在
+      // 发现页登录页用 JS。以前后两类都塞进 jsKeys，UI 一句「需 JS」会让人
+      // 白跳过一堆其实能搜的源。
+      if (usage.runnableJs) {
+        staticJsKeys.add(source.key);
+      } else if (usage.executedJs) {
         jsKeys.add(source.key);
       } else if (usage.unexecutedJs) {
         partialJsKeys.add(source.key);
@@ -237,6 +255,7 @@ class BookSourceIndexService {
       outcomes: outcomes,
       jsKeys: jsKeys,
       partialJsKeys: partialJsKeys,
+      staticJsKeys: staticJsKeys,
     );
   }
 

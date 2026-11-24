@@ -233,4 +233,83 @@ void main() {
       expect(js, contains('var REMOVES = [];'));
     });
   });
+
+  group('text. / %% 进 JS 规格（v2.78.0）', () {
+    test('text.xxx 生成 textFilter 规格 + ownText 判定', () {
+      final js = buildQueryFieldsJs(
+        parseSelector('class.item'),
+        parseSelector('text.作者：@text'),
+      );
+      expect(js, contains('"kind":"textFilter"'));
+      expect(js, contains('"query":"作者："'));
+      expect(js, contains('textFilterNodes(root, spec.query)'));
+      expect(js, contains('getElementsContainingOwnText'));
+    });
+
+    test('%% 生成 interleave 规格，并在 pickNodes 里按行交错', () {
+      final js = buildQueryFieldsJs(
+        parseSelector('tag.td.0@tag.a@text%%tag.td.2@tag.a@text'),
+        null,
+      );
+      expect(js, contains('"interleave":[{"kind":"css"'));
+      // 外层循环是**第一支**的长度（legado 同义），后面的支多出来的行丢掉
+      expect(js, contains('row < lists[0].length'));
+      expect(js, contains('row < lists[col].length'));
+    });
+  });
+
+  group('buildQueryFieldsMixedJs（I3b：选择器 + 逐行静态 JS）', () {
+    test('选择器字段与 JS 字段各占一段，返回 fields/logs/errors', () {
+      final js = buildQueryFieldsMixedJs(
+        listSelector: parseSelector('class.item'),
+        selectorFields: {'name': parseSelector('class.title@text')},
+        jsFields: {
+          'cover': parseSelector('tag.a.0@href@js:"https://i"+result'),
+        },
+        bindings: const {'baseUrl': 'https://a.example', 'key': '凡人'},
+      );
+      // 选择器字段还是原来的取值路径
+      expect(js, contains('out["name"] = arr;'));
+      // JS 字段：工厂 + 前置选择器 + 逐节点循环
+      expect(js, contains('var RUN0 = '));
+      expect(js, contains('var BASE0 = {"kind":"css"'));
+      expect(js, contains('v = RUN0(b0, baseUrl, book, key, page);'));
+      expect(js, contains('errors.push({field: "cover"'));
+      // 绑定与返回载荷
+      expect(js, contains('var key = "凡人";'));
+      expect(js, contains('JSON.stringify({fields: out'));
+      // 页面只查一次列表
+      expect('var nodes = pickNodes(LIST);'.allMatches(js).length, 1);
+    });
+
+    test('没有前置选择器时 result 取节点自身（不是 null）', () {
+      final js = buildQueryFieldsMixedJs(
+        listSelector: parseSelector('class.item'),
+        selectorFields: const {},
+        jsFields: {'name': parseSelector('@js:decodeURI(result)')},
+        bindings: const {},
+      );
+      // 没有前置选择器 → 取节点自身，且**不做相对转绝对**（JS 的 result 初值）
+      expect(js, contains('valueOfNode(nodes[i], SELF, true)'));
+    });
+  });
+
+  group('buildExtractHtmlWithJsJs（正文规则是静态 JS）', () {
+    test('删节点 → 取前置选择器 → 跑脚本，顺序与载荷都对', () {
+      final js = buildExtractHtmlWithJsJs(
+        removeSelectors: ['class.ad'],
+        base: parseSelector('id.content@html'),
+        script: r'result.replace(/广告/g, "")',
+        bindings: const {'baseUrl': 'https://a.example'},
+      );
+      final removeAt = js.indexOf('REMOVES[k]');
+      final takeAt = js.indexOf('var raw = BASE ? firstValue');
+      expect(removeAt, greaterThan(0));
+      expect(takeAt, greaterThan(removeAt));
+      expect(js, contains('var RUN = '));
+      expect(js, contains('JSON.stringify({ok: true, value: out'));
+      // 没有前置选择器时退回整页 body
+      expect(js, contains('document.body.innerHTML'));
+    });
+  });
 }

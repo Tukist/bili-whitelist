@@ -53,6 +53,7 @@ import 'package:webview_flutter/webview_flutter.dart';
 
 import '../../utils/text_decoding.dart';
 import 'js_builder.dart';
+import 'js_rule.dart';
 import 'selector.dart';
 
 /// 抓网页用的桌面 Chrome UA。
@@ -67,6 +68,14 @@ const Duration kRulePageTimeout = Duration(seconds: 8);
 
 /// 抓网页的超时。
 const Duration kRuleFetchTimeout = Duration(seconds: 15);
+
+/// 静态 JS 规则（`@js:` / `<js>`）的执行超时。
+///
+/// 为什么比页面求值（8 秒）短得多：用户脚本只做字符串变换，正常几十毫秒。
+/// 超过 3 秒基本只有一种情况 —— 死循环（`while(true)` / 巨型正则）。
+/// 超时后要**重载空白页**把脚本一起杀掉（见 [WebViewRuleEngine._killScript]），
+/// 否则那个死循环会一直占着渲染线程，后面所有求值都排队排到天荒地老。
+const Duration kRuleJsTimeout = Duration(seconds: 3);
 
 /// 失败大类（UI 按这个分组显示，message 才是给人看的那句话）。
 enum RuleErrorKind {
@@ -138,18 +147,73 @@ abstract class BookRuleEngine {
   /// （取不到的位置是 null）。
   ///
   /// [fieldSelector] 为 null 时取列表节点自身（用列表规则的取值后缀）。
+  ///
+  /// 字段规则是**静态可跑**的 JS（[SelectorValue.isStaticJsRunnable]）时，
+  /// I3b 起会真的执行（逐节点）；[bindings] 是脚本可见的绑定（见
+  /// `js_rule.dart` 的 `jsBindings`）。
   Future<List<String?>> queryFields({
     required String html,
     required String baseUrl,
     required SelectorValue listSelector,
     required SelectorValue? fieldSelector,
+    Map<String, String> bindings = const {},
   });
 
   /// 一次取多列（搜索结果页要 6 个字段，逐字段往返会慢 6 倍）。
   ///
-  /// 默认实现逐字段调 [queryFields]（对假引擎 / 简易实现够用）；
-  /// [WebViewRuleEngine] 覆写成**单次**页面加载 + 单次 JS 往返。
+  /// 默认实现：选择器字段逐字段调 [queryFields]，JS 字段走 [queryJsField]。
+  /// [WebViewRuleEngine] 覆写成**单次**页面加载 + 单次 JS 往返（混合脚本，
+  /// 见 `js_builder.dart` 的 `buildQueryFieldsMixedJs`）。
   Future<Map<String, List<String?>>> queryFieldMap({
+    required String html,
+    required String baseUrl,
+    required SelectorValue listSelector,
+    required Map<String, SelectorValue?> fields,
+    Map<String, String> bindings = const {},
+  }) async {
+    final selectorFields = <String, SelectorValue?>{};
+    final jsFields = <String, SelectorValue>{};
+    for (final entry in fields.entries) {
+      final value = entry.value;
+      if (value != null && value.kind == SelectorKind.js) {
+        jsFields[entry.key] = value;
+      } else {
+        selectorFields[entry.key] = value;
+      }
+    }
+    final out = <String, List<String?>>{};
+    if (selectorFields.isNotEmpty) {
+      out.addAll(await queryFieldMapSelectors(
+        html: html,
+        baseUrl: baseUrl,
+        listSelector: listSelector,
+        fields: selectorFields,
+      ));
+    }
+    if (jsFields.isEmpty) return out;
+    // 行数取已有列的最大长度：JS 字段本身取不出「有几行」—— 节点只有 DOM 知道。
+    var rows = 0;
+    for (final column in out.values) {
+      if (column.length > rows) rows = column.length;
+    }
+    for (final entry in jsFields.entries) {
+      out[entry.key] = await queryJsField(
+        html: html,
+        baseUrl: baseUrl,
+        listSelector: listSelector,
+        field: entry.value,
+        bindings: bindings,
+        rowCount: rows,
+      );
+    }
+    return out;
+  }
+
+  /// 只跑**选择器字段**的多列求值（JS 字段已由 [queryFieldMap] 摘出去）。
+  ///
+  /// 默认实现逐字段调 [queryFields]（对假引擎 / 简易实现够用）；
+  /// [WebViewRuleEngine] 覆写成单次往返。
+  Future<Map<String, List<String?>>> queryFieldMapSelectors({
     required String html,
     required String baseUrl,
     required SelectorValue listSelector,
@@ -167,6 +231,35 @@ abstract class BookRuleEngine {
     return out;
   }
 
+  /// 跑一条**静态 JS 字段**（逐行）。
+  ///
+  /// 默认实现没有 DOM，只能整页跑一次再把值广播到 [rowCount] 行 ——
+  /// 只服务假引擎 / 无 WebView 环境（真实现覆写成逐节点，见
+  /// `buildQueryFieldsMixedJs`）。
+  Future<List<String?>> queryJsField({
+    required String html,
+    required String baseUrl,
+    required SelectorValue listSelector,
+    required SelectorValue field,
+    Map<String, String> bindings = const {},
+    int rowCount = 1,
+  }) async {
+    final info = field.jsInfo;
+    if (info == null || !info.runnable) {
+      throw RuleEngineException(
+        field.isEmpty ? RuleErrorKind.empty : RuleErrorKind.unsupported,
+        '字段规则需要本版不支持的 JS 能力（${field.raw}）',
+      );
+    }
+    final value = await evalJsRule(
+      script: info.script,
+      bindings: bindings,
+      base: field.baseSelector,
+      asExpression: info.form == JsRuleForm.template,
+    );
+    return List<String?>.filled(rowCount < 1 ? 1 : rowCount, value);
+  }
+
   /// 正文抽取：先删 [removeSelectors] 命中的节点，再取 [textSelector]
   /// 命中节点（没命中则整页 body）的**innerHTML**。
   ///
@@ -175,16 +268,53 @@ abstract class BookRuleEngine {
   /// 策略；在 JS 里做就只能靠真机肉眼验。删节点与取内容必须在**同一次**
   /// 页面载入里完成（见 `buildExtractHtmlJs` 的注释）。
   ///
+  /// I3b：`textSelector` 是**静态可跑的 JS**（`content.text = 'div.c@html@js:…'`）
+  /// 时，先按前置选择器取 innerHTML 当 `result`，再在同一个 IIFE 里跑脚本；
+  /// [bindings] 是脚本绑定。
+  ///
   /// 默认实现直接报「不支持」：只有 [WebViewRuleEngine] 有真实 DOM。
   Future<String> extractHtml({
     required String html,
     required String baseUrl,
     List<String> removeSelectors = const [],
     required SelectorValue textSelector,
+    Map<String, String> bindings = const {},
   }) async {
     throw const RuleEngineException(
       RuleErrorKind.unsupported,
       '当前引擎不支持正文抽取（缺少 WebView）',
+    );
+  }
+
+  /// 静态 JS 规则执行（I3a）：在**当前已载入的页面**上跑一段书源脚本，
+  /// 返回脚本最后读到的 `result`（null = 脚本把结果置空了）。
+  ///
+  /// ## 为什么是「当前页面」而不是「给一段 HTML」
+  /// legado 的 `@js:` 规则是**同步语义**：它默认自己在一个已解析的文档上跑，
+  /// `result` 是上一步取到的值。本版沿用这个语义 —— 调用方先跑选择器求值
+  /// （页面已经载入），紧接着调这里做变换。重新 `loadHtmlString` 一次既慢，
+  /// 又会让「上一步取到的 DOM 状态」丢掉。列表字段的**逐行**语义由
+  /// [queryJsField] / `queryFieldMap` 负责，这里只是单值版本。
+  ///
+  /// [base] 是「先取再变换」里的前置选择器（`@css:.a@js:…`），非空时会先在
+  /// 当前页面上取值作为脚本的 `result` 初值。
+  ///
+  /// [bindings] 是脚本可见的绑定（`book` / `source` / `baseUrl` / `key` /
+  /// `page` / `chapter` / `title`，见 `js_rule.dart` 的 `jsBindings`）。
+  /// [asExpression]：`{{…}}` 模板把正文当表达式求值。
+  ///
+  /// **安全**：脚本里出现白名单外的 API（`java.ajax` / `Packages.` /
+  /// `fetch` …）直接抛 unsupported，不去碰页面；执行超时视为失败并终止脚本。
+  /// 默认实现报「不支持」（假引擎 / 无 WebView 环境）。
+  Future<String?> evalJsRule({
+    required String script,
+    required Map<String, String> bindings,
+    SelectorValue? base,
+    bool asExpression = false,
+  }) async {
+    throw const RuleEngineException(
+      RuleErrorKind.unsupported,
+      '当前引擎不支持执行书源 JS（缺少 WebView）',
     );
   }
 
@@ -199,8 +329,7 @@ abstract class BookRuleEngine {
   Future<void> dispose();
 }
 
-/// 把 `<base href>` 注入 HTML 头部（求值前必须做）。
-///
+/// 把 `<base href>` 注入 HTML 头部（求值前必须做）。///
 /// 为什么注入而不是只依赖 `loadHtmlString(baseUrl:)`：后者在部分 Android
 /// WebView 版本上不会真正更新 `document.baseURI`，结果就是相对链接被解成
 /// `about:blank` 下的相对路径 —— `new URL(v, document.baseURI)` 拿到一堆
@@ -209,9 +338,24 @@ abstract class BookRuleEngine {
 /// 注意：我们插在 `<head>` 的**最前面**，所以优先于页面自带的 `<base>`
 /// （浏览器只认第一个）。这是有意的：相对链接应该按「我们抓它时的那个 URL」
 /// 解析，而不是页面自己声明的（那可能指向 CDN / 镜像站）。
-String injectBaseHref(String html, String baseUrl) {
-  if (baseUrl.trim().isEmpty) return html;
-  final tag = '<base href="${_escapeAttr(baseUrl.trim())}">';
+String injectBaseHref(String html, String baseUrl) =>
+    _injectHeadTag(html, baseUrl.trim().isEmpty
+        ? null
+        : '<base href="${_escapeAttr(baseUrl.trim())}">');
+
+/// 给这一份 HTML 打一个**载页标记**（`<meta name="amotv-load" content="token">`）。
+///
+/// 为什么需要它（v2.78.0 实机踩到）：`loadHtmlString` 的 Future 在**平台调用
+/// 返回**时就完成了，此时新文档还没 commit —— 立刻轮询 `document.readyState`
+/// 读到的可能是**上一页**（甚至是超时后那张空白页）的 complete，于是「页面
+/// 好了」被误判，后续选择器在旧 DOM 上跑，整源取到一堆错值。
+/// 打标记之后，只有「标记 = 本次 token」才认这一页。
+String injectLoadMarker(String html, String token) =>
+    _injectHeadTag(html, '<meta name="amotv-load" content="$token">');
+
+/// 把 [tag]（`<base>` / `<meta …>`）插到 `<head>` 最前面（没有 head 就造一个）。
+String _injectHeadTag(String html, String? tag) {
+  if (tag == null) return html;
   final lower = html.toLowerCase();
 
   final headAt = lower.indexOf('<head');
@@ -236,6 +380,30 @@ String injectBaseHref(String html, String baseUrl) {
 
 String _escapeAttr(String s) =>
     s.replaceAll('&', '&amp;').replaceAll('"', '&quot;').replaceAll('<', '&lt;');
+
+/// 书源 JS 的安全门（纯函数，可单测）：脚本里还有禁用 API 就抛。
+///
+/// 为什么抽成顶层函数而不是写在 [WebViewRuleEngine.evalJsRule] 里：
+/// `flutter test` 里建不出 WebView，写在引擎里就只能靠肉眼审；
+/// 抽出来之后「拦什么、报什么话」能被单测钉死（见 `book_rule_engine_test.dart`）。
+/// 判定本身在 `js_rule.dart`（白名单只有一份）。
+void checkJsRuleAllowed(String script) {
+  final blocked = blockedApisIn(script);
+  if (blocked.isNotEmpty) {
+    throw RuleEngineException(
+      RuleErrorKind.unsupported,
+      blockedApisMessage(blocked),
+    );
+  }
+  // 同步死循环会把整个 WebView（全 App 共用）卡死，超时之后连空白页都排不进去
+  // —— 只能在执行前拦住（见 `js_rule.dart` 的 hasObviousDeadLoop）。
+  if (hasObviousDeadLoop(script)) {
+    throw const RuleEngineException(
+      RuleErrorKind.unsupported,
+      '这条规则里有死循环（while(true) / for(;;)），本版不执行',
+    );
+  }
+}
 
 /// 从 HTTP `Content-Type` 里抠出 charset（拿不到 / 写的是别名都返回原样字符串）。
 ///
@@ -339,7 +507,20 @@ class WebViewRuleEngine extends BookRuleEngine {
   /// 当前页的「加载完成」信号（每次求值换一个新的）。
   Completer<String>? _pageDone;
 
+  /// 载页代次：`reset()` 之后旧的那次轮询要立刻退出（见 [_waitUntilParsed]）。
+  int _loadToken = 0;
+
   bool _disposed = false;
+
+  /// 当前页面是否已经载入完成。
+  ///
+  /// 为什么要有这个标记（I3a）：[evalJsRule] **不重新载页**，它复用上一次
+  /// 选择器求值留下的 DOM。没有页面可复用时必须明确报错，而不是在
+  /// `about:blank` 上跑脚本然后返回一个看起来正常的空值。
+  bool _pageLoaded = false;
+
+  /// 正在跑书源 JS：期间一律禁止导航（脚本里 `location.href=…` 会被拦）。
+  bool _jsRuleRunning = false;
 
   /// ⚠️ 这里刻意**新建**一个干净的 Dio：`BiliApi` 的 Dio 带 B 站定制的
   /// baseUrl / Referer / Cookie，拿它请求第三方站点既会带上不该带的凭据，
@@ -366,6 +547,9 @@ class WebViewRuleEngine extends BookRuleEngine {
           }
         },
         onNavigationRequest: (request) {
+          // 跑书源 JS 期间**一律**不放行：白名单已经拦了网络 API，但脚本仍可能
+          // 用 `location.href` 把页面顶走 —— 页面一走，后面的求值全错。
+          if (_jsRuleRunning) return NavigationDecision.prevent;
           // 只放行 http/https：`loadHtmlString` 自己不会跳，但页面里的
           // `location.href='intent://…'` / `tel:` 之类会把 WebView 交给系统
           final scheme = Uri.tryParse(request.url)?.scheme;
@@ -444,8 +628,20 @@ class WebViewRuleEngine extends BookRuleEngine {
     required String baseUrl,
     required SelectorValue listSelector,
     required SelectorValue? fieldSelector,
+    Map<String, String> bindings = const {},
   }) async {
     _ensureAlive();
+    // 静态 JS 字段：交给混合求值（逐节点跑脚本），不按选择器查
+    if (fieldSelector != null && fieldSelector.kind == SelectorKind.js) {
+      final map = await queryFieldMap(
+        html: html,
+        baseUrl: baseUrl,
+        listSelector: listSelector,
+        fields: {'__field': fieldSelector},
+        bindings: bindings,
+      );
+      return map['__field'] ?? const [];
+    }
     _checkSelectors(listSelector, fieldSelector);
     final raw = await _serial(() async {
       final result = await _evalJs(
@@ -464,15 +660,48 @@ class WebViewRuleEngine extends BookRuleEngine {
     required String baseUrl,
     required SelectorValue listSelector,
     required Map<String, SelectorValue?> fields,
+    Map<String, String> bindings = const {},
   }) async {
     _ensureAlive();
     _checkSelectors(listSelector, null);
     if (fields.isEmpty) return const {};
-    final raw = await _serial(() => _evalJs(
-          html: html,
-          baseUrl: baseUrl,
-          js: buildQueryFieldsMultiJs(listSelector, fields),
-        ));
+    final selectorFields = <String, SelectorValue?>{};
+    final jsFields = <String, SelectorValue>{};
+    for (final entry in fields.entries) {
+      final value = entry.value;
+      if (value != null && value.kind == SelectorKind.js) {
+        // 跑不了的 JS 字段：**在载页之前**就说清楚（省一次注定失败的抓取）
+        if (!value.isStaticJsRunnable) {
+          throw RuleEngineException(
+            RuleErrorKind.unsupported,
+            _selectorMessage(value, '字段规则'),
+          );
+        }
+        jsFields[entry.key] = value;
+      } else {
+        selectorFields[entry.key] = value;
+      }
+    }
+    // 一次求值里取完所有列（选择器 + 逐行 JS），页面只载入一次 ——
+    // 逐字段载页是 6 倍等待，逐行 evalJsRule 是 N 倍往返。
+    final raw = await _serial(() async {
+      await _loadPage(html: html, baseUrl: baseUrl);
+      final js = buildQueryFieldsMixedJs(
+        listSelector: listSelector,
+        selectorFields: selectorFields,
+        jsFields: jsFields,
+        bindings: bindings,
+      );
+      if (jsFields.isEmpty) return _runJsRaw(js);
+      // 有用户脚本 → 按书源 JS 的口径执行：3 秒超时 + 期间禁止导航，
+      // 超时重载空白页把死循环顶掉（见 kRuleJsTimeout）。
+      _jsRuleRunning = true;
+      try {
+        return await _runJsOnPage(js, timeout: kRuleJsTimeout, killOnTimeout: true);
+      } finally {
+        _jsRuleRunning = false;
+      }
+    });
     final decoded = _decodeJson(raw, '字段结果');
     if (decoded is! Map) {
       throw const RuleEngineException(
@@ -480,12 +709,40 @@ class WebViewRuleEngine extends BookRuleEngine {
         '页面返回的字段结果不是对象，可能页面结构与书源规则不符',
       );
     }
+    for (final line in _stringListOf(decoded['logs'])) {
+      debugPrint('[书源 JS] $line');
+    }
+    for (final line in _stringListOf(decoded['warnings'])) {
+      debugPrint('[书源 JS 告警] $line');
+    }
+    // 某个字段「一行都没取到且有报错」→ 明确说是 JS 炸了，而不是静默空列
+    // （静默空值是本模块历史上最难查的一类问题）。
+    final errors = <String, String>{};
+    final rawErrors = decoded['errors'];
+    if (rawErrors is List) {
+      for (final item in rawErrors) {
+        if (item is! Map) continue;
+        final field = '${item['field']}';
+        errors.putIfAbsent(field, () => '${item['error']}');
+      }
+    }
+    final columns = decoded['fields'] is Map ? decoded['fields'] as Map : decoded;
     final out = <String, List<String?>>{};
     for (final entry in fields.entries) {
-      final list = decoded[entry.key];
-      out[entry.key] = list is List
+      final list = columns[entry.key];
+      final values = list is List
           ? [for (final v in list) v?.toString()]
-          : List<String?>.filled(0, null);
+          : <String?>[];
+      final hasValue =
+          values.any((v) => v != null && v.trim().isNotEmpty);
+      final jsError = errors[entry.key];
+      if (!hasValue && jsError != null) {
+        throw RuleEngineException(
+          RuleErrorKind.unsupported,
+          '字段「${entry.key}」的 JS 规则执行失败：$jsError',
+        );
+      }
+      out[entry.key] = values;
     }
     return out;
   }
@@ -496,19 +753,74 @@ class WebViewRuleEngine extends BookRuleEngine {
     required String baseUrl,
     List<String> removeSelectors = const [],
     required SelectorValue textSelector,
+    Map<String, String> bindings = const {},
   }) async {
     _ensureAlive();
-    // 正文规则为空是「取整页」的合法写法（少数站点整页只有正文），
-    // 但写了却不可执行（JS / 语法错）就必须说清楚，不能静默回空。
-    if (!textSelector.isEmpty) _checkSelectors(textSelector, null);
-    final raw = await _serial(() => _evalJs(
+    final isJs = textSelector.kind == SelectorKind.js;
+    if (isJs) {
+      if (!textSelector.isStaticJsRunnable) {
+        throw RuleEngineException(
+          RuleErrorKind.unsupported,
+          _selectorMessage(textSelector, '正文规则'),
+        );
+      }
+    } else if (!textSelector.isEmpty) {
+      // 正文规则为空是「取整页」的合法写法（少数站点整页只有正文），
+      // 但写了却不可执行（语法错）就必须说清楚，不能静默回空。
+      _checkSelectors(textSelector, null);
+    }
+    final info = textSelector.jsInfo;
+    final raw = await _serial(() async {
+      if (!isJs) {
+        return _evalJs(
           html: html,
           baseUrl: baseUrl,
           js: buildExtractHtmlJs(
             removeSelectors: removeSelectors,
             textSelector: textSelector,
           ),
-        ));
+        );
+      }
+      // 正文规则本身是 JS：同一个 IIFE 里「删节点 → 取值 → 跑脚本」，
+      // 跑脚本这一步同样按书源 JS 的口径限时（死循环要能被顶掉）。
+      await _loadPage(html: html, baseUrl: baseUrl);
+      _jsRuleRunning = true;
+      try {
+        return await _runJsOnPage(
+          buildExtractHtmlWithJsJs(
+            removeSelectors: removeSelectors,
+            base: textSelector.baseSelector,
+            script: info!.script,
+            bindings: bindings,
+            asExpression: info.form == JsRuleForm.template,
+          ),
+          timeout: kRuleJsTimeout,
+          killOnTimeout: true,
+        );
+      } finally {
+        _jsRuleRunning = false;
+      }
+    });
+    if (isJs) {
+      final run = parseJsRunOutput(raw);
+      for (final line in run.logs) {
+        debugPrint('[书源 JS] $line');
+      }
+      if (!run.ok) {
+        throw RuleEngineException(
+          RuleErrorKind.unsupported,
+          '正文 JS 规则执行失败：${run.error}',
+        );
+      }
+      final htmlOut = run.value ?? '';
+      if (htmlOut.trim().isEmpty) {
+        throw const RuleEngineException(
+          RuleErrorKind.empty,
+          '正文是空的：正文 JS 规则返回了空值',
+        );
+      }
+      return htmlOut;
+    }
     final extracted = _unwrapJsString(raw);
     if (extracted.trim().isEmpty) {
       throw const RuleEngineException(
@@ -520,10 +832,146 @@ class WebViewRuleEngine extends BookRuleEngine {
   }
 
   @override
+  Future<String?> evalJsRule({
+    required String script,
+    required Map<String, String> bindings,
+    SelectorValue? base,
+    bool asExpression = false,
+  }) async {
+    _ensureAlive();
+    // 第三道门（解析阶段是第一道、白名单本身是第二道）：脚本里只要还有
+    // 禁用 API 就直接拒，连页面都不碰。调用方即使漏了 SelectorValue 判定，
+    // 也不会把 `java.ajax(...)` 送进 WebView。
+    checkJsRuleAllowed(script);
+    return _serial(() async {
+      _ensureAlive();
+      if (_controller == null || !_pageLoaded) {
+        throw const RuleEngineException(
+          RuleErrorKind.unsupported,
+          'JS 规则要复用已载入的页面：当前页面还没载入，先跑一次选择器求值再执行 JS',
+        );
+      }
+      String? initial;
+      if (base != null) {
+        if (base.kind == SelectorKind.js) {
+          throw RuleEngineException(
+            RuleErrorKind.unsupported,
+            'JS 前置选择器本身也是 JS（${base.raw}），本版不支持嵌套',
+          );
+        }
+        if (!base.isRunnable) {
+          throw RuleEngineException(
+            base.isEmpty ? RuleErrorKind.empty : RuleErrorKind.unsupported,
+            _selectorMessage(base, 'JS 前置选择器'),
+          );
+        }
+        initial = await _valueOnCurrentPage(base);
+      }
+      _jsRuleRunning = true;
+      Object? raw;
+      try {
+        raw = await _runJsOnPage(
+          buildJsRunnerScript(
+            script: script,
+            bindings: bindings,
+            initialResult: initial,
+            asExpression: asExpression,
+          ),
+          timeout: kRuleJsTimeout,
+          killOnTimeout: true,
+        );
+      } finally {
+        _jsRuleRunning = false;
+      }
+      final out = parseJsRunOutput(raw);
+      for (final line in out.logs) {
+        debugPrint('[书源 JS] $line');
+      }
+      for (final warning in out.warnings) {
+        debugPrint('[书源 JS 告警] $warning');
+      }
+      if (!out.ok) {
+        throw RuleEngineException(
+          RuleErrorKind.unsupported,
+          'JS 规则执行失败：${out.error}',
+        );
+      }
+      return out.value;
+    });
+  }
+
+  /// 在当前页面上跑一次「取值」脚本，返回第一个非空值（JS 前置选择器用）。
+  ///
+  /// 复用 [buildQueryFieldsJs]（`fieldSelector: null` = 取节点自身的值），
+  /// 所以前置选择器的语法与普通规则完全一致，不用写第二套解析。
+  Future<String?> _valueOnCurrentPage(SelectorValue base) async {
+    final raw = await _runJsOnPage(buildQueryFieldsJs(base, null));
+    final values = _decodeValueList(raw);
+    for (final v in values) {
+      if (v != null && v.trim().isNotEmpty) return v;
+    }
+    return null;
+  }
+
+  /// 在当前页面上跑一段 JS，返回**原始**结果。
+  ///
+  /// 与 [_evalJs] 的区别：不载页。书源 JS 必须复用已载入的 DOM（见
+  /// [evalJsRule] 的说明）；顺带也让「先取值再变换」这条链只付一次载页成本。
+  ///
+  /// [timeout] 非空时超时即失败；[killOnTimeout] 为真时还会重载空白页
+  /// （见 [kRuleJsTimeout] 与 [_killScript]）。
+  Future<Object?> _runJsOnPage(
+    String js, {
+    Duration? timeout,
+    bool killOnTimeout = false,
+  }) async {
+    _ensureAlive();
+    final c = _web;
+    Future<Object?> run;
+    try {
+      run = c.runJavaScriptReturningResult(js);
+    } catch (e) {
+      throw RuleEngineException(
+        RuleErrorKind.unsupported,
+        '页面脚本执行失败（${e.runtimeType}），可能是 WebView 拒绝执行',
+      );
+    }
+    if (timeout == null) return run;
+    try {
+      return await run.timeout(timeout);
+    } on TimeoutException {
+      if (killOnTimeout) await _killScript();
+      throw RuleEngineException(
+        RuleErrorKind.timeout,
+        'JS 规则执行超过 ${timeout.inSeconds} 秒，已终止（脚本里可能有死循环）',
+      );
+    }
+  }
+
+  /// 用空白页顶掉当前页面，把还挂在渲染线程上的脚本一起终止。
+  ///
+  /// 为什么必须做：`runJavaScriptReturningResult` 的 Future 超时了，但脚本
+  /// 本身还在跑（`while(true)` 不会因为 Dart 侧不 await 就停下）。不换页的话
+  /// 这个 WebView 之后的每一次求值都会排在它后面，整条搜索卡死。
+  /// 载入空白页是唯一能强制中断同步脚本的办法。
+  Future<void> _killScript() async {
+    _pageLoaded = false;
+    try {
+      await _web
+          .loadHtmlString('', baseUrl: null)
+          .timeout(const Duration(seconds: 2));
+    } catch (_) {
+      // 杀页面失败不改变错误语义：调用方拿到的是「超时」，不是「杀失败」
+    }
+  }
+
+  @override
   void reset() {
     // 只把「正在等页面加载」的那次求值叫醒：不清 `_tail`，因为排队中的
     // 任务各自持有自己的 gate（`_serial` 的 finally 会放行下一个），
     // 硬清队列反而会让等待者永远挂住。
+    // v2.78.0 起载页是轮询 readyState，代次 +1 让那条轮询立刻退出。
+    _loadToken++;
     final done = _pageDone;
     if (done != null && !done.isCompleted) {
       done.completeError(const RuleEngineException(
@@ -567,6 +1015,27 @@ class WebViewRuleEngine extends BookRuleEngine {
     required String baseUrl,
     required String js,
   }) async {
+    await _loadPage(html: html, baseUrl: baseUrl);
+    return _runJsRaw(js);
+  }
+
+  /// 只载页（I3b 拆出来：混合求值要先载页，再按「是否含用户脚本」决定
+  /// 要不要加超时与禁导航）。
+  ///
+  /// ## 为什么不再死等 `onPageFinished`（v2.78.0）
+  /// `onPageFinished` 要等**全部子资源**（外链 jQuery / 封面图 / 统计脚本）。
+  /// 真实书站的搜索页普遍挂 `https://libs.baidu.com/jquery/...` 这类外链，
+  /// 本机网络下经常 8 秒都等不到 → 整源报「页面在 8 秒内没有加载完成」。
+  /// I3b 之前这类源被「有 JS 就不跑」直接跳过，问题被掩盖；接线之后它就成了
+  /// **主线失败原因**（实机实测：阅友小说、零零小说都卡在这一步）。
+  ///
+  /// 现在改成轮询 `document.readyState`：`complete` 立刻放行；如果 2.5 秒后
+  /// 已经是 `interactive`（HTML 解析完了、外链资源还在下载），也放行 ——
+  /// 我们只需要 DOM，不需要等图片字节。真·白屏 / 解析卡死仍按 8 秒超时。
+  Future<void> _loadPage({
+    required String html,
+    required String baseUrl,
+  }) async {
     _ensureAlive();
     if (html.trim().isEmpty) {
       throw const RuleEngineException(
@@ -577,9 +1046,12 @@ class WebViewRuleEngine extends BookRuleEngine {
     final c = _web;
     final done = Completer<String>();
     _pageDone = done;
+    _pageLoaded = false;
+    _loadToken++;
+    final token = _loadToken;
     try {
       await c.loadHtmlString(
-        injectBaseHref(html, baseUrl),
+        injectLoadMarker(injectBaseHref(html, baseUrl), '$token'),
         baseUrl: baseUrl.trim().isEmpty ? null : baseUrl.trim(),
       );
     } catch (e) {
@@ -590,17 +1062,75 @@ class WebViewRuleEngine extends BookRuleEngine {
       );
     }
     try {
-      await done.future.timeout(kRulePageTimeout);
-    } on TimeoutException {
-      throw const RuleEngineException(
-        RuleErrorKind.timeout,
-        '页面在 8 秒内没有加载完成，可能是网页太大或站点脚本卡住了',
-      );
+      await _waitUntilParsed(done, token);
     } finally {
       _pageDone = null;
     }
+    // 页面就绪：之后的 evalJsRule 可以复用它（不重新载页，见 evalJsRule 说明）
+    _pageLoaded = true;
+  }
+
+  /// 等页面「能用」（见 [_loadPage] 的说明）。
+  ///
+  /// [done] 是 `onPageFinished` 的信号，只用来**提前**放行（它是 complete 的
+  /// 权威信号）与接住导航失败；超时语义与旧版一致（8 秒）。
+  ///
+  /// 判定「是不是**这一页**」靠 [_loadPage] 注入的 `amotv-load` 标记：标记
+  /// 对不上就说明新文档还没 commit（读到的 complete 属于上一页），继续等。
+  Future<void> _waitUntilParsed(Completer<String> done, int token) async {
+    final started = DateTime.now();
+    const graceForSubresources = Duration(milliseconds: 2500);
+    final probe = '(function(){var m=document.querySelector('
+        '\'meta[name="amotv-load"]\');return JSON.stringify({'
+        't: m ? m.getAttribute("content") : "", s: document.readyState});})()';
+    while (true) {
+      if (token != _loadToken) {
+        throw const RuleEngineException(
+          RuleErrorKind.unsupported,
+          '页面已离开，本次求值已取消',
+        );
+      }
+      if (done.isCompleted) {
+        // 导航失败会在这里带出 networkError
+        await done.future;
+        return;
+      }
+      var state = '';
+      var marker = '';
+      try {
+        final raw = _unwrapJsValue(await _web.runJavaScriptReturningResult(probe));
+        if (raw is String) {
+          final decoded = jsonDecode(raw);
+          if (decoded is Map) {
+            marker = '${decoded['t'] ?? ''}';
+            state = '${decoded['s'] ?? ''}'.toLowerCase();
+          }
+        } else if (raw is Map) {
+          marker = '${raw['t'] ?? ''}';
+          state = '${raw['s'] ?? ''}'.toLowerCase();
+        }
+      } catch (_) {
+        // 文档还没建好：下一轮再问
+      }
+      if (marker == '$token') {
+        if (state == 'complete') return;
+        final elapsed = DateTime.now().difference(started);
+        if (state == 'interactive' && elapsed >= graceForSubresources) return;
+      }
+      if (DateTime.now().difference(started) >= kRulePageTimeout) {
+        throw const RuleEngineException(
+          RuleErrorKind.timeout,
+          '页面在 8 秒内没有加载完成，可能是网页太大或站点脚本卡住了',
+        );
+      }
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
+  }
+
+  /// 在**已载入**的页面上跑一段脚本（不载页、不限时）。
+  Future<Object?> _runJsRaw(String js) async {
     try {
-      return await c.runJavaScriptReturningResult(js);
+      return await _web.runJavaScriptReturningResult(js);
     } catch (e) {
       throw RuleEngineException(
         RuleErrorKind.unsupported,
@@ -634,13 +1164,20 @@ class WebViewRuleEngine extends BookRuleEngine {
 String _selectorMessage(SelectorValue v, String what) {
   switch (v.reason) {
     case kSelectorReasonJs:
-      return '$what需要 JS（${v.raw}），本版暂不支持 JS 书源';
+      // I3b 起分两种：静态可跑的不该走到这里；跑不了的要说清缺什么能力，
+      // 否则用户只看到「需要 JS」却不知道该改哪一段。
+      if (v.blockedApis.isNotEmpty) {
+        return '$what的 JS 规则用了本版不支持的接口：'
+            '${v.blockedApis.join('、')}（${v.raw}）';
+      }
+      final why = v.jsInfo?.summary ?? '本版暂不支持';
+      return '$what的 JS 规则跑不了：$why（${v.raw}）';
     case kSelectorReasonEmpty:
       return '$what是空的';
     case kSelectorReasonTextFilter:
-      return '$what用了 text. 按文字筛元素（${v.raw}），本版暂不支持';
+      return '$what用了 text. 按文字筛元素（${v.raw}），写法有误';
     case kSelectorReasonInterleave:
-      return '$what用了 %% 交叉合并（${v.raw}），本版暂不支持';
+      return '$what用了 %% 交叉合并（${v.raw}），写法有误';
     default:
       return '$what写法暂不支持（${v.raw}）';
   }
@@ -694,6 +1231,15 @@ String _unwrapJsString(Object? raw) {
   final value = _unwrapJsValue(raw);
   if (value == null) return '';
   return value is String ? value : value.toString();
+}
+
+/// 取 JS 载荷里的 `logs` / `warnings` 列表（坏数据一律当空，不让它崩）。
+List<String> _stringListOf(Object? raw) {
+  if (raw is! List) return const [];
+  return [
+    for (final v in raw)
+      if (v != null) v.toString(),
+  ];
 }
 
 /// 把 JS 返回的 JSON 数组解成 `List<String?>`。
@@ -790,7 +1336,13 @@ String _humanDioError(DioException e, String url) {
 /// 也需要一个「不会崩、给固定数据」的引擎；放 test 目录就只能测试用。
 @visibleForTesting
 class FakeRuleEngine extends BookRuleEngine {
-  FakeRuleEngine({this.onFetch, this.onQuery, this.onQueryMap, this.onExtractHtml});
+  FakeRuleEngine({
+    this.onFetch,
+    this.onQuery,
+    this.onQueryMap,
+    this.onExtractHtml,
+    this.onEvalJs,
+  });
 
   /// 按 URL 返回网页（默认返回一段空 HTML）。
   final Future<String> Function(String url)? onFetch;
@@ -815,6 +1367,21 @@ class FakeRuleEngine extends BookRuleEngine {
     List<String> removeSelectors,
     SelectorValue textSelector,
   )? onExtractHtml;
+
+  /// 静态 JS 规则执行（I3a；默认抛「不支持」，I3b 接服务后由用例注入）。
+  ///
+  /// 返回值语义与真引擎一致：脚本的 `result` 字符串，null = 结果为空。
+  /// 四种情况（成功 / 返回 null / 脚本报错 / 超时）都靠这个回调模拟，
+  /// 这样搜索编排的用例不必开 WebView。
+  final Future<String?> Function(
+    String script,
+    Map<String, String> bindings,
+    SelectorValue? base,
+  )? onEvalJs;
+
+  /// 已执行的 JS 规则次数与脚本（测试断言「哪条规则被送进沙箱」）。
+  int jsRuleCount = 0;
+  final List<String> jsRuleScripts = [];
 
   /// 已抓过的 URL（按调用顺序；测试用来断言「unsupported 的源没发请求」）。
   final List<String> fetchedUrls = [];
@@ -845,8 +1412,19 @@ class FakeRuleEngine extends BookRuleEngine {
     required String baseUrl,
     required SelectorValue listSelector,
     required SelectorValue? fieldSelector,
+    Map<String, String> bindings = const {},
   }) async {
     queryCount++;
+    // JS 字段走 onEvalJs（`onQuery` 只服务选择器；混在一起两边都验不准）
+    if (fieldSelector != null && fieldSelector.kind == SelectorKind.js) {
+      return queryJsField(
+        html: html,
+        baseUrl: baseUrl,
+        listSelector: listSelector,
+        field: fieldSelector,
+        bindings: bindings,
+      );
+    }
     if (onQuery != null) {
       return await onQuery!(html, listSelector, fieldSelector);
     }
@@ -859,17 +1437,49 @@ class FakeRuleEngine extends BookRuleEngine {
     required String baseUrl,
     required SelectorValue listSelector,
     required Map<String, SelectorValue?> fields,
+    Map<String, String> bindings = const {},
   }) async {
-    if (onQueryMap != null) {
-      queryCount++;
-      return await onQueryMap!(html, listSelector, fields);
+    if (onQueryMap == null) {
+      return super.queryFieldMap(
+        html: html,
+        baseUrl: baseUrl,
+        listSelector: listSelector,
+        fields: fields,
+        bindings: bindings,
+      );
     }
-    return super.queryFieldMap(
-      html: html,
-      baseUrl: baseUrl,
-      listSelector: listSelector,
-      fields: fields,
-    );
+    // 选择器字段交给注入的回调，JS 字段交给 onEvalJs —— 与真引擎的分工一致
+    final selectorFields = <String, SelectorValue?>{};
+    final jsFields = <String, SelectorValue>{};
+    for (final entry in fields.entries) {
+      final value = entry.value;
+      if (value != null && value.kind == SelectorKind.js) {
+        jsFields[entry.key] = value;
+      } else {
+        selectorFields[entry.key] = value;
+      }
+    }
+    final out = <String, List<String?>>{};
+    if (selectorFields.isNotEmpty) {
+      queryCount++;
+      out.addAll(await onQueryMap!(html, listSelector, selectorFields));
+    }
+    if (jsFields.isEmpty) return out;
+    var rows = 0;
+    for (final column in out.values) {
+      if (column.length > rows) rows = column.length;
+    }
+    for (final entry in jsFields.entries) {
+      out[entry.key] = await queryJsField(
+        html: html,
+        baseUrl: baseUrl,
+        listSelector: listSelector,
+        field: entry.value,
+        bindings: bindings,
+        rowCount: rows,
+      );
+    }
+    return out;
   }
 
   @override
@@ -878,6 +1488,7 @@ class FakeRuleEngine extends BookRuleEngine {
     required String baseUrl,
     List<String> removeSelectors = const [],
     required SelectorValue textSelector,
+    Map<String, String> bindings = const {},
   }) async {
     queryCount++;
     if (onExtractHtml != null) {
@@ -886,6 +1497,24 @@ class FakeRuleEngine extends BookRuleEngine {
     throw const RuleEngineException(
       RuleErrorKind.unsupported,
       '假引擎没有配置正文抽取',
+    );
+  }
+
+  @override
+  Future<String?> evalJsRule({
+    required String script,
+    required Map<String, String> bindings,
+    SelectorValue? base,
+    bool asExpression = false,
+  }) async {
+    jsRuleCount++;
+    jsRuleScripts.add(asExpression ? '{{$script}}' : script);
+    if (onEvalJs != null) {
+      return await onEvalJs!(script, bindings, base);
+    }
+    throw const RuleEngineException(
+      RuleErrorKind.unsupported,
+      '假引擎没有配置 JS 规则执行',
     );
   }
 

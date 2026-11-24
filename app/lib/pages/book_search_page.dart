@@ -151,15 +151,17 @@ class _BookSearchPageState extends State<BookSearchPage> {
     final sources = _sources;
     if (sources == null) return;
 
-    // 只搜「启用 且 执行字段里没有 JS」的源（见文件头）。
-    // 注意：`usesJs` 是 `jsUsageOf(...).executedJs` 的薄视图，签名没变。
+    // 只搜「启用 且 本版能跑」的源（见文件头）。v2.78.0 起静态 JS（纯字符串
+    // 变换）的源**照常搜索**，脚本由引擎逐行执行；只有确实缺 JS 能力的
+    // （ajax / 变量表 / 列表规则）才跳过，并在脚注里点名。
     final searchable = [
       for (final s in sources)
-        if (s.enabled && !usesJs(s)) s,
+        if (s.enabled && sourceCapabilityOf(s) != SourceCapability.needsJs) s,
     ];
     final skipped = [
       for (final s in sources)
-        if (s.enabled && usesJs(s)) s.name,
+        if (s.enabled && sourceCapabilityOf(s) == SourceCapability.needsJs)
+          s.name,
     ];
 
     final token = ++_token;
@@ -408,7 +410,7 @@ class _BookSearchPageState extends State<BookSearchPage> {
         if (noResultCount > 0) '$noResultCount 个源没搜到',
         if (failureSummary.isNotEmpty) failureSummary,
         if (_skippedJs.isNotEmpty)
-          '另有 ${_skippedJs.length} 个源需要 JS 规则，本版暂不支持',
+          '另有 ${_skippedJs.length} 个源需要本版不支持的 JS（ajax / 变量表）',
         if (noResultCount == 0 && failureSummary.isEmpty && _skippedJs.isEmpty)
           '换个关键词，或去书源管理里启用更多源',
       ];
@@ -433,7 +435,7 @@ class _BookSearchPageState extends State<BookSearchPage> {
                 children: [
                   Expanded(
                     child: Text(
-                      '已跳过 ${_skippedJs.length} 个需要 JS 规则的书源：'
+                      '已跳过 ${_skippedJs.length} 个需要 JS 的书源（ajax / 变量表）：'
                       '${_skippedJs.take(3).join('、')}'
                       '${_skippedJs.length > 3 ? '…' : ''}',
                       style: kTypeBodyS.copyWith(color: kInkGray50),
@@ -592,6 +594,7 @@ class _BookSearchPageState extends State<BookSearchPage> {
       SourceHealthStatus.blocked => kError,
       SourceHealthStatus.networkError => kError,
       SourceHealthStatus.unsupportedJs => palette.accent,
+      SourceHealthStatus.needsAjax => palette.accent,
       SourceHealthStatus.badRule => palette.accent,
     };
   }

@@ -304,4 +304,100 @@ void main() {
       expect(result.warning, contains('目录规则'));
     });
   });
+
+  group('静态 JS 接线（I3b）', () {
+    test('详情字段是静态 JS：真调用，绑定带书名 / 站点根', () async {
+      final scripts = <String>[];
+      Map<String, String>? seen;
+      final engine = FakeRuleEngine(
+        onFetch: (_) async => 'PAGE',
+        onQueryMap: (html, list, fields) async {
+          if (list.query == 'body') {
+            // author 是 JS 字段，不该出现在选择器回调里
+            expect(fields.containsKey('author'), isFalse);
+            return {'name': ['书名']};
+          }
+          return const {};
+        },
+        onEvalJs: (script, bindings, base) async {
+          scripts.add(script);
+          seen = bindings;
+          return '唐家三少';
+        },
+      );
+      final source = _source(
+        detail: const DetailRule(
+          name: '.name@text',
+          author: '.author@text@js:result.trim()',
+        ),
+        toc: const TocRule(list: ''),
+      );
+
+      final result = await BookDetailService(engine: engine).loadDetail(
+        source: source,
+        detailUrl: 'https://x.example/book/1',
+        seed: const BookDetailInfo(name: '斗罗大陆'),
+      );
+
+      expect(result.info.author, '唐家三少');
+      expect(scripts.single, contains('trim'));
+      expect(seen!['book'], '斗罗大陆');
+      expect(seen!['baseUrl'], 'https://x.example/book/1');
+      expect(seen!['sourceUrl'], 'https://x.example');
+    });
+
+    test('章节地址是静态 JS（拼接站点前缀）→ 交给沙箱并采用返回值', () async {
+      String? seenBase;
+      final engine = FakeRuleEngine(
+        onFetch: (_) async => 'PAGE',
+        onQueryMap: (html, list, fields) async {
+          if (list.query == 'body') return const {};
+          // url 是 JS 字段，不在选择器回调里
+          expect(fields.containsKey('url'), isFalse);
+          return {
+            'name': ['第1章'],
+          };
+        },
+        onEvalJs: (script, bindings, base) async {
+          seenBase = base?.query;
+          return 'https://m.example/ch/1';
+        },
+      );
+      final source = _source(
+        toc: const TocRule(
+          list: '.ch',
+          name: '',
+          urlSel: 'a@href@js:"https://m.example"+result',
+        ),
+      );
+
+      final result = await BookDetailService(engine: engine).loadDetail(
+        source: source,
+        detailUrl: 'https://x.example/book/1',
+      );
+
+      expect(seenBase, 'a');
+      expect(result.chapters.single.url, 'https://m.example/ch/1');
+      expect(result.chapters.single.name, '第1章');
+    });
+
+    test('目录地址是 JS 模板 → 明说，不硬拼脚本源码', () async {
+      final engine = FakeRuleEngine(onFetch: (_) async => 'PAGE');
+      final source = _source(
+        toc: const TocRule(
+          url: r'@js:baseUrl + "/toc"',
+          list: '.ch',
+          urlSel: 'a@href',
+        ),
+      );
+
+      final result = await BookDetailService(engine: engine).loadDetail(
+        source: source,
+        detailUrl: 'https://x.example/book/1',
+      );
+
+      expect(result.chapters, isEmpty);
+      expect(result.warning, contains('目录地址是 JS 模板'));
+    });
+  });
 }

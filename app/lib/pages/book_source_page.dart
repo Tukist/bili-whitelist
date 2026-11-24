@@ -390,18 +390,21 @@ class _BookSourcePageState extends State<BookSourcePage> {
 
   /// 检测全部书源（AppBar 溢出菜单，**较慢**）。
   ///
-  /// 只测「启用 且 不需要 JS」的：停用的源用户已经不想用了，**执行字段**里
-  /// 用了 JS 的本版根本跑不了（发请求也只会得空结果）。只在发现页 / 登录页
-  /// 用了 JS 的源**能搜**，所以照常检测。跳过的数量写在进度框里，不假装
-  /// 「全测完了」。
+  /// 只测「启用 且 本版能跑」的：停用的源用户已经不想用了，**确实缺 JS 能力**
+  /// 的源（ajax / 变量表 / 列表规则）本版跑不了（发请求也只会得空结果）。
+  /// v2.78.0 起**静态 JS 的源照常检测** —— 它的脚本本版能执行，
+  /// 再把它跳过就是在跟用户撒谎。跳过的数量写在进度框里，不假装「全测完了」。
   Future<void> _probeAll() async {
     final all = _sources ?? const <BookSource>[];
     final targets = [
       for (final s in all)
-        if (s.enabled && !usesJs(s)) s,
+        if (s.enabled && sourceCapabilityOf(s) != SourceCapability.needsJs) s,
     ];
     final disabled = all.where((s) => !s.enabled).length;
-    final jsOnly = all.where((s) => s.enabled && usesJs(s)).length;
+    final jsOnly = all
+        .where((s) =>
+            s.enabled && sourceCapabilityOf(s) == SourceCapability.needsJs)
+        .length;
     if (targets.isEmpty) {
       AppSnack.show(
         context,
@@ -714,6 +717,8 @@ class _BookSourcePageState extends State<BookSourcePage> {
             ),
           ),
           const SizedBox(width: kSpace8),
+          _capabilityBadge(source),
+          const SizedBox(width: kSpace4),
           _healthBadge(source, probing: probing),
         ],
       ),
@@ -772,6 +777,34 @@ class _BookSourcePageState extends State<BookSourcePage> {
     );
   }
 
+  /// 能力角标三态（v2.78.0）：**可搜索** / **静态 JS** / **需 JS（ajax）**。
+  ///
+  /// 为什么与 [_healthBadge] 分开：健康状态回答「这个站点现在通不通」，
+  /// 能力档回答「本版对它的 JS 能不能跑」。两件事经常不一致 ——
+  /// 一个源可能「上次检测可用」但这次改了规则变成需 ajax。
+  /// I3b 之前这里只有「需 JS」一档，把「本版能跑的静态 JS」也算进去了，
+  /// 用户会白删一堆其实好用的源。
+  Widget _capabilityBadge(BookSource source) {
+    final palette = context.palette;
+    final (label, color) = switch (sourceCapabilityOf(source)) {
+      SourceCapability.plain => ('可搜索', kSuccess),
+      SourceCapability.staticJs => ('静态 JS', palette.accent),
+      SourceCapability.needsJs => ('需 JS（ajax）', kError),
+    };
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 1),
+      decoration: BoxDecoration(
+        borderRadius: BorderRadius.circular(kRadiusSm),
+        border: Border.all(color: color.withValues(alpha: .45)),
+        color: color.withValues(alpha: .06),
+      ),
+      child: Text(
+        label,
+        style: kTypeBodyS.copyWith(color: color, fontSize: 11),
+      ),
+    );
+  }
+
   /// 状态角标：绿「可用 N 条」/ 灰「没结果」/ 红「被拦」/ 黄「需 JS」/ 灰「未检测」。
   ///
   /// 颜色只用主题里的语义色（[kSuccess] / [kError] / [kInkGray50] / accent），
@@ -792,6 +825,7 @@ class _BookSourcePageState extends State<BookSourcePage> {
       SourceHealthStatus.blocked => ('被拦', kError),
       SourceHealthStatus.networkError => ('连不上', kError),
       SourceHealthStatus.unsupportedJs => ('需 JS', palette.accent),
+      SourceHealthStatus.needsAjax => ('需 ajax', palette.accent),
       SourceHealthStatus.badRule => ('规则坏', palette.accent),
     };
     return Container(

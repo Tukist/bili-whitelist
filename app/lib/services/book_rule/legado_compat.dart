@@ -6,6 +6,8 @@
 /// 2. [jsUsageOf] / [usesJs] —— 判断一个书源**是否真的依赖 JS 规则**。
 ///    P0 起口径是「会影响我们执行的字段里有 JS 才算」（见 [JsUsage]）：
 ///    只有发现页 / 登录页 / 校验词用了 JS 的源照常能搜，不再整源判死；
+///    I3a 起再加一层 [JsUsage.runnableJs]：执行字段的 JS **全部**落在静态
+///    白名单内才算「本版能跑」（本批只产判定，接线在 I3b）；
 /// 3. [normalizeUrl] —— 相对转绝对 / 去空白 / 去尾斜杠 / 同站统一 https。
 ///
 /// ## `{{key}}` 为什么不能一刀切当 JS
@@ -19,6 +21,7 @@
 library;
 
 import '../../models/book_source.dart';
+import 'js_rule.dart';
 import 'selector.dart';
 
 /// URL 模板里允许出现的占位符（小写；`{{ page }}` 这种带空格的也算）。
@@ -86,32 +89,135 @@ class JsUsage {
   const JsUsage({
     this.executedJs = false,
     this.unexecutedJs = false,
+    this.runnableJs = false,
     this.executedFields = const [],
     this.blockedApis = const [],
   });
 
-  /// 会**影响本 App 执行**的字段里有 JS —— 这个源真跑不了。
+  /// 会**影响本 App 执行**的字段里有 JS —— 按旧口径这个源真跑不了。
   final bool executedJs;
 
   /// 只在**不执行**的字段（发现页 / 登录页 / 校验词 / 初始化 / 备注…）里有 JS。
   /// 这样的源能正常搜，只是那些能力本版没有。
   final bool unexecutedJs;
 
+  /// 执行字段里的 JS **全部**落在静态白名单内（I3a 新增）。
+  ///
+  /// 判真要求：有执行字段的 JS；每一处 JS 都是可跑的静态脚本
+  /// （[JsRuleInfo.runnable]）；且没有任何执行字段的 **URL** 里带 JS
+  /// （URL 里的 `{{…}}` 是模板替换，要 I3b 的接线才用得上）。
+  ///
+  /// ⚠️ 本批**只是判定**，`canRun` 保持旧语义（有 JS 就不跑）—— 接线在 I3b，
+  /// 半截功能上线比不支持更难排查。
+  final bool runnableJs;
+
   /// 命中 JS 的执行字段路径（`search.list` / `content.text` …），排查用。
   final List<String> executedFields;
 
-  /// 执行字段的脚本里调到的、本版跑不了的 API 名（`java.ajax` /
-  /// `java.getElements` / `Packages` …）。
+  /// 执行字段的脚本里调到的、**白名单外**的 API 名（`java.ajax` /
+  /// `java.getElements` / `Packages` / `org.jsoup` / `fetch` …）。
   ///
-  /// 本版**一个 JS 都不执行**，所以这里是脚本里出现的全部 Java API；P1 接入
-  /// 静态变换后，白名单内的名字会从这里消失，剩下的才是真正的拦路石。
+  /// v2.76.0 起这里是「脚本里出现的全部 Java API」；I3a 起白名单内的
+  /// （[kSupportedJavaApis]）不再列进来 —— 能跑的函数不该出现在「拦路石」里。
+  /// 不执行的字段**不扫**（那些脚本本版根本不跑）。
   final List<String> blockedApis;
 
   /// 能不能直接跑（= 执行字段里没有 JS）。
+  ///
+  /// v2.78.0 起**故意保持这个口径**（`!executedJs`）：它回答的是「一条 JS 都用
+  /// 不上」。要问「能不能走静态 JS」，用 [runnableJs] / [canUseStaticJs]。
   bool get canRun => !executedJs;
 }
 
+/// 这些执行字段里的 JS **本版一定跑不了**（语义上不是「字符串变换」）：
+/// - 列表规则（`search.list` / `toc.list` / 分卷）：沙箱返回的是字符串，
+///   而列表规则要的是**元素列表**；
+/// - `content.remove`：删节点必须发生在页面上，脚本给不出选择器。
+const Set<String> kListPositionJsFields = {
+  'search.list',
+  'toc.list',
+  'toc.volume.list',
+  'toc.volume.chapters',
+};
+
+/// 字段路径是不是「列表 / 删节点」这种不能由字符串变换完成的位置。
+bool _isListPositionField(String path) =>
+    kListPositionJsFields.contains(path) ||
+    path.startsWith('content.remove[');
+
+/// 这个源的 JS 能不能走本版静态沙箱（I3b 接线时用这个判定）。
+///
+/// 与 [JsUsage.canRun] 的区别：`canRun` 是「一个 JS 都不需要」，
+/// 这里是「需要的 JS 全是白名单内的纯函数变换」。两者都为假 = 真跑不了
+/// （ajax / 变量表 / JSONPath 那一类）。
+bool canUseStaticJs(BookSource source) => jsUsageOf(source).runnableJs;
+
+/// 这些 API 名说明脚本要**发网络请求**（浏览器里同步 XHR 被 CORS 拦，
+/// 不是「补个函数」能解决的）。
+///
+/// 与 `app/tools/js_rule_audit.dart` 的 `kNetworkMarkers` 同口径：审计工具
+/// 按原始规则串判，这里按 `blockedApis` 判（已经归一成 `java.xxx` / `Packages`）。
+const Set<String> kNetworkJsApis = {
+  'java.ajax',
+  'java.ajaxAll',
+  'java.connect',
+  'java.post',
+  'java.startBrowserAwait',
+  'java.getCookie',
+  'Packages',
+  'org.jsoup',
+};
+
+/// 这个源缺的 JS 能力里有没有「网络调用」（UI 上要区分「需 ajax」与「需 JS」）。
+bool jsNeedsAjax(JsUsage usage) =>
+    usage.blockedApis.any(kNetworkJsApis.contains);
+
+/// 书源在**本版**能做什么（书源管理页的三态角标）。
+enum SourceCapability {
+  /// 不依赖 JS：直接能搜。
+  plain,
+
+  /// 执行字段里的 JS 全是静态可跑的（纯字符串变换）：能搜，脚本由引擎执行。
+  staticJs,
+
+  /// 需要本版没有的 JS 能力（ajax / 变量表 / 列表规则 / 嵌套规则模板）。
+  needsJs,
+}
+
+/// 判一个源的能力档（**纯函数**，逐行现算；书源上限 200 个，代价可控）。
+///
+/// 只看**搜索**那一段（v2.78.0）：用户问的是「这个源能不能搜」。一个源可能
+/// 目录地址是 JS（`toc.url`）、搜索完全正常 —— 拿整源口径标「需 JS」会让人
+/// 白删一个能用的源。详情 / 目录 / 正文各自的闸门在各自的服务里。
+SourceCapability sourceCapabilityOf(BookSource source) {
+  final usage = jsUsageOf(source, stage: SourceStage.search);
+  if (!usage.executedJs) return SourceCapability.plain;
+  return usage.runnableJs ? SourceCapability.staticJs : SourceCapability.needsJs;
+}
+
+/// 书源规则的四段（`search` / `detail` / `toc` / `content`）。
+///
+/// 为什么需要「按阶段判」：一个源可能只有**目录地址**是 JS（`toc.url`），
+/// 搜索完全正常。用整源口径去判死，用户就白丢一个能搜的源 ——
+/// 搜索 / 详情 / 目录 / 正文各自的闸门必须各管自己那一段。
+enum SourceStage {
+  search('search.'),
+  detail('detail.'),
+  toc('toc.'),
+  content('content.');
+
+  const SourceStage(this.prefix);
+
+  /// 该阶段的字段路径前缀（`search.list` / `toc.list` …）。
+  final String prefix;
+
+  bool covers(String fieldPath) => fieldPath.startsWith(prefix);
+}
+
 /// 判定一个源的 JS 使用情况（**纯函数**，不抛异常）。
+///
+/// [stage] 非空时只看那一段的字段（搜索 / 详情 / 目录 / 正文各管自己），
+/// 为空则是整源口径（UI 的能力角标、审计工具用整源）。
 ///
 /// 口径（与 `app/tools/js_rule_audit.dart` 的分类同源）：
 /// - **执行字段**：`search.*` / `detail.*` / `toc.*` / `content.*` 里本 App
@@ -123,14 +229,28 @@ class JsUsage {
 /// 说明性字段（备注 / 分组 / 源名 / 站点根 / 版本号）里的 JS **不算**
 /// [unexecutedJs] 的证据 —— 人在备注里写一句「这条用 @js: 洗过」很常见，
 /// 拿它去污染「部分 JS」的角标只会让用户困惑。
-JsUsage jsUsageOf(BookSource source) {
+JsUsage jsUsageOf(BookSource source, {SourceStage? stage}) {
   // 有序去重：同一个字段既可能从模型读到、也可能从 raw 再读到一遍
   final executedFields = <String>{};
   final apis = <String>{};
+  // 「执行字段里每一处 JS 都能静态跑」的累计判定（I3a；I3b 起真的拿它接线）
+  var allRunnable = true;
+  var anyBlockedPosition = false;
 
   void noteExecuted(String path, String text) {
+    if (stage != null && !stage.covers(path)) return;
     executedFields.add(path);
-    apis.addAll(_jsApisIn(text));
+    apis.addAll(blockedApisIn(text));
+    final info = classifyJsRule(text);
+    if (_kUrlModelPaths.contains(path) || _isListPositionField(path)) {
+      // 两处「本版一定跑不了」的位置：
+      // - URL 字段的 JS 是「按表达式拼地址」，本批没接；
+      // - 列表 / 删节点字段要的是元素集合，沙箱只返回字符串。
+      anyBlockedPosition = true;
+      allRunnable = false;
+      return;
+    }
+    if (!info.runnable) allRunnable = false;
   }
 
   for (final entry in _selectorFields(source).entries) {
@@ -147,12 +267,14 @@ JsUsage jsUsageOf(BookSource source) {
   var unexecutedJs = false;
   final raw = source.raw;
   if (raw != null) {
+    // 按阶段判时不算「不执行字段的 JS」：那个角标是整源语义
     unexecutedJs = _scanRaw(raw, '', noteExecuted);
   }
 
   return JsUsage(
     executedJs: executedFields.isNotEmpty,
     unexecutedJs: unexecutedJs,
+    runnableJs: executedFields.isNotEmpty && allRunnable && !anyBlockedPosition,
     executedFields: List.unmodifiable(executedFields.toList()),
     blockedApis: List.unmodifiable(apis.toList()..sort()),
   );
@@ -379,6 +501,12 @@ bool _scanRaw(
 
 final RegExp _kTemplatePattern = RegExp(r'\{\{(.*?)\}\}', dotAll: true);
 
+/// 一段**地址模板**里有没有本版跑不了的 JS（非占位符的 `{{…}}` / `<js>` / `@js:`）。
+///
+/// 公开出来是给服务层判「URL 字段是 JS」用的（详情 / 目录 / 正文各自要报
+/// 自己那一段）：本版没有「按表达式拼地址」的接线，遇到就只能明说。
+bool urlTemplateUsesJs(String text) => _stringUsesJs(text);
+
 /// 一段字符串里是否有 JS 痕迹（占位符白名单见 [kUrlPlaceholders]）。
 bool _stringUsesJs(String text) {
   if (text.trim().isEmpty) return false;
@@ -390,19 +518,4 @@ bool _stringUsesJs(String text) {
     if (!kUrlPlaceholders.contains(inner)) return true;
   }
   return false;
-}
-
-final RegExp _kJavaCall = RegExp(r'java\.([A-Za-z_][A-Za-z0-9_]*)');
-
-/// 脚本里调到的 Java API（`java.ajax` → `java.ajax`；`Packages.` 单列）。
-///
-/// 只做「列出来给人看」，不判支持与否 —— 支持与否随版本变化，硬编码在这里
-/// 迟早会和引擎对不上。
-Set<String> _jsApisIn(String text) {
-  final out = <String>{
-    for (final m in _kJavaCall.allMatches(text)) 'java.${m.group(1)!}',
-  };
-  if (text.contains('Packages.')) out.add('Packages');
-  if (text.contains('org.jsoup')) out.add('org.jsoup');
-  return out;
 }

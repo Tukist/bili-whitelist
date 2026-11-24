@@ -285,4 +285,123 @@ void main() {
       expect(kDecodeGbkGuessWarning, '这个书源疑似 GBK，已按 GBK 解码');
     });
   });
+
+  group('evalJsRule（I3a 静态 JS 内核）', () {
+    test('默认实现（假引擎）报 unsupported，并把脚本记下来', () async {
+      final engine = FakeRuleEngine();
+      await expectLater(
+        engine.evalJsRule(script: 'result = "x"', bindings: const {}),
+        throwsA(
+          isA<RuleEngineException>()
+              .having((e) => e.kind, 'kind', RuleErrorKind.unsupported),
+        ),
+      );
+      expect(engine.jsRuleCount, 1);
+      expect(engine.jsRuleScripts, ['result = "x"']);
+    });
+
+    test('四态①：成功返回脚本结果', () async {
+      final engine = FakeRuleEngine(
+        onEvalJs: (script, bindings, base) async => '${bindings['key']}-已洗',
+      );
+      final value = await engine.evalJsRule(
+        script: 'result + "已洗"',
+        bindings: const {'key': '凡人'},
+        base: parseSelector('@css:.name@text'),
+      );
+      expect(value, '凡人-已洗');
+    });
+
+    test('四态②：脚本把 result 置空 → 返回 null（不是空串）', () async {
+      final engine = FakeRuleEngine(onEvalJs: (_, __, ___) async => null);
+      expect(
+        await engine.evalJsRule(script: 'result = null', bindings: const {}),
+        isNull,
+      );
+    });
+
+    test('四态③：脚本报错 → 抛 unsupported，消息里有人话原因', () async {
+      final engine = FakeRuleEngine(
+        onEvalJs: (_, __, ___) async => throw const RuleEngineException(
+          RuleErrorKind.unsupported,
+          'JS 规则执行失败：boom',
+        ),
+      );
+      await expectLater(
+        engine.evalJsRule(script: 'throw new Error("boom")', bindings: const {}),
+        throwsA(
+          isA<RuleEngineException>()
+              .having((e) => e.kind, 'kind', RuleErrorKind.unsupported)
+              .having((e) => e.message, 'message', contains('boom')),
+        ),
+      );
+    });
+
+    test('四态④：超时 → 抛 timeout（超时值 3 秒）', () async {
+      expect(kRuleJsTimeout, const Duration(seconds: 3));
+      final engine = FakeRuleEngine(
+        onEvalJs: (_, __, ___) async => throw const RuleEngineException(
+          RuleErrorKind.timeout,
+          'JS 规则执行超过 3 秒，已终止（脚本里可能有死循环）',
+        ),
+      );
+      await expectLater(
+        engine.evalJsRule(script: 'while(true){}', bindings: const {}),
+        throwsA(
+          isA<RuleEngineException>()
+              .having((e) => e.kind, 'kind', RuleErrorKind.timeout),
+        ),
+      );
+    });
+  });
+
+  group('checkJsRuleAllowed（纯函数层的安全门）', () {
+    test('白名单内的脚本放行（含 log / md5 / timeFormat）', () {
+      for (final script in [
+        'result = result.trim()',
+        'result = java.md5Encode(result)',
+        'java.log(result); result = java.timeFormat(1, "yyyy-MM-dd")',
+        'result = java.base64Decode(java.base64Encode(result))',
+      ]) {
+        expect(() => checkJsRuleAllowed(script), returnsNormally, reason: script);
+      }
+    });
+
+    test('网络 / 控制类 API 一律拒绝，消息点名具体函数', () {
+      final cases = {
+        'result = java.ajax("/x")': 'java.ajax',
+        'result = java.post("/x", "a=1")': 'java.post',
+        'result = java.connect("/x")': 'java.connect',
+        'result = java.startBrowserAwait(url)': 'java.startBrowserAwait',
+        'result = Packages.net.x.Http.get(u)': 'Packages',
+        'result = org.jsoup.Jsoup.parse(html)': 'org.jsoup',
+        'result = fetch("/x")': 'fetch',
+        'result = new XMLHttpRequest()': 'XMLHttpRequest',
+      };
+      for (final entry in cases.entries) {
+        expect(
+          () => checkJsRuleAllowed(entry.key),
+          throwsA(
+            isA<RuleEngineException>()
+                .having((e) => e.kind, 'kind', RuleErrorKind.unsupported)
+                .having((e) => e.message, 'message', contains(entry.value)),
+          ),
+          reason: entry.key,
+        );
+      }
+    });
+
+    test('java.put / getString 也拒绝（变量表 / DOM 桥本批没有）', () {
+      for (final name in ['java.put', 'java.get', 'java.getString']) {
+        expect(
+          () => checkJsRuleAllowed('result = $name("k")'),
+          throwsA(
+            isA<RuleEngineException>()
+                .having((e) => e.message, 'message', contains(name)),
+          ),
+          reason: name,
+        );
+      }
+    });
+  });
 }

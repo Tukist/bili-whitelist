@@ -21,6 +21,7 @@ library;
 
 import 'dart:convert';
 
+import 'js_rule.dart';
 import 'selector.dart';
 
 /// 生成「列表 × 字段」求值脚本。
@@ -185,6 +186,153 @@ return JSON.stringify(v);
 ''';
 }
 
+// ==================== I3b：选择器 + 静态 JS 混合求值 ====================
+
+/// 「列表 × 字段」混合求值：选择器字段照旧在 DOM 上取，**静态 JS 字段逐行**
+/// 交给 [buildJsRunnerFactory] 生成的函数跑。
+///
+/// ## 为什么必须合成一段脚本
+/// 页面只 `loadHtmlString` 一次（一次载入 = 一次 8 秒级的 onPageFinished
+/// 等待）。JS 字段如果各走一次 `evalJsRule`，一个搜索页 6 个字段就是 6 次
+/// 往返；更要紧的是**逐行语义**：`search.coverUrl = 'a.0@href@js:…'` 这类规则
+/// 在 legado 里是「每个列表节点各跑一次」，整页跑一次只会把所有行算成同一个值。
+///
+/// ## 返回值
+/// `{"fields":{字段:[值…]}, "logs":[…], "warnings":[…], "errors":[{field,index,error}]}`
+/// 的 JSON 字符串。`errors` 非空时调用方要能说清「哪个字段的 JS 炸了」——
+/// 静默回空值是本模块历史上最难查的一类问题。
+///
+/// ## `result` 的初值
+/// 字段规则带前置选择器（`class.title@text@js:…`）时按**该行的节点**取值；
+/// 不带前置选择器时取该节点自身的文本（legado 里 `result` 是 Element，
+/// 字符串化后近似于节点文字）。
+String buildQueryFieldsMixedJs({
+  required SelectorValue listSelector,
+  required Map<String, SelectorValue?> selectorFields,
+  required Map<String, SelectorValue> jsFields,
+  required Map<String, String> bindings,
+}) {
+  final list = jsonEncode(_specMap(listSelector));
+  final buffer = StringBuffer()
+    ..writeln('(function(){')
+    ..writeln(_kJsHelpers)
+    ..writeln(jsRuleRuntimePrelude())
+    ..writeln(buildJsBindingsDeclarations(bindings))
+    ..writeln('var LIST = $list;')
+    ..writeln('var nodes = pickNodes(LIST);')
+    ..writeln('var out = {};')
+    ..writeln('var errors = [];')
+    ..writeln('var SELF = {"kind":"self","query":"","attr":null};')
+    ..writeln('var arr, i, v;');
+  var index = 0;
+  for (final entry in selectorFields.entries) {
+    final spec = entry.value;
+    buffer.writeln('arr = new Array(nodes.length);');
+    if (spec == null) {
+      buffer.writeln('for (i = 0; i < nodes.length; i++) '
+          '{ arr[i] = valueOfNode(nodes[i], LIST); }');
+    } else {
+      buffer.writeln('var F$index = ${jsonEncode(_specMap(spec))};');
+      buffer.writeln('for (i = 0; i < nodes.length; i++) '
+          '{ arr[i] = firstValue(nodes[i], F$index); }');
+      index++;
+    }
+    buffer.writeln('out[${jsonEncode(entry.key)}] = arr;');
+  }
+  var jsIndex = 0;
+  for (final entry in jsFields.entries) {
+    final info = entry.value.jsInfo!;
+    final base = entry.value.baseSelector;
+    buffer
+      ..writeln('var RUN$jsIndex = '
+          '${buildJsRunnerFactory(script: info.script, asExpression: info.form == JsRuleForm.template)};')
+      ..writeln('var BASE$jsIndex = '
+          '${base == null ? 'null' : jsonEncode(_specMap(base))};')
+      ..writeln('arr = new Array(nodes.length);')
+      ..writeln('for (i = 0; i < nodes.length; i++) {')
+      ..writeln('  v = null;')
+      ..writeln('  try {')
+      ..writeln('    var b$jsIndex = BASE$jsIndex ? '
+          'firstValue(nodes[i], BASE$jsIndex, true) : valueOfNode(nodes[i], SELF, true);')
+      // 前置选择器没命中时给空串而不是 null：语料里大量脚本是
+      // `'https://x'+result`，拼出 `https://xnull` 是个看着像值、其实是垃圾的
+      // 地址（还会被当成「有详情页地址」留着）。空串至少拼出来的地址会
+      // 在 URL 归一化那一步被丢掉。
+      ..writeln('    if (b$jsIndex === null) b$jsIndex = "";')
+      ..writeln('    v = RUN$jsIndex(b$jsIndex, baseUrl, book, key, page);')
+      ..writeln('    v = (v === null || typeof v === "undefined") ? null : String(v);')
+      ..writeln('  } catch (e) {')
+      ..writeln('    v = null;')
+      ..writeln('    errors.push({field: ${jsonEncode(entry.key)}, index: i, '
+          'error: String(e && e.message ? e.message : e)});')
+      ..writeln('  }')
+      ..writeln('  arr[i] = v;')
+      ..writeln('}')
+      ..writeln('out[${jsonEncode(entry.key)}] = arr;');
+    jsIndex++;
+  }
+  buffer
+    ..writeln('return JSON.stringify({fields: out, logs: __logs, '
+        'warnings: __warnings, errors: errors});')
+    ..writeln('})();');
+  return buffer.toString();
+}
+
+/// 正文页：删节点 → 取结果初值 → 跑静态 JS → 回 `{ok,value|error,logs,warnings}`。
+///
+/// 与 [buildExtractHtmlJs] 的区别只有最后一步：正文规则本身是 JS
+/// （`class.content@html@js:result.replace(…)`）时，先按前置选择器取值当
+/// `result`，再跑脚本。**删节点和取值必须在同一个 IIFE 里**（理由见
+/// [buildExtractHtmlJs] 的注释）；脚本也在同一个 IIFE 里跑，因为页面只载入一次。
+///
+/// `base` 为 null 时结果初值是整页 `body.innerHTML`（legado 里 `result` 是
+/// 正文元素，`<js>result</js>` 这类「原样返回」的规则靠它）。
+String buildExtractHtmlWithJsJs({
+  required List<String> removeSelectors,
+  required SelectorValue? base,
+  required String script,
+  required Map<String, String> bindings,
+  bool asExpression = false,
+}) {
+  final removes = jsonEncode([
+    for (final s in removeSelectors)
+      if (s.trim().isNotEmpty) _specMap(parseSelector(s)),
+  ]);
+  final baseSpec = base == null ? 'null' : jsonEncode(_specMap(base));
+  return '''
+(function(){
+$_kJsHelpers
+${jsRuleRuntimePrelude()}
+${buildJsBindingsDeclarations(bindings)}
+var REMOVES = $removes;
+var BASE = $baseSpec;
+var RUN = ${buildJsRunnerFactory(script: script, asExpression: asExpression)};
+// ① 先删广告 / 推荐位（顺序即清洗顺序）
+for (var k = 0; k < REMOVES.length; k++) {
+  try {
+    var dead = queryAll(document, REMOVES[k]);
+    for (var d = 0; d < dead.length; d++) {
+      var deadNode = dead[d];
+      if (deadNode && deadNode.parentNode) deadNode.parentNode.removeChild(deadNode);
+    }
+  } catch (e) { /* 单条规则失败不影响其它规则 */ }
+}
+// ② 取 result 初值：前置选择器命中就用它（**不转绝对**，与选择器字段不同），
+//    否则整页 body
+var raw = BASE ? firstValue(document, BASE, true) : null;
+if (raw === null && document.body) raw = String(document.body.innerHTML);
+try {
+  var out = RUN(raw, baseUrl, book, key, page);
+  out = (out === null || typeof out === 'undefined') ? null : String(out);
+  return JSON.stringify({ok: true, value: out, logs: __logs, warnings: __warnings});
+} catch (e) {
+  return JSON.stringify({ok: false, error: String(e && e.message ? e.message : e),
+    logs: __logs, warnings: __warnings});
+}
+})();
+''';
+}
+
 // ==================== 内部：选择器 → JSON 规格 ====================
 
 /// 把 [SelectorValue] 压成 JS 侧认识的小对象（键名短、全部可 JSON 化）。
@@ -195,6 +343,8 @@ Map<String, dynamic> _specMap(SelectorValue v) => {
         SelectorKind.regex => 'regex',
         SelectorKind.self => 'self',
         SelectorKind.children => 'children',
+        // text.xxx：按「自身文字包含」筛元素（v2.78.0）
+        SelectorKind.textFilter => 'textFilter',
         SelectorKind.jsonPath => 'json',
         _ => 'none',
       },
@@ -213,6 +363,8 @@ Map<String, dynamic> _specMap(SelectorValue v) => {
       'indexes': v.indexes,
       'indexExclude': v.indexExclude,
       'concat': [for (final c in v.concat) _specMap(c)],
+      // v2.78.0：%% 交叉合并（按行交错）
+      'interleave': [for (final c in v.interleave) _specMap(c)],
     };
 
 // ==================== 内部：共用的 JS 工具函数 ====================
@@ -236,6 +388,27 @@ function pickOne(spec) {
   return [];
 }
 function pickNodes(spec) {
+  // `%%` 交叉合并（v2.78.0）：各支结果按行交错，外层长度取**第一支**。
+  // legado `AnalyzeByJSoup.getElements` 的原义：
+  // `for (i in 0 until elementsList[0].size) for (es in elementsList) if (i < es.size) add(es[i])`
+  // —— 后面的支比第一支长时，多出来的元素会被丢掉（照抄，不"改良"）。
+  var mixed = [spec].concat((spec && spec.interleave) || []);
+  if (mixed.length > 1) {
+    var lists = [];
+    for (var m = 0; m < mixed.length; m++) {
+      if (!mixed[m]) continue;
+      lists.push(pickOne(mixed[m]));
+    }
+    var outMix = [];
+    if (lists.length) {
+      for (var row = 0; row < lists[0].length; row++) {
+        for (var col = 0; col < lists.length; col++) {
+          if (row < lists[col].length) outMix.push(lists[col][row]);
+        }
+      }
+    }
+    return outMix;
+  }
   // `&&` 并列：每一支各自从 document 找一遍，结果按顺序接起来
   var branches = [spec].concat((spec && spec.concat) || []);
   var out = [];
@@ -271,6 +444,25 @@ function applyIndex(nodes, spec) {
   }
   return out;
 }
+function containsOwnText(node, needle) {
+  // legado `text.xxx` = jsoup `getElementsContainingOwnText`：
+  // 判据是**自身文字**（直接文本节点，空白折叠后）包含该串
+  if (!node || !needle) return false;
+  var own = ownText(node);
+  return own.indexOf(needle) >= 0;
+}
+function textFilterNodes(root, needle) {
+  // jsoup 的 Collector 会把根自身也算一遍，这里照做：先看根，再看后代
+  var out = [];
+  if (containsOwnText(root, needle)) out.push(root);
+  if (root && root.querySelectorAll) {
+    var kids = toArray(root.querySelectorAll('*'));
+    for (var i = 0; i < kids.length; i++) {
+      if (containsOwnText(kids[i], needle)) out.push(kids[i]);
+    }
+  }
+  return out;
+}
 function queryAll(root, spec) {
   if (!root || !spec) return [];
   var head;
@@ -280,6 +472,8 @@ function queryAll(root, spec) {
     head = toArray(root.children);
   } else if (spec.kind === 'regex') {
     head = [root];
+  } else if (spec.kind === 'textFilter') {
+    head = textFilterNodes(root, spec.query);
   } else if (!spec.query) {
     head = [];
   } else {
@@ -397,7 +591,7 @@ function regexOf(text, spec) {
     return null;
   }
 }
-function valueOfNode(node, spec) {
+function valueOfNode(node, spec, noAbs) {
   var v;
   if (spec && spec.kind === 'regex') {
     v = regexOf(rootText(node), spec);
@@ -406,20 +600,24 @@ function valueOfNode(node, spec) {
   }
   if (v === null) return null;
   v = String(v).trim();
-  v = absolutize(v, spec);
+  // noAbs：书源 JS 的 `result` 初值**不做**相对转绝对（I3b 实测踩到）。
+  // 语料里最典型的写法是 `h2@a@href@js:'https://www.xiaxs.la'+result`，
+  // 作者期望 result 是页面里的 `/book/123/`；先转绝对再拼就得到
+  // `https://www.xiaxs.lahttps://m.xiaxs.la/book/123/`（整列详情页打不开）。
+  if (!noAbs) v = absolutize(v, spec);
   v = applySuffix(v, spec);
   if (v === null) return null;
   v = String(v).trim();
   return v === '' ? null : v;
 }
-function firstValueOne(node, spec) {
+function firstValueOne(node, spec, noAbs) {
   var tries = [spec].concat((spec && spec.fallbacks) || []);
   for (var t = 0; t < tries.length; t++) {
     var s = tries[t];
     if (!s) continue;
     var v = null;
     if (s.kind === 'regex') {
-      v = valueOfNode(node, s);
+      v = valueOfNode(node, s, noAbs);
     } else if (s.kind === 'json') {
       // JSONPath 本版只解析不执行（JSON 接口源还没接）
       v = null;
@@ -428,7 +626,7 @@ function firstValueOne(node, spec) {
       // 一个字段命中多个节点时取**第一个非空**（legado 是拼接，本版取的
       // 是最小语义：拼接会把「作者 A / 作者 B」糊成一串，反而更难用）
       for (var i = 0; i < nodes.length; i++) {
-        v = valueOfNode(nodes[i], s);
+        v = valueOfNode(nodes[i], s, noAbs);
         if (v !== null) break;
       }
     }
@@ -436,13 +634,25 @@ function firstValueOne(node, spec) {
   }
   return null;
 }
-function firstValue(node, spec) {
+function firstValue(node, spec, noAbs) {
+  // `%%` 交叉合并（v2.78.0）：字段位置上的 `%%` 只有一行可放，按「各支轮流取
+  // 第一个非空」处理 —— 与 legado `getStringList` 交错后 `getString` 取首个
+  // 元素的结果一致（外层是第一支，第一支非空时就是它的值）。
+  var mixedBranches = [spec].concat((spec && spec.interleave) || []);
+  if (mixedBranches.length > 1) {
+    for (var m = 0; m < mixedBranches.length; m++) {
+      if (!mixedBranches[m]) continue;
+      var mv = firstValueOne(node, mixedBranches[m], noAbs);
+      if (mv !== null && mv !== '') return mv;
+    }
+    return null;
+  }
   // `&&` 并列：每一支各取一遍，非空的按 `\n` 拼起来（legado 同义）
   var branches = [spec].concat((spec && spec.concat) || []);
-  if (branches.length === 1) return firstValueOne(node, spec);
+  if (branches.length === 1) return firstValueOne(node, spec, noAbs);
   var parts = [];
   for (var b = 0; b < branches.length; b++) {
-    var v = firstValueOne(node, branches[b]);
+    var v = firstValueOne(node, branches[b], noAbs);
     if (v !== null && v !== '') parts.push(v);
   }
   return parts.length ? parts.join('\n') : null;

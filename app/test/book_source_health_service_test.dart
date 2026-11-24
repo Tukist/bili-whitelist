@@ -160,13 +160,52 @@ void main() {
       expect(health.status, SourceHealthStatus.networkError);
     });
 
-    test('unsupportedJs：需要 JS 的源不发请求', () async {
+    test('unsupportedJs：缺本版没有的 JS 能力（变量表）的源不发请求', () async {
       final engine = _okEngine();
       final service = BookSourceHealthService(engine: engine);
-      final health = await service.probe(_src('js源', nameRule: '<js>x</js>'));
+      final health = await service.probe(
+        _src('js源', nameRule: '<js>java.put("a", "b"); result = "x"</js>'),
+      );
 
       expect(health.status, SourceHealthStatus.unsupportedJs);
+      expect(health.message, contains('java.put'));
       expect(engine.fetchedUrls, isEmpty);
+    });
+
+    test('needsAjax：需要 java.ajax 的源单列一档，也不发请求', () async {
+      // v2.78.0 新增：与「需 JS」分开 —— 一个等版本，一个要改源
+      final engine = _okEngine();
+      final service = BookSourceHealthService(engine: engine);
+      final health = await service.probe(
+        _src('ajax源', nameRule: '<js>result = java.ajax("/api")</js>'),
+      );
+
+      expect(health.status, SourceHealthStatus.needsAjax);
+      expect(health.message, contains('java.ajax'));
+      expect(health.label, '需 ajax');
+      expect(engine.fetchedUrls, isEmpty);
+    });
+
+    test('纯静态 JS 的源**真的去探测**（不再判死）', () async {
+      // v2.78.0 的设计契约变更：v2.77.0 及以前 `<js>x</js>` 直接判「需 JS」。
+      // I3b 起静态 JS 能跑，判死就是白丢一个能搜的源。
+      final engine = FakeRuleEngine(
+        onFetch: (url) async => '<html><body>ok</body></html>',
+        onQueryMap: (html, list, fields) async => {
+          // nameRule 是 JS（不在回调里），回调只负责选择器字段
+          'detailUrl': ['https://book.example/1'],
+        },
+        onEvalJs: (script, bindings, base) async => '斗罗大陆',
+      );
+      final service = BookSourceHealthService(engine: engine);
+      final health =
+          await service.probe(_src('静态JS源', nameRule: '<js>x</js>'));
+
+      expect(health.status, SourceHealthStatus.ok);
+      expect(health.count, 1);
+      expect(engine.fetchedUrls, isNotEmpty);
+      // 脚本真的被送进沙箱
+      expect(engine.jsRuleScripts, ['x']);
     });
 
     test('badRule：规则本身拼不出来（没配列表规则）', () async {
@@ -374,6 +413,15 @@ void main() {
           status: BookSearchStatus.unsupported,
         )),
         SourceHealthStatus.badRule,
+      );
+      // v2.78.0：判死原因是「要发网络请求」时单列 needsAjax（不是规则坏）
+      expect(
+        classifyGroup(const BookSearchGroup(
+          sourceName: 'a',
+          status: BookSearchStatus.unsupported,
+          needsAjax: true,
+        )),
+        SourceHealthStatus.needsAjax,
       );
       expect(
         classifyGroup(const BookSearchGroup(

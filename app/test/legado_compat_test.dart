@@ -58,7 +58,7 @@ void main() {
       // 用真实语料量过之后改成真支持：`&&` 出现在 622 个源（25.1%），
       // 语义在 legado 源码里是明确的「并列」——两支各自取值后按 \n 拼接。
       // 契约变更点：原来「判死」的源现在能跑，所以断言从 unsupported 改成
-      // 「两支都在 concat 里」。仍然不支持的 `%%` 由 selector.dart 报出来。
+      // 「两支都在 concat 里」（`%%` 从 v2.78.0 起也支持，见下一条）。
       final v = legadoSelector('@css:div.book && @css:span.title');
       expect(v.kind, SelectorKind.css);
       expect(v.query, 'div.book');
@@ -67,10 +67,14 @@ void main() {
       expect(v.isRunnable, isTrue);
     });
 
-    test('%% 仍然是「语法不支持」，且与「需要 JS」分开报', () {
+    test('%% 交叉合并（v2.78.0 起支持）：其余各支挂在 interleave 上', () {
+      // 契约变更：v2.77.0 这里断言 unsupported / reason=interleave。
+      // I3b 查了 legado `AnalyzeByJSoup.getStringList` / `getElements` 的实现
+      // （各支结果按行交错、外层取第一支长度），实现成 interleave，断言改成能跑。
       final v = legadoSelector('@css:div.book %% @css:span.title');
-      expect(v.kind, SelectorKind.unsupported);
-      expect(v.reason, kSelectorReasonInterleave);
+      expect(v.kind, SelectorKind.css);
+      expect(v.interleave.length, 1);
+      expect(v.isRunnable, isTrue);
       expect(v.needsJs, isFalse);
     });
 
@@ -358,6 +362,81 @@ void main() {
         final once = normalizeUrl(raw, 'https://a.example');
         expect(normalizeUrl(once, 'https://a.example'), once, reason: raw);
       }
+    });
+  });
+
+  group('runnableJs / canUseStaticJs（I3a 判定，本批不接线）', () {
+    test('纯字符串变换 → runnableJs 为真，但 canRun 仍为假（旧语义不变）', () {
+      final s = _source(name: '@js:result.split("##")[0]');
+      final usage = jsUsageOf(s);
+      expect(usage.executedJs, isTrue);
+      expect(usage.runnableJs, isTrue);
+      expect(canUseStaticJs(s), isTrue);
+      // ⚠️ 本批只产判定：服务层照旧按 `canRun` 判死，用户可见行为不变
+      expect(usage.canRun, isFalse);
+      expect(usage.blockedApis, isEmpty);
+    });
+
+    test('白名单内的 java.* 不再进 blockedApis', () {
+      final usage = jsUsageOf(_source(
+        name: '<js>java.md5Encode(result) + java.timeFormat(1, "HH:mm")</js>',
+      ));
+      expect(usage.blockedApis, isEmpty);
+      expect(usage.runnableJs, isTrue);
+    });
+
+    test('ajax / getString 这类 → 不可静态跑，blockedApis 点名', () {
+      final s = _source(name: '<js>java.ajax("/x?q=" + java.getString("a"))</js>');
+      final usage = jsUsageOf(s);
+      expect(usage.runnableJs, isFalse);
+      expect(canUseStaticJs(s), isFalse);
+      expect(usage.blockedApis, containsAll(['java.ajax', 'java.getString']));
+    });
+
+    test('java.put 变量表 → 不可静态跑', () {
+      final usage = jsUsageOf(_source(contentText: '@js:java.put("k","v")'));
+      expect(usage.runnableJs, isFalse);
+      expect(usage.blockedApis, contains('java.put'));
+    });
+
+    test('一处可跑、一处不可跑 → 整源不可静态跑（半对半错比不支持更糟）', () {
+      final usage = jsUsageOf(_source(
+        name: '@js:result.trim()',
+        contentText: '@js:java.ajax("/x")',
+      ));
+      expect(usage.executedFields, containsAll(['search.name', 'content.text']));
+      expect(usage.runnableJs, isFalse);
+    });
+
+    test('URL 字段里的 JS（非占位符 {{…}}）不算可静态跑（模板替换要 I3b）', () {
+      final usage = jsUsageOf(_source(searchUrl: '/s?q={{book.name}}'));
+      expect(usage.executedJs, isTrue);
+      expect(usage.runnableJs, isFalse);
+    });
+
+    test('没有执行字段的 JS → runnableJs 为假（不需要就不该说能跑）', () {
+      final usage = jsUsageOf(_source());
+      expect(usage.executedJs, isFalse);
+      expect(usage.runnableJs, isFalse);
+      expect(canUseStaticJs(_source()), isFalse);
+    });
+
+    test('只在发现页 / 初始化里有 JS：runnableJs 假，但 canRun 真', () {
+      final s = _source(raw: {
+        'exploreUrl': '@js:result.trim()',
+        'init': '<js>java.ajax("/x")</js>',
+      });
+      final usage = jsUsageOf(s);
+      expect(usage.unexecutedJs, isTrue);
+      expect(usage.runnableJs, isFalse);
+      expect(usage.blockedApis, isEmpty); // 不执行的字段不扫 API
+      expect(usage.canRun, isTrue);
+    });
+
+    test('回退链里的 JS（半截 base）判不可静态跑', () {
+      final usage = jsUsageOf(_source(name: '@css:.a || <js>result.trim()</js>'));
+      expect(usage.executedJs, isTrue);
+      expect(usage.runnableJs, isFalse);
     });
   });
 }

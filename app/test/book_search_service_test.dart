@@ -8,6 +8,7 @@ import 'package:flutter_test/flutter_test.dart';
 
 import 'package:bili_whitelist_app/models/book_source.dart';
 import 'package:bili_whitelist_app/services/book_rule/rule_engine.dart';
+import 'package:bili_whitelist_app/services/book_rule/selector.dart';
 import 'package:bili_whitelist_app/services/book_search_service.dart';
 
 /// 造一个书源（规则串可按需覆盖）。
@@ -254,6 +255,29 @@ void main() {
       expect(engine.fetchedUrls, isEmpty);
     });
 
+    test('需要 ajax 的源：分组带 needsAjax（健康检测据此分档）', () async {
+      final engine = FakeRuleEngine(onFetch: (url) async => 'A');
+      final groups = await BookSearchService(engine: engine).search(
+        sources: [_source('ajax源', nameRule: '<js>java.ajax("/x")</js>')],
+        keyword: 'x',
+      );
+      expect(groups.single.status, BookSearchStatus.unsupported);
+      expect(groups.single.needsAjax, isTrue);
+      expect(groups.single.message, contains('java.ajax'));
+      expect(engine.fetchedUrls, isEmpty);
+    });
+
+    test('搜索列表规则本身是 JS → 明确说「只能执行取到值之后的变换」', () async {
+      final engine = FakeRuleEngine(onFetch: (url) async => 'A');
+      final groups = await BookSearchService(engine: engine).search(
+        sources: [_source('列表JS源', list: '<js>result</js>')],
+        keyword: 'x',
+      );
+      expect(groups.single.status, BookSearchStatus.unsupported);
+      expect(groups.single.message, contains('列表规则是 JS'));
+      expect(engine.fetchedUrls, isEmpty);
+    });
+
     test('{{tab}} 占位符标 unsupported 且**不发请求**（不拿关键词硬填）', () async {
       final engine = FakeRuleEngine(
         onFetch: (url) async => 'A',
@@ -276,6 +300,113 @@ void main() {
       // 只有「正常」那个源发过请求
       expect(engine.fetchedUrls.length, 1);
       expect(groups[1].status, BookSearchStatus.ok);
+    });
+  });
+
+  group('静态 JS 接线（I3b）', () {
+    // 这一组是 I3b 的核心：v2.77.0 及以前「有 JS 就不跑」，现在静态 JS 真的执行。
+    test('静态 JS 字段被真正调用，绑定带 result / key / baseUrl', () async {
+      final calls = <String>[];
+      Map<String, String>? seenBindings;
+      String? seenBase;
+      final engine = FakeRuleEngine(
+        onFetch: (url) async => 'PAGE',
+        onQueryMap: (html, list, fields) async {
+          // 选择器字段（name 是 JS，不在这里出现）
+          expect(fields.containsKey('name'), isFalse);
+          return {
+            'detailUrl': ['/book/1'],
+          };
+        },
+        onEvalJs: (script, bindings, base) async {
+          calls.add(script);
+          seenBindings = bindings;
+          seenBase = base?.query;
+          return '斗罗大陆';
+        },
+      );
+      final groups = await BookSearchService(engine: engine).search(
+        sources: [
+          _source(
+            '静态JS',
+            nameRule: 'class.title@text@js:result.replace(/\\s+/g, "")',
+          ),
+        ],
+        keyword: '斗罗',
+      );
+
+      expect(groups.single.status, BookSearchStatus.ok);
+      expect(groups.single.items.single.name, '斗罗大陆');
+      // 脚本正文被送进沙箱（`@js:` 之后那一段）
+      expect(calls.single, contains('replace'));
+      // 前置选择器一起进沙箱（result 的初值来源）
+      expect(seenBase, '.title');
+      // 绑定：key = 关键词、baseUrl = 本次搜索页、book.origin 的站点根
+      expect(seenBindings!['baseUrl'], contains('a.example'));
+      expect(seenBindings!['key'], '斗罗');
+      expect(seenBindings!['sourceUrl'], 'https://a.example');
+    });
+
+    test('一次搜索只载入一次页面（多字段不重复抓）', () async {
+      // 抓取次数 = 页数；求值次数 = 1（选择器 + JS 一起求）。
+      // 逐字段载页会让「20 个源 × 6 字段」变成 120 次载入。
+      final engine = FakeRuleEngine(
+        onFetch: (url) async => 'PAGE',
+        onQueryMap: (html, list, fields) async => {
+          'detailUrl': ['/book/1'],
+        },
+        onEvalJs: (script, bindings, base) async => '书',
+      );
+      final groups = await BookSearchService(engine: engine).search(
+        sources: [
+          _source(
+            '甲',
+            nameRule: 'class.title@text@js:result',
+            authorRule: 'class.author@text@js:result',
+          ),
+        ],
+        keyword: 'x',
+      );
+      expect(groups.single.status, BookSearchStatus.ok);
+      expect(engine.fetchedUrls.length, 1);
+      // 选择器那一批 1 次 + 两个 JS 字段各 1 次（假引擎没有 DOM，
+      // 真引擎在混合脚本里一次求值跑完；这里钉的是「不按次数载页」）
+      expect(engine.queryCount, 1);
+    });
+
+    test('被拦的 API：跳过且文案点名（不是一句「需要 JS」）', () async {
+      final engine = FakeRuleEngine(onFetch: (url) async => 'PAGE');
+      final groups = await BookSearchService(engine: engine).search(
+        sources: [
+          _source('毒源', coverRule: '<js>fetch("/api")</js>'),
+        ],
+        keyword: 'x',
+      );
+      expect(groups.single.status, BookSearchStatus.unsupported);
+      expect(groups.single.message, contains('cover'));
+      expect(groups.single.message, contains('fetch'));
+      expect(engine.fetchedUrls, isEmpty);
+    });
+
+    test('text. 按文字筛元素：不再是「不支持」，照常发给引擎', () async {
+      Map<String, SelectorValue?>? seen;
+      final engine = FakeRuleEngine(
+        onFetch: (url) async => 'PAGE',
+        onQueryMap: (html, list, fields) async {
+          seen = fields;
+          return {
+            'name': ['斗罗大陆'],
+            'detailUrl': ['/book/1'],
+          };
+        },
+      );
+      final groups = await BookSearchService(engine: engine).search(
+        sources: [_source('文字筛', authorRule: 'text.作者：@text')],
+        keyword: 'x',
+      );
+      expect(groups.single.status, BookSearchStatus.ok);
+      expect(seen!['author']!.kind, SelectorKind.textFilter);
+      expect(seen!['author']!.query, '作者：');
     });
   });
 
