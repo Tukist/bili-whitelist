@@ -365,14 +365,14 @@ void main() {
     });
   });
 
-  group('runnableJs / canUseStaticJs（I3a 判定，本批不接线）', () {
+  group('runnableJs / canUseStaticJs（I3a 判定，I4 起地址模板也算）', () {
     test('纯字符串变换 → runnableJs 为真，但 canRun 仍为假（旧语义不变）', () {
       final s = _source(name: '@js:result.split("##")[0]');
       final usage = jsUsageOf(s);
       expect(usage.executedJs, isTrue);
       expect(usage.runnableJs, isTrue);
       expect(canUseStaticJs(s), isTrue);
-      // ⚠️ 本批只产判定：服务层照旧按 `canRun` 判死，用户可见行为不变
+      // `canRun` 的口径是「一条 JS 都用不上」，不随接线变化
       expect(usage.canRun, isFalse);
       expect(usage.blockedApis, isEmpty);
     });
@@ -408,9 +408,35 @@ void main() {
       expect(usage.runnableJs, isFalse);
     });
 
-    test('URL 字段里的 JS（非占位符 {{…}}）不算可静态跑（模板替换要 I3b）', () {
+    // ⚠️ 契约变更（v2.79.0，I4 批）：这条断言原为「URL 字段的 JS 一律不可静态跑
+    // （模板替换要 I3b）」。I4 把「按表达式拼地址」接上了 —— 地址模板里的
+    // `{{…}}` 现在交给空白页沙箱求值，所以 `{{book.name}}` 是可跑的；
+    // `<js>` / `@js:` 整条地址、`{{java.ajax(...)}}`、`{{$.id}}` 仍不可跑。
+    test('URL 字段里的 {{…}} JS 表达式可静态跑（I4 接线）', () {
       final usage = jsUsageOf(_source(searchUrl: '/s?q={{book.name}}'));
       expect(usage.executedJs, isTrue);
+      expect(usage.runnableJs, isTrue);
+    });
+
+    test('URL 字段的三种跑不了：整条 <js>、ajax、JSONPath', () {
+      for (final url in [
+        '<js>baseUrl + "/search?q=" + key</js>',
+        '/s?q={{java.ajax("/x?q="+key)}}',
+        r'/s?q={{$.keyword}}',
+        '/s?q={{cookie.getKey()}}',
+      ]) {
+        final usage = jsUsageOf(_source(searchUrl: url));
+        expect(usage.executedJs, isTrue, reason: url);
+        expect(usage.runnableJs, isFalse, reason: url);
+      }
+    });
+
+    test('带请求选项的普通 POST 源不算 JS 源（I4）', () {
+      final usage = jsUsageOf(_source(
+        searchUrl: '/search,{"method":"POST","body":"searchkey={{key}}"}',
+      ));
+      expect(usage.executedJs, isFalse);
+      expect(usage.unexecutedJs, isFalse);
       expect(usage.runnableJs, isFalse);
     });
 

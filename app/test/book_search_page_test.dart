@@ -407,6 +407,8 @@ class _GbkEngine extends FakeRuleEngine {
     String url, {
     Map<String, String>? headers,
     String charset = 'utf-8',
+    String method = 'GET',
+    String? body,
   }) async {
     fetchedUrls.add(url);
     lastDecodeEncoding = 'gbk';

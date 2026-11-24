@@ -23,6 +23,7 @@ library;
 import '../models/book_source.dart';
 import 'book_rule/js_rule.dart';
 import 'book_rule/legado_compat.dart';
+import 'book_rule/request_options.dart';
 import 'book_rule/rule_engine.dart';
 import 'book_rule/selector.dart';
 import 'book_search_service.dart';
@@ -162,14 +163,36 @@ class BookDetailService {
     final detailRule = source.detail;
     final detailFields = _detailFields(detailRule);
     String? firstPageHtml;
+    // 详情页真正要抓的地址：本模型的 `detail.url` 支持模板 / 请求选项
+    // （legado 没有这个字段，留空就是搜索结果里那个地址）。
+    var detailPageUrl = detailUrl;
     // 只有真的写了详情规则才去抓详情页：没有规则时抓了也解析不出东西，
     // 白白多一次请求（目录页同址时目录那一趟会自己抓）。
     if (detailFields.isNotEmpty && detailUrl.trim().isNotEmpty) {
+      final detailRequest = await _resolveRequest(
+        detailRule?.url ?? '',
+        source: source,
+        baseUrl: detailUrl,
+        bookName: info.name,
+        bookAuthor: info.author,
+        bookUrl: detailUrl,
+        placeholders: {'@detailUrl': detailUrl, '{{detailUrl}}': detailUrl},
+      );
+      if (!detailRequest.ok) {
+        warnings.add('详情地址拼不出来（${detailRequest.error}），'
+            '已改用搜索结果里的地址');
+      } else if (detailRequest.url.trim().isNotEmpty) {
+        final resolved = normalizeUrl(detailRequest.url, detailUrl);
+        if (resolved.isNotEmpty) detailPageUrl = resolved;
+      }
       try {
         firstPageHtml = await engine.fetchHtml(
-          detailUrl,
-          headers: source.headers,
-          charset: source.charset,
+          detailPageUrl,
+          // 选项里的请求头覆盖书源级同名项（大小写不敏感，见 mergeHeaders）
+          headers: mergeHeaders(source.headers, detailRequest.headers),
+          charset: detailRequest.charset ?? source.charset,
+          method: detailRequest.method,
+          body: detailRequest.body,
         );
         // 编码告警**当场**收下（引擎上只留最近一次抓取的结果，后面目录页一抓
         // 就会被盖掉）。GBK 站点以前是「搜得到、点进去满屏乱码」，现在能读了，
@@ -185,7 +208,7 @@ class BookDetailService {
       try {
         final columns = await engine.queryFieldMap(
           html: firstPageHtml,
-          baseUrl: detailUrl,
+          baseUrl: detailPageUrl,
           // 详情页没有「列表」概念：拿 body 当一个节点，字段规则相对它跑。
           // 用 body 而不是 html：部分规则写的是 `.container h1` 这种后代选择器，
           // 以 document 为根也能跑，但以 body 为根更贴近 legado 的语义。
@@ -193,10 +216,10 @@ class BookDetailService {
           fields: detailFields,
           // 静态 JS 字段的绑定：详情页拿得到书名 / 作者，能喂给脚本
           bindings: jsBindings(
-            baseUrl: detailUrl,
+            baseUrl: detailPageUrl,
             bookName: info.name,
             bookAuthor: info.author,
-            bookUrl: detailUrl,
+            bookUrl: detailPageUrl,
             sourceName: source.name,
             sourceUrl: source.baseUrl,
             sourceComment: _sourceComment(source),
@@ -210,15 +233,37 @@ class BookDetailService {
 
     // ---------- 目录 ----------
     final tocRule = source.toc;
-    final tocUrl = _resolveDetailTemplate(tocRule.url, detailUrl);
     final listSelector = legadoSelector(tocRule.list);
+    // 目录地址：支持 `@detailUrl` / `{{detailUrl}}`、`{{…}}` JS 模板与请求选项
+    // （I4；以前只要带 JS 就整段放弃，白丢一批「搜索能搜、目录是脚本拼的」源）。
+    final tocRequest = await _resolveRequest(
+      tocRule.url ?? '',
+      source: source,
+      baseUrl: detailUrl,
+      bookName: info.name,
+      bookAuthor: info.author,
+      bookUrl: detailUrl,
+      placeholders: {'@detailUrl': detailUrl, '{{detailUrl}}': detailUrl},
+    );
+    var tocUrl = '';
+    if ((tocRule.url ?? '').trim().isEmpty) {
+      tocUrl = detailUrl;
+    } else if (!tocRequest.ok) {
+      // 整条目录地址是 JS（`@js:baseUrl+'/toc'` / `<js>…</js>`）与「模板拼不出来」
+      // 对用户是两件事：前者是能力边界，后者是规则写坏了。分开说。
+      final wholeJs = (tocRequest.error ?? '').contains('整条地址是 JS');
+      warnings.add(wholeJs
+          ? '目录地址是 JS 模板（toc.url），本版不支持按表达式拼地址'
+          : '目录地址拼不出来（${tocRequest.error}）');
+    } else {
+      tocUrl = normalizeUrl(tocRequest.url, detailUrl);
+      if (tocUrl.isEmpty) warnings.add('目录地址拼不出来（toc.url 可能是空的或写法有误）');
+    }
 
     if (tocRule.list.trim().isEmpty) {
       warnings.add('书源没有配置目录规则（toc.list）');
-    } else if (urlTemplateUsesJs(tocRule.url ?? '')) {
-      // 目录地址是 JS 模板（`@js:baseUrl+'/toc'`）：本版没有「按表达式拼地址」
-      // 的接线，硬拼出来是一串脚本源码。明说，别让用户以为目录坏了。
-      warnings.add('目录地址是 JS 模板（toc.url），本版不支持');
+    } else if (tocUrl.isEmpty) {
+      // 上面已经说明原因，这里不再重复（同一句话刷两遍只会挤满提示条）
     } else if (listSelector.kind == SelectorKind.js) {
       warnings.add('目录列表规则是 JS（${listSelector.raw}），'
           '本版只能执行「取到值之后做变换」的 JS');
@@ -228,12 +273,13 @@ class BookDetailService {
       // 目录页与详情页同一个地址时复用详情页那份 HTML：省一次抓取，
       // 也省掉一次被站点拦的风险。地址不同就只传 null，避免拿错文档解析。
       final tocHtmlHint =
-          _samePage(tocUrl, detailUrl) ? firstPageHtml : null;
+          _samePage(tocUrl, detailPageUrl) ? firstPageHtml : null;
       final tocLoad = await _loadChapters(
         source: source,
         tocRule: tocRule,
         listSelector: listSelector,
         tocUrl: tocUrl,
+        tocRequest: tocRequest,
         firstPageHtml: tocHtmlHint,
         bookName: info.name,
       );
@@ -292,6 +338,7 @@ class BookDetailService {
     required TocRule tocRule,
     required SelectorValue listSelector,
     required String tocUrl,
+    required ResolvedRequest tocRequest,
     required String? firstPageHtml,
     String bookName = '',
   }) async {
@@ -338,6 +385,9 @@ class BookDetailService {
     }
 
     var partial = false;
+    // 第 1 页用目录地址那次解析出来的请求形态；翻页另解析（`toc.pages` 也可能
+    // 带模板 / 请求选项）
+    var pageRequest = tocRequest;
     for (var page = 1; page <= pageCount; page++) {
       // 页与页之间按源配置限速（对敏感站点是必要的，默认 0 = 不限）
       if (page > 1 && source.requestIntervalMs > 0) {
@@ -346,9 +396,27 @@ class BookDetailService {
         );
       }
 
-      final pageUrl = page == 1
-          ? tocUrl
-          : _pageUrl(tocRule.pages ?? '', page, tocUrl, source.baseUrl);
+      if (page > 1) {
+        pageRequest = await _resolveRequest(
+          tocRule.pages ?? '',
+          source: source,
+          baseUrl: tocUrl,
+          bookName: bookName,
+          bookUrl: tocUrl,
+          page: page,
+          placeholders: {
+            '@detailUrl': tocUrl,
+            '{{detailUrl}}': tocUrl,
+            '@page': '$page',
+          },
+        );
+        if (!pageRequest.ok) {
+          warnings.add('目录第 $page 页地址拼不出来（${pageRequest.error}）');
+          partial = true;
+          break;
+        }
+      }
+      final pageUrl = page == 1 ? tocUrl : normalizeUrl(pageRequest.url, tocUrl);
       if (pageUrl.isEmpty) {
         warnings.add('目录第 $page 页地址拼不出来');
         partial = page > 1;
@@ -363,8 +431,11 @@ class BookDetailService {
         try {
           html = await engine.fetchHtml(
             pageUrl,
-            headers: source.headers,
-            charset: source.charset,
+            // 选项里的请求头覆盖书源级同名项（大小写不敏感，见 mergeHeaders）
+            headers: mergeHeaders(source.headers, pageRequest.headers),
+            charset: pageRequest.charset ?? source.charset,
+            method: pageRequest.method,
+            body: pageRequest.body,
           );
           // 同详情页：每页抓完就当场收下编码告警
           final decodeWarning = engine.lastDecodeWarning;
@@ -461,20 +532,26 @@ class BookDetailService {
     }
 
     try {
-      final names = await engine.queryFields(
+      // 卷名与卷容器**必须在同一次求值里取出**（v2.79.0 修）。
+      //
+      // 以前是两次独立的 `queryFields`（先卷名、再每卷 innerHTML），两列只能
+      // 靠下标对齐。只要两次返回的节点集有任何差异 —— 卷名规则是 JS 字段、
+      // 列表规则带 `.N`、第二次载页恰好失败、字段取不到值时被过滤掉 ——
+      // 卷名就会整体错位，最典型的表现是「所有卷都用第一条卷名」。
+      // 一次 `queryFieldMap` 里两列出自**同一批节点**，对齐关系由构造保证，
+      // 不再依赖两次求值「应该一样」这种约定；顺带少载一次页面。
+      final columns = await engine.queryFieldMap(
         html: tocHtml,
         baseUrl: tocUrl,
         listSelector: volumeSelector,
-        fieldSelector:
-            rule.name.trim().isEmpty ? null : legadoSelector(rule.name),
+        fields: <String, SelectorValue?>{
+          'name': rule.name.trim().isEmpty ? null : legadoSelector(rule.name),
+          // 每卷的 innerHTML：取值后缀 @html（kind=self + attr=html）
+          'html': parseSelector('@html'),
+        },
       );
-      // 每卷的 innerHTML：取值后缀 @html（kind=self + attr=html）
-      final containers = await engine.queryFields(
-        html: tocHtml,
-        baseUrl: tocUrl,
-        listSelector: volumeSelector,
-        fieldSelector: parseSelector('@html'),
-      );
+      final names = columns['name'] ?? const <String?>[];
+      final containers = columns['html'] ?? const <String?>[];
       if (containers.isEmpty) return null;
 
       final volumes = <TocVolume>[];
@@ -576,15 +653,45 @@ class BookDetailService {
     );
   }
 
-  /// 目录地址：支持 `@detailUrl` / `{{detailUrl}}` 模板；空则用详情页地址。
-  String _resolveDetailTemplate(String? template, String detailUrl) {
-    final text = (template ?? '').trim();
-    if (text.isEmpty) return detailUrl;
-    return normalizeUrl(
-      text
-          .replaceAll('@detailUrl', detailUrl)
-          .replaceAll('{{detailUrl}}', detailUrl),
-      detailUrl,
+  /// 解析一个地址字段：先做本模型自己的占位符（`@detailUrl` 之类），再交给
+  /// `request_options` 拆请求选项 + 求值 `{{…}}` 模板（I4）。
+  ///
+  /// JS 表达式在**空白页**上求值（引擎的 `evalUrlTemplateJs`），绑定里有
+  /// `baseUrl` / `key`（书名）/ `page` / `book` / `source` —— 与 legado 在
+  /// 详情 / 目录阶段能看到的上下文一致。
+  Future<ResolvedRequest> _resolveRequest(
+    String raw, {
+    required BookSource source,
+    required String baseUrl,
+    Map<String, String> placeholders = const {},
+    String keyword = '',
+    String bookName = '',
+    String bookAuthor = '',
+    String bookUrl = '',
+    int page = 1,
+  }) async {
+    var text = raw;
+    for (final entry in placeholders.entries) {
+      text = text.replaceAll(entry.key, entry.value);
+    }
+    return resolveRequestField(
+      text,
+      baseUrl: source.baseUrl,
+      keyword: keyword.isEmpty ? bookName : keyword,
+      page: page,
+      bindings: jsBindings(
+        baseUrl: baseUrl,
+        keyword: keyword.isEmpty ? bookName : keyword,
+        page: '$page',
+        bookName: bookName,
+        bookAuthor: bookAuthor,
+        bookUrl: bookUrl.isEmpty ? baseUrl : bookUrl,
+        sourceName: source.name,
+        sourceUrl: source.baseUrl,
+        sourceComment: _sourceComment(source),
+      ),
+      evalJs: (script, bindings) =>
+          engine.evalUrlTemplateJs(script: script, bindings: bindings),
     );
   }
 
@@ -593,21 +700,6 @@ class BookDetailService {
       template.contains('{{ page }}') ||
       template.contains('@page') ||
       template.contains('{{searchPage}}');
-
-  /// 拼第 [page] 页目录地址。
-  String _pageUrl(
-    String template,
-    int page,
-    String tocUrl,
-    String baseUrl,
-  ) {
-    final text = template
-        .replaceAll('{{page}}', '$page')
-        .replaceAll('{{ page }}', '$page')
-        .replaceAll('@page', '$page')
-        .replaceAll('{{searchPage}}', '$page');
-    return normalizeUrl(text, tocUrl.isEmpty ? baseUrl : tocUrl);
-  }
 }
 
 class _TocLoad {

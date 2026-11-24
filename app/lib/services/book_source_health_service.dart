@@ -49,7 +49,9 @@ import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/book_source.dart';
+import 'book_rule/js_rule.dart';
 import 'book_rule/legado_compat.dart';
+import 'book_rule/request_options.dart';
 import 'book_rule/rule_engine.dart';
 import 'book_search_service.dart';
 
@@ -415,15 +417,37 @@ class BookSourceHealthService {
   ///
   /// 抓不到（超时 / 连不上）就返回 false —— 这种情况下 [classifyGroup]
   /// 给的 `noResult` 已经是最合理的说法，不能因为复核失败改判。
+  ///
+  /// 复核这一趟**必须与真实搜索同形**（I4）：POST 源用 GET 复核会拿到另一个
+  /// 页面（有的站点 GET 直接回首页），「有没有验证页」就判错了。
   Future<bool> _looksLikeChallenge(BookSource source, String keyword) async {
-    final url = normalizeUrl(
-      buildSearchUrl(source.search.url, keyword, 1),
-      source.baseUrl,
+    final resolved = await resolveRequestField(
+      source.search.url,
+      baseUrl: source.baseUrl,
+      keyword: keyword,
+      bindings: jsBindings(
+        baseUrl: source.baseUrl,
+        keyword: keyword,
+        page: '1',
+        sourceName: source.name,
+        sourceUrl: source.baseUrl,
+      ),
+      evalJs: (script, bindings) =>
+          _engine.evalUrlTemplateJs(script: script, bindings: bindings),
     );
+    if (!resolved.ok) return false;
+    final url = normalizeUrl(resolved.url, source.baseUrl);
     if (url.isEmpty) return false;
     try {
       final html = await _engine
-          .fetchHtml(url, headers: source.headers, charset: source.charset)
+          .fetchHtml(
+            url,
+            // 选项里的请求头覆盖书源级同名项（大小写不敏感，见 mergeHeaders）
+            headers: mergeHeaders(source.headers, resolved.headers),
+            charset: resolved.charset ?? source.charset,
+            method: resolved.method,
+            body: resolved.body,
+          )
           .timeout(perSourceTimeout);
       final lower = html.toLowerCase();
       return kChallengeMarkers.any(lower.contains);

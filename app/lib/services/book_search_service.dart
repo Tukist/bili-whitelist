@@ -20,6 +20,7 @@ import 'dart:async';
 import '../models/book_source.dart';
 import 'book_rule/js_rule.dart';
 import 'book_rule/legado_compat.dart';
+import 'book_rule/request_options.dart';
 import 'book_rule/rule_engine.dart';
 import 'book_rule/selector.dart';
 
@@ -117,6 +118,16 @@ class BookSearchGroup {
   /// `lastDecodeEncoding` 早就被别的源覆盖了）。归到分组才是按源的事实。
   final String? decodeNote;
 
+  /// **部分失败但保留了一部分结果**时的提示（`ok` 分组也可能有）。
+  ///
+  /// 现状只有翻页失败会产生它：第 2 页起抓取失败 / 地址拼不出来时，前面几页
+  /// 已经拿到的条目不该因为一句 unsupported 就全丢掉 —— 结果是好的，只是
+  /// 不完整，所以用一行提示说清「缺了哪一页」，而不是把整组判死。
+  ///
+  /// 与 [message] 分开：`message` 是「这个源为什么一条都没有」，健康检测也拿它
+  /// 判原因；这条是「有结果，但不全」，两者不能混。
+  final String? warning;
+
   /// 判死的原因是「需要发网络请求的 JS」（`java.ajax` / `Packages.` …）。
   ///
   /// 只有 `unsupported` 分组会为真：健康检测据此把状态归到 `needsAjax`
@@ -131,6 +142,7 @@ class BookSearchGroup {
     this.httpStatus,
     this.errorKind,
     this.decodeNote,
+    this.warning,
     this.needsAjax = false,
   });
 
@@ -245,10 +257,14 @@ class BookSearchService {
         );
       }
       if (usage.executedFields.contains('search.url')) {
+        final inspect = inspectUrlTemplate(source.search.url);
+        final why =
+            inspect.reasons.isEmpty ? '需要本版不支持的 JS 能力' : inspect.reasons.first;
         return BookSearchGroup(
           sourceName: source.name,
           status: BookSearchStatus.unsupported,
-          message: '搜索地址是 JS 模板（search.url），本版不支持按表达式拼地址',
+          message: '搜索地址拼不出来：$why',
+          needsAjax: jsNeedsAjax(usage),
         );
       }
       final fields = usage.executedFields.take(2).join('、');
@@ -271,9 +287,12 @@ class BookSearchService {
         message: '书源没有配置搜索地址（search.url）',
       );
     }
+    // 地址与请求选项只拆这一处：`"...?q={{key}},{"method":"POST","body":"…"}"`
+    // 必须把选项剥掉再拼地址（I4），否则拼出来的是一个带花括号的非法 URL。
+    final spec = parseRequestSpec(source.search.url);
     // legado 的 `{{tab}}` 是分页 / 分类页签语义，不是关键词 —— 替换出来的
     // 地址基本必错（把书名塞进分类参数），索性不发请求，直接说清楚。
-    if (_usesTabPlaceholder(source.search.url)) {
+    if (_usesTabPlaceholder(spec.url)) {
       return BookSearchGroup(
         sourceName: source.name,
         status: BookSearchStatus.unsupported,
@@ -339,14 +358,51 @@ class BookSearchService {
     // 这次搜索里出现过的编码旁注（正常 UTF-8 不产生，所以多数源是空的）
     final decodeNotes = <String>{};
     String? notes() => decodeNotes.isEmpty ? null : decodeNotes.join('；');
+    // 翻页中途失败时留下的提示（有提示 = 结果是「已拿到的那些」，不完整）
+    final warnings = <String>[];
+    String? partialWarning() =>
+        warnings.isEmpty ? null : warnings.join('；');
 
     for (var page = 1; page <= pages; page++) {
       // 搜索模板常写相对路径（`/search?q={{key}}`），必须先按 baseUrl 补全，
       // 否则 Dio 拿到 `/search?...` 直接报无 scheme。
-      final pageUrl = normalizeUrl(
-        buildSearchUrl(source.search.url, keyword, page),
-        source.baseUrl,
+      // I4：`{{…}}` 里可能是 JS 表达式（`{{page-1}}` / `{{baseUrl...}}`），
+      // 在空白页上求值后再拼；请求体里的模板同样处理。
+      final resolved = await resolveRequestField(
+        source.search.url,
+        baseUrl: source.baseUrl,
+        keyword: keyword,
+        page: page,
+        bindings: jsBindings(
+          baseUrl: source.baseUrl,
+          keyword: keyword,
+          page: '$page',
+          sourceName: source.name,
+          sourceUrl: source.baseUrl,
+          sourceComment: _sourceComment(source),
+        ),
+        evalJs: (script, bindings) =>
+            engine.evalUrlTemplateJs(script: script, bindings: bindings),
       );
+      if (!resolved.ok) {
+        // 拼不出来就别发请求：半截地址（`https://host/`）只会让用户以为
+        // 「站点没这本书」。JS 跑不了的归 unsupported，其它算规则坏。
+        // 第 2 页起拼不出来不该把**整组**判死：第 1 页的结果是真的，丢了只会
+        // 让用户以为这个源什么也没搜到。留结果 + 一行提示，与抓取失败一致。
+        if (page == 1) {
+          return BookSearchGroup(
+            sourceName: source.name,
+            status: BookSearchStatus.unsupported,
+            message: '搜索地址拼不出来：${resolved.error}',
+            needsAjax: resolved.error!.contains('java.ajax') ||
+                resolved.error!.contains('Packages'),
+          );
+        }
+        warnings.add('第 $page 页地址拼不出来（${resolved.error}），'
+            '已保留前 ${page - 1} 页结果');
+        break;
+      }
+      final pageUrl = normalizeUrl(resolved.url, source.baseUrl);
       if (pageUrl.isEmpty) {
         return BookSearchGroup(
           sourceName: source.name,
@@ -358,12 +414,20 @@ class BookSearchService {
       try {
         html = await engine.fetchHtml(
           pageUrl,
-          headers: source.headers,
-          charset: source.charset,
+          // 选项里的请求头覆盖书源级同名项（更贴这一次请求）。
+          // 走 mergeHeaders 而不是 map 展开：`Referer` / `referer` 只算一个键，
+          // 否则两个都会进 Dio，真正发出去哪个由底层实现决定（见 mergeHeaders）。
+          headers: mergeHeaders(source.headers, resolved.headers),
+          // 选项里的 charset 是这次请求的编码声明，优先于书源级
+          charset: resolved.charset ?? source.charset,
+          method: resolved.method,
+          body: resolved.body,
         );
       } catch (e) {
         // 第一页就失败 → 整个源算失败；后面几页失败 → 保留已拿到的结果
         if (page == 1) return _errorGroup(source, e, decodeNote: notes());
+        warnings.add('第 $page 页没取到（${_describe(e)}），'
+            '已保留前 ${page - 1} 页结果');
         break;
       }
 
@@ -395,6 +459,9 @@ class BookSearchService {
         );
       } catch (e) {
         if (page == 1) return _errorGroup(source, e, decodeNote: notes());
+        // 同样保留已拿到的页，别让第 2 页的结构变化把第 1 页结果一起吞了
+        warnings.add('第 $page 页字段没解析出来（${_describe(e)}），'
+            '已保留前 ${page - 1} 页结果');
         break;
       }
 
@@ -440,6 +507,7 @@ class BookSearchService {
         status: BookSearchStatus.noResult,
         message: '没有找到「$keyword」',
         decodeNote: notes(),
+        warning: partialWarning(),
       );
     }
     return BookSearchGroup(
@@ -447,6 +515,8 @@ class BookSearchService {
       status: BookSearchStatus.ok,
       items: items,
       decodeNote: notes(),
+      // 翻页中途失败：有结果但不完整，提示一行（见 BookSearchGroup.warning）
+      warning: partialWarning(),
     );
   }
 
@@ -497,29 +567,19 @@ class BookSearchService {
 /// 把搜索模板拼成真实地址（纯函数）。
 ///
 /// 支持 `{{key}}` / `{{keyword}}` / `{{page}}` / `{{searchPage}}` /
-/// `{{searchKey}}` 五种占位符（大小写不敏感、允许中间有空格），以及老式的
-/// `%s`（只替换**第一个**，剩余的字面 `%s` 留着 —— 站点真写了两个说明它有两个
-/// 参数，我们只喂关键词）。
+/// `{{searchKey}}` / `{{baseUrl}}` 占位符（大小写不敏感、允许中间有空格），
+/// 以及老式的 `%s`（只替换**第一个**，剩余的字面 `%s` 留着 —— 站点真写了两个
+/// 说明它有两个参数，我们只喂关键词）。
 ///
 /// **`{{tab}}` 故意不替换**：legado 里它是分页 / 分类页签语义（值来自站点自己
 /// 的页签列表），不是关键词。拿关键词去填只会拼出一个错地址，所以调用方
 /// （[BookSearchService]）遇到它就标 unsupported 且不发请求，这里原样保留。
-String buildSearchUrl(String template, String keyword, int page) {
-  final encoded = Uri.encodeComponent(keyword.trim());
-  var url = template.replaceAllMapped(
-    RegExp(
-      r'\{\{\s*(key|keyword|page|searchPage|searchKey)\s*\}\}',
-      caseSensitive: false,
-    ),
-    (m) {
-      final name = (m.group(1) ?? '').toLowerCase();
-      if (name == 'page' || name == 'searchpage') return '$page';
-      return encoded;
-    },
-  );
-  if (url.contains('%s')) url = url.replaceFirst('%s', encoded);
-  return url.trim();
-}
+///
+/// v2.79.0 起实现只剩一处（`request_options.dart` 的 `applyUrlPlaceholders`）：
+/// 服务层真实的拼地址走 [resolveRequestField]（会额外处理请求选项与 JS 模板），
+/// 这个函数保留给审计 / 检测这类「只想要一个朴素地址」的地方。
+String buildSearchUrl(String template, String keyword, int page) =>
+    applyUrlPlaceholders(template, keyword: keyword, page: page);
 
 final RegExp _kTabPlaceholder = RegExp(r'\{\{\s*tab\s*\}\}', caseSensitive: false);
 

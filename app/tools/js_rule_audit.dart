@@ -64,6 +64,7 @@ import 'dart:io';
 
 import 'package:bili_whitelist_app/services/book_rule/js_rule.dart';
 import 'package:bili_whitelist_app/services/book_rule/legado_compat.dart';
+import 'package:bili_whitelist_app/services/book_rule/request_options.dart';
 import 'package:bili_whitelist_app/services/book_rule/selector.dart';
 
 /// 默认抽样用的 4 个公开索引（legado 书源聚合站）。
@@ -145,17 +146,9 @@ const List<String> kNetworkMarkers = [
   'org.jsoup',
 ];
 
-/// URL 模板里允许出现的占位符（与 `legado_compat.dart` 的 `kUrlPlaceholders`
-/// 同口径；`{{key}}` 不是 JS）。
-const Set<String> kUrlPlaceholders = {
-  'key',
-  'keyword',
-  'page',
-  'searchpage',
-  'searchkey',
-  'tab',
-  'baseurl',
-};
+// URL 模板里的占位符白名单不再在本文件写第二份：`legado_compat.dart` 再导出了
+// `request_options.dart` 的 [kUrlPlaceholders]（I4 起「地址 + 请求选项」的判定
+// 也只有那一份），这里直接用。
 
 /// 一个源的审计结论。
 class SourceAudit {
@@ -526,7 +519,13 @@ const Set<String> _kListJsFields = {'ruleSearch.bookList', 'ruleToc.chapterList'
 /// 判定全部交给 `selector.dart` / `js_rule.dart`（与引擎执行时同一份），
 /// 这里只做「URL / 列表位置」两条位置上的加判。
 String? _jsBlockReason(String path, String text) {
-  if (kUrlExecutedFields.contains(path)) return 'url';
+  if (kUrlExecutedFields.contains(path)) {
+    // I4：地址字段先拆请求选项，再看 `{{…}}` 里的 JS 能不能静态求值 ——
+    // 「能求值」= 运行时真的会拼出地址，不再算拦路石。
+    final inspect = inspectUrlTemplate(text);
+    if (!inspect.usesJs || inspect.runnable) return null;
+    return 'url';
+  }
   if (_kListJsFields.contains(path)) return 'list';
   final parsed = legadoSelector(text);
   final info = parsed.jsInfo;
@@ -649,6 +648,29 @@ class _SelectorReport {
   /// 执行字段的 JS **全是静态可跑**的源数（不管选择器有没有问题）。
   var jsStaticRunnable = 0;
 
+  /// `searchUrl` 带请求选项（`,{…}`）的源数，以及 POST / GET / 带 body 模板的细分。
+  var requestOptions = 0;
+  var requestPost = 0;
+  var requestGet = 0;
+  var requestBodyTemplate = 0;
+  var requestHeaders = 0;
+  var requestCharset = 0;
+
+  /// `searchUrl` 里有 `,{` 但尾部不是合法 JSON 的源数（回退整串当地址）。
+  var requestBadJson = 0;
+
+  /// 地址字段里的 JS 能静态求值 / 不能的源数（I4 的作用面）。
+  var urlJsSupported = 0;
+  var urlJsUnsupported = 0;
+
+  /// 「本版可搜索」里带请求选项的源数（I4 真正救回的实用面）。
+  ///
+  /// 为什么单列：审计的「可搜索」只看规则能不能被解释，**不**看请求发得对不对
+  /// —— 400 个来源（其中 POST 266）以前就被算进「可搜索」，但拼出来的地址带
+  /// 花括号、发出去必错。这个数字才是「本批让多少源第一次真的发出正确请求」。
+  var runnableWithOptions = 0;
+  var runnablePost = 0;
+
   /// 被选择器语法挡住的源里，**只差这一条**就能跑的（实现优先级用）。
   final Map<String, int> soleBlocker = {};
 
@@ -668,8 +690,15 @@ class _SelectorReport {
         final v = _lookup(raw, path);
         if (v is! String || v.trim().isEmpty) continue;
         if (kUrlExecutedFields.contains(path)) {
-          // 地址模板：`{{key}}` 之类的占位符不算 JS；真的 JS 就是跑不了
-          if (_jsStylesIn(v).isNotEmpty) problems.add('url');
+          // 地址模板（I4）：先拆请求选项再判 `{{…}}` 里的 JS —— 能静态求值
+          // 就不再挡（运行时会在空白页上真的拼出地址）；整条 `<js>` / `@js:`、
+          // ajax、变量表、JSONPath 仍算拦路石。
+          final inspect = inspectUrlTemplate(v);
+          if (inspect.usesJs && !inspect.runnable) {
+            problems.add('url');
+            final key = _truncate(v.trim().replaceAll(RegExp(r'\s+'), ' '), 80);
+            unrecognized.update(key, (n) => n + 1, ifAbsent: () => 1);
+          }
           continue;
         }
         // JS 规则不是「语法不认识」：走 JS 那条线（能不能跑问真的解析器）
@@ -695,6 +724,40 @@ class _SelectorReport {
       }
       if (audit.jsAllRunnable) jsStaticRunnable++;
 
+      // ---- 请求选项与地址模板（I4）----
+      // 这两个数字是 I4 的作用面：多少源写的是「地址 + 选项」、多少源的地址
+      // 模板里是 JS。判据全部走 `request_options.dart`（与运行时同一份）。
+      final searchUrlRaw = (_lookup(raw, 'searchUrl') as String?) ?? '';
+      final spec = parseRequestSpec(searchUrlRaw);
+      if (spec.hasOptions) {
+        requestOptions++;
+        if (spec.isPost) {
+          requestPost++;
+        } else {
+          requestGet++;
+        }
+        if ((spec.body ?? '').contains('{{')) requestBodyTemplate++;
+        if ((spec.headers).isNotEmpty) requestHeaders++;
+        if ((spec.charset ?? '').isNotEmpty) requestCharset++;
+      } else if (spec.warning != null) {
+        requestBadJson++;
+      }
+      var urlJsOk = false;
+      var urlJsBad = false;
+      for (final path in kUrlExecutedFields) {
+        final v = _lookup(raw, path);
+        if (v is! String || v.trim().isEmpty) continue;
+        final inspect = inspectUrlTemplate(v);
+        if (!inspect.usesJs) continue;
+        if (inspect.runnable) {
+          urlJsOk = true;
+        } else {
+          urlJsBad = true;
+        }
+      }
+      if (urlJsOk) urlJsSupported++;
+      if (urlJsBad) urlJsUnsupported++;
+
       // ---- 可搜索判定 ----
       // v2.78.0：选择器全可解析 **且** 执行字段的 JS 全静态可跑。
       final hasSearchRule = ((_lookup(raw, 'searchUrl') as String?) ?? '')
@@ -712,6 +775,12 @@ class _SelectorReport {
       }
       if (problems.isEmpty) {
         runnable++;
+        // 这一档以前就「可搜索」，但带请求选项的那批其实发不出正确请求；
+        // I4 之后它们才真的能搜到东西。
+        if (spec.hasOptions) {
+          runnableWithOptions++;
+          if (spec.isPost) runnablePost++;
+        }
         continue;
       }
       // 只要有一条「JS 能力不够」，这个源就算被 JS 挡（哪怕选择器也有毛病）：
@@ -763,6 +832,17 @@ class _SelectorReport {
         'blockedBySelector': blockedBySelector,
         'missingSearchRule': missingSearchRule,
         'jsStaticRunnable': jsStaticRunnable,
+        'requestOptions': requestOptions,
+        'requestPost': requestPost,
+        'requestGet': requestGet,
+        'requestBodyTemplate': requestBodyTemplate,
+        'requestHeaders': requestHeaders,
+        'requestCharset': requestCharset,
+        'requestBadJson': requestBadJson,
+        'urlJsSupported': urlJsSupported,
+        'urlJsUnsupported': urlJsUnsupported,
+        'runnableWithOptions': runnableWithOptions,
+        'runnablePost': runnablePost,
         'features': {for (final e in _sortedFeatures()) e.key: e.value},
         'reasons': reasonSources,
         'soleBlocker': soleBlocker,
@@ -821,14 +901,28 @@ class _SelectorReport {
     String line(String label, int n) =>
         '  ${_pad(label, 18)}${_pad('$n', 6)}${(n * 100 / total).toStringAsFixed(1)}%';
     stdout.writeln(line('去重源', total));
-    stdout.writeln('${line('可搜索', runnable)}  ← v2.78.0（I3b）');
-    stdout.writeln('  （对照）v2.77.0（I2）时点 754 个 = 30.4%；'
-        'v2.76.0（I1）时点 495 个 = 19.9%');
+    stdout.writeln(line('可搜索', runnable));
+    stdout.writeln('  （对照）v2.78.0（I3b）时点 1079 个 = 43.5%；'
+        'v2.77.0（I2）时点 754 个 = 30.4%；v2.76.0（I1）时点 495 个 = 19.9%');
     stdout.writeln(line('被 JS 能力挡', blockedByJs));
     stdout.writeln(line('被选择器语法挡', blockedBySelector));
     stdout.writeln(line('缺搜索规则', missingSearchRule));
     stdout.writeln('  （附）执行字段的 JS 全静态可跑的源：$jsStaticRunnable 个'
-        '（这批就是 I3b 能真搜的 JS 源，不含选择器 / 搜索规则的额外门槛）');
+        '（这批就是本版能真搜的 JS 源，不含选择器 / 搜索规则的额外门槛）');
+
+    stdout.writeln('');
+    stdout.writeln('════════ 表⑨ 请求选项与地址模板（I4 的作用面） ════════');
+    stdout.writeln('${_pad('searchUrl 带请求选项', 24)} $requestOptions');
+    stdout.writeln('  ${_pad('其中 POST / GET', 22)} $requestPost / $requestGet');
+    stdout.writeln('  ${_pad('body 里带模板', 22)} $requestBodyTemplate');
+    stdout.writeln('  ${_pad('带 headers / charset', 22)} $requestHeaders / $requestCharset');
+    stdout.writeln('${_pad('选项不是合法 JSON（回退）', 24)} $requestBadJson');
+    stdout.writeln('${_pad('地址模板 JS 可求值', 24)} $urlJsSupported'
+        '  ← 本批新增能力');
+    stdout.writeln('${_pad('地址模板 JS 仍跑不了', 24)} $urlJsUnsupported'
+        '（整条 <js>/@js:、ajax、变量表、JSONPath）');
+    stdout.writeln('${_pad('「可搜索」里带请求选项', 24)} $runnableWithOptions'
+        '（其中 POST $runnablePost 个）← 这批以前算「可搜索」但发不出正确请求');
 
     if (reasonSources.isNotEmpty) {
       final reasons = reasonSources.entries.toList()

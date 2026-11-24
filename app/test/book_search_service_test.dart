@@ -24,11 +24,13 @@ BookSource _source(
   String detailRule = '@css:a@href',
   String lastChapterRule = '',
   bool enabled = true,
+  Map<String, String> headers = const {},
 }) =>
     BookSource(
       name: name,
       baseUrl: baseUrl,
       enabled: enabled,
+      headers: headers,
       search: SearchRule(
         url: searchUrl,
         list: list,
@@ -410,6 +412,209 @@ void main() {
     });
   });
 
+  group('请求选项与地址模板（I4）', () {
+    test('POST 源：方法 / body 模板 / charset 真的传下去，结果照常解析', () async {
+      final engine = FakeRuleEngine(
+        onFetch: (url) async => 'PAGE',
+        onQueryMap: (html, list, fields) async => {
+          'name': ['斗罗大陆'],
+          'detailUrl': ['/book/1'],
+        },
+      );
+      final groups = await BookSearchService(engine: engine).search(
+        sources: [
+          _source(
+            'POST源',
+            // 语料里最常见的形态：地址 + 请求选项，body 里还有关键词模板
+            searchUrl: '/search.php,{"method":"POST",'
+                '"body":"searchkey={{key}}&searchtype=all","charset":"gbk"}',
+          ),
+        ],
+        keyword: '斗罗',
+      );
+
+      expect(groups.single.status, BookSearchStatus.ok);
+      expect(groups.single.items.single.name, '斗罗大陆');
+      final req = engine.fetchedRequests.single;
+      expect(req.isPost, isTrue);
+      // 地址里的选项被剥掉了，body 的模板被替换（关键词**不编码**，见
+      // request_options.applyUrlPlaceholders：body 的值要原文）
+      expect(req.url, 'https://a.example/search.php');
+      expect(req.body, 'searchkey=斗罗&searchtype=all');
+      // 选项里的 charset 作为解码提示传下去
+      expect(req.charset, 'gbk');
+    });
+
+    test('选项 headers 覆盖书源级 headers（大小写不敏感，最终只剩一个键）', () async {
+      final engine = FakeRuleEngine(
+        onFetch: (url) async => 'PAGE',
+        onQueryMap: (html, list, fields) async => {
+          'name': ['书'],
+          'detailUrl': ['/book/1'],
+        },
+      );
+      await BookSearchService(engine: engine).search(
+        sources: [
+          _source(
+            '带头',
+            headers: {'Referer': 'https://a.example/', 'X-Src': '1'},
+            searchUrl: '/s,{"headers":{"referer":"https://m.example/"}}',
+          ),
+        ],
+        keyword: 'x',
+      );
+      final req = engine.fetchedRequests.single;
+      // HTTP 头名大小写不敏感：`Referer` / `referer` 只留一个键（以前两个都进
+      // Dio，真正发出去哪个由底层折叠决定）。选项这次写的优先。
+      expect(
+        req.headers.keys.where((k) => k.toLowerCase() == 'referer').length,
+        1,
+      );
+      expect(req.headers['referer'], 'https://m.example/');
+      expect(req.headers.containsKey('Referer'), isFalse);
+      expect(req.headers['X-Src'], '1');
+    });
+
+    test('地址模板里的 JS 表达式被求值后再拼地址', () async {
+      final pages = <String>[];
+      final engine = FakeRuleEngine(
+        onFetch: (url) async => 'PAGE',
+        onQueryMap: (html, list, fields) async => {
+          'name': ['书'],
+          'detailUrl': ['/book/1'],
+        },
+        onEvalUrlJs: (script, bindings) async {
+          // 只有空白页上能看到的上下文：baseUrl / key / page / book / source
+          expect(bindings['key'], '斗罗');
+          pages.add(bindings['page']!);
+          if (script == 'page-1') return '${int.parse(bindings['page']!) - 1}';
+          return '斗罗';
+        },
+      );
+      final groups = await BookSearchService(engine: engine).search(
+        sources: [
+          _source('模板源', searchUrl: '/s?p={{page-1}}&q={{book.name}}'),
+        ],
+        keyword: '斗罗',
+        maxPages: 2,
+      );
+      expect(groups.single.status, BookSearchStatus.ok);
+      // 每页各求两段（页码表达式 + 书名），两页都跑
+      expect(engine.urlTemplateScripts, ['page-1', 'book.name', 'page-1', 'book.name']);
+      expect(pages, ['1', '1', '2', '2']);
+      final urls = engine.fetchedRequests.map((r) => r.url).toList();
+      expect(urls.length, 2);
+      expect(urls[0], contains('p=0'));
+      expect(urls[1], contains('p=1'));
+      // 关键词进 query 后被 Uri 正常编码（归一化那一步做的）
+      expect(urls[0], contains(Uri.encodeComponent('斗罗')));
+    });
+
+    test('地址模板求值为空 → unsupported 且不发请求（不发半截地址）', () async {
+      final engine = FakeRuleEngine(
+        onFetch: (url) async => 'PAGE',
+        onEvalUrlJs: (script, bindings) async => '',
+      );
+      final groups = await BookSearchService(engine: engine).search(
+        sources: [_source('空模板', searchUrl: '/s?q={{book.name}}')],
+        keyword: 'x',
+      );
+      expect(groups.single.status, BookSearchStatus.unsupported);
+      expect(groups.single.message, contains('求值为空'));
+      expect(engine.fetchedUrls, isEmpty);
+    });
+
+    test('模板里访问 document → unsupported，文案说清是能力边界', () async {
+      final engine = FakeRuleEngine(onFetch: (url) async => 'PAGE');
+      final groups = await BookSearchService(engine: engine).search(
+        sources: [_source('页面对象', searchUrl: '/s?q={{document.title}}')],
+        keyword: 'x',
+      );
+      expect(groups.single.status, BookSearchStatus.unsupported);
+      expect(groups.single.message, contains('document'));
+      expect(engine.fetchedUrls, isEmpty);
+    });
+
+    test('请求选项是坏 JSON：退回整串当地址，照常发请求', () async {
+      final engine = FakeRuleEngine(
+        onFetch: (url) async => 'PAGE',
+        onQueryMap: (html, list, fields) async => {
+          'name': ['书'],
+          'detailUrl': ['/book/1'],
+        },
+      );
+      final groups = await BookSearchService(engine: engine).search(
+        sources: [
+          _source('坏选项', searchUrl: '/s?q={{key}},{"method":POST}'),
+        ],
+        keyword: 'x',
+      );
+      expect(groups.single.status, BookSearchStatus.ok);
+      // 整串当地址（这就是旧行为，不报错）
+      expect(engine.fetchedRequests.single.url, contains('POST'));
+    });
+
+    // ---- 翻页部分失败：保留已拿到的结果，别整组判死 ----
+    //
+    // 以前第 2 页 `resolveRequestField` 失败会 `return` 一个 unsupported 分组，
+    // 第 1 页明明已经拿到条目也一起丢了 —— 用户看到的是「这个源不支持」，
+    // 实际上只是第 2 页的模板拼不出来。
+
+    test('第 2 页地址拼不出来 → ok + 保留第 1 页条目 + 一行提示', () async {
+      final engine = FakeRuleEngine(
+        onFetch: (url) async => 'PAGE',
+        onQueryMap: (html, list, fields) async => {
+          'name': ['书'],
+          'detailUrl': ['/book/1'],
+        },
+        // 第 2 页的模板求值为空 → 拼不出地址
+        onEvalUrlJs: (script, bindings) async =>
+            bindings['page'] == '2' ? '' : '0',
+      );
+      final groups = await BookSearchService(engine: engine).search(
+        sources: [_source('翻页拼不出', searchUrl: '/s?p={{page-1}}')],
+        keyword: 'x',
+        maxPages: 2,
+      );
+      final group = groups.single;
+      expect(group.status, BookSearchStatus.ok);
+      expect(group.items.single.name, '书');
+      expect(group.warning, contains('第 2 页'));
+      expect(group.warning, contains('已保留前 1 页结果'));
+      // 第 2 页没发请求（拼不出来就别发半截地址）
+      expect(engine.fetchedUrls.length, 1);
+    });
+
+    test('第 2 页抓取失败 → ok + 保留第 1 页条目 + 一行提示', () async {
+      final engine = FakeRuleEngine(
+        onFetch: (url) async {
+          if (url.contains('p=1')) {
+            throw const RuleEngineException(
+              RuleErrorKind.network,
+              '第 2 页连不上',
+            );
+          }
+          return 'PAGE';
+        },
+        onQueryMap: (html, list, fields) async => {
+          'name': ['书'],
+          'detailUrl': ['/book/1'],
+        },
+        onEvalUrlJs: (script, bindings) async => '${int.parse(bindings['page']!) - 1}',
+      );
+      final groups = await BookSearchService(engine: engine).search(
+        sources: [_source('翻页断网', searchUrl: '/s?p={{page-1}}')],
+        keyword: 'x',
+        maxPages: 2,
+      );
+      final group = groups.single;
+      expect(group.status, BookSearchStatus.ok);
+      expect(group.items.single.name, '书');
+      expect(group.warning, contains('第 2 页没取到'));
+      expect(group.warning, contains('已保留前 1 页结果'));
+    });
+  });
+
   group('超时与异常', () {
     test('单源超时只影响自己', () async {
       final engine = FakeRuleEngine(
@@ -733,6 +938,8 @@ class _EncodingEngine extends FakeRuleEngine {
     String url, {
     Map<String, String>? headers,
     String charset = 'utf-8',
+    String method = 'GET',
+    String? body,
   }) async {
     fetchedUrls.add(url);
     // 与真实现同序：先当作「这次什么都不知道」，再按本次结果写

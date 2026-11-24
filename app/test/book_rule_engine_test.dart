@@ -29,6 +29,15 @@ class _BytesAdapter implements HttpClientAdapter {
   /// 被请求过的 URL（按调用顺序）。
   final List<String> urls = [];
 
+  /// 每次请求的方法（GET / POST）。
+  final List<String> methods = [];
+
+  /// 每次请求的 `content-type` 请求头（没带为 null）。
+  final List<String?> contentTypes = [];
+
+  /// 每次请求体（GET / 无 body 为 null）。
+  final List<String?> bodies = [];
+
   @override
   void close({bool force = false}) {}
 
@@ -39,6 +48,15 @@ class _BytesAdapter implements HttpClientAdapter {
     Future<void>? cancelFuture,
   ) async {
     urls.add(options.uri.toString());
+    methods.add(options.method.toUpperCase());
+    String? ct;
+    for (final entry in options.headers.entries) {
+      if (entry.key.toLowerCase() == 'content-type') {
+        ct = entry.value?.toString();
+      }
+    }
+    contentTypes.add(ct);
+    bodies.add(options.data?.toString());
     return ResponseBody.fromBytes(
       bytes,
       200,
@@ -257,6 +275,80 @@ void main() {
         ),
       );
       await engine.dispose();
+    });
+  });
+
+  group('fetchHtml 的请求形态（I4：POST / body / content-type）', () {
+    /// 记录请求的适配器：把方法 / 头 / 体原样捞出来断言。
+    ///
+    /// 为什么要「真适配器」而不是只测 `inferContentType`：content-type 是
+    /// Dio 在请求层拼的，单测纯函数证明不了「真的发出去了」。
+    final seen = <String, Object?>{};
+    late _BytesAdapter adapter;
+    late WebViewRuleEngine engine;
+
+    setUp(() {
+      seen.clear();
+      adapter = _BytesAdapter(const [0x3C, 0x68, 0x74, 0x6D, 0x6C, 0x3E]);
+      final dio = Dio()..httpClientAdapter = adapter;
+      engine = WebViewRuleEngine(dio: dio);
+    });
+
+    tearDown(() async => engine.dispose());
+
+    test('GET 路径不受影响：没有 body，也不塞 content-type', () async {
+      await engine.fetchHtml('https://a.example/s');
+      expect(adapter.methods, ['GET']);
+      expect(adapter.bodies, [null]);
+      expect(adapter.contentTypes.single, isNull);
+    });
+
+    test('POST + 表单 body：方法 / 体 / content-type 都真的发出去了', () async {
+      await engine.fetchHtml(
+        'https://a.example/s',
+        method: 'POST',
+        body: 'searchkey=%E6%96%97%E7%BD%97&searchtype=all',
+      );
+      expect(adapter.methods, ['POST']);
+      expect(adapter.bodies.single, 'searchkey=%E6%96%97%E7%BD%97&searchtype=all');
+      expect(adapter.contentTypes.single, 'application/x-www-form-urlencoded');
+    });
+
+    test('POST + JSON body → application/json', () async {
+      await engine.fetchHtml(
+        'https://a.example/api',
+        method: 'POST',
+        body: '{"q":"x"}',
+      );
+      expect(adapter.contentTypes.single, 'application/json');
+    });
+
+    test('选项里的显式 content-type 优先于推断', () async {
+      await engine.fetchHtml(
+        'https://a.example/s',
+        method: 'POST',
+        body: 'q=x',
+        headers: {'Content-Type': 'text/plain; charset=utf-8'},
+      );
+      expect(adapter.contentTypes.single, 'text/plain; charset=utf-8');
+    });
+
+    test('POST + 中文 body + gbk：明确报不支持（没有 GBK 编码器）', () async {
+      await expectLater(
+        engine.fetchHtml(
+          'https://a.example/s',
+          method: 'POST',
+          body: 'searchkey=斗罗',
+          charset: 'gbk',
+        ),
+        throwsA(
+          isA<RuleEngineException>()
+              .having((e) => e.kind, 'kind', RuleErrorKind.unsupported)
+              .having((e) => e.message, 'message', contains('GBK')),
+        ),
+      );
+      // 连请求都不该发
+      expect(adapter.urls, isEmpty);
     });
   });
 

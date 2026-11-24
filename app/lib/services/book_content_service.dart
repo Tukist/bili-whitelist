@@ -21,6 +21,7 @@ import '../models/book_source.dart';
 import 'book_detail_service.dart' show TocChapter;
 import 'book_rule/js_rule.dart';
 import 'book_rule/legado_compat.dart';
+import 'book_rule/request_options.dart';
 import 'book_rule/rule_engine.dart';
 import 'book_rule/selector.dart';
 import 'chapter_cache_store.dart';
@@ -152,22 +153,19 @@ class BookContentService {
 
     var pageCount = rule.maxPages < 1 ? 1 : rule.maxPages;
     if (pageCount > maxContentPages) pageCount = maxContentPages;
-    // 地址里是 JS（`@js:'/p'+page`）：本版没有「按表达式拼地址」的接线
-    if (urlTemplateUsesJs(rule.url ?? '')) {
-      throw const RuleEngineException(
-        RuleErrorKind.unsupported,
-        '正文地址是 JS 模板（content.url），本版不支持',
-      );
-    }
-    if (urlTemplateUsesJs(nextTemplate)) {
-      if (pageCount > 1) warnings.add('正文分页地址是 JS 模板（content.nextPage），只取了第一页');
+    // 整条分页地址是 JS（`@js:baseUrl + "/next"` / `<js>…</js>`）：I4 只接了
+    // `{{…}}` 表达式模板，这种仍是「跑不了」—— 只取第一页并说清楚。
+    if (wholeUrlJsKind(nextTemplate) != null) {
+      if (pageCount > 1) {
+        warnings.add('正文分页地址是 JS 模板（content.nextPage），只取了第一页');
+      }
       pageCount = 1;
     }
     // 分页模板必须是「能拼出不同地址」的：没有页码占位符时翻下去还是同一页
     // （有的站点连 `{{page}}` 都没写），这时只取第一页并说清楚。
-    final hasPageToken = nextTemplate.contains('{{page}}') ||
-        nextTemplate.contains('{{ page }}') ||
-        nextTemplate.contains('@page');
+    // 页码可能包在 JS 表达式里（`{{page+1}}` / `{{(page-1)*15}}`），所以按
+    // 正则找「含 page 的模板」，而不是死抠 `{{page}}` 这一个字面量。
+    final hasPageToken = _kPageToken.hasMatch(nextTemplate);
     if (nextTemplate.isEmpty || !hasPageToken) {
       if (pageCount > 1) {
         warnings.add('正文分页规则里没有页码占位符（{{page}}），只取了第一页');
@@ -177,9 +175,41 @@ class BookContentService {
 
     String? previousUrl;
     for (var page = 1; page <= pageCount; page++) {
-      final pageUrl = page == 1
-          ? _resolvePageUrl(rule.url, chapterUrl, 1)
-          : _resolvePageUrl(nextTemplate, chapterUrl, page);
+      final rawTemplate = page == 1 ? (rule.url ?? '') : nextTemplate;
+      // `content.url` 为空 = 章节页本身就是正文页（legado 的默认语义）：
+      // 不用解析模板，直接用章节地址（请求形态取书源级 headers / charset）。
+      ResolvedRequest request = const ResolvedRequest(url: '');
+      if (rawTemplate.trim().isNotEmpty) {
+        // 地址 / 请求选项 / `{{…}}` 模板（I4）：分页模板里的 JS 表达式在空白页
+        // 上求值后再拼（`{{page-1}}` 这种写法在真实语料里不少）。
+        request = await _resolveRequest(
+          rawTemplate,
+          source: source,
+          baseUrl: chapterUrl,
+          bookName: title,
+          bookUrl: chapterUrl,
+          page: page,
+          placeholders: {
+            '@chapterUrl': chapterUrl,
+            '{{chapterUrl}}': chapterUrl,
+            '@page': '$page',
+          },
+        );
+        if (!request.ok) {
+          if (page == 1) {
+            throw RuleEngineException(
+              RuleErrorKind.unsupported,
+              '正文地址拼不出来：${request.error}',
+            );
+          }
+          partial = true;
+          warnings.add('正文第 $page 页地址拼不出来（${request.error}）');
+          break;
+        }
+      }
+      final pageUrl = request.url.trim().isEmpty
+          ? chapterUrl
+          : normalizeUrl(request.url, chapterUrl);
       if (pageUrl.isEmpty) {
         if (page == 1) {
           throw const RuleEngineException(
@@ -199,8 +229,11 @@ class BookContentService {
       try {
         html = await engine.fetchHtml(
           pageUrl,
-          headers: source.headers,
-          charset: source.charset,
+          // 选项里的请求头覆盖书源级同名项（大小写不敏感，见 mergeHeaders）
+          headers: mergeHeaders(source.headers, request.headers),
+          charset: request.charset ?? source.charset,
+          method: request.method,
+          body: request.body,
         );
       } catch (e) {
         if (page == 1) throw _asRuleError(e);
@@ -390,19 +423,50 @@ class BookContentService {
     );
   }
 
-  /// 正文页地址：`content.url` 为空就用章节页；支持 `@chapterUrl` 模板。
-  String _resolvePageUrl(String? template, String chapterUrl, int page) {
-    final text = (template ?? '').trim();
-    if (text.isEmpty) return chapterUrl;
-    final filled = text
-        .replaceAll('@chapterUrl', chapterUrl)
-        .replaceAll('{{chapterUrl}}', chapterUrl)
-        .replaceAll('{{page}}', '$page')
-        .replaceAll('{{ page }}', '$page')
-        .replaceAll('@page', '$page');
-    return normalizeUrl(filled, chapterUrl);
+  /// 解析一个正文地址 / 分页模板（I4）。
+  ///
+  /// 本模型自己的占位符（`@chapterUrl` / `@page`）先替换，再交给
+  /// `request_options` 拆请求选项 + 求值 `{{…}}` JS 模板。
+  Future<ResolvedRequest> _resolveRequest(
+    String raw, {
+    required BookSource source,
+    required String baseUrl,
+    Map<String, String> placeholders = const {},
+    String bookName = '',
+    String bookUrl = '',
+    int page = 1,
+  }) async {
+    var text = raw;
+    for (final entry in placeholders.entries) {
+      text = text.replaceAll(entry.key, entry.value);
+    }
+    return resolveRequestField(
+      text,
+      baseUrl: source.baseUrl,
+      keyword: bookName,
+      page: page,
+      bindings: jsBindings(
+        baseUrl: baseUrl,
+        keyword: bookName,
+        page: '$page',
+        bookName: bookName,
+        bookUrl: bookUrl.isEmpty ? baseUrl : bookUrl,
+        chapterTitle: bookName,
+        sourceName: source.name,
+        sourceUrl: source.baseUrl,
+        sourceComment: _sourceComment(source),
+      ),
+      evalJs: (script, bindings) =>
+          engine.evalUrlTemplateJs(script: script, bindings: bindings),
+    );
   }
 }
+
+/// 分页模板里有没有页码（`{{page}}` / `{{ page }}` / `{{page+1}}` / `@page`）。
+final RegExp _kPageToken = RegExp(
+  r'@page|\{\{[^{}]*(\bpage\b|searchpage)[^{}]*\}\}',
+  caseSensitive: false,
+);
 
 /// 批量缓存的结果（阅读页 / 详情页据此弹提示）。
 class CacheBatchResult {

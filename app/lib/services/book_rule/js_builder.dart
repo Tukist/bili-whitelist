@@ -15,6 +15,9 @@
 /// 2. **相对查询**：字段选择器是相对**列表节点**的（`node.querySelectorAll`
 ///    或 `document.evaluate(sel, node, …)`），不是全文档查一遍再按顺序对号。
 ///    全文档查会导致「第一个字段全取到了，后面全错位」。
+///    注意 XPath 的 `//x` 是**绝对路径**（上下文节点不影响它），光传 node
+///    并不会变相对 —— 字段位置由 [_specMap] 的 `relative` 补 `.` 改成 `.//x`，
+///    否则每行都取文档里第一个匹配（分卷目录里 = 所有章名都带「第一卷」，v2.79.0）。
 /// 3. **不依赖外部库**：一个 IIFE 里自带全部工具函数，页面自己的框架挂了也
 ///    不影响（顺便这也是「不引新依赖」的一部分）。
 library;
@@ -38,8 +41,14 @@ String buildQueryFieldsJs(
   SelectorValue? fieldSelector,
 ) {
   final list = jsonEncode(_specMap(listSelector));
-  final field =
-      fieldSelector == null ? 'null' : jsonEncode(_specMap(fieldSelector));
+  // 字段位置：相对每个列表节点（`//x` 会被补成 `.//x`，见 [_specMap]）。
+  // 容器本身就是整篇文档时**不补**：详情页拿 `@css:body` 当容器，`<head>` 里的
+  // meta 不在 body 里，补成 `.//meta` 就再也取不到（见 [_fieldsAreRelative]）。
+  final field = fieldSelector == null
+      ? 'null'
+      : jsonEncode(
+          _specMap(fieldSelector, relative: _fieldsAreRelative(listSelector)),
+        );
   return '''
 (function(){
 $_kJsHelpers
@@ -67,6 +76,7 @@ String buildQueryFieldsMultiJs(
   Map<String, SelectorValue?> fields,
 ) {
   final list = jsonEncode(_specMap(listSelector));
+  final fieldsRelative = _fieldsAreRelative(listSelector);
   final buffer = StringBuffer()
     ..writeln('(function(){')
     ..writeln(_kJsHelpers)
@@ -83,7 +93,8 @@ String buildQueryFieldsMultiJs(
           '{ arr[i] = valueOfNode(nodes[i], LIST); }');
     } else {
       // 每个字段单独一个局部变量，避免 6 个长 JSON 字面量重复出现在循环体里
-      buffer.writeln('var F$index = ${jsonEncode(_specMap(spec))};');
+      buffer.writeln('var F$index = '
+          '${jsonEncode(_specMap(spec, relative: fieldsRelative))};');
       buffer.writeln('for (i = 0; i < nodes.length; i++) '
           '{ arr[i] = firstValue(nodes[i], F$index); }');
       index++;
@@ -213,6 +224,7 @@ String buildQueryFieldsMixedJs({
   required Map<String, String> bindings,
 }) {
   final list = jsonEncode(_specMap(listSelector));
+  final fieldsRelative = _fieldsAreRelative(listSelector);
   final buffer = StringBuffer()
     ..writeln('(function(){')
     ..writeln(_kJsHelpers)
@@ -232,7 +244,8 @@ String buildQueryFieldsMixedJs({
       buffer.writeln('for (i = 0; i < nodes.length; i++) '
           '{ arr[i] = valueOfNode(nodes[i], LIST); }');
     } else {
-      buffer.writeln('var F$index = ${jsonEncode(_specMap(spec))};');
+      buffer.writeln('var F$index = '
+          '${jsonEncode(_specMap(spec, relative: fieldsRelative))};');
       buffer.writeln('for (i = 0; i < nodes.length; i++) '
           '{ arr[i] = firstValue(nodes[i], F$index); }');
       index++;
@@ -247,7 +260,7 @@ String buildQueryFieldsMixedJs({
       ..writeln('var RUN$jsIndex = '
           '${buildJsRunnerFactory(script: info.script, asExpression: info.form == JsRuleForm.template)};')
       ..writeln('var BASE$jsIndex = '
-          '${base == null ? 'null' : jsonEncode(_specMap(base))};')
+          '${base == null ? 'null' : jsonEncode(_specMap(base, relative: fieldsRelative))};')
       ..writeln('arr = new Array(nodes.length);')
       ..writeln('for (i = 0; i < nodes.length; i++) {')
       ..writeln('  v = null;')
@@ -335,8 +348,56 @@ try {
 
 // ==================== 内部：选择器 → JSON 规格 ====================
 
+/// 字段规则要不要相对化（`//x` → `.//x`）。
+///
+/// ## 为什么不能无条件相对化
+/// 相对化是为「列表 × 字段」设计的：搜索 / 目录的列表选择器指向**每行一个
+/// 节点**（`dl dd` / `.grid tr`），字段里的 `//dt` 必须落到这一行里，否则每行
+/// 都命中文档里第一条 `dt`（v2.79.0 分卷目录 57 章全带「第一卷」就是这么来的）。
+///
+/// 但详情页没有列表：`book_detail_service.dart` 拿 `@css:body` 当容器，字段
+/// 规则按整篇文档写是常态 —— `<head>` 里的
+/// `//meta[@property="og:image"]/@content`（封面）/ `og:novel:author`（作者）
+/// 根本不在 body 里，补成 `.//meta` 就永远取不到（legado 语料里用 meta 取
+/// 封面 / 作者很常见）。所以容器本身就是整篇文档时**保持绝对路径**。
+///
+/// 判据只认「明显是整篇」的写法：`body` / `html`、空选择器、`self`。
+/// 其它任何选择器（包括 `body .container` 这种）都按列表节点处理 ——
+/// 宁可按行相对化（最坏是取不到值），也不能回到「每行都取第一条」。
+bool _fieldsAreRelative(SelectorValue container) {
+  switch (container.kind) {
+    case SelectorKind.css:
+      final q = container.query.trim().toLowerCase();
+      return q.isNotEmpty && q != 'body' && q != 'html';
+    case SelectorKind.xpath:
+      final q = container.query.trim().toLowerCase().replaceAll(' ', '');
+      const whole = {'', '/', '//', '/body', '//body', '/html', '//html'};
+      return !whole.contains(q);
+    case SelectorKind.none:
+    case SelectorKind.self:
+      // 空规则 / 节点自身：没有「一行一个元素」的概念，字段按整篇写
+      return false;
+    default:
+      return true;
+  }
+}
+
 /// 把 [SelectorValue] 压成 JS 侧认识的小对象（键名短、全部可 JSON 化）。
-Map<String, dynamic> _specMap(SelectorValue v) => {
+///
+/// [relative] = true 表示这个规则会作为**字段**（相对列表节点）求值，
+/// 而不是当列表在整页上查。唯一的差别在 XPath：`//x` 在 XPath 1.0 里是
+/// **绝对路径**，`document.evaluate` 的第二个参数（上下文节点）对它没有影响 ——
+/// 一条「本意相对」的字段规则会变成「每一行都取文档里第一个匹配」。
+///
+/// 分卷目录里这个坑的典型表现（v2.79.0 实机）：章名规则写成
+/// `//dt[@class='vcss']/text()&&a@text`（先卷名、再章名），结果 57 章**全部**
+/// 变成「第一卷 XXX」——因为 `//dt` 每次都命中文档里第一条 `dt`，也就是第一
+/// 卷的卷名。所以在**生成规格时**就给字段位置补一个 `.`（`//x` → `.//x`），
+/// 让「字段相对节点」从注释里的约定变成选择器本身的事实，单测也能直接断言
+/// （JS 侧只有真机 WebView 跑得到，断言不了）。
+///
+/// **例外**：容器本身是整篇文档（`@css:body` 等）时不补，见 [_fieldsAreRelative]。
+Map<String, dynamic> _specMap(SelectorValue v, {bool relative = false}) => {
       'kind': switch (v.kind) {
         SelectorKind.css => 'css',
         SelectorKind.xpath => 'xpath',
@@ -348,7 +409,9 @@ Map<String, dynamic> _specMap(SelectorValue v) => {
         SelectorKind.jsonPath => 'json',
         _ => 'none',
       },
-      'query': v.query,
+      'query': relative && v.kind == SelectorKind.xpath
+          ? _relativeXPath(v.query)
+          : v.query,
       // null = 取文本；'html' / 'href' / 'src' / 'ownText' / 'textNodes' / 'all'
       // / 属性名 = 其它取值方式
       'attr': v.attr,
@@ -357,15 +420,30 @@ Map<String, dynamic> _specMap(SelectorValue v) => {
       'suffixReplacement': v.suffixReplacement,
       // true = 只替换第一个（legado 的 `##正则##替换###`）
       'suffixReplaceFirst': v.suffixReplaceFirst,
-      'fallbacks': [for (final f in v.fallbacks) _specMap(f)],
+      // 链式段、回退链、并列/交叉分支都按同一个位置语义递归处理：
+      // 字段里的 `//` 落到哪一段都是「相对该段的结果」
+      'fallbacks': [
+        for (final f in v.fallbacks) _specMap(f, relative: relative),
+      ],
       // v2.77.0：链式 / 索引 / 并列
-      'steps': [for (final s in v.steps) _specMap(s)],
+      'steps': [for (final s in v.steps) _specMap(s, relative: relative)],
       'indexes': v.indexes,
       'indexExclude': v.indexExclude,
-      'concat': [for (final c in v.concat) _specMap(c)],
-      // v2.78.0：%% 交叉合并（按行交错）
-      'interleave': [for (final c in v.interleave) _specMap(c)],
+      'concat': [for (final c in v.concat) _specMap(c, relative: relative)],
+      // v2.78.0：`%%` 交叉合并（按行交错）
+      'interleave': [
+        for (final c in v.interleave) _specMap(c, relative: relative),
+      ],
     };
+
+/// 绝对 XPath → 相对：`//x` → `.//x`、`/x` → `./x`。
+///
+/// 只处理**开头就是 `/`** 的写法。`(//div)[1]` 这种带括号的整段表达式保持
+/// 原样（补 `.` 会变成语法错误 `.(//div)[1]`）—— 它在语料里极少，且作者写
+/// 括号时通常就是要「整页第一个」，不该被我们改掉。
+String _relativeXPath(String query) =>
+    query.startsWith('/') ? '.$query' : query;
+
 
 // ==================== 内部：共用的 JS 工具函数 ====================
 

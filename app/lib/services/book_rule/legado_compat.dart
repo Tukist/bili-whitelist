@@ -7,7 +7,7 @@
 ///    P0 起口径是「会影响我们执行的字段里有 JS 才算」（见 [JsUsage]）：
 ///    只有发现页 / 登录页 / 校验词用了 JS 的源照常能搜，不再整源判死；
 ///    I3a 起再加一层 [JsUsage.runnableJs]：执行字段的 JS **全部**落在静态
-///    白名单内才算「本版能跑」（本批只产判定，接线在 I3b）；
+///    白名单内才算「本版能跑」（I3b 起真的接线，I4 起地址模板也算在内）；
 /// 3. [normalizeUrl] —— 相对转绝对 / 去空白 / 去尾斜杠 / 同站统一 https。
 ///
 /// ## `{{key}}` 为什么不能一刀切当 JS
@@ -22,23 +22,14 @@ library;
 
 import '../../models/book_source.dart';
 import 'js_rule.dart';
+import 'request_options.dart';
 import 'selector.dart';
 
-/// URL 模板里允许出现的占位符（小写；`{{ page }}` 这种带空格的也算）。
+/// URL 模板里允许出现的占位符（白名单只有一份，在 `request_options.dart`）。
 ///
-/// `tab` 留在表里是**故意**的：legado 的 `tab` 是分页 / 分类页签语义，本版
-/// 不替换它（见 `buildSearchUrl`），但它也不是 JS —— 留在白名单里，`usesJs`
-/// 才不会把它误判成「需要 JS 的源」，从而走到搜索侧那条明确的 unsupported 分支。
-const Set<String> kUrlPlaceholders = {
-  'key',
-  'keyword',
-  'page',
-  'searchpage',
-  'searchkey',
-  'tab',
-  // legado 生态里偶见 `{{baseUrl}}`（拼绝对地址用），不是 JS
-  'baseurl',
-};
+/// 再导出一次是为了保住既有导入路径：调用点一直从「legado 兼容层」取这个
+/// 常量（它确实是 legado 的约定），而实现放在请求选项那边更贴题。
+export 'request_options.dart' show kUrlPlaceholders;
 
 /// legado 书源里**不参与 JS 判定**的说明性字段。
 ///
@@ -104,11 +95,8 @@ class JsUsage {
   /// 执行字段里的 JS **全部**落在静态白名单内（I3a 新增）。
   ///
   /// 判真要求：有执行字段的 JS；每一处 JS 都是可跑的静态脚本
-  /// （[JsRuleInfo.runnable]）；且没有任何执行字段的 **URL** 里带 JS
-  /// （URL 里的 `{{…}}` 是模板替换，要 I3b 的接线才用得上）。
-  ///
-  /// ⚠️ 本批**只是判定**，`canRun` 保持旧语义（有 JS 就不跑）—— 接线在 I3b，
-  /// 半截功能上线比不支持更难排查。
+  /// （[JsRuleInfo.runnable]）；地址字段里的 `{{…}}` 也能静态求值
+  /// （I4 起「按表达式拼地址」已接线；整条地址是 `<js>` / `@js:` 的仍不算）。
   final bool runnableJs;
 
   /// 命中 JS 的执行字段路径（`search.list` / `content.text` …），排查用。
@@ -177,7 +165,7 @@ enum SourceCapability {
   /// 不依赖 JS：直接能搜。
   plain,
 
-  /// 执行字段里的 JS 全是静态可跑的（纯字符串变换）：能搜，脚本由引擎执行。
+  /// 执行字段里的 JS 全是静态可跑的（纯字符串变换 / 地址模板）：能搜，脚本由引擎执行。
   staticJs,
 
   /// 需要本版没有的 JS 能力（ajax / 变量表 / 列表规则 / 嵌套规则模板）。
@@ -189,10 +177,18 @@ enum SourceCapability {
 /// 只看**搜索**那一段（v2.78.0）：用户问的是「这个源能不能搜」。一个源可能
 /// 目录地址是 JS（`toc.url`）、搜索完全正常 —— 拿整源口径标「需 JS」会让人
 /// 白删一个能用的源。详情 / 目录 / 正文各自的闸门在各自的服务里。
+///
+/// v2.79.0：**只有地址模板里的 `{{…}}` 是 JS 的源算「可搜索」**（[plain]）。
+/// 那点脚本是引擎在空白页上拼接地址时顺手跑的，用户既看不到也没有「跑脚本」
+/// 的概念；只有选择器 / 列表字段带 JS 才显示「静态 JS」。两档都会被搜索，
+/// 区别只是文案（见 `book_source_page.dart` 的角标说明）。
 SourceCapability sourceCapabilityOf(BookSource source) {
   final usage = jsUsageOf(source, stage: SourceStage.search);
   if (!usage.executedJs) return SourceCapability.plain;
-  return usage.runnableJs ? SourceCapability.staticJs : SourceCapability.needsJs;
+  if (!usage.runnableJs) return SourceCapability.needsJs;
+  final onlyUrlTemplates =
+      usage.executedFields.every((field) => _kUrlModelPaths.contains(field));
+  return onlyUrlTemplates ? SourceCapability.plain : SourceCapability.staticJs;
 }
 
 /// 书源规则的四段（`search` / `detail` / `toc` / `content`）。
@@ -237,15 +233,22 @@ JsUsage jsUsageOf(BookSource source, {SourceStage? stage}) {
   var allRunnable = true;
   var anyBlockedPosition = false;
 
-  void noteExecuted(String path, String text) {
+  void noteExecuted(String path, String text, {UrlTemplateInspection? urlInspect}) {
     if (stage != null && !stage.covers(path)) return;
     executedFields.add(path);
     apis.addAll(blockedApisIn(text));
+    // 地址字段（I4）：`{{…}}` 里的 JS 能静态求值就**真的跑**（在空白页上拼
+    // 地址），整条地址是 `<js>` / `@js:` 的仍然跑不了。判定在 request_options.dart。
+    if (urlInspect != null) {
+      if (!urlInspect.runnable) {
+        anyBlockedPosition = true;
+        allRunnable = false;
+      }
+      return;
+    }
     final info = classifyJsRule(text);
-    if (_kUrlModelPaths.contains(path) || _isListPositionField(path)) {
-      // 两处「本版一定跑不了」的位置：
-      // - URL 字段的 JS 是「按表达式拼地址」，本批没接；
-      // - 列表 / 删节点字段要的是元素集合，沙箱只返回字符串。
+    // 列表 / 删节点字段要的是元素集合，沙箱只返回字符串 —— 一定跑不了。
+    if (_isListPositionField(path)) {
       anyBlockedPosition = true;
       allRunnable = false;
       return;
@@ -261,14 +264,19 @@ JsUsage jsUsageOf(BookSource source, {SourceStage? stage}) {
     if (parseSelector(rule).needsJs) noteExecuted(entry.key, rule);
   }
   for (final entry in _urlFields(source).entries) {
-    if (_stringUsesJs(entry.value)) noteExecuted(entry.key, entry.value);
+    // 地址字段要先把「地址 + 请求选项」拆开：选项 JSON 里的 `{` / `,` 不是
+    // 模板，body 里的 `{{key}}` 也只是占位符。整串直接判会把普通 POST 源
+    // 误判成 JS 源（语料里 617 个 searchUrl 带合法选项，另有 99 个坏 JSON）。
+    final inspect = inspectUrlTemplate(entry.value);
+    if (inspect.usesJs) noteExecuted(entry.key, entry.value, urlInspect: inspect);
   }
 
   var unexecutedJs = false;
   final raw = source.raw;
   if (raw != null) {
     // 按阶段判时不算「不执行字段的 JS」：那个角标是整源语义
-    unexecutedJs = _scanRaw(raw, '', noteExecuted);
+    unexecutedJs = _scanRaw(raw, '', (path, text, inspect) =>
+        noteExecuted(path, text, urlInspect: inspect));
   }
 
   return JsUsage(
@@ -437,8 +445,10 @@ const Map<String, String> _kRawMappedPaths = {
 
 /// 上表里属于「地址 / 模板」的模型字段（`{{key}}` 要按占位符白名单放行）。
 ///
-/// 选择器字段里的 `{{…}}` 一律算 JS，URL 字段里只有白名单外的才算 ——
-/// 两条口径必须分开，否则 `searchUrl=/s?q={{key}}` 会被误判。
+/// 选择器字段里的 `{{…}}` 一律算 JS；地址字段要**先拆请求选项**
+/// （`,{"method":"POST",…}`），再按白名单放行占位符、按 JS 判定其余表达式
+/// （见 `request_options.dart` 的 [inspectUrlTemplate]）。两条口径必须分开，
+/// 否则 `searchUrl=/s?q={{key}}` 会被误判成 JS 源。
 const Set<String> _kUrlModelPaths = {
   'search.url',
   'detail.url',
@@ -468,15 +478,21 @@ const Set<String> _kModelShapeKeys = {
 bool _scanRaw(
   Object? node,
   String path,
-  void Function(String modelPath, String text) onExecuted,
+  void Function(String modelPath, String text, UrlTemplateInspection? inspect)
+      onExecuted,
 ) {
   if (node is String) {
     final mapped = _kRawMappedPaths[path];
     if (mapped == null) return _stringUsesJs(node);
-    final isJs = _kUrlModelPaths.contains(mapped)
-        ? _stringUsesJs(node)
-        : (parseSelector(node).needsJs || _stringUsesJs(node));
-    if (isJs) onExecuted(mapped, node);
+    if (_kUrlModelPaths.contains(mapped)) {
+      // 地址字段：先拆请求选项（见 [inspectUrlTemplate]），别把 `,{…}` 里的
+      // 花括号 / 逗号当成模板
+      final inspect = inspectUrlTemplate(node);
+      if (inspect.usesJs) onExecuted(mapped, node, inspect);
+      return false;
+    }
+    final isJs = parseSelector(node).needsJs || _stringUsesJs(node);
+    if (isJs) onExecuted(mapped, node, null);
     return false;
   }
   if (node is Map) {
@@ -500,12 +516,6 @@ bool _scanRaw(
 }
 
 final RegExp _kTemplatePattern = RegExp(r'\{\{(.*?)\}\}', dotAll: true);
-
-/// 一段**地址模板**里有没有本版跑不了的 JS（非占位符的 `{{…}}` / `<js>` / `@js:`）。
-///
-/// 公开出来是给服务层判「URL 字段是 JS」用的（详情 / 目录 / 正文各自要报
-/// 自己那一段）：本版没有「按表达式拼地址」的接线，遇到就只能明说。
-bool urlTemplateUsesJs(String text) => _stringUsesJs(text);
 
 /// 一段字符串里是否有 JS 痕迹（占位符白名单见 [kUrlPlaceholders]）。
 bool _stringUsesJs(String text) {

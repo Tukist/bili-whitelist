@@ -287,5 +287,89 @@ void main() {
       expect(fetches, 1);
       expect(result.warning, contains('JS 模板'));
     });
+
+    test('正文地址是 {{…}} 表达式模板 → 求值后真的去抓（I4）', () async {
+      final urls = <String>[];
+      final engine = FakeRuleEngine(
+        onFetch: (url) async {
+          urls.add(url);
+          return '<html>p</html>';
+        },
+        onExtractHtml: (_, __, ___) async => '正文',
+        onEvalUrlJs: (script, bindings) async {
+          expect(bindings['chapterTitle'], '第1章');
+          return script == 'chapter.title' ? '第1章' : '/c';
+        },
+      );
+      final source = _source(
+        content: const ContentRule(
+          text: '#content',
+          url: '/c/{{chapter.title}}.html',
+        ),
+      );
+
+      final result = await BookContentService(engine: engine).loadContent(
+        source: source,
+        chapter: const TocChapter(name: '第1章', url: 'https://x.example/1'),
+      );
+
+      expect(result.body, '正文');
+      expect(urls, hasLength(1));
+      expect(urls.single, contains('/c/${Uri.encodeComponent('第1章')}.html'));
+    });
+
+    test('正文地址是 POST 源：正文页也用 POST + body 抓（I4）', () async {
+      final engine = FakeRuleEngine(
+        onFetch: (_) async => '<html>p</html>',
+        onExtractHtml: (_, __, ___) async => '正文',
+      );
+      final source = _source(
+        content: const ContentRule(
+          text: '#content',
+          url: '/read,{"method":"POST","body":"c={{chapterUrl}}"}',
+        ),
+      );
+
+      await BookContentService(engine: engine).loadContent(
+        source: source,
+        chapter: const TocChapter(name: '第1章', url: 'https://x.example/1'),
+      );
+
+      final req = engine.fetchedRequests.single;
+      expect(req.isPost, isTrue);
+      expect(req.url, 'https://x.example/read');
+      // `@chapterUrl` / `{{chapterUrl}}` 是**模型自己的**占位符，先替换
+      expect(req.body, 'c=https://x.example/1');
+    });
+
+    test('分页模板里的页码表达式（{{page}}）照常翻页', () async {
+      final urls = <String>[];
+      final engine = FakeRuleEngine(
+        onFetch: (url) async {
+          urls.add(url);
+          return '<html>p</html>';
+        },
+        onExtractHtml: (_, __, ___) async => '正文',
+      );
+      final source = _source(
+        content: const ContentRule(
+          text: '#content',
+          nextPage: '/p/{{page}}.html',
+          maxPages: 3,
+        ),
+      );
+
+      final result = await BookContentService(engine: engine).loadContent(
+        source: source,
+        chapter: const TocChapter(name: '第1章', url: 'https://x.example/1'),
+      );
+
+      expect(result.body, contains('正文'));
+      expect(urls, [
+        'https://x.example/1',
+        'https://x.example/p/2.html',
+        'https://x.example/p/3.html',
+      ]);
+    });
   });
 }

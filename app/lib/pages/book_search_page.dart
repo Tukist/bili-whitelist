@@ -581,6 +581,17 @@ class _BookSearchPageState extends State<BookSearchPage> {
                 style: kTypeBodyS.copyWith(color: kInkGray50, fontSize: 11),
               ),
             ),
+          // 翻页部分失败（第 2 页起抓不到 / 地址拼不出来）：结果是好的，只是
+          // 不完整 —— 一行小字说清缺了哪一页，不把整组判死（见
+          // BookSearchGroup.warning）。
+          if (group.warning != null)
+            Padding(
+              padding: const EdgeInsets.only(top: 2),
+              child: Text(
+                group.warning!,
+                style: kTypeBodyS.copyWith(color: kInkGray70, fontSize: 11),
+              ),
+            ),
         ],
       ),
     );

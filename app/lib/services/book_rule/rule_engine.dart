@@ -54,6 +54,7 @@ import 'package:webview_flutter/webview_flutter.dart';
 import '../../utils/text_decoding.dart';
 import 'js_builder.dart';
 import 'js_rule.dart';
+import 'request_options.dart';
 import 'selector.dart';
 
 /// 抓网页用的桌面 Chrome UA。
@@ -135,11 +136,19 @@ abstract class BookRuleEngine {
   ///
   /// [charset] 是书源声明的编码（默认 `utf-8`），只当**提示**用：
   /// 优先级是 `响应头 charset` > [charset] > 自动判定，判定顺序见文件头。
-  /// 失败抛 [RuleEngineException]（网络 / 超时 / 空内容）。
+  ///
+  /// [method] / [body] 来自 legado 地址字段的**请求选项**（I4）：
+  /// `searchUrl` 写成 `"...?q={{key}},{"method":"POST","body":"…"}"` 的源必须
+  /// 真的用 POST 发出去，否则站点只会回一个空结果页。GET 路径行为不变
+  /// （不传 [body] 时内部仍走 `dio.get`）。
+  ///
+  /// 失败抛 [RuleEngineException]（网络 / 超时 / 空内容 / 不支持的请求形态）。
   Future<String> fetchHtml(
     String url, {
     Map<String, String>? headers,
     String charset = 'utf-8',
+    String method = 'GET',
+    String? body,
   });
 
   /// 在 [html]（以 [baseUrl] 为基准）里，对 [listSelector] 命中的每个节点，
@@ -318,6 +327,29 @@ abstract class BookRuleEngine {
     );
   }
 
+  /// 在**空白页**上求值一段 URL 模板表达式（I4）。
+  ///
+  /// 为什么单独一个方法而不是复用 [evalJsRule]：后者刻意**不载页**、只在
+  /// 「当前页面」上跑（选择器字段要复用已解析的 DOM）。URL 模板求值发生在
+  /// **发请求之前**，此时根本没有页面，而且它只做字符串拼接 —— 载一张空白页
+  /// 是最接近 legado「无文档上下文」语义的做法。
+  ///
+  /// [bindings] 只有 `baseUrl` / `key` / `page` / `book` / `source` 这几个
+  /// （见 `js_rule.dart` 的 `jsBindings`）；脚本里 `document` / `window` 这类
+  /// 页面对象会被解析阶段拦掉（[checkJsRuleAllowed] 之外另有一道，见
+  /// `request_options.dart` 的 `urlTemplateJsProblem`）。
+  ///
+  /// 默认实现报「不支持」（假引擎 / 无 WebView 环境）。
+  Future<String?> evalUrlTemplateJs({
+    required String script,
+    required Map<String, String> bindings,
+  }) async {
+    throw const RuleEngineException(
+      RuleErrorKind.unsupported,
+      '当前引擎不支持执行 URL 模板里的 JS（缺少 WebView）',
+    );
+  }
+
   /// 丢弃页面上正在等待的求值（**页面离开时调，不销毁引擎**）。
   ///
   /// 为什么不 dispose：真实现里一个引擎 = 一个 WebView，dispose 掉下一个
@@ -404,6 +436,9 @@ void checkJsRuleAllowed(String script) {
     );
   }
 }
+
+/// 请求体 / 地址里的非 ASCII 字符（POST + GBK 时要明确拒绝，见 [WebViewRuleEngine.fetchHtml]）。
+final RegExp _kNonAscii = RegExp(r'[^\x00-\x7F]');
 
 /// 从 HTTP `Content-Type` 里抠出 charset（拿不到 / 写的是别名都返回原样字符串）。
 ///
@@ -576,21 +611,52 @@ class WebViewRuleEngine extends BookRuleEngine {
     String url, {
     Map<String, String>? headers,
     String charset = 'utf-8',
+    String method = 'GET',
+    String? body,
   }) async {
     _ensureAlive();
     lastDecodeWarning = null;
     lastDecodeEncoding = null;
+    final isPost = method.toUpperCase() == 'POST';
+    // POST 的请求体里出现非 ASCII + 声明 GBK：Dart 没有 GBK 编码器，发出去的
+    // 是 UTF-8 字节，站点按 GBK 解就是一串乱码 —— 结果页面通常还是 200，
+    // 表现为「搜得到但 0 条」，比明确报错难查得多。这里直接说清楚。
+    if (isPost && body != null && body.isNotEmpty) {
+      final needsGbkBody = _kNonAscii.hasMatch(body) && isGbkCharset(charset);
+      if (needsGbkBody) {
+        throw const RuleEngineException(
+          RuleErrorKind.unsupported,
+          '请求体里有中文且声明为 GBK 编码，本版没有 GBK 编码器，'
+          '无法按站点要求的编码发送',
+        );
+      }
+    }
+    final mergedHeaders = <String, String>{
+      if (headers != null) ...headers,
+    };
+    if (isPost && !hasContentType(mergedHeaders)) {
+      // 判据：显式 content-type > body 是 JSON > 表单串（见 [inferContentType]）
+      mergedHeaders['content-type'] = inferContentType(body);
+    }
     Response<List<int>> resp;
     try {
-      resp = await _dio.get<List<int>>(
-        url,
-        options: Options(
-          responseType: ResponseType.bytes,
-          headers: {
-            if (headers != null) ...headers,
-          },
-        ),
-      );
+      resp = isPost
+          ? await _dio.request<List<int>>(
+              url,
+              data: body,
+              options: Options(
+                method: 'POST',
+                responseType: ResponseType.bytes,
+                headers: mergedHeaders,
+              ),
+            )
+          : await _dio.get<List<int>>(
+              url,
+              options: Options(
+                responseType: ResponseType.bytes,
+                headers: mergedHeaders,
+              ),
+            );
     } on DioException catch (e) {
       throw RuleEngineException(
         RuleErrorKind.network,
@@ -894,6 +960,51 @@ class WebViewRuleEngine extends BookRuleEngine {
         throw RuleEngineException(
           RuleErrorKind.unsupported,
           'JS 规则执行失败：${out.error}',
+        );
+      }
+      return out.value;
+    });
+  }
+
+  /// 在空白页上跑 URL 模板里的 JS 表达式（I4）。
+  ///
+  /// 见接口注释：这件事发生在**发请求之前**，没有页面可复用，所以自己载一张
+  /// 空白页。载页 + 求值同在一个串行任务里，不会与选择器求值抢 WebView。
+  @override
+  Future<String?> evalUrlTemplateJs({
+    required String script,
+    required Map<String, String> bindings,
+  }) async {
+    _ensureAlive();
+    checkJsRuleAllowed(script);
+    return _serial(() async {
+      _ensureAlive();
+      await _loadPage(html: '<html><head></head><body></body></html>', baseUrl: '');
+      _jsRuleRunning = true;
+      Object? raw;
+      try {
+        raw = await _runJsOnPage(
+          buildJsRunnerScript(
+            script: script,
+            bindings: bindings,
+            // `{{…}}` 里是**表达式**：`page-1` 要得到 0，`book.name` 要得到值，
+            // 不能当成语句丢掉（与选择器字段的 `{{}}` 同语义）
+            asExpression: true,
+          ),
+          timeout: kRuleJsTimeout,
+          killOnTimeout: true,
+        );
+      } finally {
+        _jsRuleRunning = false;
+      }
+      final out = parseJsRunOutput(raw);
+      for (final line in out.logs) {
+        debugPrint('[书源 JS] $line');
+      }
+      if (!out.ok) {
+        throw RuleEngineException(
+          RuleErrorKind.unsupported,
+          'URL 模板里的 JS 执行失败：${out.error}',
         );
       }
       return out.value;
@@ -1342,6 +1453,7 @@ class FakeRuleEngine extends BookRuleEngine {
     this.onQueryMap,
     this.onExtractHtml,
     this.onEvalJs,
+    this.onEvalUrlJs,
   });
 
   /// 按 URL 返回网页（默认返回一段空 HTML）。
@@ -1379,12 +1491,27 @@ class FakeRuleEngine extends BookRuleEngine {
     SelectorValue? base,
   )? onEvalJs;
 
+  /// URL 模板里的 JS 求值（I4；默认抛「不支持」）。
+  ///
+  /// 与 [onEvalJs] 分开：URL 模板求值发生在**发请求之前**、空白页上，
+  /// 用例要能单独断言「地址是哪段表达式拼出来的」。
+  final Future<String?> Function(
+    String script,
+    Map<String, String> bindings,
+  )? onEvalUrlJs;
+
   /// 已执行的 JS 规则次数与脚本（测试断言「哪条规则被送进沙箱」）。
   int jsRuleCount = 0;
   final List<String> jsRuleScripts = [];
 
+  /// URL 模板里执行过的 JS 表达式（按调用顺序）。
+  final List<String> urlTemplateScripts = [];
+
   /// 已抓过的 URL（按调用顺序；测试用来断言「unsupported 的源没发请求」）。
   final List<String> fetchedUrls = [];
+
+  /// 每次抓取的请求形态（I4：断言 POST / body / 请求头真的传下去了）。
+  final List<FetchedRequest> fetchedRequests = [];
 
   /// 已求值的 HTML 次数。
   int queryCount = 0;
@@ -1400,8 +1527,17 @@ class FakeRuleEngine extends BookRuleEngine {
     String url, {
     Map<String, String>? headers,
     String charset = 'utf-8',
+    String method = 'GET',
+    String? body,
   }) async {
     fetchedUrls.add(url);
+    fetchedRequests.add(FetchedRequest(
+      url: url,
+      method: method,
+      headers: Map.unmodifiable(headers ?? const <String, String>{}),
+      body: body,
+      charset: charset,
+    ));
     if (onFetch != null) return onFetch!(url);
     return '<html><head></head><body></body></html>';
   }
@@ -1519,6 +1655,21 @@ class FakeRuleEngine extends BookRuleEngine {
   }
 
   @override
+  Future<String?> evalUrlTemplateJs({
+    required String script,
+    required Map<String, String> bindings,
+  }) async {
+    urlTemplateScripts.add(script);
+    if (onEvalUrlJs != null) {
+      return await onEvalUrlJs!(script, bindings);
+    }
+    throw const RuleEngineException(
+      RuleErrorKind.unsupported,
+      '假引擎没有配置 URL 模板 JS 执行',
+    );
+  }
+
+  @override
   void reset() {
     resetCount++;
   }
@@ -1527,4 +1678,26 @@ class FakeRuleEngine extends BookRuleEngine {
   Future<void> dispose() async {
     disposeCount++;
   }
+}
+
+/// 假引擎记录的一次抓取（I4：验「POST / body / 请求头真的传下去了」）。
+class FetchedRequest {
+  const FetchedRequest({
+    required this.url,
+    this.method = 'GET',
+    this.headers = const {},
+    this.body,
+    this.charset = 'utf-8',
+  });
+
+  final String url;
+  final String method;
+  final Map<String, String> headers;
+  final String? body;
+  final String charset;
+
+  bool get isPost => method == 'POST';
+
+  @override
+  String toString() => 'FetchedRequest($method $url, body=$body)';
 }

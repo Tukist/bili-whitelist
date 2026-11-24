@@ -181,6 +181,98 @@ void main() {
       expect(js, contains('document.evaluate'));
       expect(js, contains('"query":".//h3"'));
     });
+
+    // ---- v2.79.0：字段位置的绝对 XPath 必须相对化 ----
+    //
+    // `//x` 在 XPath 1.0 里是绝对路径，`document.evaluate(sel, node, …)` 传什么
+    // 节点都不影响结果 —— 之前字段规则写 `//dt` 时，每一行都取到文档里**第一个**
+    // `dt`。分卷目录的实测表现：章名规则 `//dt/text()&&a@text` 让 57 章全叫
+    // 「第一卷 XXX」（第一卷的卷名被刷到每一章上）。
+
+    test('字段里的绝对 XPath 补成相对（.//x），列表仍按整页查', () {
+      final js = buildQueryFieldsMultiJs(
+        parseSelector('@xpath://div[@id="list"]/dl/dd'),
+        {'name': parseSelector("@xpath://dt[@class='vcss']/text()")},
+      );
+      // 列表规则：整页查，`//` 保持绝对
+      expect(js, contains('"query":"//div[@id='));
+      // 字段规则：相对每个列表节点 → `.//dt`；绝不能留成 `//dt`
+      expect(js, contains('".//dt[@class='));
+      expect(js, isNot(contains('"query":"//dt')));
+    });
+
+    test('单字段求值同样把绝对 XPath 变相对', () {
+      final js = buildQueryFieldsJs(
+        parseSelector('@css:.book'),
+        parseSelector('@xpath://h3'),
+      );
+      expect(js, contains('".//h3"'));
+    });
+
+    test('链式段与回退链里的绝对 XPath 也按字段位置相对化', () {
+      final js = buildQueryFieldsJs(
+        parseSelector('@css:.book'),
+        parseSelector('//section@xpath://a || //span'),
+      );
+      expect(js, contains('".//section"'));
+      expect(js, contains('".//a"'));
+      expect(js, contains('".//span"'));
+    });
+
+    // ---- 例外：容器本身是整篇文档时**保持绝对** ----
+    //
+    // 详情页拿 `@css:body` 当容器（它没有「一行一个节点」的列表概念）。作者用
+    // `//meta[@property="og:image"]/@content` 取封面、`og:novel:author` 取作者
+    // 是 legado 语料里的常见写法，而 `<head>` 里的 meta **不在 body 里** ——
+    // 补成 `.//meta` 就永远取不到（封面 / 作者整列空掉）。
+
+    test('容器是 body 时字段 XPath 保持绝对（<head> 里的 meta 取得到）', () {
+      final js = buildQueryFieldsJs(
+        parseSelector('@css:body'),
+        parseSelector('//meta[@property="og:image"]/@content'),
+      );
+      expect(
+        js,
+        contains(r'"query":"//meta[@property=\"og:image\"]/@content"'),
+      );
+      expect(js, isNot(contains(r'"query":".//meta')));
+    });
+
+    test('容器是 html / xpath 的 //body 时同样保持绝对', () {
+      for (final container in ['@css:html', '@xpath://body']) {
+        final js = buildQueryFieldsJs(
+          parseSelector(container),
+          parseSelector('//meta[@property="og:image"]/@content'),
+        );
+        expect(js, contains('"query":"//meta'), reason: container);
+        expect(js, isNot(contains('".//meta"')), reason: container);
+      }
+    });
+
+    test('详情页走的混合求值也按容器决定是否相对化', () {
+      final js = buildQueryFieldsMixedJs(
+        listSelector: parseSelector('@css:body'),
+        selectorFields: {
+          'cover': parseSelector('//meta[@property="og:image"]/@content'),
+        },
+        jsFields: {
+          'author': parseSelector(
+            '//meta[@property="og:novel:author"]/@content@js:result',
+          ),
+        },
+        bindings: const {},
+      );
+      expect(js, contains(r'"query":"//meta[@property=\"og:image\"]/@content"'));
+      expect(js, isNot(contains(r'"query":".//meta')));
+    });
+
+    test('带括号的整段 XPath 原样保留（补 `.` 会变成语法错误）', () {
+      final js = buildQueryFieldsJs(
+        parseSelector('@css:.book'),
+        parseSelector('(//div)[1]'),
+      );
+      expect(js, contains('"(//div)[1]"'));
+    });
   });
 
   group('buildRemoveNodesJs', () {
